@@ -356,7 +356,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Coalesces rapid live-resize events so we re-layout once the drag settles.
     private var resizeWork: DispatchWorkItem?
 
-    private let defaultURL = "https://example.com"
+    private let defaultURL = "https://browserscore.dev"
     private let toolbarHeight: CGFloat = 48
     private let tabBarHeight: CGFloat = 36
 
@@ -1034,6 +1034,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if self.inFlightLoads <= 0 {
                     self.inFlightLoads = 0
                     self.progress.stopAnimation(nil)
+                }
+                // Use the page's <title> for the tab label (fall back to the host title).
+                if let cstr = browser_engine_title(engine) {
+                    let pageTitle = String(cString: cstr)
+                    if !pageTitle.isEmpty { tab.title = pageTitle }
+                }
+                if let idx = self.tabs.firstIndex(where: { $0 === tab }), idx < self.tabButtons.count {
+                    self.tabButtons[idx].updateTitle()
                 }
                 // Only repaint if the tab that finished is still the active one.
                 if self.activeTab === tab {

@@ -74,6 +74,17 @@ int32_t browser_engine_load_url(struct Engine *engine, const char *url);
 void browser_engine_scroll_by(struct Engine *engine, float dy);
 
 /**
+ * The loaded page's `<title>` as a NUL-terminated UTF-8 C string, or null if none.
+ *
+ * Lifetime: owned by the engine handle (stored in `last_title`); valid until the next
+ * `browser_engine_title` call on this handle or until `browser_engine_free`. Copy before reusing.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_title(struct Engine *engine);
+
+/**
  * Paint the current state and return a borrowed view of the framebuffer.
  * Valid until the next render/free on this handle.
  *

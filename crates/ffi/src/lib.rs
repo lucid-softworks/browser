@@ -17,6 +17,7 @@ use std::ffi::CString;
 pub struct Engine {
     inner: engine::Engine,
     last_link: Option<CString>,
+    last_title: Option<CString>,
 }
 
 /// A borrowed view of the engine's RGBA8 (straight-alpha) framebuffer.
@@ -38,7 +39,11 @@ impl Framebuffer {
 /// Create a new engine. Release with [`browser_engine_free`].
 #[no_mangle]
 pub extern "C" fn browser_engine_new() -> *mut Engine {
-    Box::into_raw(Box::new(Engine { inner: engine::Engine::new(), last_link: None }))
+    Box::into_raw(Box::new(Engine {
+        inner: engine::Engine::new(),
+        last_link: None,
+        last_title: None,
+    }))
 }
 
 /// Free an engine created by [`browser_engine_new`]. Null is a no-op.
@@ -94,6 +99,29 @@ pub unsafe extern "C" fn browser_engine_load_url(engine: *mut Engine, url: *cons
 pub unsafe extern "C" fn browser_engine_scroll_by(engine: *mut Engine, dy: f32) {
     if let Some(e) = engine.as_mut() {
         e.inner.scroll_by(dy);
+    }
+}
+
+/// The loaded page's `<title>` as a NUL-terminated UTF-8 C string, or null if none.
+///
+/// Lifetime: owned by the engine handle (stored in `last_title`); valid until the next
+/// `browser_engine_title` call on this handle or until `browser_engine_free`. Copy before reusing.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_title(engine: *mut Engine) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    match e.inner.title().and_then(|s| CString::new(s).ok()) {
+        Some(cstr) => {
+            let ptr = cstr.as_ptr();
+            e.last_title = Some(cstr);
+            ptr
+        }
+        None => {
+            e.last_title = None;
+            std::ptr::null()
+        }
     }
 }
 

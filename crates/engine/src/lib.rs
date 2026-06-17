@@ -267,6 +267,37 @@ impl Engine {
         self.framebuffer.as_ref()
     }
 
+    /// The page's `<title>` text (whitespace-collapsed), if the loaded page has one.
+    pub fn title(&self) -> Option<String> {
+        let doc = match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => d,
+            _ => return None,
+        };
+        fn find(doc: &dom::Document, id: dom::NodeId) -> Option<String> {
+            if let dom::NodeData::Element(e) = &doc.get(id).data {
+                if e.tag.eq_ignore_ascii_case("title") {
+                    let mut s = String::new();
+                    for &c in &doc.get(id).children {
+                        if let dom::NodeData::Text(t) = &doc.get(c).data {
+                            s.push_str(t);
+                        }
+                    }
+                    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !s.is_empty() {
+                        return Some(s);
+                    }
+                }
+            }
+            for &c in &doc.get(id).children {
+                if let Some(t) = find(doc, c) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+        find(doc, doc.root())
+    }
+
     /// Hit-test the painted page at framebuffer device-pixel `(x, y)` and, if the deepest box
     /// hit belongs to (or descends from) an `<a href>`, return the absolute link URL.
     ///
