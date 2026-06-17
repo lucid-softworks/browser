@@ -11,10 +11,10 @@ use std::rc::Rc;
 use boa_engine::{
     builtins::promise::PromiseState,
     js_string,
-    module::{ModuleLoader, Referrer},
+    module::{ModuleLoader, ModuleRequest, Referrer},
     object::{builtins::JsArray, ObjectInitializer},
     property::Attribute,
-    Context, JsObject, JsResult, JsString, JsValue, Module, NativeFunction, Source,
+    Context, JsObject, JsResult, JsValue, Module, NativeFunction, Source,
 };
 
 /// A JS execution result: the value rendered as a string (if any) plus any console output
@@ -257,10 +257,10 @@ impl ModuleLoader for MapLoader {
     async fn load_imported_module(
         self: Rc<Self>,
         _referrer: Referrer,
-        specifier: JsString,
+        request: ModuleRequest,
         context: &RefCell<&mut Context>,
     ) -> JsResult<Module> {
-        let key = specifier.to_std_string_escaped();
+        let key = request.specifier().to_std_string_escaped();
         if let Some(m) = self.cache.borrow().get(&key) {
             return Ok(m.clone());
         }

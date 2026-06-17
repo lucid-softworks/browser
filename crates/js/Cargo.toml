@@ -7,6 +7,8 @@ license.workspace = true
 [dependencies]
 # Reused JS engine (pure Rust). Walled off behind our own Runtime API so it can be
 # replaced by a hand-written engine later — same pattern as net/ureq and paint/fontdue.
-boa_engine = "0.21"
+# Pinned past 0.21.1 to clear a VM panic ("must be declarative environment") that the
+# released version hits when running Vue 3's full component/template codegen.
+boa_engine = { git = "https://github.com/boa-dev/boa", rev = "de2221a09c132951c2ebad36e62ecd20b9987215" }
 # The real DOM, so page scripts can read and mutate the live document tree.
 dom = { path = "../dom" }
