@@ -52,7 +52,7 @@ fn main() {
         }
         println!("module errors: {}", merrs.len());
         for e in merrs.iter().take(20) {
-            println!("  {}", e.lines().next().unwrap_or(""));
+            println!("  ERR: {e}");
         }
     }
 }

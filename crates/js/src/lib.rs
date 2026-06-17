@@ -468,6 +468,69 @@ fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
     out
 }
 
+/// Serialize the children of `id` back to an HTML string (the `innerHTML` of `id`).
+///
+/// This is a minimal HTML serializer: it emits start/end tags with attributes, text, and
+/// comments. It is enough for frameworks that read `container.innerHTML` to recover an in-DOM
+/// template (e.g. Vue's `mount` uses the container's innerHTML as the component template), where
+/// a text-only serialization would silently drop structural directives like `v-for`/`v-if`.
+fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
+    /// HTML void elements never have an end tag.
+    fn is_void(tag: &str) -> bool {
+        matches!(
+            tag.to_ascii_lowercase().as_str(),
+            "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link"
+                | "meta" | "param" | "source" | "track" | "wbr"
+        )
+    }
+    fn escape_text(s: &str) -> String {
+        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    }
+    fn escape_attr(s: &str) -> String {
+        s.replace('&', "&amp;").replace('"', "&quot;")
+    }
+    fn serialize_node(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
+        match &doc.get(id).data {
+            dom::NodeData::Text(t) => out.push_str(&escape_text(t)),
+            dom::NodeData::Comment(c) => {
+                out.push_str("<!--");
+                out.push_str(c);
+                out.push_str("-->");
+            }
+            dom::NodeData::Element(e) => {
+                out.push('<');
+                out.push_str(&e.tag);
+                for (k, v) in &e.attrs {
+                    out.push(' ');
+                    out.push_str(k);
+                    out.push_str("=\"");
+                    out.push_str(&escape_attr(v));
+                    out.push('"');
+                }
+                out.push('>');
+                if !is_void(&e.tag) {
+                    for &child in &doc.get(id).children {
+                        serialize_node(doc, child, out);
+                    }
+                    out.push_str("</");
+                    out.push_str(&e.tag);
+                    out.push('>');
+                }
+            }
+            dom::NodeData::Document => {
+                for &child in &doc.get(id).children {
+                    serialize_node(doc, child, out);
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    for &child in &doc.get(id).children {
+        serialize_node(doc, child, &mut out);
+    }
+    out
+}
+
 /// Replace all children of `id` with a single `Text` node holding `text`.
 fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
     // Detach existing children (orphan them; the arena keeps the slots, which is fine).
@@ -789,13 +852,16 @@ fn make_element(id: dom::NodeId, doc: &SharedDoc, context: &mut Context) -> JsOb
         .to_js_function(&realm)
     };
 
-    // --- innerHTML: get returns the concatenated text; set replaces with a single text node. ---
+    // --- innerHTML: get serializes children back to HTML markup (tags + attrs + text), so code
+    // that reads `el.innerHTML` as a template (e.g. Vue's `mount` uses the mount container's
+    // innerHTML as the component template) recovers structural directives like `v-for`/`v-if`
+    // instead of a flattened text run. set replaces with a single text node. ---
     let html_get = {
         let doc = Rc::clone(doc);
         unsafe {
             NativeFunction::from_closure(move |this, _args, ctx| {
                 let s = node_id_of(this, ctx)
-                    .map(|n| text_content(&doc.borrow(), n))
+                    .map(|n| inner_html(&doc.borrow(), n))
                     .unwrap_or_default();
                 Ok(JsValue::from(js_string!(s)))
             })
@@ -2884,6 +2950,25 @@ mod tests {
         doc.append_child(t, dom::NodeData::Text(title.to_string()));
         let body = doc.append_element(html, "body");
         (doc, body)
+    }
+
+    #[test]
+    fn inner_html_serializes_child_markup_not_just_text() {
+        // innerHTML must return tags + attributes (so framework in-DOM templates survive), not a
+        // flattened text run.
+        let (mut doc, body) = doc_with_body("");
+        let span = doc.append_element(body, "span");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(span).data {
+            e.attrs.insert("class".to_string(), "hi".to_string());
+        }
+        doc.append_child(span, dom::NodeData::Text("x".to_string()));
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"document.body.innerHTML"#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some(r#"<span class="hi">x</span>"#));
     }
 
     #[test]
