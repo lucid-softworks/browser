@@ -626,35 +626,69 @@ fn collect_images(
     }
     let mut targets = Vec::new();
     walk(doc, doc.root(), base, &mut targets);
+    if targets.len() > MAX_IMAGES {
+        for (_, url) in targets.drain(MAX_IMAGES..) {
+            console.push(format!("[skipped image (limit {MAX_IMAGES} reached): {url}]"));
+        }
+    }
+
+    // `data:` images decode inline (no I/O); network images are fetched concurrently across a
+    // small pool of scoped threads, since they're independent and order doesn't matter.
+    let (data_targets, net_targets): (Vec<_>, Vec<_>) =
+        targets.into_iter().partition(|(_, url)| url.starts_with("data:"));
+
+    let mut results: Vec<(dom::NodeId, String, Result<DecodedImage, String>)> = Vec::new();
+    for (node, url) in data_targets {
+        let r = decode_data_url(&url)
+            .ok_or_else(|| "malformed data: URL".to_string())
+            .and_then(|b| decode_image(&b).ok_or_else(|| "decode failed".to_string()));
+        results.push((node, url, r));
+    }
+
+    if !net_targets.is_empty() {
+        let n_threads = net_targets.len().min(8).max(1);
+        let chunks: Vec<Vec<(dom::NodeId, String)>> = {
+            let mut cs: Vec<Vec<_>> = (0..n_threads).map(|_| Vec::new()).collect();
+            for (i, t) in net_targets.into_iter().enumerate() {
+                cs[i % n_threads].push(t);
+            }
+            cs
+        };
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunks
+                .into_iter()
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .into_iter()
+                            .map(|(node, url)| {
+                                let r = net::fetch(&url)
+                                    .and_then(|resp| {
+                                        decode_image(&resp.body)
+                                            .ok_or_else(|| "decode failed".to_string())
+                                    });
+                                (node, url, r)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                results.extend(h.join().unwrap_or_default());
+            }
+        });
+    }
 
     let mut images = HashMap::new();
-    let mut fetched = 0usize;
-    for (node, url) in targets {
-        if fetched >= MAX_IMAGES {
-            console.push(format!("[skipped image (limit {MAX_IMAGES} reached): {url}]"));
-            continue;
-        }
-        fetched += 1;
-        // `data:` URLs decode inline; everything else is fetched over the network.
-        let bytes = if url.starts_with("data:") {
-            match decode_data_url(&url) {
-                Some(b) => Ok(b),
-                None => Err("malformed data: URL".to_string()),
+    for (node, url, r) in results {
+        match r {
+            Ok(img) => {
+                images.insert(node, img);
             }
-        } else {
-            net::fetch(&url).map(|r| r.body).map_err(|e| e)
-        };
-        match bytes {
-            Ok(b) => match decode_image(&b) {
-                Some(img) => {
-                    images.insert(node, img);
-                }
-                None => {
-                    let label = if url.starts_with("data:") { "data: image" } else { &url };
-                    console.push(format!("[failed to decode image: {label}]"));
-                }
-            },
-            Err(e) => console.push(format!("[failed to load image: {url} — {e}]")),
+            Err(e) => {
+                let label = if url.starts_with("data:") { "data: image" } else { &url };
+                console.push(format!("[failed to load image: {label} — {e}]"));
+            }
         }
     }
     images
