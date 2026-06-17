@@ -1387,7 +1387,7 @@ pub fn collect_module_graph(
 
         // Fetch this level concurrently across a small scoped thread pool.
         if !net_urls.is_empty() {
-            let n = net_urls.len().min(16).max(1);
+            let n = net_urls.len().min(8).max(1);
             let mut chunks: Vec<Vec<String>> = (0..n).map(|_| Vec::new()).collect();
             for (i, u) in net_urls.into_iter().enumerate() {
                 chunks[i % n].push(u);

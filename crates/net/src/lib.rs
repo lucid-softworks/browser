@@ -5,6 +5,22 @@
 //! touching callers. Keep the public surface stable.
 
 use std::io::Read;
+use std::sync::OnceLock;
+
+/// A single shared HTTP agent: it pools TCP/TLS connections and caches DNS per host, so many
+/// concurrent fetches to the same origin (e.g. a 200+ module graph) reuse connections instead
+/// of each doing its own DNS lookup + handshake — which previously overwhelmed flaky resolvers
+/// ("failed to lookup address") and was slow.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(15))
+            .max_idle_connections_per_host(16)
+            .build()
+    })
+}
 
 /// A mainstream desktop-Safari User-Agent so sites serve us their normal content.
 const BROWSER_USER_AGENT: &str =
@@ -35,7 +51,8 @@ pub fn fetch(url: &str) -> Result<Response, String> {
 
     // Present a mainstream browser User-Agent. Many sites (Google, etc.) serve a stripped
     // or blocked page to unknown clients like ureq's default UA, so we look like a browser.
-    let resp = match ureq::get(url)
+    let resp = match agent()
+        .get(url)
         // Bound the whole request (DNS + connect + read) so one stalled connection can't hang
         // the engine — important when fetching large resource graphs (e.g. 200+ JS modules).
         .timeout(std::time::Duration::from_secs(15))
