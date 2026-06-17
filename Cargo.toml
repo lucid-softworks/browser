@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/net",
+    "crates/html",
+    "crates/css",
+    "crates/dom",
+    "crates/js",
+    "crates/style",
+    "crates/layout",
+    "crates/paint",
+    "crates/engine",
+    "crates/ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+# Optimize the release build of the engine; debug stays fast to compile.
+[profile.release]
+opt-level = 3
+lto = "thin"
