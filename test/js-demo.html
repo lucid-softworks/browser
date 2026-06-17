@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>JS demo</title>
+  <style>body { font-family: sans-serif; }</style>
+</head>
+<body>
+  <h1>JavaScript demo page</h1>
+  <p>This page runs an inline script. The engine executes it with the embedded JS runtime and captures console output.</p>
+  <p>Open the console panel to see the result.</p>
+  <script>
+    var sum = 0;
+    for (var i = 1; i <= 10; i++) { sum += i; }
+    console.log("sum of 1..10 =", sum);
+    console.log("string ops:", "browser".toUpperCase() + "!");
+    console.log("math:", Math.sqrt(144), Math.max(3, 7, 2));
+    var nums = [5, 2, 8, 1].sort(function(a, b) { return a - b; });
+    console.log("sorted:", nums.join(", "));
+  </script>
+</body>
+</html>

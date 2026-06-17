@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head><title>Timer demo</title></head>
+<body>
+  <h1>Timer / event-loop demo</h1>
+  <script>
+    console.log("typeof setTimeout =", typeof setTimeout);
+    console.log("start");
+    setTimeout(function () { console.log("timeout 50ms"); }, 50);
+    setTimeout(function () { console.log("timeout 0ms"); }, 0);
+    queueMicrotask(function () { console.log("microtask"); });
+    Promise.resolve().then(function () { console.log("promise.then"); });
+    var n = 0;
+    var iv = setInterval(function () {
+      n++;
+      console.log("interval tick", n);
+      if (n >= 3) clearInterval(iv);
+    }, 10);
+    console.log("end of sync script");
+  </script>
+</body>
+</html>

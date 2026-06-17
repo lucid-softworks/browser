@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Box model demo</title>
+  <style>
+    body { color: #e0e0e0; }
+    .card {
+      background-color: #243044;
+      border: 3px solid #5ec8ff;
+      padding: 16px;
+      margin: 12px;
+      width: 520px;
+    }
+    .danger {
+      background-color: #402024;
+      border: 2px solid #ff6060;
+      padding: 12px;
+      margin: 12px;
+    }
+    h1 { color: #5ec8ff; font-size: 30px; }
+    .tag {
+      background-color: #2e7d32;
+      color: #ffffff;
+      padding: 6px;
+      border: 1px solid #80ff80;
+      width: 180px;
+      margin: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Box model</h1>
+  <div class="card">
+    This card has a background, a 3px blue border, padding, a margin, and a fixed width.
+    Text inside wraps within the content box rather than running edge to edge.
+  </div>
+  <div class="danger">
+    This box has a red border and a dark red background with its own padding and margin.
+  </div>
+  <div class="tag">A small fixed-width tag box.</div>
+</body>
+</html>

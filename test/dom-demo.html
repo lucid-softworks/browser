@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head><title>DOM bindings demo</title></head>
+<body>
+  <h1 id="title">original heading</h1>
+  <p id="msg">original paragraph</p>
+  <div id="out"></div>
+  <script>
+    // Globals that previously threw:
+    console.log("typeof window =", typeof window);
+    console.log("typeof self =", typeof self);
+    console.log("typeof globalThis =", typeof globalThis);
+    console.log("window === self:", window === self);
+
+    // DOM reads + mutation:
+    var h = document.getElementById("title");
+    console.log("found heading:", h.textContent);
+    h.textContent = "CHANGED BY JAVASCRIPT";
+
+    document.getElementById("msg").textContent = "this paragraph was rewritten by JS";
+
+    var out = document.getElementById("out");
+    var node = document.createElement("p");
+    node.textContent = "this paragraph was created with createElement";
+    out.appendChild(node);
+
+    console.log("document.title =", document.title);
+  </script>
+</body>
+</html>

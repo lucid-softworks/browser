@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head><title>Flex / position demo</title>
+<style>
+  body { color: #e8e8e8; }
+  .row {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    background-color: #1d2636;
+    padding: 12px;
+    margin: 10px;
+  }
+  .row > div {
+    background-color: #2e7d32;
+    padding: 10px;
+    border: 1px solid #80ff80;
+    color: #ffffff;
+  }
+  .grow { flex-grow: 1; background-color: #355c9e; border-color: #9cc4ff; }
+  .center {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 90px;
+    background-color: #402024;
+    border: 2px solid #ff6060;
+    margin: 10px;
+  }
+  .badge {
+    position: relative;
+    background-color: #243044;
+    border: 1px solid #5ec8ff;
+    padding: 16px;
+    margin: 10px;
+    height: 60px;
+  }
+  .corner {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    background-color: #d4a017;
+    color: #000000;
+    padding: 4px;
+  }
+</style>
+</head>
+<body>
+  <h1>Flexbox + positioning</h1>
+  <div class="row">
+    <div>left</div>
+    <div class="grow">middle (flex-grow:1 fills space)</div>
+    <div>right</div>
+  </div>
+  <div class="center"><div>centered both axes</div></div>
+  <div class="badge">
+    A positioned container.
+    <div class="corner">absolute top-right</div>
+  </div>
+</body>
+</html>
