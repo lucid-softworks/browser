@@ -62,11 +62,24 @@ type SharedDoc = Rc<RefCell<dom::Document>>;
 struct HostState {
     doc: SharedDoc,
     console: RefCell<Vec<String>>,
+    /// Host network fetcher (the same one the engine passes into `run_modules`). Called on the
+    /// isolate's own worker thread by the `__fetch` native primitive that backs JS `fetch()`.
+    /// Blocking inside it is fine (single-threaded worker, synchronous drain model). The no-DOM
+    /// paths install a no-op fetcher that always returns `None`. Held as an `Rc` so the module
+    /// registry on the `run_modules` path can share the very same fetcher.
+    fetcher: Rc<dyn Fn(&str) -> Option<String>>,
 }
 
 impl HostState {
     fn new(doc: SharedDoc) -> Rc<Self> {
-        Rc::new(HostState { doc, console: RefCell::new(Vec::new()) })
+        Self::with_fetcher(doc, Rc::new(|_| None))
+    }
+
+    fn with_fetcher(
+        doc: SharedDoc,
+        fetcher: Rc<dyn Fn(&str) -> Option<String>>,
+    ) -> Rc<Self> {
+        Rc::new(HostState { doc, console: RefCell::new(Vec::new()), fetcher })
     }
 }
 
@@ -1030,6 +1043,46 @@ fn prim_title_text(
     rv.set(v);
 }
 
+/// `__fetch(url) -> string | null`
+///
+/// Synchronous network primitive backing JS `fetch()`. Resolves `url` against `globalThis.__pageURL`
+/// (absolute URLs pass through unchanged; relative ones are joined onto the page URL), calls the host
+/// fetcher, and returns the response body as a string. Returns `null` (JS) on any failure — bad URL,
+/// no fetcher result, etc. Runs on the isolate's own worker thread, so the blocking host fetch is
+/// fine. Never panics.
+fn prim_fetch(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let raw = arg_str(scope, &args, 0);
+    // Resolve against the page URL when present (so relative URLs work like other fetches).
+    let resolved = {
+        let global = scope.get_current_context().global(scope);
+        let key = v8::String::new(scope, "__pageURL").unwrap();
+        let base = global
+            .get(scope, key.into())
+            .filter(|v| v.is_string())
+            .map(|v| v.to_rust_string_lossy(scope));
+        match base {
+            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
+                Ok(u) => u.to_string(),
+                // Join failed: fall back to the raw URL (likely already absolute).
+                Err(_) => raw.clone(),
+            },
+            _ => raw.clone(),
+        }
+    };
+    let body = (host_state(scope).fetcher)(&resolved);
+    match body {
+        Some(s) => {
+            let v = js_str(scope, &s);
+            rv.set(v);
+        }
+        None => rv.set_null(),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Installation: register native primitives + evaluate the JS bootstrap onto a fresh context.
 // ---------------------------------------------------------------------------------------------
@@ -1095,6 +1148,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__headId", prim_head_id);
     set_fn(scope, global, "__rootId", prim_root_id);
     set_fn(scope, global, "__titleText", prim_title_text);
+    set_fn(scope, global, "__fetch", prim_fetch);
 }
 
 /// Compile+run a script in the current context, ignoring the result. Used for bootstraps where a
@@ -2037,6 +2091,22 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (!("offsetHeight" in el)) { el.offsetHeight = 0; }
     if (!("clientWidth" in el)) { el.clientWidth = 0; }
     if (!("clientHeight" in el)) { el.clientHeight = 0; }
+    // SVG geometry properties expose SVGAnimatedLength / SVGAnimatedRect objects whose `.baseVal`
+    // pages read (e.g. favicon generators do `svg.width.baseVal.value`). Provide zeroed stubs so
+    // those reads don't throw. Gated on SVG tags so HTML elements keep their own width/height attrs.
+    try {
+      var __svgTag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : "";
+      if (svgTags[__svgTag]) {
+        var __len = ["width", "height", "x", "y"];
+        for (var __si = 0; __si < __len.length; __si++) {
+          (function (p) {
+            if (!(p in el)) { def(el, p, { baseVal: { value: 0, valueAsString: "0", valueInSpecifiedUnits: 0 }, animVal: { value: 0 } }); }
+          })(__len[__si]);
+        }
+        if (!("viewBox" in el)) { def(el, "viewBox", { baseVal: { x: 0, y: 0, width: 0, height: 0 }, animVal: { x: 0, y: 0, width: 0, height: 0 } }); }
+        if (!("preserveAspectRatio" in el)) { def(el, "preserveAspectRatio", { baseVal: { align: 0, meetOrSlice: 0 }, animVal: { align: 0, meetOrSlice: 0 } }); }
+      }
+    } catch (e) {}
     installEvents(el);
     return el;
   }
@@ -2449,9 +2519,34 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     subtle: {}
   };
 
-  // fetch: present but rejects (no networking yet).
+  // fetch: backed by the native __fetch primitive (synchronous host fetch under the hood; wrapping
+  // the result in Promise.resolve is correct for our synchronous drain model). Returns a minimal
+  // Response. Rejects with TypeError("Failed to fetch") when the host fetch fails (null body).
   if (typeof globalThis.fetch !== "function") {
-    def(globalThis, "fetch", function () { return Promise.reject(new Error("fetch not implemented")); });
+    def(globalThis, "fetch", function (input, init) {
+      var url;
+      try { url = (input && input.url) ? String(input.url) : String(input); }
+      catch (e) { url = String(input); }
+      var body = (typeof __fetch === "function") ? __fetch(url) : null;
+      if (body == null) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      var response = {
+        ok: true, status: 200, statusText: "OK",
+        url: url, redirected: false, type: "basic", bodyUsed: false,
+        headers: { get: function () { return null; }, has: function () { return false; },
+          forEach: fn, keys: function () { return [][Symbol.iterator](); },
+          values: function () { return [][Symbol.iterator](); },
+          entries: function () { return [][Symbol.iterator](); } },
+        text: function () { return Promise.resolve(body); },
+        json: function () { return Promise.resolve(JSON.parse(body)); },
+        arrayBuffer: function () { return Promise.resolve(new ArrayBuffer(0)); },
+        blob: function () { return Promise.resolve({ size: 0, type: "" }); },
+        formData: function () { return Promise.reject(new TypeError("formData not supported")); },
+        clone: function () { return response; }
+      };
+      return Promise.resolve(response);
+    });
   }
 
   // XMLHttpRequest: present but inert.
@@ -2827,7 +2922,8 @@ struct ModuleRegistry {
     identity_to_url: RefCell<HashMap<i32, String>>,
     /// On-demand fetcher for modules absent from `sources` (dynamic imports of non-pre-fetched
     /// URLs). Called only on the isolate's own worker thread, so blocking inside it is fine.
-    fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    /// Shared (via `Rc`) with [`HostState`] so the JS `fetch()` primitive uses the same fetcher.
+    fetcher: Rc<dyn Fn(&str) -> Option<String>>,
     /// Page/entry URL, used as the base for resolving specifiers when a referrer's own URL is
     /// unknown (e.g. dynamic `import()` from a non-module classic context).
     base_url: String,
@@ -3103,7 +3199,10 @@ pub fn run_modules(
                 v8::scope!(let handle_scope, &mut isolate);
                 let context = v8::Context::new(handle_scope, Default::default());
                 let scope = &mut v8::ContextScope::new(handle_scope, context);
-                let state = HostState::new(Rc::clone(&shared));
+                // Share one fetcher between the module loader and the JS `fetch()` primitive.
+                let fetcher: Rc<dyn Fn(&str) -> Option<String>> =
+                    Rc::new(move |u: &str| fetcher(u));
+                let state = HostState::with_fetcher(Rc::clone(&shared), Rc::clone(&fetcher));
                 scope.get_current_context().set_slot(state);
                 let registry = Rc::new(ModuleRegistry {
                     sources: RefCell::new(modules),
@@ -4145,6 +4244,72 @@ mod tests {
             console.iter().any(|l| l == "side effect ran"),
             "console was {console:?}"
         );
+    }
+
+    #[test]
+    fn fetch_resolves_and_json_parses_via_host_fetcher() {
+        // A module fetches a relative URL; the host fetcher serves canned JSON. The Response's
+        // .json() must parse it and the value must reach the console (proving fetch + Promise drain).
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"fetch("data.json").then(r => r.json()).then(d => console.log("got:" + d.score));"#
+                .to_string(),
+        );
+
+        let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
+            // The URL is resolved against the page URL before reaching the host fetcher.
+            assert_eq!(u, "https://x/data.json", "fetch should resolve relative URLs");
+            Some(r#"{"score": 99}"#.to_string())
+        });
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, fetcher);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.iter().any(|l| l == "got:99"), "console was {console:?}");
+    }
+
+    #[test]
+    fn fetch_rejects_with_typeerror_when_host_fetch_fails() {
+        // When the host fetcher returns None, fetch() rejects with a TypeError("Failed to fetch").
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"fetch("nope.json").catch(e => console.log("caught:" + e.name + ":" + e.message));"#
+                .to_string(),
+        );
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(
+            console.iter().any(|l| l == "caught:TypeError:Failed to fetch"),
+            "console was {console:?}"
+        );
+    }
+
+    #[test]
+    fn svg_baseval_stub_does_not_throw() {
+        // Reading SVG geometry props (width/height/viewBox .baseVal) must not throw.
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+               console.log("dims:" + svg.width.baseVal.value + "," + svg.height.baseVal.value
+                 + "," + svg.viewBox.baseVal.width);"#
+                .to_string(),
+        );
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.iter().any(|l| l == "dims:0,0,0"), "console was {console:?}");
     }
 
     #[test]
