@@ -407,7 +407,7 @@ pub fn run_modules(
             // Wait a bounded slice; if the worker doesn't finish (slow/looping app), render the
             // pre-module DOM. The detached worker runs to completion on its own (and is reaped at
             // process exit). A panic in the worker drops `tx`, so `recv` also returns Err here.
-            let budget = std::time::Duration::from_secs(10);
+            let budget = std::time::Duration::from_secs(20);
             match rx.recv_timeout(budget) {
                 Ok(result) => result,
                 Err(_) => (
