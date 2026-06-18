@@ -90,14 +90,351 @@ fn parse_rules(
         // Read the declaration block body up to the matching `}` (balanced).
         let body_start = pos;
         let body_end = scan_balanced_block_end(bytes, pos, end);
-        let body: String = bytes[body_start..body_end].iter().collect();
         pos = if body_end < end { body_end + 1 } else { body_end };
 
         let selectors = parse_selector_list(&prelude);
-        let declarations = parse_declarations(&body);
         if !selectors.is_empty() {
-            out.push(Rule { selectors, declarations, media: media.map(str::to_string) });
+            // The body may contain BOTH declarations and nested rule blocks (CSS Nesting). Parse
+            // it splitting the two, then flatten nested rules against this rule's selectors.
+            parse_rule_body(bytes, body_start, body_end, &selectors, media, out);
         }
+    }
+}
+
+/// Parse a rule body (`bytes[start..end]`) that may interleave declarations and nested rule
+/// blocks. `parent_selectors` is the (already comma-expanded) selector list of the enclosing
+/// rule; nested selectors are combined against it (`&` substitution / bare-descendant). The
+/// produced flat [`Rule`]s are appended to `out`, preserving source order as much as practical:
+/// all declarations collected directly in this body form one rule (emitted at the point its
+/// run begins), and each nested block is flattened in place.
+// The final `flush_decls!()` after the loop assigns `own_rule_idx` it then never reads; that
+// dead write is intentional (the macro is shared with in-loop flushes that DO read it).
+#[allow(unused_assignments)]
+fn parse_rule_body(
+    bytes: &[char],
+    start: usize,
+    end: usize,
+    parent_selectors: &[String],
+    media: Option<&str>,
+    out: &mut Vec<Rule>,
+) {
+    let mut pos = start;
+    let mut decl_buf = String::new();
+    // Index in `out` of this body's own declaration rule (created lazily on first declaration).
+    let mut own_rule_idx: Option<usize> = None;
+
+    // Flush accumulated declaration text into this body's own rule.
+    macro_rules! flush_decls {
+        () => {{
+            let decls = parse_declarations(&decl_buf);
+            decl_buf.clear();
+            if !decls.is_empty() {
+                match own_rule_idx {
+                    Some(i) => out[i].declarations.extend(decls),
+                    None => {
+                        own_rule_idx = Some(out.len());
+                        out.push(Rule {
+                            selectors: parent_selectors.to_vec(),
+                            declarations: decls,
+                            media: media.map(str::to_string),
+                        });
+                    }
+                }
+            }
+        }};
+    }
+
+    while pos < end {
+        while pos < end && bytes[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos >= end {
+            break;
+        }
+
+        // A nested at-rule (e.g. `@media (...) { ... }`) inside a rule body.
+        if bytes[pos] == '@' {
+            flush_decls!();
+            pos = parse_nested_at_rule(bytes, pos, end, parent_selectors, media, out);
+            continue;
+        }
+
+        // Scan to the next top-level `;`, `{`, or `}`.
+        let seg_start = pos;
+        pos = scan_to_decl_or_block(bytes, pos, end);
+        if pos >= end {
+            // Trailing declaration text with no terminator.
+            decl_buf.push_str(&bytes[seg_start..end].iter().collect::<String>());
+            break;
+        }
+        match bytes[pos] {
+            ';' => {
+                // A declaration (or empty). Accumulate including the `;` for parse_declarations.
+                decl_buf.push_str(&bytes[seg_start..pos].iter().collect::<String>());
+                decl_buf.push(';');
+                pos += 1;
+            }
+            '}' => {
+                // Stray close inside the body; treat preceding text as a final declaration.
+                decl_buf.push_str(&bytes[seg_start..pos].iter().collect::<String>());
+                pos += 1;
+            }
+            '{' => {
+                // A nested rule block. Flush pending declarations first so source order (and thus
+                // cascade order) is preserved between this body's own rule and the nested rules.
+                flush_decls!();
+                // Any declarations after this nested block start a fresh own-rule (later in source
+                // order than the nested rules), rather than merging into the pre-block rule.
+                own_rule_idx = None;
+                // The text before `{` is its selector prelude.
+                let prelude: String = bytes[seg_start..pos].iter().collect();
+                pos += 1;
+                let nbody_start = pos;
+                let nbody_end = scan_balanced_block_end(bytes, pos, end);
+                pos = if nbody_end < end { nbody_end + 1 } else { nbody_end };
+
+                let nested_sel = parse_selector_list(&prelude);
+                if !nested_sel.is_empty() {
+                    let combined = combine_selectors(parent_selectors, &nested_sel);
+                    // Recurse: the nested body may itself interleave declarations / nesting.
+                    parse_rule_body(bytes, nbody_start, nbody_end, &combined, media, out);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    flush_decls!();
+}
+
+/// Handle an at-rule nested inside a rule body. `@media`/`@supports` blocks are unwrapped: their
+/// inner content is parsed as a rule body against `parent_selectors`, with `@media` extending the
+/// media context. Other at-rules are consumed/skipped. Returns the position past the at-rule.
+fn parse_nested_at_rule(
+    bytes: &[char],
+    start: usize,
+    end: usize,
+    parent_selectors: &[String],
+    media: Option<&str>,
+    out: &mut Vec<Rule>,
+) -> usize {
+    let mut i = start + 1;
+    let name_start = i;
+    while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_') {
+        i += 1;
+    }
+    let name: String = bytes[name_start..i].iter().collect::<String>().to_ascii_lowercase();
+
+    let prelude_start = i;
+    let prelude_end = scan_to_block_or_semi(bytes, i, end);
+    if prelude_end >= end {
+        return prelude_end;
+    }
+    if bytes[prelude_end] == ';' {
+        return prelude_end + 1;
+    }
+
+    let body_start = prelude_end + 1;
+    let body_end = scan_balanced_block_end(bytes, body_start, end);
+    let next = if body_end < end { body_end + 1 } else { body_end };
+    let prelude: String = bytes[prelude_start..prelude_end].iter().collect();
+    let prelude = prelude.trim();
+
+    match name.as_str() {
+        "media" => {
+            let combined = match media {
+                Some(m) if !m.is_empty() => format!("{m} and {prelude}"),
+                _ => prelude.to_string(),
+            };
+            parse_rule_body(bytes, body_start, body_end, parent_selectors, Some(&combined), out);
+        }
+        "supports" => {
+            parse_rule_body(bytes, body_start, body_end, parent_selectors, media, out);
+        }
+        _ => {}
+    }
+    next
+}
+
+/// Scan from `pos` to the first top-level `;`, `{`, or `}` (or `end`), skipping balanced
+/// `(…)`/`[…]` and string literals.
+fn scan_to_decl_or_block(bytes: &[char], mut pos: usize, end: usize) -> usize {
+    while pos < end {
+        match bytes[pos] {
+            ';' | '{' | '}' => return pos,
+            '(' => pos = skip_balanced(bytes, pos, end, '(', ')'),
+            '[' => pos = skip_balanced(bytes, pos, end, '[', ']'),
+            '"' => pos = skip_string(bytes, pos, end, '"'),
+            '\'' => pos = skip_string(bytes, pos, end, '\''),
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
+/// Combine a parent selector list with a nested selector list per CSS Nesting, expanding both
+/// comma lists combinatorially. For each (parent, nested) pair: every `&` in the nested selector
+/// is replaced by the parent; a nested selector with no `&` becomes `parent nested` (descendant).
+fn combine_selectors(parents: &[String], nested: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(parents.len() * nested.len());
+    for child in nested {
+        for parent in parents {
+            out.push(combine_one(parent, child));
+        }
+    }
+    out
+}
+
+/// Combine a single parent selector with a single nested selector. `&` (top-level, not inside a
+/// string) is replaced by `parent`; if the nested selector contains no top-level `&`, it's
+/// treated as a descendant (`parent child`).
+fn combine_one(parent: &str, child: &str) -> String {
+    let chars: Vec<char> = child.chars().collect();
+    let mut has_amp = false;
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            out.push(c);
+            if c == '\\' && i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '(' | '[' => {
+                depth += 1;
+                out.push(c);
+            }
+            ')' | ']' => {
+                depth = (depth - 1).max(0);
+                out.push(c);
+            }
+            '&' if depth == 0 => {
+                has_amp = true;
+                out.push_str(parent);
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    if has_amp {
+        out
+    } else {
+        format!("{parent} {}", out.trim())
+    }
+}
+
+/// Extract the URL specifiers of top-level `@import` rules in source order. Handles
+/// `@import "url";`, `@import 'url';`, `@import url("url");`, `@import url(url);`, and an optional
+/// trailing media query (`@import "x" screen;`) — only the URL is returned. `@import` rules inside
+/// any `{ … }` block are ignored (only top level / not inside another at-rule's block).
+pub fn extract_imports(css: &str) -> Vec<String> {
+    let stripped = strip_comments(css);
+    let chars: Vec<char> = stripped.chars().collect();
+    let bytes: &[char] = &chars;
+    let end = bytes.len();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < end {
+        while pos < end && bytes[pos].is_whitespace() {
+            pos += 1;
+        }
+        if pos >= end {
+            break;
+        }
+        if bytes[pos] == '@' {
+            // Read the at-rule name.
+            let mut i = pos + 1;
+            let name_start = i;
+            while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_')
+            {
+                i += 1;
+            }
+            let name: String =
+                bytes[name_start..i].iter().collect::<String>().to_ascii_lowercase();
+            let prelude_end = scan_to_block_or_semi(bytes, i, end);
+            if name == "import" && prelude_end < end && bytes[prelude_end] == ';' {
+                let prelude: String = bytes[i..prelude_end].iter().collect();
+                if let Some(u) = parse_import_specifier(&prelude) {
+                    out.push(u);
+                }
+            }
+            // Advance past this at-rule (skip its block if it has one).
+            if prelude_end >= end {
+                break;
+            }
+            if bytes[prelude_end] == ';' {
+                pos = prelude_end + 1;
+            } else {
+                // Block at-rule: skip its balanced body so nested `@import`s aren't surfaced.
+                let body_end = scan_balanced_block_end(bytes, prelude_end + 1, end);
+                pos = if body_end < end { body_end + 1 } else { body_end };
+            }
+            continue;
+        }
+        // A normal rule: skip its prelude and balanced block.
+        pos = scan_to_block_or_semi(bytes, pos, end);
+        if pos >= end {
+            break;
+        }
+        match bytes[pos] {
+            '{' => {
+                let body_end = scan_balanced_block_end(bytes, pos + 1, end);
+                pos = if body_end < end { body_end + 1 } else { body_end };
+            }
+            _ => pos += 1, // `;` or stray `}`
+        }
+    }
+    out
+}
+
+/// Parse the prelude of an `@import` rule (everything after `@import`, before the `;`) into its
+/// URL string. Accepts `"url"`, `'url'`, `url("url")`, `url('url')`, `url(bare)`, with optional
+/// trailing media query (ignored). Returns `None` if no URL is found.
+fn parse_import_specifier(prelude: &str) -> Option<String> {
+    let s = prelude.trim();
+    let lower = s.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("url(") {
+        // Find the matching `)` in the original (case-preserving) string.
+        let open = s.len() - rest.len() - 1 + 1; // index just past `url(`
+        let close_rel = s[open..].find(')')?;
+        let inner = s[open..open + close_rel].trim();
+        Some(unquote(inner))
+    } else if s.starts_with('"') || s.starts_with('\'') {
+        let quote = s.chars().next().unwrap();
+        let rest = &s[1..];
+        let close = rest.find(quote)?;
+        Some(rest[..close].to_string())
+    } else {
+        None
+    }
+}
+
+/// Strip surrounding matching quotes from a string, if present.
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'"' || bytes[0] == b'\'')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -518,6 +855,111 @@ mod tests {
                 ("font-weight".to_string(), "bold".to_string()),
             ]
         );
+    }
+
+    // --- @import extraction -----------------------------------------------------------------
+
+    #[test]
+    fn extract_imports_manifest_forms() {
+        let css = r#"
+            @import "tokens.css";
+            @import 'icons.css';
+            @import url("carbon.css");
+            @import url('../components/tooltip/tooltip.css');
+            @import url(../../src/vue/components/feature/feature.css);
+            @import "print.css" print;
+            @import "responsive.css" screen and (min-width: 600px);
+            .a { color: red }
+        "#;
+        let imports = extract_imports(css);
+        assert_eq!(
+            imports,
+            vec![
+                "tokens.css".to_string(),
+                "icons.css".to_string(),
+                "carbon.css".to_string(),
+                "../components/tooltip/tooltip.css".to_string(),
+                "../../src/vue/components/feature/feature.css".to_string(),
+                "print.css".to_string(),
+                "responsive.css".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_imports_ignores_nested_imports() {
+        // An `@import` inside a block is not a real top-level import and must be ignored.
+        let css = "@import \"top.css\"; @media screen { @import \"inner.css\"; } .a {}";
+        assert_eq!(extract_imports(css), vec!["top.css".to_string()]);
+    }
+
+    #[test]
+    fn extract_imports_none_when_absent() {
+        assert!(extract_imports("p { color: red } .a { color: blue }").is_empty());
+    }
+
+    // --- CSS nesting ------------------------------------------------------------------------
+
+    #[test]
+    fn nesting_amp_pseudo() {
+        let sheet = parse(".a { color: red; &:hover { color: blue } }");
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[0].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[0].declarations, vec![("color".to_string(), "red".to_string())]);
+        assert_eq!(sheet.rules[1].selectors, vec![".a:hover"]);
+        assert_eq!(sheet.rules[1].declarations, vec![("color".to_string(), "blue".to_string())]);
+    }
+
+    #[test]
+    fn nesting_bare_descendant() {
+        let sheet = parse(".a { .b { color: green } }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selectors, vec![".a .b"]);
+        assert_eq!(sheet.rules[0].declarations, vec![("color".to_string(), "green".to_string())]);
+    }
+
+    #[test]
+    fn nesting_comma_expansion() {
+        let sheet = parse(".a, .b { & .c { color: red } }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selectors, vec![".a .c", ".b .c"]);
+    }
+
+    #[test]
+    fn nesting_recursive() {
+        let sheet = parse(".a { color: red; & .b { color: green; &:hover { color: blue } } }");
+        // .a {color:red}, .a .b {color:green}, .a .b:hover {color:blue}
+        assert_eq!(sheet.rules.len(), 3);
+        assert_eq!(sheet.rules[0].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[1].selectors, vec![".a .b"]);
+        assert_eq!(sheet.rules[2].selectors, vec![".a .b:hover"]);
+    }
+
+    #[test]
+    fn nesting_media_inside_rule_flattens() {
+        let sheet = parse(".a { color: red; @media (min-width: 600px) { color: blue } }");
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[0].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[0].media, None);
+        assert_eq!(sheet.rules[1].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[1].media.as_deref(), Some("(min-width: 600px)"));
+        assert_eq!(sheet.rules[1].declarations, vec![("color".to_string(), "blue".to_string())]);
+    }
+
+    #[test]
+    fn non_nested_sheet_unchanged() {
+        // Flat CSS must behave identically to before.
+        let sheet = parse("h1 { color: red; font-size: 32px } p, .note { color: #00f }");
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[0].selectors, vec!["h1"]);
+        assert_eq!(
+            sheet.rules[0].declarations,
+            vec![
+                ("color".to_string(), "red".to_string()),
+                ("font-size".to_string(), "32px".to_string())
+            ]
+        );
+        assert_eq!(sheet.rules[1].selectors, vec!["p", ".note"]);
     }
 
     #[test]

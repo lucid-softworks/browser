@@ -644,8 +644,10 @@ pub fn extract_visible_text(doc: &dom::Document) -> String {
     collapse_whitespace(&out)
 }
 
-/// Maximum number of external stylesheets fetched per page; the rest are skipped with a note.
-const MAX_EXTERNAL_STYLESHEETS: usize = 12;
+/// Maximum number of external stylesheets fetched per page (including transitively `@import`ed
+/// files); the rest are skipped with a note. Sized to accommodate `@import` manifests (a single
+/// `<link>` can pull in many component CSS files) while still capping runaway / cyclic imports.
+const MAX_EXTERNAL_STYLESHEETS: usize = 100;
 /// Maximum number of external scripts fetched per page; the rest are skipped with a note.
 const MAX_EXTERNAL_SCRIPTS: usize = 24;
 /// Skip fetched script bodies larger than this (mirrors the inline-script cap).
@@ -757,27 +759,74 @@ pub fn collect_stylesheets(doc: &dom::Document, base: &str) -> (Vec<css::Stylesh
     let mut sheets = Vec::new();
     let mut console = Vec::new();
     let mut fetched = 0usize;
+    // URLs already fetched (across all sources) so a file imported twice isn't refetched, and
+    // import cycles terminate.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for source in collect_style_sources(doc, base) {
         match source {
-            StyleSource::Inline(src) => sheets.push(css::parse(&src)),
+            StyleSource::Inline(src) => {
+                // Inline `<style>` may itself `@import` (rare, but cheap): resolve those against
+                // the page/base URL, recursively pulling them in BEFORE the inline body's rules.
+                process_css_text(&src, base, &mut sheets, &mut console, &mut fetched, &mut seen);
+            }
             StyleSource::External(url) => {
-                if fetched >= MAX_EXTERNAL_STYLESHEETS {
-                    console.push(format!(
-                        "[skipped stylesheet (limit {MAX_EXTERNAL_STYLESHEETS} reached): {url}]"
-                    ));
-                    continue;
-                }
-                fetched += 1;
-                match net::fetch(&url) {
-                    Ok(resp) => sheets.push(css::parse(&String::from_utf8_lossy(&resp.body))),
-                    Err(e) => {
-                        console.push(format!("[failed to load stylesheet: {url} — {e}]"))
-                    }
-                }
+                fetch_css(&url, &mut sheets, &mut console, &mut fetched, &mut seen);
             }
         }
     }
     (sheets, console)
+}
+
+/// Parse `text` (a CSS body fetched/found at URL `base_url`) and append its stylesheet to
+/// `sheets`, but FIRST follow each top-level `@import`: resolve the specifier against `base_url`,
+/// recursively fetch+process it, and include its rules before `text`'s own (CSS precedence:
+/// imported styles come first / lower precedence, in import order). `fetched`/`seen` track the
+/// global file count cap and dedup.
+fn process_css_text(
+    text: &str,
+    base_url: &str,
+    sheets: &mut Vec<css::Stylesheet>,
+    console: &mut Vec<String>,
+    fetched: &mut usize,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    for spec in css::extract_imports(text) {
+        match resolve_url(base_url, &spec) {
+            Some(abs) => fetch_css(&abs, sheets, console, fetched, seen),
+            None => console.push(format!("[skipped @import (unresolvable): {spec}]")),
+        }
+    }
+    sheets.push(css::parse(text));
+}
+
+/// Fetch the external CSS at absolute URL `url`, then process it (following its own `@import`s).
+/// Dedups against `seen` and enforces the [`MAX_EXTERNAL_STYLESHEETS`] fetch cap. A failed fetch
+/// is a console note, not a panic.
+fn fetch_css(
+    url: &str,
+    sheets: &mut Vec<css::Stylesheet>,
+    console: &mut Vec<String>,
+    fetched: &mut usize,
+    seen: &mut std::collections::HashSet<String>,
+) {
+    if !seen.insert(url.to_string()) {
+        return; // already fetched (dedup / cycle guard)
+    }
+    if *fetched >= MAX_EXTERNAL_STYLESHEETS {
+        console.push(format!(
+            "[skipped stylesheet (limit {MAX_EXTERNAL_STYLESHEETS} reached): {url}]"
+        ));
+        return;
+    }
+    *fetched += 1;
+    match net::fetch(url) {
+        Ok(resp) => {
+            let text = String::from_utf8_lossy(&resp.body).into_owned();
+            // Resolve this file's own `@import`s relative to the URL it was fetched under.
+            process_css_text(&text, url, sheets, console, fetched, seen);
+        }
+        Err(e) => console.push(format!("[failed to load stylesheet: {url} — {e}]")),
+    }
 }
 
 /// Walk the DOM in document order collecting `<img>` elements with a resolvable `src`, then
@@ -2054,6 +2103,43 @@ mod tests {
             sheets[1].rules.iter().any(|r| r.selectors.iter().any(|s| s.contains('p'))),
             "external sheet not parsed: {:?}",
             sheets[1]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn external_stylesheet_at_import_is_followed_in_order() {
+        // A `<link>` CSS file that `@import`s another CSS file (both via file://). The imported
+        // sheet's rules must be collected BEFORE the importer's own rules (CSS precedence), with
+        // no network. Tests recursion (the importer also has its own rule) and ordering.
+        let dir = std::env::temp_dir().join(format!("engine_import_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // tokens.css is imported by main.css and defines `.token`.
+        let tokens_path = dir.join("tokens.css");
+        std::fs::write(&tokens_path, ".token { color: #111111 }").unwrap();
+        // main.css imports tokens.css (relative) then defines `.main`.
+        let main_path = dir.join("main.css");
+        std::fs::write(&main_path, "@import \"tokens.css\";\n.main { color: #222222 }").unwrap();
+
+        let css_url = format!("file://{}", main_path.display());
+        let base = format!("file://{}/page.html", dir.display());
+        let html = format!(
+            r#"<html><head><link rel="stylesheet" href="{css_url}"></head><body></body></html>"#
+        );
+        let doc = html::parse(&html);
+        let (sheets, console) = collect_stylesheets(&doc, &base);
+
+        // Two sheets: imported tokens.css FIRST, then main.css.
+        assert_eq!(sheets.len(), 2, "console: {console:?}");
+        assert!(console.is_empty(), "unexpected notes: {console:?}");
+        assert!(
+            sheets[0].rules.iter().any(|r| r.selectors.iter().any(|s| s == ".token")),
+            "imported tokens.css should come first: {sheets:?}"
+        );
+        assert!(
+            sheets[1].rules.iter().any(|r| r.selectors.iter().any(|s| s == ".main")),
+            "importer main.css should come second: {sheets:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
