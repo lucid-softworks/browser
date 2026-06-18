@@ -21,6 +21,11 @@ pub struct Rule {
     /// Nested `@media` queries are joined with `" and "`. `@layer`/`@supports` wrappers do
     /// not contribute to this (their inner rules surface with the surrounding media context).
     pub media: Option<String>,
+    /// The raw `@container` condition this rule lives under (`None` if not inside any
+    /// `@container`). The container name (if any) is dropped — only the `(condition)` part is
+    /// retained (joined with `" and "` when nested). Evaluated like `media` by the `style` crate
+    /// against an assumed container width.
+    pub container: Option<String>,
 }
 
 /// Parse a CSS string into a [`Stylesheet`].
@@ -28,8 +33,29 @@ pub fn parse(css: &str) -> Stylesheet {
     let stripped = strip_comments(css);
     let bytes: Vec<char> = stripped.chars().collect();
     let mut rules = Vec::new();
-    parse_rules(&bytes, 0, bytes.len(), None, &mut rules);
+    parse_rules(&bytes, 0, bytes.len(), None, None, &mut rules);
     Stylesheet { rules }
+}
+
+/// Combine an existing at-rule context (`media` or `container`) with a newly entered query,
+/// joining nested conditions with `" and "`.
+fn combine_query(existing: Option<&str>, new: &str) -> String {
+    match existing {
+        Some(m) if !m.is_empty() => format!("{m} and {new}"),
+        _ => new.to_string(),
+    }
+}
+
+/// Strip an optional leading container name from an `@container` prelude, returning just the
+/// `(condition …)` part. `@container sidebar (min-width: 400px)` → `(min-width: 400px)`;
+/// `@container (min-width: 400px)` is returned unchanged. If there's no `(`, returns the prelude
+/// trimmed (an unrecognized/`style(...)`-style query the cascade will treat permissively).
+fn strip_container_name(prelude: &str) -> String {
+    let p = prelude.trim();
+    match p.find('(') {
+        Some(idx) => p[idx..].trim().to_string(),
+        None => p.to_string(),
+    }
 }
 
 /// Parse the rules within `bytes[start..end]`, appending them to `out`. `media` is the media
@@ -40,6 +66,7 @@ fn parse_rules(
     start: usize,
     end: usize,
     media: Option<&str>,
+    container: Option<&str>,
     out: &mut Vec<Rule>,
 ) {
     let mut pos = start;
@@ -53,7 +80,7 @@ fn parse_rules(
         }
 
         if bytes[pos] == '@' {
-            pos = parse_at_rule(bytes, pos, end, media, out);
+            pos = parse_at_rule(bytes, pos, end, media, container, out);
             continue;
         }
 
@@ -96,7 +123,7 @@ fn parse_rules(
         if !selectors.is_empty() {
             // The body may contain BOTH declarations and nested rule blocks (CSS Nesting). Parse
             // it splitting the two, then flatten nested rules against this rule's selectors.
-            parse_rule_body(bytes, body_start, body_end, &selectors, media, out);
+            parse_rule_body(bytes, body_start, body_end, &selectors, media, container, out);
         }
     }
 }
@@ -116,6 +143,7 @@ fn parse_rule_body(
     end: usize,
     parent_selectors: &[String],
     media: Option<&str>,
+    container: Option<&str>,
     out: &mut Vec<Rule>,
 ) {
     let mut pos = start;
@@ -137,6 +165,7 @@ fn parse_rule_body(
                             selectors: parent_selectors.to_vec(),
                             declarations: decls,
                             media: media.map(str::to_string),
+                            container: container.map(str::to_string),
                         });
                     }
                 }
@@ -155,7 +184,7 @@ fn parse_rule_body(
         // A nested at-rule (e.g. `@media (...) { ... }`) inside a rule body.
         if bytes[pos] == '@' {
             flush_decls!();
-            pos = parse_nested_at_rule(bytes, pos, end, parent_selectors, media, out);
+            pos = parse_nested_at_rule(bytes, pos, end, parent_selectors, media, container, out);
             continue;
         }
 
@@ -197,7 +226,7 @@ fn parse_rule_body(
                 if !nested_sel.is_empty() {
                     let combined = combine_selectors(parent_selectors, &nested_sel);
                     // Recurse: the nested body may itself interleave declarations / nesting.
-                    parse_rule_body(bytes, nbody_start, nbody_end, &combined, media, out);
+                    parse_rule_body(bytes, nbody_start, nbody_end, &combined, media, container, out);
                 }
             }
             _ => unreachable!(),
@@ -215,6 +244,7 @@ fn parse_nested_at_rule(
     end: usize,
     parent_selectors: &[String],
     media: Option<&str>,
+    container: Option<&str>,
     out: &mut Vec<Rule>,
 ) -> usize {
     let mut i = start + 1;
@@ -241,14 +271,16 @@ fn parse_nested_at_rule(
 
     match name.as_str() {
         "media" => {
-            let combined = match media {
-                Some(m) if !m.is_empty() => format!("{m} and {prelude}"),
-                _ => prelude.to_string(),
-            };
-            parse_rule_body(bytes, body_start, body_end, parent_selectors, Some(&combined), out);
+            let combined = combine_query(media, prelude);
+            parse_rule_body(bytes, body_start, body_end, parent_selectors, Some(&combined), container, out);
+        }
+        "container" => {
+            let cond = strip_container_name(prelude);
+            let combined = combine_query(container, &cond);
+            parse_rule_body(bytes, body_start, body_end, parent_selectors, media, Some(&combined), out);
         }
         "supports" => {
-            parse_rule_body(bytes, body_start, body_end, parent_selectors, media, out);
+            parse_rule_body(bytes, body_start, body_end, parent_selectors, media, container, out);
         }
         _ => {}
     }
@@ -447,6 +479,7 @@ fn parse_at_rule(
     start: usize,
     end: usize,
     media: Option<&str>,
+    container: Option<&str>,
     out: &mut Vec<Rule>,
 ) -> usize {
     // Read the at-rule name (the identifier after `@`).
@@ -484,15 +517,19 @@ fn parse_at_rule(
     match name.as_str() {
         "media" => {
             // Combine the existing media context with this query.
-            let combined = match media {
-                Some(m) if !m.is_empty() => format!("{m} and {prelude}"),
-                _ => prelude.to_string(),
-            };
-            parse_rules(bytes, body_start, body_end, Some(&combined), out);
+            let combined = combine_query(media, prelude);
+            parse_rules(bytes, body_start, body_end, Some(&combined), container, out);
+        }
+        "container" => {
+            // Treat `@container [name] (cond)` like `@media`: drop the optional name, retain the
+            // `(condition)` and tag inner rules so the cascade can evaluate it.
+            let cond = strip_container_name(prelude);
+            let combined = combine_query(container, &cond);
+            parse_rules(bytes, body_start, body_end, media, Some(&combined), out);
         }
         "supports" | "layer" => {
-            // Unwrap: parse the inner content as normal rules, preserving media context.
-            parse_rules(bytes, body_start, body_end, media, out);
+            // Unwrap: parse the inner content as normal rules, preserving media/container context.
+            parse_rules(bytes, body_start, body_end, media, container, out);
         }
         // @font-face, @keyframes, @property, @page, @counter-style, @font-feature-values, …
         // Consume and skip the block (no rules emitted).
@@ -798,6 +835,46 @@ mod tests {
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].selectors, vec![".b"]);
         assert_eq!(sheet.rules[0].media.as_deref(), Some("(min-width: 768px)"));
+    }
+
+    #[test]
+    fn container_at_rule_surfaces_tagged_rule() {
+        let sheet = parse("@container (min-width: 400px) { .a { color: red } }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[0].container.as_deref(), Some("(min-width: 400px)"));
+        assert_eq!(sheet.rules[0].media, None);
+        assert_eq!(sheet.rules[0].declarations, vec![("color".to_string(), "red".to_string())]);
+    }
+
+    #[test]
+    fn named_container_drops_name_keeps_condition() {
+        let sheet = parse("@container sidebar (min-width: 400px) { .a { color: blue } }");
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[0].container.as_deref(), Some("(min-width: 400px)"));
+    }
+
+    #[test]
+    fn container_nested_inside_media() {
+        let sheet = parse(
+            "@media (min-width: 640px) { @container (max-width: 700px) { .c { color: #0f0 } } }",
+        );
+        assert_eq!(sheet.rules.len(), 1);
+        assert_eq!(sheet.rules[0].selectors, vec![".c"]);
+        assert_eq!(sheet.rules[0].media.as_deref(), Some("(min-width: 640px)"));
+        assert_eq!(sheet.rules[0].container.as_deref(), Some("(max-width: 700px)"));
+    }
+
+    #[test]
+    fn container_nested_inside_rule_flattens() {
+        let sheet = parse(".a { color: red; @container (min-width: 300px) { color: blue } }");
+        assert_eq!(sheet.rules.len(), 2);
+        assert_eq!(sheet.rules[0].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[0].container, None);
+        assert_eq!(sheet.rules[1].selectors, vec![".a"]);
+        assert_eq!(sheet.rules[1].container.as_deref(), Some("(min-width: 300px)"));
+        assert_eq!(sheet.rules[1].declarations, vec![("color".to_string(), "blue".to_string())]);
     }
 
     #[test]

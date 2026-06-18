@@ -343,6 +343,15 @@ pub fn cascade(
 /// the cascade, since the real viewport isn't part of [`cascade`]'s signature.
 const ASSUMED_VIEWPORT_WIDTH: f32 = 1280.0;
 
+/// Assumed viewport height (px) used to resolve `vh` units in math functions (no real viewport
+/// is available during the cascade).
+const ASSUMED_VIEWPORT_HEIGHT: f32 = 800.0;
+
+/// Assumed width (px) of a query container, used to evaluate `@container` conditions during the
+/// cascade. Correct container sizing requires layout (which runs after the cascade), so we
+/// approximate with a content-column-ish width slightly below the viewport.
+const ASSUMED_CONTAINER_WIDTH: f32 = 1000.0;
+
 /// Recursively compute styles. `parent` is the parent's computed style (the inheritance
 /// source); `parent_vars` is the set of custom properties inherited from ancestors;
 /// `parent_hidden` is true if any ancestor was `display: none`.
@@ -456,7 +465,7 @@ fn compute_element_style(
     let mut order = 0usize;
 
     for rule in &ua.rules {
-        if media_applies(rule.media.as_deref()) {
+        if media_applies(rule.media.as_deref()) && container_applies(rule.container.as_deref()) {
             if let Some(spec) = rule_specificity(&rule.selectors, el) {
                 matches.push(MatchEntry { origin: 0, specificity: spec, order, decls: &rule.declarations });
             }
@@ -465,7 +474,7 @@ fn compute_element_style(
     }
     for sheet in author {
         for rule in &sheet.rules {
-            if media_applies(rule.media.as_deref()) {
+            if media_applies(rule.media.as_deref()) && container_applies(rule.container.as_deref()) {
                 if let Some(spec) = rule_specificity(&rule.selectors, el) {
                     matches.push(MatchEntry { origin: 1, specificity: spec, order, decls: &rule.declarations });
                 }
@@ -688,6 +697,83 @@ fn media_component_matches(component: &str) -> bool {
         }
     }
     true
+}
+
+/// Decide whether a rule with the given raw `@container` condition applies, evaluated against an
+/// assumed container width ([`ASSUMED_CONTAINER_WIDTH`]). Correct container sizing needs layout
+/// (which runs after the cascade), so this is a pragmatic approximation that mirrors
+/// [`media_applies`]: `min-width`/`max-width`/`inline-size`/`width` thresholds are compared
+/// against the assumed width; multiple `and`-joined conditions must all pass. `None` (no
+/// container) always applies, and unrecognized conditions are treated permissively (applied) so
+/// container rules aren't dropped.
+fn container_applies(container: Option<&str>) -> bool {
+    let query = match container {
+        None => return true,
+        Some(q) => q.trim(),
+    };
+    if query.is_empty() {
+        return true;
+    }
+    // Conditions joined by `and` must all match. We also tolerate a `(width > 400px)`-style
+    // comparison form in addition to the `(min-width: 400px)` colon form.
+    let lower = query.to_ascii_lowercase();
+    for raw in lower.split(" and ") {
+        let part = raw.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(inner) = part.strip_prefix('(').and_then(|p| p.strip_suffix(')')) {
+            if !container_feature_matches(inner.trim()) {
+                return false;
+            }
+        }
+        // Non-parenthesized tokens (a bare container name etc.) are ignored → permissive.
+    }
+    true
+}
+
+/// Evaluate a single `@container` feature condition (the text inside the parens) against
+/// [`ASSUMED_CONTAINER_WIDTH`]. Handles the colon form (`min-width: 400px`,
+/// `max-inline-size: 600px`) and the range form (`width >= 400px`, `inline-size < 600px`).
+/// Unrecognized features/forms → `true` (permissive).
+fn container_feature_matches(inner: &str) -> bool {
+    let w = ASSUMED_CONTAINER_WIDTH;
+    // Colon form: `feature: value`.
+    if let Some((feature, value)) = inner.split_once(':') {
+        let feature = feature.trim();
+        let value = value.trim();
+        if let Some(px) = length_px(value) {
+            return match feature {
+                "min-width" | "min-inline-size" => w >= px,
+                "max-width" | "max-inline-size" => w <= px,
+                _ => true, // height/aspect/orientation/unknown → permissive
+            };
+        }
+        return true;
+    }
+    // Range form: `feature OP value` where OP is one of >= <= > < =.
+    for (op, less, oreq) in [(">=", false, true), ("<=", true, true), (">", false, false), ("<", true, false), ("=", false, false)] {
+        if let Some((feature, value)) = inner.split_once(op) {
+            let feature = feature.trim();
+            if !matches!(feature, "width" | "inline-size" | "height" | "block-size") {
+                return true; // unknown feature → permissive
+            }
+            if matches!(feature, "height" | "block-size") {
+                return true; // no assumed container height → permissive
+            }
+            if let Some(px) = length_px(value.trim()) {
+                return match (less, oreq) {
+                    (false, true) => w >= px,
+                    (true, true) => w <= px,
+                    (false, false) if op == "=" => (w - px).abs() < f32::EPSILON,
+                    (false, false) => w > px,
+                    (true, false) => w < px,
+                };
+            }
+            return true;
+        }
+    }
+    true // unrecognized form → permissive
 }
 
 /// Parse a media-query length to px. Supports `px`, `rem`/`em` (×16), bare numbers (px).
@@ -1282,6 +1368,9 @@ fn parse_size_constraint(val: &str) -> Option<SizeConstraint> {
     if v.is_empty() || v == "none" || v == "auto" {
         return None;
     }
+    if has_math_func(&v) {
+        return eval_length(&v, 16.0).map(SizeConstraint::Px);
+    }
     if let Some(p) = v.strip_suffix('%') {
         return p.trim().parse::<f32>().ok().map(|x| SizeConstraint::Pct(x / 100.0));
     }
@@ -1342,6 +1431,9 @@ fn parse_line_height(val: &str, font_size: f32) -> Option<f32> {
     if v.is_empty() || v == "normal" {
         return None;
     }
+    if has_math_func(&v) {
+        return eval_length(&v, font_size);
+    }
     if let Some(p) = v.strip_suffix('%') {
         return p.trim().parse::<f32>().ok().map(|x| x / 100.0 * font_size);
     }
@@ -1385,6 +1477,10 @@ fn apply_text_decoration(style: &mut ComputedStyle, val: &str) {
 /// and elliptical `/` syntax are simplified away). `%` resolves to `None` here (can't resolve
 /// without box size) → falls back to 0; px/unitless resolve directly.
 fn parse_border_radius(val: &str) -> Option<f32> {
+    // A single math function (which may itself contain spaces / a `/`) is evaluated whole.
+    if has_math_func(val) {
+        return eval_length(val, 16.0).map(|r| r.max(0.0));
+    }
     // Ignore the elliptical `a / b` part: use the horizontal radii before `/`.
     let main = val.split('/').next().unwrap_or(val);
     let first = main.split_whitespace().next()?;
@@ -1406,12 +1502,247 @@ enum EdgeSide {
     All,
 }
 
+/// Evaluate a CSS length value that may use the math functions `min()`, `max()`, `clamp()`, and
+/// `calc()`, resolving to a final px `f32`. `font_size_px` is the element's font size, used to
+/// resolve `em` (and is the basis for `%` would-be percentages — but percentages in lengths are
+/// resolved here against [`ASSUMED_VIEWPORT_WIDTH`] as an approximation, since the real
+/// percentage basis isn't known until layout). Units handled: `px`, `rem` (×16), `em`
+/// (×`font_size_px`), `pt` (×4/3), `vw` (=`ASSUMED_VIEWPORT_WIDTH`/100×n), `vh`
+/// (=`ASSUMED_VIEWPORT_HEIGHT`/100×n), `%` (×`ASSUMED_VIEWPORT_WIDTH`/100 — approximate), and a
+/// bare unitless number (used as-is, e.g. multipliers / `calc(2 * 3px)`). Nested functions are
+/// supported. Any unknown unit/function or a parse failure yields `None` so callers fall back to
+/// their existing behavior; it never panics.
+///
+/// Returns `None` for plain lengths that contain no math function — callers should only reach for
+/// this when a `(`/math token is present, then fall back to their own parser.
+fn eval_length(value: &str, font_size_px: f32) -> Option<f32> {
+    let lower = value.trim().to_ascii_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    let mut p = MathParser { chars: &chars, pos: 0, font_size: font_size_px };
+    p.skip_ws();
+    let v = p.parse_expr()?;
+    p.skip_ws();
+    if p.pos != p.chars.len() {
+        return None; // trailing garbage → bail
+    }
+    if v.is_finite() {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// A tiny recursive-descent evaluator for CSS length math (`calc`/`min`/`max`/`clamp` and the
+/// terms they contain). Operates on a lowercased char slice. Each evaluated value is already
+/// resolved to px (or a unitless number for bare numbers / multipliers).
+struct MathParser<'a> {
+    chars: &'a [char],
+    pos: usize,
+    font_size: f32,
+}
+
+impl<'a> MathParser<'a> {
+    fn skip_ws(&mut self) {
+        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    /// `expr := term (('+' | '-') term)*`
+    fn parse_expr(&mut self) -> Option<f32> {
+        let mut acc = self.parse_term()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('+') => {
+                    self.pos += 1;
+                    acc += self.parse_term()?;
+                }
+                Some('-') => {
+                    self.pos += 1;
+                    acc -= self.parse_term()?;
+                }
+                _ => break,
+            }
+        }
+        Some(acc)
+    }
+
+    /// `term := factor (('*' | '/') factor)*`
+    fn parse_term(&mut self) -> Option<f32> {
+        let mut acc = self.parse_factor()?;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some('*') => {
+                    self.pos += 1;
+                    acc *= self.parse_factor()?;
+                }
+                Some('/') => {
+                    self.pos += 1;
+                    let d = self.parse_factor()?;
+                    if d == 0.0 {
+                        return None;
+                    }
+                    acc /= d;
+                }
+                _ => break,
+            }
+        }
+        Some(acc)
+    }
+
+    /// `factor := '(' expr ')' | func | number-with-unit`
+    fn parse_factor(&mut self) -> Option<f32> {
+        self.skip_ws();
+        match self.peek()? {
+            '(' => {
+                self.pos += 1;
+                let v = self.parse_expr()?;
+                self.skip_ws();
+                if self.peek() == Some(')') {
+                    self.pos += 1;
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+            '+' => {
+                // Unary plus.
+                self.pos += 1;
+                self.parse_factor()
+            }
+            '-' => {
+                // Unary minus.
+                self.pos += 1;
+                self.parse_factor().map(|v| -v)
+            }
+            c if c.is_ascii_alphabetic() => self.parse_function(),
+            _ => self.parse_value(),
+        }
+    }
+
+    /// Parse a `min()/max()/clamp()/calc()` call (the identifier and its parenthesized,
+    /// comma-separated argument list).
+    fn parse_function(&mut self) -> Option<f32> {
+        let name_start = self.pos;
+        while self.pos < self.chars.len()
+            && (self.chars[self.pos].is_ascii_alphabetic() || self.chars[self.pos] == '-')
+        {
+            self.pos += 1;
+        }
+        let name: String = self.chars[name_start..self.pos].iter().collect();
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            return None;
+        }
+        self.pos += 1; // consume '('
+        let mut args: Vec<f32> = Vec::new();
+        loop {
+            let v = self.parse_expr()?;
+            args.push(v);
+            self.skip_ws();
+            match self.peek() {
+                Some(',') => {
+                    self.pos += 1;
+                    continue;
+                }
+                Some(')') => {
+                    self.pos += 1;
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        match name.as_str() {
+            "calc" => {
+                if args.len() == 1 {
+                    Some(args[0])
+                } else {
+                    None
+                }
+            }
+            "min" => args.iter().cloned().reduce(f32::min),
+            "max" => args.iter().cloned().reduce(f32::max),
+            "clamp" => {
+                if args.len() == 3 {
+                    // clamp(lo, val, hi) == max(lo, min(val, hi))
+                    Some(args[0].max(args[1].min(args[2])))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse a single numeric token with an optional unit, resolving it to px (or a unitless
+    /// number). The numeric part may be a float; the unit is a trailing run of letters or `%`.
+    fn parse_value(&mut self) -> Option<f32> {
+        let start = self.pos;
+        while self.pos < self.chars.len()
+            && (self.chars[self.pos].is_ascii_digit() || self.chars[self.pos] == '.')
+        {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        let num: f32 = self.chars[start..self.pos]
+            .iter()
+            .collect::<String>()
+            .parse()
+            .ok()?;
+        // Read a trailing unit (letters or `%`).
+        let unit_start = self.pos;
+        while self.pos < self.chars.len()
+            && (self.chars[self.pos].is_ascii_alphabetic() || self.chars[self.pos] == '%')
+        {
+            self.pos += 1;
+        }
+        let unit: String = self.chars[unit_start..self.pos].iter().collect();
+        match unit.as_str() {
+            "" => Some(num), // unitless number (multiplier / line-height factor)
+            "px" => Some(num),
+            "rem" => Some(num * 16.0),
+            "em" => Some(num * self.font_size),
+            "pt" => Some(num * 4.0 / 3.0),
+            "vw" => Some(num * ASSUMED_VIEWPORT_WIDTH / 100.0),
+            "vh" => Some(num * ASSUMED_VIEWPORT_HEIGHT / 100.0),
+            "vmin" => Some(num * ASSUMED_VIEWPORT_WIDTH.min(ASSUMED_VIEWPORT_HEIGHT) / 100.0),
+            "vmax" => Some(num * ASSUMED_VIEWPORT_WIDTH.max(ASSUMED_VIEWPORT_HEIGHT) / 100.0),
+            // Percentages in a length: no real basis at cascade time; approximate against the
+            // assumed viewport width.
+            "%" => Some(num / 100.0 * ASSUMED_VIEWPORT_WIDTH),
+            _ => None, // unknown unit
+        }
+    }
+}
+
+/// True if a value contains a length math function we can evaluate (`calc`/`min`/`max`/`clamp`).
+fn has_math_func(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("calc(")
+        || lower.contains("min(")
+        || lower.contains("max(")
+        || lower.contains("clamp(")
+}
+
 /// Parse a CSS length to px. Accepts `Npx`, `Npt` (×4/3), and bare numbers (px). `auto`,
 /// percentages, and unparseable values yield `None`. `0` (unitless) yields `Some(0)`.
+/// Length math functions (`calc`/`min`/`max`/`clamp`) are evaluated via [`eval_length`] (with a
+/// default 16px font size for `em`, since this parser has no element context).
 fn parse_length(val: &str) -> Option<f32> {
     let v = val.trim().to_ascii_lowercase();
     if v.is_empty() || v == "auto" {
         return None;
+    }
+    if has_math_func(&v) {
+        return eval_length(&v, 16.0);
     }
     if v.ends_with('%') {
         return None; // percentages unsupported for now
@@ -1547,6 +1878,10 @@ fn parse_font_weight(val: &str) -> Option<bool> {
 /// are treated as px.
 fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
     let v = val.trim().to_ascii_lowercase();
+    if has_math_func(&v) {
+        // `em` in a font-size resolves against the parent font size.
+        return eval_length(&v, parent_px).filter(|n| *n > 0.0);
+    }
     let num = |suffix: &str| v.strip_suffix(suffix).and_then(|n| n.trim().parse::<f32>().ok());
     if let Some(px) = num("px") {
         Some(px)
@@ -2578,6 +2913,122 @@ mod tests {
         let map = cascade(&doc, &[sheet]);
         let span = elem(&doc, |e| e.tag == "span");
         assert_eq!(map[&span].opacity, 1.0);
+    }
+
+    // --- Math functions: min/max/clamp/calc -------------------------------------------------
+
+    #[test]
+    fn eval_min_max_clamp() {
+        assert_eq!(eval_length("min(10px, 20px)", 16.0), Some(10.0));
+        assert_eq!(eval_length("max(10px, 20px, 5px)", 16.0), Some(20.0));
+        // clamped up to lo
+        assert_eq!(eval_length("clamp(5px, 2px, 10px)", 16.0), Some(5.0));
+        // value within range
+        assert_eq!(eval_length("clamp(5px, 8px, 10px)", 16.0), Some(8.0));
+        // clamped down to hi
+        assert_eq!(eval_length("clamp(5px, 80px, 10px)", 16.0), Some(10.0));
+    }
+
+    #[test]
+    fn eval_calc_precedence_and_units() {
+        // 2rem(32) + 10px = 42
+        assert_eq!(eval_length("calc(2rem + 10px)", 16.0), Some(42.0));
+        // precedence: 2 + 3*4px = 14
+        assert_eq!(eval_length("calc(2px + 3 * 4px)", 16.0), Some(14.0));
+        // parens override precedence: (2 + 3) * 4 = 20
+        assert_eq!(eval_length("calc((2px + 3px) * 4)", 16.0), Some(20.0));
+        // em resolves against the passed font size
+        assert_eq!(eval_length("calc(2em)", 10.0), Some(20.0));
+        // vw = 1280/100 * 10 = 128
+        assert_eq!(eval_length("calc(10vw)", 16.0), Some(128.0));
+    }
+
+    #[test]
+    fn eval_nested_functions() {
+        // calc(1px*100) = 100, clamped to [1rem=16, 50] → 50
+        assert_eq!(eval_length("clamp(1rem, calc(1px * 100), 50px)", 16.0), Some(50.0));
+        // nested min inside max
+        assert_eq!(eval_length("max(min(30px, 10px), 5px)", 16.0), Some(10.0));
+    }
+
+    #[test]
+    fn eval_unknown_falls_back_to_none() {
+        assert_eq!(eval_length("calc(2px + 3foo)", 16.0), None); // unknown unit
+        assert_eq!(eval_length("min()", 16.0), None);
+        assert_eq!(eval_length("calc(1px /)", 16.0), None); // malformed
+        assert_eq!(eval_length("clamp(1px, 2px)", 16.0), None); // wrong arity
+    }
+
+    #[test]
+    fn plain_lengths_still_parse_identically() {
+        assert_eq!(parse_length("12px"), Some(12.0));
+        assert_eq!(parse_length("0"), Some(0.0));
+        assert_eq!(parse_length("50%"), None);
+        // math wired into parse_length
+        assert_eq!(parse_length("min(10px, 20px)"), Some(10.0));
+        assert_eq!(parse_length("calc(2rem + 10px)"), Some(42.0));
+    }
+
+    #[test]
+    fn font_size_clamp_resolves_on_node() {
+        let sheet = css::parse("p { font-size: clamp(10px, 2vw, 30px) }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        // 2vw = 25.6, within [10,30] → 25.6
+        assert!((map[&p].font_size - 25.6).abs() < 0.01, "got {}", map[&p].font_size);
+    }
+
+    #[test]
+    fn width_calc_resolves_on_node() {
+        let sheet = css::parse("div { width: calc(100px + 1rem) }");
+        let doc = html::parse(r#"<html><body><div>t</div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&d].width, Some(116.0));
+    }
+
+    #[test]
+    fn max_width_max_function_resolves() {
+        let sheet = css::parse("div { max-width: max(200px, 50px) }");
+        let doc = html::parse(r#"<html><body><div>t</div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&d].max_width, Some(SizeConstraint::Px(200.0)));
+    }
+
+    // --- Container queries -------------------------------------------------------------------
+
+    #[test]
+    fn container_min_width_rule_applies_at_assumed_width() {
+        // 400px <= assumed container width (1000px) → applies.
+        let sheet = css::parse("@container (min-width: 400px) { p { color: #00ff00 } }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (0, 255, 0));
+    }
+
+    #[test]
+    fn container_min_width_above_assumed_does_not_apply() {
+        let sheet = css::parse(
+            "p { color: #ff0000 } @container (min-width: 5000px) { p { color: #00ff00 } }",
+        );
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        // 5000px > 1000px assumed container width → rule does not apply: stays red.
+        assert_eq!(map[&p].color, (255, 0, 0));
+    }
+
+    #[test]
+    fn container_unrecognized_condition_is_permissive() {
+        // An aspect/orientation-style condition we don't model → rule still applies.
+        let sheet = css::parse("@container (orientation: landscape) { p { color: #00ff00 } }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (0, 255, 0));
     }
 
     #[test]
