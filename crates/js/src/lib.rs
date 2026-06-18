@@ -3169,6 +3169,72 @@ fn dynamic_import_callback<'s>(
     Some(promise)
 }
 
+/// `import.meta` initialization host callback. V8 calls this lazily the first time a module reads
+/// `import.meta`. We populate `import.meta.url` with the module's canonical URL (recovered from the
+/// registry's `identity_to_url` map, keyed by `Module::get_identity_hash`), falling back to the
+/// page/entry base URL if absent. We also define `import.meta.resolve(spec)` as a small JS closure
+/// that resolves a specifier against that URL via the WHATWG `URL` constructor. Best-effort and
+/// panic-free: if anything is missing we leave `meta` as V8 created it.
+extern "C" fn initialize_import_meta_callback(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+    // Recover the module's canonical URL from the registry, falling back to the base/page URL.
+    let url = {
+        let Some(registry) = scope.get_current_context().get_slot::<ModuleRegistry>() else {
+            return;
+        };
+        let identity = module.get_identity_hash().get() as i32;
+        let mapped = registry.identity_to_url.borrow().get(&identity).cloned();
+        mapped.unwrap_or_else(|| registry.base_url.clone())
+    };
+
+    // import.meta.url = <canonical url>
+    if let (Some(key), Some(val)) =
+        (v8::String::new(scope, "url"), v8::String::new(scope, &url))
+    {
+        meta.create_data_property(scope, key.into(), val.into());
+    }
+
+    // import.meta.resolve = (spec) => new URL(spec, <url>).href  (best-effort, never panics).
+    let resolve_src = format!(
+        "(function(){{const base={base};return function(spec){{return new URL(spec, base).href;}};}})()",
+        base = json_string_literal(&url)
+    );
+    if let Some(code) = v8::String::new(scope, &resolve_src) {
+        v8::tc_scope!(let tc, scope);
+        if let Some(script) = v8::Script::compile(tc, code, None) {
+            if let Some(func) = script.run(tc) {
+                if let Some(key) = v8::String::new(tc, "resolve") {
+                    meta.create_data_property(tc, key.into(), func);
+                }
+            }
+        }
+    }
+}
+
+/// Encode `s` as a JSON/JS string literal (double-quoted, with the handful of characters that would
+/// break out of a `"..."` literal escaped). Used to embed a URL safely inside generated JS source.
+fn json_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Run the ES module graph for a page. `entries` are the canonical URLs of the entry modules in
 /// document order; `modules` maps every canonical module URL to its already-rewritten source.
 /// Returns the (possibly mutated) document plus one [`EvalOutput`] per entry. The browser
@@ -3193,6 +3259,10 @@ pub fn run_modules(
             let mut isolate = v8::Isolate::new(v8::CreateParams::default());
             isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
             isolate.set_promise_reject_callback(promise_reject_callback);
+            // Populate `import.meta.url` for every module the first time it touches `import.meta`,
+            // so relative `new URL(..., import.meta.url)` (e.g. browserscore's support-status.js
+            // `fetch(new URL('./support-status.css', import.meta.url))`) resolves correctly.
+            isolate.set_host_initialize_import_meta_object_callback(initialize_import_meta_callback);
 
             let mut results: Vec<EvalOutput> = Vec::with_capacity(entries.len());
             {
@@ -4210,6 +4280,34 @@ mod tests {
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "chained"), "console was {console:?}");
+    }
+
+    #[test]
+    fn import_meta_url_is_module_canonical_url() {
+        let entry = "https://x/sub/mod.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"console.log(import.meta.url);
+               console.log(import.meta.resolve("./other.css"));"#
+                .to_string(),
+        );
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) =
+            run_modules(doc, "https://x/", vec![entry.clone()], modules, no_fetch());
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(
+            console.iter().any(|l| l == &entry),
+            "import.meta.url should be {entry}, console was {console:?}"
+        );
+        // resolve() builds the URL relative to the module's own URL (the exact dot-normalization
+        // depends on the environment's `URL` shim; what matters is the base is the module URL).
+        assert!(
+            console.iter().any(|l| l.starts_with("https://x/sub/") && l.ends_with("other.css")),
+            "import.meta.resolve should resolve relative to the module URL, console was {console:?}"
+        );
     }
 
     #[test]
