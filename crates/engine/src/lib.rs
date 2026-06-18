@@ -180,6 +180,10 @@ impl Engine {
     /// cached tree for this exact device size is already present. This is the expensive part of
     /// rendering; keeping it out of the scroll path makes scrolling cheap (paint-only).
     fn ensure_layout(&mut self, dw: u32, dh: u32, header_h: f32) {
+        // Feed the real logical viewport + scale to the cascade so @media (width/height/resolution),
+        // @container, and vw/vh units evaluate against the true window — and, since this runs on
+        // every viewport change, they re-evaluate on resize.
+        style::set_viewport_metrics(self.vp_w as f32, self.vp_h as f32, self.scale);
         if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
             return;
         }

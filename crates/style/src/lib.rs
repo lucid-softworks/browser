@@ -424,18 +424,44 @@ impl<'a> SelectorIndex<'a> {
     }
 }
 
-/// Assumed viewport width (px) used to evaluate `min-width`/`max-width` media queries during
-/// the cascade, since the real viewport isn't part of [`cascade`]'s signature.
-const ASSUMED_VIEWPORT_WIDTH: f32 = 1280.0;
+// Live viewport metrics used to evaluate media queries (`min-width`/`max-width`/resolution),
+// `@container` conditions, and viewport units (`vw`/`vh`/`%`) during the cascade. The engine sets
+// these via `set_viewport_metrics` before each cascade, so they reflect the real window size and
+// backing scale — and because the cascade re-runs on resize, media/container queries and viewport
+// units respond to window resizing. Stored as f32 bits in atomics (0 = unset → fall back below).
+static VIEWPORT_W_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static VIEWPORT_H_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static VIEWPORT_DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Assumed viewport height (px) used to resolve `vh` units in math functions (no real viewport
-/// is available during the cascade).
-const ASSUMED_VIEWPORT_HEIGHT: f32 = 800.0;
+/// Set the logical viewport size (CSS px) and device pixel ratio used by the cascade for media
+/// queries and viewport units. Call before [`cascade`] whenever the viewport changes.
+pub fn set_viewport_metrics(width: f32, height: f32, device_pixel_ratio: f32) {
+    use std::sync::atomic::Ordering;
+    VIEWPORT_W_BITS.store(width.max(1.0).to_bits(), Ordering::Relaxed);
+    VIEWPORT_H_BITS.store(height.max(1.0).to_bits(), Ordering::Relaxed);
+    VIEWPORT_DPR_BITS.store(device_pixel_ratio.max(0.1).to_bits(), Ordering::Relaxed);
+}
 
-/// Assumed width (px) of a query container, used to evaluate `@container` conditions during the
-/// cascade. Correct container sizing requires layout (which runs after the cascade), so we
-/// approximate with a content-column-ish width slightly below the viewport.
-const ASSUMED_CONTAINER_WIDTH: f32 = 1000.0;
+fn viewport_width() -> f32 {
+    let b = VIEWPORT_W_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if b == 0 { 1280.0 } else { f32::from_bits(b) }
+}
+fn viewport_height() -> f32 {
+    let b = VIEWPORT_H_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if b == 0 { 800.0 } else { f32::from_bits(b) }
+}
+fn viewport_dpr() -> f32 {
+    let b = VIEWPORT_DPR_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if b == 0 { 2.0 } else { f32::from_bits(b) }
+}
+
+/// Viewport width (px) used for `min-width`/`max-width` media queries — the real window width.
+fn assumed_viewport_width() -> f32 { viewport_width() }
+/// Viewport height (px) used to resolve `vh` units — the real window height.
+fn assumed_viewport_height() -> f32 { viewport_height() }
+/// Width (px) used to evaluate `@container` conditions. Correct container sizing needs layout
+/// (which runs after the cascade), so we approximate with the viewport width.
+fn assumed_container_width() -> f32 { viewport_width() }
 
 /// Recursively compute styles. `parent` is the parent's computed style (the inheritance
 /// source); `parent_vars` is the set of custom properties inherited from ancestors;
@@ -749,7 +775,7 @@ fn split_first_comma(s: &str) -> (&str, Option<&str>) {
 }
 
 /// Decide whether a rule with the given raw `@media` query applies at the assumed desktop
-/// viewport ([`ASSUMED_VIEWPORT_WIDTH`]). `None` (no media) always applies. We parse the
+/// viewport ([`assumed_viewport_width()`]). `None` (no media) always applies. We parse the
 /// common Tailwind shapes: `screen`/`all` match, `print` does not, and single
 /// `min-width`/`max-width` px thresholds are compared against the assumed width. Multiple
 /// `and`-joined conditions must all pass. Unrecognized features are treated as matching
@@ -789,19 +815,54 @@ fn media_component_matches(component: &str) -> bool {
                 match feature {
                     "min-width" => {
                         if let Some(px) = length_px(value) {
-                            if ASSUMED_VIEWPORT_WIDTH < px {
+                            if assumed_viewport_width() < px {
                                 return false;
                             }
                         }
                     }
                     "max-width" => {
                         if let Some(px) = length_px(value) {
-                            if ASSUMED_VIEWPORT_WIDTH > px {
+                            if assumed_viewport_width() > px {
                                 return false;
                             }
                         }
                     }
-                    // Unrecognized features (orientation, prefers-*, …): treat as matching.
+                    "min-height" => {
+                        if let Some(px) = length_px(value) {
+                            if assumed_viewport_height() < px {
+                                return false;
+                            }
+                        }
+                    }
+                    "max-height" => {
+                        if let Some(px) = length_px(value) {
+                            if assumed_viewport_height() > px {
+                                return false;
+                            }
+                        }
+                    }
+                    // Resolution / HiDPI queries, compared against the real device pixel ratio.
+                    "min-resolution" | "-webkit-min-device-pixel-ratio" | "min--moz-device-pixel-ratio" => {
+                        if let Some(r) = resolution_dppx(value) {
+                            if viewport_dpr() < r {
+                                return false;
+                            }
+                        }
+                    }
+                    "max-resolution" | "-webkit-max-device-pixel-ratio" | "max--moz-device-pixel-ratio" => {
+                        if let Some(r) = resolution_dppx(value) {
+                            if viewport_dpr() > r {
+                                return false;
+                            }
+                        }
+                    }
+                    "orientation" => {
+                        let landscape = assumed_viewport_width() >= assumed_viewport_height();
+                        if (value == "portrait" && landscape) || (value == "landscape" && !landscape) {
+                            return false;
+                        }
+                    }
+                    // Unrecognized features (prefers-*, hover, …): treat as matching.
                     _ => {}
                 }
             }
@@ -817,7 +878,7 @@ fn media_component_matches(component: &str) -> bool {
 }
 
 /// Decide whether a rule with the given raw `@container` condition applies, evaluated against an
-/// assumed container width ([`ASSUMED_CONTAINER_WIDTH`]). Correct container sizing needs layout
+/// assumed container width ([`assumed_container_width()`]). Correct container sizing needs layout
 /// (which runs after the cascade), so this is a pragmatic approximation that mirrors
 /// [`media_applies`]: `min-width`/`max-width`/`inline-size`/`width` thresholds are compared
 /// against the assumed width; multiple `and`-joined conditions must all pass. `None` (no
@@ -850,11 +911,11 @@ fn container_applies(container: Option<&str>) -> bool {
 }
 
 /// Evaluate a single `@container` feature condition (the text inside the parens) against
-/// [`ASSUMED_CONTAINER_WIDTH`]. Handles the colon form (`min-width: 400px`,
+/// [`assumed_container_width()`]. Handles the colon form (`min-width: 400px`,
 /// `max-inline-size: 600px`) and the range form (`width >= 400px`, `inline-size < 600px`).
 /// Unrecognized features/forms → `true` (permissive).
 fn container_feature_matches(inner: &str) -> bool {
-    let w = ASSUMED_CONTAINER_WIDTH;
+    let w = assumed_container_width();
     // Colon form: `feature: value`.
     if let Some((feature, value)) = inner.split_once(':') {
         let feature = feature.trim();
@@ -902,6 +963,22 @@ fn length_px(value: &str) -> Option<f32> {
         n.trim().parse::<f32>().ok().map(|x| x * 16.0)
     } else if let Some(n) = v.strip_suffix("em") {
         n.trim().parse::<f32>().ok().map(|x| x * 16.0)
+    } else {
+        v.parse::<f32>().ok()
+    }
+}
+
+/// Parse a resolution value into dppx (dots per `px`, i.e. the device pixel ratio): `2dppx`/`2x`
+/// → 2, `192dpi` → 2 (96dpi = 1dppx), `96dpcm`→…, or a bare number (the `-webkit-*-device-pixel-ratio`
+/// form) → that number.
+fn resolution_dppx(value: &str) -> Option<f32> {
+    let v = value.trim().to_ascii_lowercase();
+    if let Some(n) = v.strip_suffix("dppx").or_else(|| v.strip_suffix('x')) {
+        n.trim().parse::<f32>().ok()
+    } else if let Some(n) = v.strip_suffix("dpi") {
+        n.trim().parse::<f32>().ok().map(|x| x / 96.0)
+    } else if let Some(n) = v.strip_suffix("dpcm") {
+        n.trim().parse::<f32>().ok().map(|x| x / 96.0 * 2.54)
     } else {
         v.parse::<f32>().ok()
     }
@@ -1622,10 +1699,10 @@ enum EdgeSide {
 /// Evaluate a CSS length value that may use the math functions `min()`, `max()`, `clamp()`, and
 /// `calc()`, resolving to a final px `f32`. `font_size_px` is the element's font size, used to
 /// resolve `em` (and is the basis for `%` would-be percentages — but percentages in lengths are
-/// resolved here against [`ASSUMED_VIEWPORT_WIDTH`] as an approximation, since the real
+/// resolved here against [`assumed_viewport_width()`] as an approximation, since the real
 /// percentage basis isn't known until layout). Units handled: `px`, `rem` (×16), `em`
-/// (×`font_size_px`), `pt` (×4/3), `vw` (=`ASSUMED_VIEWPORT_WIDTH`/100×n), `vh`
-/// (=`ASSUMED_VIEWPORT_HEIGHT`/100×n), `%` (×`ASSUMED_VIEWPORT_WIDTH`/100 — approximate), and a
+/// (×`font_size_px`), `pt` (×4/3), `vw` (=`assumed_viewport_width()`/100×n), `vh`
+/// (=`assumed_viewport_height()`/100×n), `%` (×`assumed_viewport_width()`/100 — approximate), and a
 /// bare unitless number (used as-is, e.g. multipliers / `calc(2 * 3px)`). Nested functions are
 /// supported. Any unknown unit/function or a parse failure yields `None` so callers fall back to
 /// their existing behavior; it never panics.
@@ -1828,13 +1905,13 @@ impl<'a> MathParser<'a> {
             "rem" => Some(num * 16.0),
             "em" => Some(num * self.font_size),
             "pt" => Some(num * 4.0 / 3.0),
-            "vw" => Some(num * ASSUMED_VIEWPORT_WIDTH / 100.0),
-            "vh" => Some(num * ASSUMED_VIEWPORT_HEIGHT / 100.0),
-            "vmin" => Some(num * ASSUMED_VIEWPORT_WIDTH.min(ASSUMED_VIEWPORT_HEIGHT) / 100.0),
-            "vmax" => Some(num * ASSUMED_VIEWPORT_WIDTH.max(ASSUMED_VIEWPORT_HEIGHT) / 100.0),
+            "vw" => Some(num * assumed_viewport_width() / 100.0),
+            "vh" => Some(num * assumed_viewport_height() / 100.0),
+            "vmin" => Some(num * assumed_viewport_width().min(assumed_viewport_height()) / 100.0),
+            "vmax" => Some(num * assumed_viewport_width().max(assumed_viewport_height()) / 100.0),
             // Percentages in a length: no real basis at cascade time; approximate against the
             // assumed viewport width.
-            "%" => Some(num / 100.0 * ASSUMED_VIEWPORT_WIDTH),
+            "%" => Some(num / 100.0 * assumed_viewport_width()),
             _ => None, // unknown unit
         }
     }
