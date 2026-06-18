@@ -133,12 +133,20 @@ pub unsafe extern "C" fn browser_engine_title(engine: *mut Engine) -> *const c_c
 #[no_mangle]
 pub unsafe extern "C" fn browser_engine_render(engine: *mut Engine) -> Framebuffer {
     let Some(e) = engine.as_mut() else { return Framebuffer::empty() };
-    let fb = e.inner.render();
-    Framebuffer {
-        pixels: fb.pixels.as_ptr(),
-        width: fb.width,
-        height: fb.height,
-        stride: fb.stride,
+    // Panic backstop: a panic must NEVER cross this C boundary (it would abort the whole app).
+    // Heavy/hostile pages can drive the engine into edge cases; on a render panic we return an
+    // empty framebuffer and keep the app alive rather than crashing.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let fb = e.inner.render();
+        Framebuffer {
+            pixels: fb.pixels.as_ptr(),
+            width: fb.width,
+            height: fb.height,
+            stride: fb.stride,
+        }
+    })) {
+        Ok(fb) => fb,
+        Err(_) => Framebuffer::empty(),
     }
 }
 

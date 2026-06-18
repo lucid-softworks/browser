@@ -523,7 +523,15 @@ fn arg_node(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, i: i
     if n.is_nan() || n < 0.0 {
         return None;
     }
-    Some(dom::NodeId(n as usize))
+    let id = dom::NodeId(n as usize);
+    // Reject ids outside the live arena. Valid node ids are always `< len` (the arena only grows,
+    // never reuses slots), so a stale or garbage id from page JS — which would otherwise be pushed
+    // into a children list and later panic the renderer with an out-of-bounds index — is dropped
+    // here. Callers treat `None` as "no such node" and skip the operation.
+    if id.0 >= host_state(scope).doc.borrow().len() {
+        return None;
+    }
+    Some(id)
 }
 
 /// Build a JS string Local. Falls back to an empty string if V8 rejects the (huge) input.
