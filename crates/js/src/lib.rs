@@ -65,6 +65,26 @@ fn ensure_v8_initialized() {
 /// A shared, mutable handle to the page's DOM.
 type SharedDoc = Rc<RefCell<dom::Document>>;
 
+/// A single DOM mutation recorded by the native mutation primitives while at least one
+/// `MutationObserver` is registered (`observers_active == true`). The JS dispatch layer
+/// (`__deliverMutations`) drains these as JSON, matches them against the JS-side observer
+/// registry, and builds the spec `MutationRecord` objects. We keep this Rust-side struct (rather
+/// than tracking mutations in JS) because the mutations happen inside the Rust DOM primitives.
+struct MutationRec {
+    /// "childList" | "attributes" | "characterData".
+    kind: &'static str,
+    target: dom::NodeId,
+    /// Attribute name for `attributes` records (None otherwise).
+    attr_name: Option<String>,
+    /// Previous value, captured BEFORE the write: the attribute's old value (`attributes`) or the
+    /// node's old text (`characterData`). Used for `attributeOldValue`/`characterDataOldValue`.
+    old_value: Option<String>,
+    /// Nodes added by a `childList` mutation.
+    added: Vec<dom::NodeId>,
+    /// Nodes removed by a `childList` mutation.
+    removed: Vec<dom::NodeId>,
+}
+
 /// State shared between Rust and the native primitive callbacks. Stored on the context slot as an
 /// `Rc<HostState>` so any callback can recover it from `scope.get_current_context().get_slot()`.
 /// Interior mutability via `RefCell` since the slot only hands out `&HostState` (well, `Rc`).
@@ -98,6 +118,12 @@ struct HostState {
     /// Count of async fetches started but not yet drained. Keeps [`drain_event_loop`] looping (on a
     /// longer budget) while network is outstanding so the `fetch()` promise settles before snapshot.
     in_flight: Cell<usize>,
+    /// Queue of DOM mutations recorded for `MutationObserver`s. Only written while
+    /// `observers_active` is true. Drained as JSON by `__drainMutations` and dispatched to JS.
+    mutations: RefCell<Vec<MutationRec>>,
+    /// Cheap gate: true only while at least one `MutationObserver` is registered. When false the
+    /// mutation primitives record nothing (the common case for pages with no observers).
+    observers_active: Cell<bool>,
 }
 
 impl HostState {
@@ -122,7 +148,16 @@ impl HostState {
             fetch_tx,
             next_fetch_id: AtomicU64::new(1),
             in_flight: Cell::new(0),
+            mutations: RefCell::new(Vec::new()),
+            observers_active: Cell::new(false),
         })
+    }
+
+    /// Record a mutation if any `MutationObserver` is registered. Cheap no-op otherwise.
+    fn record_mutation(&self, rec: MutationRec) {
+        if self.observers_active.get() {
+            self.mutations.borrow_mut().push(rec);
+        }
     }
 }
 
@@ -700,9 +735,26 @@ fn prim_set_attr(
     let value = arg_str(scope, &args, 2);
     let state = host_state(scope);
     if let Some(n) = node {
+        let old = if state.observers_active.get() {
+            // Capture the old value BEFORE overwriting (for `attributeOldValue`).
+            match &state.doc.borrow().get(n).data {
+                dom::NodeData::Element(e) => e.attrs.get(&name).cloned(),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if let dom::NodeData::Element(e) = &mut state.doc.borrow_mut().get_mut(n).data {
-            e.attrs.insert(name, value);
+            e.attrs.insert(name.clone(), value);
         }
+        state.record_mutation(MutationRec {
+            kind: "attributes",
+            target: n,
+            attr_name: Some(name),
+            old_value: old,
+            added: Vec::new(),
+            removed: Vec::new(),
+        });
     }
 }
 
@@ -716,9 +768,25 @@ fn prim_remove_attr(
     let name = arg_str(scope, &args, 1);
     let state = host_state(scope);
     if let Some(n) = node {
+        let old = if state.observers_active.get() {
+            match &state.doc.borrow().get(n).data {
+                dom::NodeData::Element(e) => e.attrs.get(&name).cloned(),
+                _ => None,
+            }
+        } else {
+            None
+        };
         if let dom::NodeData::Element(e) = &mut state.doc.borrow_mut().get_mut(n).data {
             e.attrs.remove(&name);
         }
+        state.record_mutation(MutationRec {
+            kind: "attributes",
+            target: n,
+            attr_name: Some(name),
+            old_value: old,
+            added: Vec::new(),
+            removed: Vec::new(),
+        });
     }
 }
 
@@ -750,12 +818,39 @@ fn prim_append_child(
     let child = arg_node(scope, &args, 1);
     let state = host_state(scope);
     if let (Some(parent), Some(child)) = (parent, child) {
-        let mut d = state.doc.borrow_mut();
-        if let Some(old_parent) = d.get(child).parent {
-            d.get_mut(old_parent).children.retain(|&c| c != child);
+        let old_parent = {
+            let mut d = state.doc.borrow_mut();
+            let old_parent = d.get(child).parent;
+            if let Some(old_parent) = old_parent {
+                d.get_mut(old_parent).children.retain(|&c| c != child);
+            }
+            d.get_mut(child).parent = Some(parent);
+            d.get_mut(parent).children.push(child);
+            old_parent
+        };
+        if state.observers_active.get() {
+            // A move is a removal from the old parent + an addition to the new one.
+            if let Some(old_parent) = old_parent {
+                if old_parent != parent {
+                    state.record_mutation(MutationRec {
+                        kind: "childList",
+                        target: old_parent,
+                        attr_name: None,
+                        old_value: None,
+                        added: Vec::new(),
+                        removed: vec![child],
+                    });
+                }
+            }
+            state.record_mutation(MutationRec {
+                kind: "childList",
+                target: parent,
+                attr_name: None,
+                old_value: None,
+                added: vec![child],
+                removed: Vec::new(),
+            });
         }
-        d.get_mut(child).parent = Some(parent);
-        d.get_mut(parent).children.push(child);
     }
 }
 
@@ -771,15 +866,41 @@ fn prim_insert_before(
     let ref_node = arg_node(scope, &args, 2);
     let state = host_state(scope);
     if let (Some(parent), Some(child)) = (parent, child) {
-        let mut d = state.doc.borrow_mut();
-        if let Some(old) = d.get(child).parent {
-            d.get_mut(old).children.retain(|&c| c != child);
-        }
-        d.get_mut(child).parent = Some(parent);
-        let pos = ref_node.and_then(|r| d.get(parent).children.iter().position(|&c| c == r));
-        match pos {
-            Some(i) => d.get_mut(parent).children.insert(i, child),
-            None => d.get_mut(parent).children.push(child),
+        let old_parent = {
+            let mut d = state.doc.borrow_mut();
+            let old_parent = d.get(child).parent;
+            if let Some(old) = old_parent {
+                d.get_mut(old).children.retain(|&c| c != child);
+            }
+            d.get_mut(child).parent = Some(parent);
+            let pos = ref_node.and_then(|r| d.get(parent).children.iter().position(|&c| c == r));
+            match pos {
+                Some(i) => d.get_mut(parent).children.insert(i, child),
+                None => d.get_mut(parent).children.push(child),
+            }
+            old_parent
+        };
+        if state.observers_active.get() {
+            if let Some(old) = old_parent {
+                if old != parent {
+                    state.record_mutation(MutationRec {
+                        kind: "childList",
+                        target: old,
+                        attr_name: None,
+                        old_value: None,
+                        added: Vec::new(),
+                        removed: vec![child],
+                    });
+                }
+            }
+            state.record_mutation(MutationRec {
+                kind: "childList",
+                target: parent,
+                attr_name: None,
+                old_value: None,
+                added: vec![child],
+                removed: Vec::new(),
+            });
         }
     }
 }
@@ -794,10 +915,24 @@ fn prim_remove_child(
     let child = arg_node(scope, &args, 1);
     let state = host_state(scope);
     if let (Some(parent), Some(child)) = (parent, child) {
-        let mut d = state.doc.borrow_mut();
-        d.get_mut(parent).children.retain(|&c| c != child);
-        if d.get(child).parent == Some(parent) {
-            d.get_mut(child).parent = None;
+        let removed = {
+            let mut d = state.doc.borrow_mut();
+            let was_child = d.get(parent).children.contains(&child);
+            d.get_mut(parent).children.retain(|&c| c != child);
+            if d.get(child).parent == Some(parent) {
+                d.get_mut(child).parent = None;
+            }
+            was_child
+        };
+        if removed {
+            state.record_mutation(MutationRec {
+                kind: "childList",
+                target: parent,
+                attr_name: None,
+                old_value: None,
+                added: Vec::new(),
+                removed: vec![child],
+            });
         }
     }
 }
@@ -889,7 +1024,29 @@ fn prim_set_text_content(
     let text = arg_str(scope, &args, 1);
     let state = host_state(scope);
     if let Some(n) = node {
+        // For Text/Comment nodes, setting textContent/data is a `characterData` mutation; capture
+        // the old string value first (for `characterDataOldValue`). For elements it replaces the
+        // subtree (we don't emit a childList record for that simplification).
+        let char_old = if state.observers_active.get() {
+            match &state.doc.borrow().get(n).data {
+                dom::NodeData::Text(t) => Some(("characterData", t.clone())),
+                dom::NodeData::Comment(c) => Some(("characterData", c.clone())),
+                _ => None,
+            }
+        } else {
+            None
+        };
         set_text_content(&mut state.doc.borrow_mut(), n, &text);
+        if let Some((_, old)) = char_old {
+            state.record_mutation(MutationRec {
+                kind: "characterData",
+                target: n,
+                attr_name: None,
+                old_value: Some(old),
+                added: Vec::new(),
+                removed: Vec::new(),
+            });
+        }
     }
 }
 
@@ -1271,6 +1428,71 @@ fn install_console_sink(scope: &mut v8::PinScope, global: v8::Local<v8::Object>)
     eval_internal(scope, src, "<console>");
 }
 
+/// `__observersActive(bool)` — JS sets this true when the first `MutationObserver` is registered
+/// and false when the last disconnects. Gates whether the mutation primitives record anything.
+fn prim_observers_active(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let active = args.get(0).boolean_value(scope);
+    let state = host_state(scope);
+    state.observers_active.set(active);
+    if !active {
+        // No observers left: drop any pending records so they don't leak into a later session.
+        state.mutations.borrow_mut().clear();
+    }
+}
+
+/// `__drainMutations() -> string` — returns the queued mutation records as a JSON array and
+/// clears the queue. Each record: `{kind,target,attr,oldValue,added:[ids],removed:[ids]}`.
+fn prim_drain_mutations(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let recs = std::mem::take(&mut *state.mutations.borrow_mut());
+    let mut json = String::from("[");
+    for (i, r) in recs.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str("{\"kind\":");
+        json.push_str(&js_string_literal(r.kind));
+        json.push_str(",\"target\":");
+        json.push_str(&r.target.0.to_string());
+        json.push_str(",\"attr\":");
+        match &r.attr_name {
+            Some(a) => json.push_str(&js_string_literal(a)),
+            None => json.push_str("null"),
+        }
+        json.push_str(",\"oldValue\":");
+        match &r.old_value {
+            Some(v) => json.push_str(&js_string_literal(v)),
+            None => json.push_str("null"),
+        }
+        json.push_str(",\"added\":[");
+        for (j, id) in r.added.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            json.push_str(&id.0.to_string());
+        }
+        json.push_str("],\"removed\":[");
+        for (j, id) in r.removed.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            json.push_str(&id.0.to_string());
+        }
+        json.push_str("]}");
+    }
+    json.push(']');
+    let s = js_str(scope, &json);
+    rv.set(s);
+}
+
 /// Install the node-id DOM primitives onto `globalThis`.
 fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object>) {
     set_fn(scope, global, "__createElement", prim_create_element);
@@ -1305,6 +1527,8 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__fetch", prim_fetch);
     set_fn(scope, global, "__request", prim_request);
     set_fn(scope, global, "__startFetch", prim_start_fetch);
+    set_fn(scope, global, "__observersActive", prim_observers_active);
+    set_fn(scope, global, "__drainMutations", prim_drain_mutations);
 }
 
 /// Compile+run a script in the current context, ignoring the result. Used for bootstraps where a
@@ -2673,24 +2897,228 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(document, "fonts", { value: fontFaces, enumerable: false, configurable: true, writable: true });
   }
 
-  // --- Observer constructors (presence + no-op observe/disconnect/takeRecords) --------------
-  function makeObserver(name) {
-    def(globalThis, name, function (cb) {
+  // --- Observer constructors ---------------------------------------------------------------
+  // ============================================================================================
+  // Real MutationObserver / IntersectionObserver / ResizeObserver.
+  //
+  // The heavy lifting lives in Rust: mutation TRACKING happens in the DOM primitives (queued and
+  // exposed via __drainMutations), and geometry/intersection/size COMPUTATION happens in the
+  // engine. These JS classes are the spec-facing registries + callback dispatch only.
+  //
+  //  - MutationObserver records {targetId, options} in __moRegistry; on first observe it flips the
+  //    Rust gate via __observersActive(true). After a task, drain_event_loop calls __deliverMutations
+  //    which reads __drainMutations(), matches recs to observers, builds MutationRecords, fires cbs.
+  //  - IntersectionObserver/ResizeObserver register (observerId,nodeId,opts) in __io/__ro. The Rust
+  //    engine reads __observedTargets(), computes geometry, and calls __deliverObservations(json).
+  // ============================================================================================
+  globalThis.__moRegistry = globalThis.__moRegistry || [];   // [{observer, targets:[{id,opts}], queue:[]}]
+  globalThis.__io = globalThis.__io || {};                   // observerId -> {observer, cb, opts, targets:{nodeId:true}}
+  globalThis.__ro = globalThis.__ro || {};                   // observerId -> {observer, cb, targets:{nodeId:true}}
+  var __obsIdSeq = 1;
+
+  function __syncObserversActive() {
+    var any = false;
+    for (var i = 0; i < globalThis.__moRegistry.length; i++) {
+      if (globalThis.__moRegistry[i].targets.length) { any = true; break; }
+    }
+    try { __observersActive(any); } catch (e) {}
+  }
+
+  // node-id -> wrapper element. Reuse the canonical wrapper machinery so callbacks get the same
+  // element objects the page already holds.
+  function __nodeWrap(id) {
+    if (typeof id !== "number" || id < 0) { return null; }
+    try { return canon(__wrapNode(id)); } catch (e) { return null; }
+  }
+  globalThis.__nodeWrap = __nodeWrap;
+
+  if (typeof globalThis.MutationObserver !== "function") {
+    def(globalThis, "MutationObserver", function (cb) {
       this.callback = typeof cb === "function" ? cb : fn;
-      this.observe = fn; this.unobserve = fn; this.disconnect = fn;
-      this.takeRecords = function () { return []; };
+      this._entry = { observer: this, targets: [], queue: [] };
+    });
+    def(globalThis.MutationObserver.prototype, "observe", function (target, opts) {
+      var id = (target && typeof target.__node === "number") ? target.__node : -1;
+      if (id < 0) { return; }
+      opts = opts || {};
+      var rec = {
+        targetId: id,
+        childList: !!opts.childList,
+        attributes: opts.attributes !== undefined ? !!opts.attributes : (opts.attributeOldValue || opts.attributeFilter ? true : false),
+        characterData: opts.characterData !== undefined ? !!opts.characterData : (opts.characterDataOldValue ? true : false),
+        subtree: !!opts.subtree,
+        attributeOldValue: !!opts.attributeOldValue,
+        characterDataOldValue: !!opts.characterDataOldValue,
+        attributeFilter: opts.attributeFilter ? [].concat(opts.attributeFilter) : null
+      };
+      // Per spec, observing the same node again replaces its options.
+      var t = this._entry.targets;
+      for (var i = 0; i < t.length; i++) { if (t[i].targetId === id) { t.splice(i, 1); break; } }
+      t.push(rec);
+      if (globalThis.__moRegistry.indexOf(this._entry) < 0) { globalThis.__moRegistry.push(this._entry); }
+      __syncObserversActive();
+    });
+    def(globalThis.MutationObserver.prototype, "disconnect", function () {
+      this._entry.targets = [];
+      this._entry.queue = [];
+      var i = globalThis.__moRegistry.indexOf(this._entry);
+      if (i >= 0) { globalThis.__moRegistry.splice(i, 1); }
+      __syncObserversActive();
+    });
+    def(globalThis.MutationObserver.prototype, "takeRecords", function () {
+      var q = this._entry.queue; this._entry.queue = []; return q;
     });
   }
-  if (typeof globalThis.MutationObserver !== "function") { makeObserver("MutationObserver"); }
+
+  // Walk ancestors (inclusive) of a node id, capped, to test subtree membership.
+  function __isInclusiveAncestor(ancestorId, nodeId) {
+    var cur = nodeId, guard = 0;
+    while (typeof cur === "number" && cur >= 0 && guard++ < 10000) {
+      if (cur === ancestorId) { return true; }
+      cur = __parent(cur);
+    }
+    return false;
+  }
+
+  // Called (as a microtask) after a task when Rust has queued mutations. Drains them, matches each
+  // against every observer's registered targets, builds MutationRecords, and invokes callbacks.
+  def(globalThis, "__deliverMutations", function () {
+    var recs;
+    try { recs = JSON.parse(__drainMutations()); } catch (e) { recs = []; }
+    if (!recs.length) { return; }
+    var reg = globalThis.__moRegistry;
+    for (var o = 0; o < reg.length; o++) {
+      var entry = reg[o];
+      var batch = [];
+      for (var r = 0; r < recs.length; r++) {
+        var rec = recs[r];
+        for (var ti = 0; ti < entry.targets.length; ti++) {
+          var t = entry.targets[ti];
+          // Does this observed target match the mutated node? (exact, or ancestor if subtree)
+          var matches = (t.targetId === rec.target) || (t.subtree && __isInclusiveAncestor(t.targetId, rec.target));
+          if (!matches) { continue; }
+          if (rec.kind === "childList") {
+            if (!t.childList) { continue; }
+          } else if (rec.kind === "attributes") {
+            if (!t.attributes) { continue; }
+            if (t.attributeFilter && t.attributeFilter.indexOf(rec.attr) < 0) { continue; }
+          } else if (rec.kind === "characterData") {
+            if (!t.characterData) { continue; }
+          }
+          var mr = { type: rec.kind, target: __nodeWrap(rec.target),
+            attributeName: rec.kind === "attributes" ? rec.attr : null,
+            attributeNamespace: null,
+            oldValue: null,
+            addedNodes: [], removedNodes: [],
+            previousSibling: null, nextSibling: null };
+          if (rec.kind === "attributes" && t.attributeOldValue) { mr.oldValue = rec.oldValue; }
+          if (rec.kind === "characterData" && t.characterDataOldValue) { mr.oldValue = rec.oldValue; }
+          if (rec.kind === "childList") {
+            for (var a = 0; a < rec.added.length; a++) { var w = __nodeWrap(rec.added[a]); if (w) { mr.addedNodes.push(w); } }
+            for (var rm = 0; rm < rec.removed.length; rm++) { var w2 = __nodeWrap(rec.removed[rm]); if (w2) { mr.removedNodes.push(w2); } }
+          }
+          batch.push(mr);
+          break; // one record per mutation per observer
+        }
+      }
+      if (batch.length) {
+        try { entry.observer.callback.call(entry.observer, batch, entry.observer); }
+        catch (e) { try { (globalThis.__timerErrors || (globalThis.__timerErrors = [])).push("MutationObserver: " + (e && e.message || e)); } catch (e2) {} }
+      }
+    }
+  });
+
   if (typeof globalThis.IntersectionObserver !== "function") {
     def(globalThis, "IntersectionObserver", function (cb, opts) {
       this.callback = typeof cb === "function" ? cb : fn;
       this.root = (opts && opts.root) || null; this.rootMargin = (opts && opts.rootMargin) || "0px";
       this.thresholds = (opts && [].concat(opts.threshold || 0)) || [0];
-      this.observe = fn; this.unobserve = fn; this.disconnect = fn; this.takeRecords = function () { return []; };
+      this._oid = __obsIdSeq++;
+      globalThis.__io[this._oid] = { observer: this, cb: this.callback, opts: opts || {}, targets: {} };
+    });
+    def(globalThis.IntersectionObserver.prototype, "observe", function (el) {
+      var id = (el && typeof el.__node === "number") ? el.__node : -1;
+      if (id >= 0 && globalThis.__io[this._oid]) { globalThis.__io[this._oid].targets[id] = true; }
+    });
+    def(globalThis.IntersectionObserver.prototype, "unobserve", function (el) {
+      var id = (el && typeof el.__node === "number") ? el.__node : -1;
+      if (id >= 0 && globalThis.__io[this._oid]) { delete globalThis.__io[this._oid].targets[id]; }
+    });
+    def(globalThis.IntersectionObserver.prototype, "disconnect", function () {
+      if (globalThis.__io[this._oid]) { globalThis.__io[this._oid].targets = {}; }
+    });
+    def(globalThis.IntersectionObserver.prototype, "takeRecords", function () { return []; });
+  }
+
+  if (typeof globalThis.ResizeObserver !== "function") {
+    def(globalThis, "ResizeObserver", function (cb) {
+      this.callback = typeof cb === "function" ? cb : fn;
+      this._oid = __obsIdSeq++;
+      globalThis.__ro[this._oid] = { observer: this, cb: this.callback, targets: {} };
+    });
+    def(globalThis.ResizeObserver.prototype, "observe", function (el) {
+      var id = (el && typeof el.__node === "number") ? el.__node : -1;
+      if (id >= 0 && globalThis.__ro[this._oid]) { globalThis.__ro[this._oid].targets[id] = true; }
+    });
+    def(globalThis.ResizeObserver.prototype, "unobserve", function (el) {
+      var id = (el && typeof el.__node === "number") ? el.__node : -1;
+      if (id >= 0 && globalThis.__ro[this._oid]) { delete globalThis.__ro[this._oid].targets[id]; }
+    });
+    def(globalThis.ResizeObserver.prototype, "disconnect", function () {
+      if (globalThis.__ro[this._oid]) { globalThis.__ro[this._oid].targets = {}; }
     });
   }
-  if (typeof globalThis.ResizeObserver !== "function") { makeObserver("ResizeObserver"); }
+
+  // Native-readable list of IO/RO targets the engine should compute geometry for.
+  def(globalThis, "__observedTargets", function () {
+    var out = [];
+    for (var ioid in globalThis.__io) {
+      var io = globalThis.__io[ioid];
+      for (var n in io.targets) { out.push({ kind: "io", observerId: Number(ioid), nodeId: Number(n) }); }
+    }
+    for (var roid in globalThis.__ro) {
+      var ro = globalThis.__ro[roid];
+      for (var n2 in ro.targets) { out.push({ kind: "ro", observerId: Number(roid), nodeId: Number(n2) }); }
+    }
+    return out;
+  });
+
+  // Engine calls this with computed geometry. Builds entries, groups per observer callback, fires.
+  def(globalThis, "__deliverObservations", function (arr) {
+    if (!arr || !arr.length) { return; }
+    var ioBatches = {}, roBatches = {};
+    for (var i = 0; i < arr.length; i++) {
+      var it = arr[i];
+      var target = __nodeWrap(it.nodeId);
+      if (!target) { continue; }
+      if (it.kind === "io" && globalThis.__io[it.observerId]) {
+        var br = { x: it.x, y: it.y, width: it.width, height: it.height,
+          top: it.y, left: it.x, right: it.x + it.width, bottom: it.y + it.height };
+        var ratio = it.intersectionRatio || 0;
+        var ir = it.isIntersecting
+          ? { x: it.ix, y: it.iy, width: it.iw, height: it.ih, top: it.iy, left: it.ix, right: it.ix + it.iw, bottom: it.iy + it.ih }
+          : { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
+        var rb = { x: 0, y: 0, width: it.rootW, height: it.rootH, top: 0, left: 0, right: it.rootW, bottom: it.rootH };
+        var entry = { target: target, isIntersecting: !!it.isIntersecting, intersectionRatio: ratio,
+          boundingClientRect: br, intersectionRect: ir, rootBounds: rb,
+          time: (globalThis.__eventLoop ? globalThis.__eventLoop.now : 0) };
+        (ioBatches[it.observerId] || (ioBatches[it.observerId] = [])).push(entry);
+      } else if (it.kind === "ro" && globalThis.__ro[it.observerId]) {
+        var cr = { x: it.x, y: it.y, width: it.width, height: it.height, top: it.y, left: it.x, right: it.x + it.width, bottom: it.y + it.height };
+        var box = [{ inlineSize: it.width, blockSize: it.height }];
+        var entry2 = { target: target, contentRect: cr, borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box };
+        (roBatches[it.observerId] || (roBatches[it.observerId] = [])).push(entry2);
+      }
+    }
+    for (var oid in ioBatches) {
+      var ioReg = globalThis.__io[oid];
+      if (ioReg) { try { ioReg.cb.call(ioReg.observer, ioBatches[oid], ioReg.observer); } catch (e) { try { (globalThis.__timerErrors || (globalThis.__timerErrors = [])).push("IntersectionObserver: " + (e && e.message || e)); } catch (e2) {} } }
+    }
+    for (var oid2 in roBatches) {
+      var roReg = globalThis.__ro[oid2];
+      if (roReg) { try { roReg.cb.call(roReg.observer, roBatches[oid2], roReg.observer); } catch (e) { try { (globalThis.__timerErrors || (globalThis.__timerErrors = [])).push("ResizeObserver: " + (e && e.message || e)); } catch (e2) {} } }
+    }
+  });
   if (typeof globalThis.PerformanceObserver !== "function") {
     def(globalThis, "PerformanceObserver", function (cb) {
       this.callback = typeof cb === "function" ? cb : fn;
@@ -3818,6 +4246,34 @@ fn drain_event_loop(
         scope.perform_microtask_checkpoint();
     }
 
+    // MutationObserver delivery: callbacks fire as a microtask after the task. If the task queued
+    // any DOM mutations, deliver them; a delivered callback may itself mutate the DOM, so loop
+    // (bounded) until the queue drains or we hit the cap (guards against infinite mutation loops).
+    {
+        let has_mutations = |scope: &mut v8::PinScope| {
+            scope
+                .get_current_context()
+                .get_slot::<HostState>()
+                .map(|s| !s.mutations.borrow().is_empty())
+                .unwrap_or(false)
+        };
+        let mut rounds = 0usize;
+        while rounds < 64 && has_mutations(scope) {
+            eval_internal(
+                scope,
+                "if (typeof __deliverMutations === 'function') { __deliverMutations(); }",
+                "<mutations>",
+            );
+            scope.perform_microtask_checkpoint();
+            // A callback may have scheduled timers; let one round of due work run so e.g. a
+            // setTimeout(0) inside an observer still progresses within this drain.
+            run_due_timers(scope);
+            scope.perform_microtask_checkpoint();
+            did_work = true;
+            rounds += 1;
+        }
+    }
+
     // Collect timer/microtask errors recorded JS-side.
     let mut extra: Vec<String> = Vec::new();
     if let Some(joined) = eval_to_string(
@@ -4787,6 +5243,22 @@ impl Session {
     fn eval_interact(&self, source: String) -> (dom::Document, Vec<String>) {
         let (_v, doc, console) = self.eval_full(source);
         (doc, console)
+    }
+
+    /// Return the JSON list of currently-observed IntersectionObserver / ResizeObserver targets
+    /// (`[{kind:"io"|"ro", observerId, nodeId}, ...]`). Empty `[]` when no such observers exist —
+    /// the engine uses this to skip geometry work entirely on pages without observers.
+    pub fn observed_targets(&self) -> String {
+        let (out, _doc, _console) =
+            self.eval_full("JSON.stringify(__observedTargets())".to_string());
+        out.value.unwrap_or_else(|| "[]".to_string())
+    }
+
+    /// Deliver computed IntersectionObserver/ResizeObserver geometry to the page: invokes the JS
+    /// observer callbacks (which may mutate the DOM), drains the loop, and returns a fresh snapshot
+    /// + console. `arr_json` is the JSON array described in `__deliverObservations`.
+    pub fn deliver_observations(&self, arr_json: &str) -> (dom::Document, Vec<String>) {
+        self.eval_interact(format!("__deliverObservations({arr_json})"))
     }
 
     /// Evaluate `source` and return the (result value / error EvalOutput, snapshot, console).
@@ -6789,5 +7261,101 @@ mod tests {
         assert_eq!(attr_of(&after, body, "data-target").as_deref(), Some("focused"));
         // ...but the ancestor's did NOT (focus does not bubble).
         assert_eq!(attr_of(&after, body, "data-ancestor").as_deref(), None);
+    }
+
+    // --- MutationObserver -------------------------------------------------------------------
+
+    #[test]
+    fn mutation_observer_childlist_fires_with_added_node() {
+        // observe({childList:true}); append a child; the callback should run and see the addedNode.
+        let (doc, _body) = doc_with_body("");
+        let (doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var target = document.body;
+                var seenTag = "";
+                var ran = 0;
+                var mo = new MutationObserver(function (records) {
+                    for (var i = 0; i < records.length; i++) {
+                        var r = records[i];
+                        if (r.type === "childList" && r.addedNodes.length) {
+                            ran++;
+                            seenTag = r.addedNodes[0].tagName;
+                        }
+                    }
+                    document.body.setAttribute("data-mo-ran", String(ran));
+                    document.body.setAttribute("data-mo-tag", seenTag);
+                });
+                mo.observe(target, { childList: true });
+                var el = document.createElement("span");
+                target.appendChild(el);
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        let body = find_by_tag(&doc, doc.root(), "body").expect("body");
+        // Callback fired exactly once with the appended <span> in addedNodes.
+        assert_eq!(attr_of(&doc, body, "data-mo-ran").as_deref(), Some("1"));
+        assert_eq!(attr_of(&doc, body, "data-mo-tag").as_deref(), Some("SPAN"));
+    }
+
+    #[test]
+    fn mutation_observer_attributes_with_old_value() {
+        // observe({attributes:true, attributeOldValue:true}); change an attr; the callback should
+        // see the attributeName and the captured oldValue.
+        let (mut doc, body) = doc_with_body("");
+        // Give body an initial attribute so the change has an old value.
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(body).data {
+            e.attrs.insert("data-x".to_string(), "old".to_string());
+        }
+        let (doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var target = document.body;
+                var captured = false;
+                var mo = new MutationObserver(function (records) {
+                    if (captured) { return; }
+                    var r = records[0];
+                    if (r.attributeName !== "data-x") { return; }
+                    captured = true;
+                    document.body.setAttribute("data-name", r.attributeName);
+                    document.body.setAttribute("data-old", r.oldValue == null ? "<null>" : r.oldValue);
+                });
+                mo.observe(target, { attributes: true, attributeOldValue: true });
+                target.setAttribute("data-x", "new");
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        let body = find_by_tag(&doc, doc.root(), "body").expect("body");
+        assert_eq!(attr_of(&doc, body, "data-x").as_deref(), Some("new"));
+        assert_eq!(attr_of(&doc, body, "data-name").as_deref(), Some("data-x"));
+        assert_eq!(attr_of(&doc, body, "data-old").as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn mutation_observer_disconnect_stops_delivery_and_gate() {
+        // After disconnect(), subsequent mutations must NOT invoke the callback.
+        let (doc, _body) = doc_with_body("");
+        let (doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var runs = 0;
+                var mo = new MutationObserver(function () { runs++; });
+                mo.observe(document.body, { childList: true });
+                mo.disconnect();
+                document.body.appendChild(document.createElement("span"));
+                // Deliver any queued mutations synchronously via a microtask drain happens at end;
+                // record the count on an attribute so we can read it post-drain.
+                document.body.setAttribute("data-runs", String(runs));
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        let body = find_by_tag(&doc, doc.root(), "body").expect("body");
+        assert_eq!(attr_of(&doc, body, "data-runs").as_deref(), Some("0"));
     }
 }

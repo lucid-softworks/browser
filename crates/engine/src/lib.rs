@@ -79,6 +79,13 @@ pub struct Engine {
     /// The node currently under the pointer (most recent `dispatch_move` hit). Used so hover events
     /// (mouseover/out, mouseenter/leave) fire only on transitions. Cleared on navigation.
     hovered_node: Option<dom::NodeId>,
+    /// IntersectionObserver change-tracking: last `isIntersecting` flag per (observerId, nodeId).
+    /// An IO callback fires only on the initial observation and whenever this flips. Cleared on
+    /// navigation.
+    prev_intersecting: HashMap<(u64, usize), bool>,
+    /// ResizeObserver change-tracking: last reported (width, height) per (observerId, nodeId). A RO
+    /// callback fires on the initial observation and whenever the size changes. Cleared on navigation.
+    prev_size: HashMap<(u64, usize), (f32, f32)>,
 }
 
 impl Default for Engine {
@@ -102,6 +109,8 @@ impl Engine {
             focused_node: None,
             focus_value: None,
             hovered_node: None,
+            prev_intersecting: HashMap::new(),
+            prev_size: HashMap::new(),
         }
     }
 
@@ -127,6 +136,8 @@ impl Engine {
         self.focused_node = None; // a new page has no focused field
         self.focus_value = None;
         self.hovered_node = None; // and nothing is hovered
+        self.prev_intersecting.clear(); // observer change-tracking is per-page
+        self.prev_size.clear();
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
         match net::fetch(url) {
             Ok(resp) => {
@@ -188,6 +199,9 @@ impl Engine {
                     console,
                     images,
                 };
+                // Fire the initial IntersectionObserver/ResizeObserver observations (each observer
+                // must deliver its initial state once, even before any scroll/resize).
+                self.deliver_observations();
                 0
             }
             Err(e) => {
@@ -618,15 +632,146 @@ impl Engine {
             None => return false,
         };
         // `None` => nothing was due this tick; cheap no-op (no snapshot clone, no re-render).
-        let (mut snapshot, console) = match session.tick() {
-            Some(r) => r,
+        let mut dirty = false;
+        if let Some((mut snapshot, console)) = session.tick() {
+            snapshot.prune_invalid();
+            if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+                *doc = Some(snapshot);
+                c.extend(console);
+                self.layout_cache = None;
+                dirty = true;
+            }
+        }
+        // Re-evaluate IntersectionObserver/ResizeObserver geometry against the current scroll
+        // offset + viewport every tick. As the user scrolls, scroll_y changes and previously
+        // off-screen targets become intersecting → lazy-load / reveal callbacks fire. Cheap when
+        // the page has no such observers (one tiny eval).
+        if self.deliver_observations() {
+            dirty = true;
+        }
+        dirty
+    }
+
+    /// Compute IntersectionObserver / ResizeObserver geometry for the page's observed targets and,
+    /// when an observation changes (or it's the first one), fire the JS callbacks.
+    ///
+    /// Geometry is computed in Rust from the cached layout tree (all in device pixels — layout is
+    /// built at the device viewport size, so "CSS px" and device px coincide here and scroll_y is
+    /// already device px). The IntersectionObserver root is the viewport. ResizeObserver reports
+    /// the border-box size (we don't subtract padding/border — a documented simplification).
+    ///
+    /// Returns `true` if a callback fired and the DOM snapshot was adopted (so a re-render is
+    /// warranted). Cheap no-op when the page has no IO/RO observers (one tiny eval per call).
+    pub fn deliver_observations(&mut self) -> bool {
+        // Read the observed-targets list (empty when the page registered no IO/RO observers).
+        let targets_json = match &self.session {
+            Some(s) => s.observed_targets(),
             None => return false,
         };
+        if targets_json.is_empty() || targets_json == "[]" {
+            return false;
+        }
+        let targets: Vec<ObservedTarget> = match parse_observed_targets(&targets_json) {
+            Some(t) if !t.is_empty() => t,
+            _ => return false,
+        };
+
+        // Make sure layout reflects the current viewport, then map NodeId -> border-box rect.
+        let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
+        let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
+        self.ensure_layout(dw, dh, 0.0);
+        let cache = match &self.layout_cache {
+            Some(c) => c,
+            None => return false,
+        };
+        let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
+        collect_node_rects(&cache.root, &mut rects);
+
+        // Viewport visible region in layout (device-px) coords.
+        let root_w = dw as f32;
+        let root_h = dh as f32;
+        let view_top = self.scroll_y;
+        let view_bottom = self.scroll_y + root_h;
+        let view_left = 0.0_f32;
+        let view_right = root_w;
+
+        // Build the delivery JSON, recording only changed/initial observations.
+        let mut items: Vec<String> = Vec::new();
+        for t in &targets {
+            let rect = match rects.get(&t.node_id) {
+                Some(r) => *r,
+                None => continue, // not laid out (display:none / detached): no geometry to report
+            };
+            match t.kind {
+                ObsKind::Io => {
+                    // Element rect in document coords; intersection with the viewport region.
+                    let ex0 = rect.x;
+                    let ey0 = rect.y;
+                    let ex1 = rect.x + rect.width;
+                    let ey1 = rect.y + rect.height;
+                    let ix0 = ex0.max(view_left);
+                    let iy0 = ey0.max(view_top);
+                    let ix1 = ex1.min(view_right);
+                    let iy1 = ey1.min(view_bottom);
+                    let iw = (ix1 - ix0).max(0.0);
+                    let ih = (iy1 - iy0).max(0.0);
+                    let overlap = iw * ih;
+                    let elem_area = (rect.width * rect.height).max(1.0);
+                    let is_intersecting = overlap > 0.0;
+                    let ratio = (overlap / elem_area).clamp(0.0, 1.0);
+                    let key = (t.observer_id, t.node_id);
+                    let changed = match self.prev_intersecting.get(&key) {
+                        Some(&prev) => prev != is_intersecting,
+                        None => true, // initial observation always fires
+                    };
+                    self.prev_intersecting.insert(key, is_intersecting);
+                    if !changed {
+                        continue;
+                    }
+                    // Report the element rect relative to the viewport (clientRect-style: subtract
+                    // the scroll offset) so JS sees usual top/left semantics.
+                    items.push(format!(
+                        "{{\"kind\":\"io\",\"observerId\":{},\"nodeId\":{},\"isIntersecting\":{},\"intersectionRatio\":{},\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"ix\":{},\"iy\":{},\"iw\":{},\"ih\":{},\"rootW\":{},\"rootH\":{}}}",
+                        t.observer_id, t.node_id, is_intersecting, ratio,
+                        fnum(rect.x - view_left), fnum(rect.y - view_top), fnum(rect.width), fnum(rect.height),
+                        fnum(ix0 - view_left), fnum(iy0 - view_top), fnum(iw), fnum(ih),
+                        fnum(root_w), fnum(root_h),
+                    ));
+                }
+                ObsKind::Ro => {
+                    let w = rect.width;
+                    let h = rect.height;
+                    let key = (t.observer_id, t.node_id);
+                    let changed = match self.prev_size.get(&key) {
+                        Some(&(pw, ph)) => (pw - w).abs() > 0.01 || (ph - h).abs() > 0.01,
+                        None => true, // initial observation always fires
+                    };
+                    self.prev_size.insert(key, (w, h));
+                    if !changed {
+                        continue;
+                    }
+                    items.push(format!(
+                        "{{\"kind\":\"ro\",\"observerId\":{},\"nodeId\":{},\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+                        t.observer_id, t.node_id, fnum(0.0), fnum(0.0), fnum(w), fnum(h),
+                    ));
+                }
+            }
+        }
+
+        if items.is_empty() {
+            return false;
+        }
+        let arr = format!("[{}]", items.join(","));
+        let session = match &self.session {
+            Some(s) => s,
+            None => return false,
+        };
+        let (mut snapshot, console) = session.deliver_observations(&arr);
         snapshot.prune_invalid();
         if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
             *doc = Some(snapshot);
             c.extend(console);
-            self.layout_cache = None;
+            self.layout_cache = None; // callbacks may have mutated the DOM
             true
         } else {
             false
@@ -712,6 +857,21 @@ impl Engine {
         };
         self.focused_node = found;
         found.is_some()
+    }
+
+    /// Test-only: the value of attribute `name` on the live document's `<body>`.
+    #[cfg(test)]
+    fn body_attr(&self, name: &str) -> Option<String> {
+        match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => {
+                let body = find_tag(d, d.root(), "body")?;
+                match &d.get(body).data {
+                    dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Test-only: the `value` attribute of a node in the live document.
@@ -916,6 +1076,80 @@ fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<dom::NodeId>
     }
 }
 
+/// Kind of observer a target belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum ObsKind {
+    Io,
+    Ro,
+}
+
+/// One observed IntersectionObserver/ResizeObserver target (parsed from `__observedTargets()`).
+struct ObservedTarget {
+    kind: ObsKind,
+    observer_id: u64,
+    node_id: usize,
+}
+
+/// Parse the `[{kind,observerId,nodeId}, ...]` JSON produced by `__observedTargets()`. Hand-rolled
+/// (no serde dep): scans for the three fields per object. Returns `None` only on a malformed list.
+fn parse_observed_targets(json: &str) -> Option<Vec<ObservedTarget>> {
+    let mut out = Vec::new();
+    let bytes = json.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let end = json[i..].find('}').map(|e| i + e)?;
+        let obj = &json[i..=end];
+        let kind = if obj.contains("\"kind\":\"io\"") {
+            ObsKind::Io
+        } else if obj.contains("\"kind\":\"ro\"") {
+            ObsKind::Ro
+        } else {
+            i = end + 1;
+            continue;
+        };
+        let observer_id = json_number_field(obj, "observerId")? as u64;
+        let node_id = json_number_field(obj, "nodeId")? as usize;
+        out.push(ObservedTarget { kind, observer_id, node_id });
+        i = end + 1;
+    }
+    Some(out)
+}
+
+/// Extract the integer value of `"field":N` from a small JSON object slice.
+fn json_number_field(obj: &str, field: &str) -> Option<f64> {
+    let needle = format!("\"{field}\":");
+    let start = obj.find(&needle)? + needle.len();
+    let rest = &obj[start..];
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-' || c == '.'))
+        .unwrap_or(rest.len());
+    rest[..end].parse::<f64>().ok()
+}
+
+/// Map every laid-out DOM node to its border-box rect (device px). When a node appears as multiple
+/// boxes, the first (outermost in document order) wins — that's the element's principal box.
+fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
+    if let Some(node) = b.node {
+        out.entry(node.0).or_insert_with(|| b.dimensions.border_box());
+    }
+    for c in &b.children {
+        collect_node_rects(c, out);
+    }
+}
+
+/// Format an f32 for embedding in JSON, finite-guarded (NaN/Inf → 0).
+fn fnum(v: f32) -> f32 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
 /// True if `id` is an editable text field: a text-like `<input>` (type text/search/email/url/tel/
 /// password/number/none) or a `<textarea>`, and not `disabled`/`readonly`. These are the controls
 /// that accept typed character input.
@@ -1018,6 +1252,25 @@ fn find_by_attr_id(doc: &dom::Document, root: dom::NodeId, id: &str) -> Option<d
     }
     for &c in &doc.get(root).children {
         if let Some(f) = find_by_attr_id(doc, c, id) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// Test-only: depth-first search for the first element with the given lowercase tag name.
+#[cfg(test)]
+fn find_tag(doc: &dom::Document, root: dom::NodeId, tag: &str) -> Option<dom::NodeId> {
+    if root.0 >= doc.len() {
+        return None;
+    }
+    if let dom::NodeData::Element(e) = &doc.get(root).data {
+        if e.tag.eq_ignore_ascii_case(tag) {
+            return Some(root);
+        }
+    }
+    for &c in &doc.get(root).children {
+        if let Some(f) = find_tag(doc, c, tag) {
             return Some(f);
         }
     }
@@ -3979,5 +4232,92 @@ mod tests {
             notes.iter().any(|n| n.contains("[skipped bare import: vue]")),
             "expected bare-import note, got {notes:?}"
         );
+    }
+
+    #[test]
+    fn intersection_observer_fires_on_scroll_into_view() {
+        // A tall page with a spacer pushing the target far below the fold, then a target the JS
+        // observes. The observer callback writes the isIntersecting flag onto <body data-seen>.
+        let html = r#"<html><body>
+            <div style="height:2000px; background-color:#102030"></div>
+            <div id="target" style="height:100px; background-color:#a01010"></div>
+            <script>
+              var io = new IntersectionObserver(function (entries) {
+                for (var i = 0; i < entries.length; i++) {
+                  if (entries[i].isIntersecting) { document.body.setAttribute('data-seen', '1'); }
+                }
+              });
+              io.observe(document.getElementById('target'));
+            </script>
+            </body></html>"#;
+        let path = std::env::temp_dir().join("browser_io_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 300, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+
+        // Target is ~2000px down; the 300px viewport at the top can't see it → not intersecting.
+        assert_eq!(e.body_attr("data-seen"), None, "target must not be seen at the top");
+
+        // Scroll down past the spacer so the target enters the viewport, then tick to re-evaluate.
+        e.scroll_by(2000.0);
+        let _ = e.render();
+        let mut fired = false;
+        for _ in 0..5 {
+            e.tick();
+            if e.body_attr("data-seen").as_deref() == Some("1") {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "IntersectionObserver callback must fire once the target scrolls into view");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resize_observer_fires_on_viewport_change() {
+        // Observe a block element; changing the viewport width reflows it (full-width block), so the
+        // observer fires with the new size. The callback records the observed width on <body>.
+        let html = r#"<html><body>
+            <div id="box" style="height:50px; background-color:#20a020"></div>
+            <script>
+              var ro = new ResizeObserver(function (entries) {
+                for (var i = 0; i < entries.length; i++) {
+                  document.body.setAttribute('data-w', String(Math.round(entries[i].contentRect.width)));
+                }
+              });
+              ro.observe(document.getElementById('box'));
+            </script>
+            </body></html>"#;
+        let path = std::env::temp_dir().join("browser_ro_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 300, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+
+        // Initial observation must have fired with the initial (200-wide) box.
+        let initial = e.body_attr("data-w");
+        assert!(initial.is_some(), "ResizeObserver must deliver an initial size, got {initial:?}");
+
+        // Widen the viewport so the full-width block reflows to ~400px wide.
+        e.set_viewport(400, 300, 1.0);
+        let _ = e.render();
+        let mut changed = false;
+        for _ in 0..5 {
+            e.tick();
+            let w = e.body_attr("data-w");
+            if w.is_some() && w != initial {
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "ResizeObserver callback must fire with the new size after a viewport change (was {initial:?}, now {:?})", e.body_attr("data-w"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
