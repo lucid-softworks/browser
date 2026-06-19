@@ -69,6 +69,13 @@ pub struct PaintStyle {
     pub italic: bool,
     pub background_color: Option<(u8, u8, u8)>,
     pub border_color: (u8, u8, u8),
+    /// `border-collapse` (inherited from the table). On a collapsed table the painter draws cell
+    /// borders as single shared 1px lines (top+left of each cell, plus the table's right/bottom
+    /// rim) instead of per-box 4-edge fills, so adjacent cells don't double up. Read by the painter.
+    pub border_collapse: style::BorderCollapse,
+    /// True for a `display: table-cell` box. Lets the painter apply the collapsed-borders single-line
+    /// rule to cells (top+left lines only) while the table box keeps its full outer border frame.
+    pub is_table_cell: bool,
     /// Draw an underline under text runs (`text-decoration: underline`).
     pub underline: bool,
     /// Draw a strike-through line over text runs (`text-decoration: line-through`).
@@ -118,6 +125,8 @@ impl Default for PaintStyle {
             italic: false,
             background_color: None,
             border_color: (0, 0, 0),
+            border_collapse: style::BorderCollapse::Separate,
+            is_table_cell: false,
             underline: false,
             line_through: false,
             overline: false,
@@ -699,6 +708,8 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         italic: cs.italic,
         background_color: cs.background_color,
         border_color: cs.border_color,
+        border_collapse: cs.border_collapse,
+        is_table_cell: cs.display == style::Display::TableCell,
         underline: cs.underline,
         line_through: cs.line_through,
         overline: cs.overline,
@@ -2285,7 +2296,14 @@ fn capture_table_spans(doc: &dom::Document) {
         map.clear();
         for id in (0..doc.len()).map(dom::NodeId) {
             if let dom::NodeData::Element(el) = &doc.get(id).data {
-                let cs = parse_span(el, "colspan");
+                let tag = el.tag.to_ascii_lowercase();
+                // `<col>`/`<colgroup>` use the `span` attribute; cells use `colspan`. Store both in
+                // the colspan channel so `col_span_attr`/`table_span` can read them uniformly.
+                let cs = if tag == "col" || tag == "colgroup" {
+                    parse_span(el, "span")
+                } else {
+                    parse_span(el, "colspan")
+                };
                 let rs = parse_span(el, "rowspan");
                 if cs != 1 || rs != 1 {
                     map.insert(id, (cs, rs));
@@ -2349,6 +2367,67 @@ fn collect_table_rows(
     rows.append(&mut bodies);
     rows.append(&mut footers);
     rows
+}
+
+/// Collect explicit per-column widths declared by `<colgroup>`/`<col>` children of the table, in
+/// column order. Each entry is `Some(px)` when a column has an explicit width (from a `width`
+/// attribute mapped to `style.width`, or CSS `width` on the `<col>`), else `None`. A `<col span=N>`
+/// repeats its width across N columns; a `<colgroup width=W>` with no `<col>` children applies `W`
+/// to the single column it represents (we don't model multi-column colgroup spans without `<col>`
+/// — a documented simplification). Returns an empty vec when the table has no columns.
+fn collect_col_widths(
+    table: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> Vec<Option<f32>> {
+    let mut widths: Vec<Option<f32>> = Vec::new();
+    // `<col>`'s span comes from the same `TABLE_SPANS` snapshot used for cells' colspan (it stores
+    // any element's colspan-like attribute), but `<col span>` uses the `span` attribute — read it
+    // directly via `table_span(.., "colspan")` won't see `span`, so fall back to 1 here. We honor
+    // an explicit width and a `span` value via the box's node attributes captured at build time.
+    for child in &table.children {
+        let d = style_of(child, styles).map(|cs| cs.display);
+        match d {
+            Some(style::Display::TableColumn) => {
+                let w = style_of(child, styles).and_then(|cs| cs.width);
+                let span = col_span_attr(child).max(1);
+                for _ in 0..span {
+                    widths.push(w);
+                }
+            }
+            Some(style::Display::TableColumnGroup) => {
+                // A colgroup with <col> children contributes those; otherwise itself = 1 column.
+                let group_w = style_of(child, styles).and_then(|cs| cs.width);
+                let mut had_col = false;
+                for col in &child.children {
+                    if style_of(col, styles).map(|cs| cs.display) == Some(style::Display::TableColumn) {
+                        had_col = true;
+                        let w = style_of(col, styles).and_then(|cs| cs.width).or(group_w);
+                        let span = col_span_attr(col).max(1);
+                        for _ in 0..span {
+                            widths.push(w);
+                        }
+                    }
+                }
+                if !had_col {
+                    widths.push(group_w);
+                }
+            }
+            _ => {}
+        }
+    }
+    widths
+}
+
+/// The `span` attribute of a `<col>`/`<colgroup>` box (default 1), read from the table-span
+/// snapshot captured at build time (stored under the "colspan" channel).
+fn col_span_attr(col: &LayoutBox) -> usize {
+    let node = match col.node {
+        Some(n) => n,
+        None => return 1,
+    };
+    TABLE_SPANS.with(|t| {
+        t.borrow().get(&node).map(|(c, _)| (*c).max(1)).unwrap_or(1)
+    })
 }
 
 /// Append the `<tr>` rows found inside a row-group box (`thead`/`tbody`/`tfoot`) to `out`.
@@ -2424,6 +2503,14 @@ fn layout_table(
     let content = boxx.dimensions.content;
     let table_cs = style_of(boxx, styles).cloned().unwrap_or_default();
 
+    // Border model. In the SEPARATE model, `border-spacing` opens a gap between adjacent cells (and
+    // a margin between the cells and the table edge). In the COLLAPSE model cells are flush (no
+    // spacing) and adjacent borders resolve to a single shared line (drawn by the painter). We thread
+    // a single `spacing` scalar (0 when collapsed) through the column/row offset maths so the
+    // geometry adapts; the painter reads `border_collapse` off each cell to draw single lines.
+    let collapsed = table_cs.border_collapse == style::BorderCollapse::Collapse;
+    let spacing = if collapsed { 0.0 } else { table_cs.border_spacing.max(0.0) };
+
     // --- 1. Pull out captions (laid out above the grid) and collect rows of cells. ---
     // Captions are direct table children with display: table-caption.
     let mut captions: Vec<LayoutBox> = Vec::new();
@@ -2438,6 +2525,8 @@ fn layout_table(
         }
         boxx.children = kept;
     }
+    // Explicit column widths from `<colgroup>`/`<col>` (read before the children are drained).
+    let col_attr_widths = collect_col_widths(boxx, styles);
     let row_cells = collect_table_rows(boxx, styles);
 
     // --- 2. Assign cells to grid positions honoring colspan/rowspan via an occupancy grid. ---
@@ -2507,6 +2596,14 @@ fn layout_table(
             }
         }
     }
+    // Apply explicit `<col>`/`<colgroup>` widths: a column with a declared width is pinned to it as
+    // its preferred width (and at least its min-content, so content never overflows the column).
+    for c in 0..col_count {
+        if let Some(Some(w)) = col_attr_widths.get(c) {
+            col_pref[c] = w.max(col_min[c]);
+        }
+    }
+
     // Ensure preferred >= min per column.
     for c in 0..col_count {
         col_pref[c] = col_pref[c].max(col_min[c]);
@@ -2514,12 +2611,16 @@ fn layout_table(
 
     let sum_pref: f32 = col_pref.iter().sum();
     let sum_min: f32 = col_min.iter().sum();
-    // Available width: an explicit table width (clamped to the containing content width) else the
-    // table shrinks to its preferred width, capped to the available content width.
-    let avail = content.width;
+    // Total inter-cell + edge spacing consumed horizontally (separated model). `spacing` is 0 when
+    // collapsed, so this term vanishes and cells sit flush.
+    let h_spacing_total = spacing * (col_count as f32 + 1.0);
+    // Available width for the columns themselves (after reserving the spacing): an explicit table
+    // width (clamped to the containing content width) else the table shrinks to its preferred width,
+    // capped to the available content width.
+    let avail = (content.width - h_spacing_total).max(0.0);
     let mut col_w = col_pref.clone();
     let target = match table_cs.width {
-        Some(w) => w.max(sum_min).min(avail.max(sum_min)),
+        Some(w) => (w - h_spacing_total).max(sum_min).min(avail.max(sum_min)),
         None => sum_pref.min(avail),
     };
     if target > sum_pref && sum_pref > 0.0 {
@@ -2544,12 +2645,18 @@ fn layout_table(
         }
     }
 
-    // Column x offsets (cumulative; separated borders model → no inter-column gap by default).
-    let table_width: f32 = col_w.iter().sum();
+    // Column x offsets. In the separated model each column is preceded by `spacing` (and there's a
+    // leading `spacing` before column 0); collapsed → `spacing == 0` so columns are flush. `col_x[c]`
+    // is the left edge of column c's cell box; the table's used width includes the trailing spacing.
     let mut col_x = vec![0.0f32; col_count + 1];
+    let mut x = spacing;
     for c in 0..col_count {
-        col_x[c + 1] = col_x[c] + col_w[c];
+        col_x[c] = x;
+        x += col_w[c] + spacing;
     }
+    col_x[col_count] = x; // right edge incl. trailing spacing
+    let cols_only: f32 = col_w.iter().sum();
+    let table_width: f32 = cols_only + h_spacing_total;
 
     // --- Caption above the grid. ---
     let caption_h = layout_table_captions(&mut captions, content, ctx, styles, measurer);
@@ -2561,7 +2668,9 @@ fn layout_table(
     for (i, cell) in cells.iter_mut().enumerate() {
         let start = cell.col;
         let end = (start + cell.colspan).min(col_count);
-        let cell_border_w: f32 = col_w[start..end].iter().sum();
+        // A spanning cell also covers the inter-column spacing between the columns it spans.
+        let last = end.saturating_sub(1).max(start);
+        let cell_border_w: f32 = (col_x[last] + col_w[last] - col_x[start]).max(0.0);
         let m = cell.boxx.dimensions.margin;
         let b = cell.boxx.dimensions.border;
         let p = cell.boxx.dimensions.padding;
@@ -2601,12 +2710,16 @@ fn layout_table(
         }
     }
 
-    // Row y offsets.
+    // Row y offsets. Like columns, each row is preceded by `spacing` in the separated model (with a
+    // leading `spacing` above row 0); collapsed → flush. `row_y[r]` is row r's top.
     let mut row_y = vec![0.0f32; num_rows + 1];
+    let mut y = spacing;
     for r in 0..num_rows {
-        row_y[r + 1] = row_y[r] + row_h[r];
+        row_y[r] = y;
+        y += row_h[r] + spacing;
     }
-    let grid_h: f32 = row_h.iter().sum();
+    row_y[num_rows] = y;
+    let grid_h: f32 = y; // includes leading + trailing + inter-row spacing
 
     // --- Final placement: each cell fills its spanned column/row rect. ---
     for cell in &mut cells {
@@ -2614,8 +2727,11 @@ fn layout_table(
         let end_c = (start_c + cell.colspan).min(col_count);
         let start_r = cell.row.min(num_rows.saturating_sub(1));
         let end_r = (cell.row + cell.rowspan).min(num_rows);
-        let cell_border_w: f32 = col_w[start_c..end_c].iter().sum();
-        let cell_border_h: f32 = row_h[start_r..end_r.max(start_r + 1)].iter().sum();
+        let last_c = end_c.saturating_sub(1).max(start_c);
+        let last_r = end_r.saturating_sub(1).max(start_r);
+        // Spanning cells also cover the inter-track spacing between the tracks they span.
+        let cell_border_w: f32 = (col_x[last_c] + col_w[last_c] - col_x[start_c]).max(0.0);
+        let cell_border_h: f32 = (row_y[last_r] + row_h[last_r] - row_y[start_r]).max(0.0);
         let m = cell.boxx.dimensions.margin;
         let b = cell.boxx.dimensions.border;
         let p = cell.boxx.dimensions.padding;
@@ -2634,6 +2750,13 @@ fn layout_table(
 
     // The table box is at least as wide as its columns. Record the used width.
     boxx.dimensions.content.width = table_width;
+
+    // Collapsed-borders resolution is handled entirely in the painter (see `paint_box_opacity`):
+    // each collapsed cell draws a 1px line on its left/top edges and on its OUTER right/bottom edge
+    // coordinate, so a cell's right line and its neighbour's left line land on the SAME device pixel
+    // (cells are flush) — a clean single-line grid instead of a doubled/gapped pair. (Documented
+    // simplification: borders are not resolved per-edge by width; one line is drawn where any border
+    // exists, using the cell's own border color.)
 
     // Rebuild the table box's children: captions first (above), then the flattened cells (the row /
     // row-group boxes were structural only — cells carry their own borders/backgrounds, so we drop
@@ -5417,6 +5540,136 @@ mod tests {
         assert!(lines.len() > 1, "cell content should wrap to multiple lines, got {}", lines.len());
         // The cell content width should not exceed the (narrow) column.
         assert!(cell_box.dimensions.content.width <= 60.0 + 0.5, "cell wider than column");
+    }
+
+    #[test]
+    fn table_border_collapse_cells_are_flush() {
+        // In the collapsed model adjacent cells sit flush: the right edge of one cell == the left
+        // edge (x) of the next, with no inter-cell gap.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let table = doc.append_element(body, "table");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut tcs = disp(style::Display::Table);
+        tcs.border_collapse = style::BorderCollapse::Collapse;
+        styles.insert(table, tcs);
+
+        let cells = build_row(&mut doc, &mut styles, table, "td", &["aa", "bb", "cc"]);
+        // Give each cell a 1px border (the collapsed line) — inherits collapse from the table.
+        for &c in &cells {
+            if let Some(cs) = styles.get_mut(&c) {
+                cs.border = style::Edges { top: 1.0, right: 1.0, bottom: 1.0, left: 1.0 };
+                cs.border_collapse = style::BorderCollapse::Collapse;
+            }
+        }
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let bx = |n: dom::NodeId| {
+            find_box(&root_box, &|x| x.node == Some(n) && matches!(x.content, BoxContent::Block))
+                .unwrap()
+                .dimensions
+                .border_box()
+        };
+        let c0 = bx(cells[0]);
+        let c1 = bx(cells[1]);
+        let c2 = bx(cells[2]);
+        // Flush: next cell's x == previous cell's right edge.
+        assert!((c1.x - (c0.x + c0.width)).abs() < 0.01, "cell1 not flush with cell0: {} vs {}", c1.x, c0.x + c0.width);
+        assert!((c2.x - (c1.x + c1.width)).abs() < 0.01, "cell2 not flush with cell1");
+    }
+
+    #[test]
+    fn table_border_spacing_opens_a_gap() {
+        // With the separated model + border-spacing, adjacent cells have a gap == the spacing.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let table = doc.append_element(body, "table");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut tcs = disp(style::Display::Table);
+        tcs.border_spacing = 10.0; // separate is the default
+        styles.insert(table, tcs);
+
+        let cells = build_row(&mut doc, &mut styles, table, "td", &["aa", "bb"]);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let bx = |n: dom::NodeId| {
+            find_box(&root_box, &|x| x.node == Some(n) && matches!(x.content, BoxContent::Block))
+                .unwrap()
+                .dimensions
+                .border_box()
+        };
+        let c0 = bx(cells[0]);
+        let c1 = bx(cells[1]);
+        let gap = c1.x - (c0.x + c0.width);
+        assert!((gap - 10.0).abs() < 0.5, "expected 10px border-spacing gap, got {gap}");
+        // And the cells are offset from the table content left by the leading spacing.
+        let table_box = find_box(&root_box, &|x| x.node == Some(table)).unwrap().dimensions.content;
+        assert!((c0.x - (table_box.x + 10.0)).abs() < 0.5, "first cell not offset by leading spacing");
+    }
+
+    #[test]
+    fn table_explicit_cell_width_sizes_column() {
+        // A cell with an explicit width (what the `width="200"` presentational hint maps to) sizes
+        // its column to that width.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let table = doc.append_element(body, "table");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(table, disp(style::Display::Table));
+
+        let cells = build_row(&mut doc, &mut styles, table, "td", &["a", "b"]);
+        if let Some(cs) = styles.get_mut(&cells[0]) {
+            cs.width = Some(200.0);
+        }
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let c0 = find_box(&root_box, &|x| x.node == Some(cells[0]) && matches!(x.content, BoxContent::Block)).unwrap();
+        assert!(
+            (c0.dimensions.content.width - 200.0).abs() < 1.0,
+            "explicit cell width not honored: {}",
+            c0.dimensions.content.width
+        );
+    }
+
+    #[test]
+    fn table_colgroup_col_width_sizes_columns() {
+        // <colgroup><col width=150><col width=50> sets the two column widths.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let table = doc.append_element(body, "table");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(table, disp(style::Display::Table));
+
+        let cg = doc.append_element(table, "colgroup");
+        styles.insert(cg, disp(style::Display::TableColumnGroup));
+        let col0 = doc.append_element(cg, "col");
+        let mut c0s = disp(style::Display::TableColumn);
+        c0s.width = Some(150.0);
+        styles.insert(col0, c0s);
+        let col1 = doc.append_element(cg, "col");
+        let mut c1s = disp(style::Display::TableColumn);
+        c1s.width = Some(50.0);
+        styles.insert(col1, c1s);
+
+        let cells = build_row(&mut doc, &mut styles, table, "td", &["a", "b"]);
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let bx = |n: dom::NodeId| {
+            find_box(&root_box, &|x| x.node == Some(n) && matches!(x.content, BoxContent::Block))
+                .unwrap()
+                .dimensions
+                .border_box()
+        };
+        let w0 = bx(cells[0]).width;
+        let w1 = bx(cells[1]).width;
+        assert!((w0 - 150.0).abs() < 1.5, "col0 width should be 150, got {w0}");
+        assert!((w1 - 50.0).abs() < 1.5, "col1 width should be 50, got {w1}");
     }
 }
 

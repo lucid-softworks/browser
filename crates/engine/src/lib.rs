@@ -2566,21 +2566,37 @@ fn paint_box_opacity(
             fill_box(fb, xf, border.x, border.y, border.width, border.height, radius, c, axis);
         }
 
-        // (b) Borders: four filled edge rects, each `border.<side>` thick.
+        // (b) Borders. For a collapsed table CELL, draw single shared 1px lines: left/top at the
+        // border-box edges and right/bottom at the OUTER edge coordinate, so a cell's right line and
+        // its flush neighbour's left line land on the same device pixel (a clean single-line grid,
+        // not a doubled/gapped pair). Otherwise: the normal four filled edge rects.
         let e = b.dimensions.border;
         let ba = scale_alpha(255, opacity);
         let bc = Color { r: b.style.border_color.0, g: b.style.border_color.1, b: b.style.border_color.2, a: ba };
-        if e.top > 0.0 {
-            fill_box(fb, xf, border.x, border.y, border.width, e.top, radius.min(e.top.max(1.0)), bc, axis);
-        }
-        if e.bottom > 0.0 {
-            fill_box(fb, xf, border.x, border.y + border.height - e.bottom, border.width, e.bottom, radius.min(e.bottom.max(1.0)), bc, axis);
-        }
-        if e.left > 0.0 {
-            fill_box(fb, xf, border.x, border.y, e.left, border.height, 0.0, bc, axis);
-        }
-        if e.right > 0.0 {
-            fill_box(fb, xf, border.x + border.width - e.right, border.y, e.right, border.height, 0.0, bc, axis);
+        let collapsed_cell = b.style.is_table_cell
+            && b.style.border_collapse == style::BorderCollapse::Collapse
+            && (e.top > 0.0 || e.right > 0.0 || e.bottom > 0.0 || e.left > 0.0);
+        if collapsed_cell {
+            let lw = 1.0f32; // single hairline regardless of declared width (simplified resolution)
+            // left + top at the border-box edges
+            fill_box(fb, xf, border.x, border.y, lw, border.height + lw, 0.0, bc, axis);
+            fill_box(fb, xf, border.x, border.y, border.width + lw, lw, 0.0, bc, axis);
+            // right + bottom at the OUTER edge coordinate (coincides with the neighbour's left/top)
+            fill_box(fb, xf, border.x + border.width, border.y, lw, border.height + lw, 0.0, bc, axis);
+            fill_box(fb, xf, border.x, border.y + border.height, border.width + lw, lw, 0.0, bc, axis);
+        } else {
+            if e.top > 0.0 {
+                fill_box(fb, xf, border.x, border.y, border.width, e.top, radius.min(e.top.max(1.0)), bc, axis);
+            }
+            if e.bottom > 0.0 {
+                fill_box(fb, xf, border.x, border.y + border.height - e.bottom, border.width, e.bottom, radius.min(e.bottom.max(1.0)), bc, axis);
+            }
+            if e.left > 0.0 {
+                fill_box(fb, xf, border.x, border.y, e.left, border.height, 0.0, bc, axis);
+            }
+            if e.right > 0.0 {
+                fill_box(fb, xf, border.x + border.width - e.right, border.y, e.right, border.height, 0.0, bc, axis);
+            }
         }
 
         // (a2) INSET box-shadows: painted inside the box AFTER the background (best-effort: a
@@ -6509,4 +6525,80 @@ mod tests {
         assert!(!(outside[2] > 200 && outside[0] < 60), "outside the triangle must not be blue, got {outside:?}");
     }
 
+    // --- Table presentational attributes / border-collapse -------------------------------------
+
+    #[test]
+    fn td_bgcolor_red_fills_cell() {
+        // <td bgcolor="red"> paints red pixels in the cell.
+        let html = "<html><body style='margin:0'>\
+            <table cellspacing='0'><tr><td id='c' bgcolor='red'>cell</td></tr></table></body></html>";
+        let e = load_rendered(html, "browser_td_bgcolor.html", 200, 100);
+        let td = e.node_by_attr_id("c").and_then(|id| e.node_device_rect(id)).expect("td rect");
+        // Scan the cell interior for a clearly-red pixel.
+        let mut red = false;
+        let x0 = td.x as i32 + 1;
+        let y0 = td.y as i32 + 1;
+        let x1 = (td.x + td.width) as i32 - 1;
+        let y1 = (td.y + td.height) as i32 - 1;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let (r, g, b) = px_at(&e, x, y);
+                if r > 200 && g < 80 && b < 80 {
+                    red = true;
+                }
+            }
+        }
+        assert!(red, "td bgcolor=red should fill the cell with red");
+    }
+
+    #[test]
+    fn border_collapse_draws_single_line_between_cells() {
+        // Two collapsed cells with 1px borders: the shared vertical edge must be a SINGLE 1px line,
+        // not a doubled/gapped pair. We scan a horizontal strip across the shared edge and count
+        // contiguous dark-pixel runs; collapse should give exactly one run there.
+        let html = "<html><body style='margin:0'>\
+            <style>table{border-collapse:collapse} td{border:1px solid black; padding:6px}</style>\
+            <table><tr><td id='a'>AA</td><td id='b'>BB</td></tr></table></body></html>";
+        let e = load_rendered(html, "browser_collapse_line.html", 200, 100);
+        let r0 = e.node_by_attr_id("a").and_then(|id| e.node_device_rect(id)).expect("td0");
+        let r1 = e.node_by_attr_id("b").and_then(|id| e.node_device_rect(id)).expect("td1");
+        // The two cells are flush: cell1's left == cell0's right (within 1px).
+        assert!((r1.x - (r0.x + r0.width)).abs() <= 1.5, "collapsed cells not flush: {} vs {}", r1.x, r0.x + r0.width);
+        // Scan a row through the middle of the cells; count dark vertical runs across the boundary.
+        let y = (r0.y + r0.height / 2.0) as i32;
+        let scan_x0 = (r0.x + r0.width) as i32 - 4;
+        let scan_x1 = (r1.x) as i32 + 4;
+        let mut runs = 0;
+        let mut prev_dark = false;
+        for x in scan_x0..=scan_x1 {
+            let (r, g, b) = px_at(&e, x, y);
+            let dark = r < 100 && g < 100 && b < 100;
+            if dark && !prev_dark {
+                runs += 1;
+            }
+            prev_dark = dark;
+        }
+        assert_eq!(runs, 1, "collapsed shared edge should be a single line, found {runs} dark runs");
+    }
+
+    #[test]
+    fn table_border_attr_paints_visible_borders() {
+        // <table border="2"> gives the table a visible border (dark pixels near the table frame).
+        let html = "<html><body style='margin:0'>\
+            <table id='t' border='2' cellspacing='0'><tr><td>X</td></tr></table></body></html>";
+        let e = load_rendered(html, "browser_table_border_attr.html", 200, 100);
+        let r = e.node_by_attr_id("t").and_then(|id| e.node_device_rect(id)).expect("table rect");
+        // Scan the top border band for dark pixels.
+        let mut dark = 0;
+        let yb = r.y as i32;
+        for x in (r.x as i32 + 1)..((r.x + r.width) as i32 - 1) {
+            for y in yb..(yb + 2) {
+                let (rr, g, b) = px_at(&e, x, y);
+                if rr < 120 && g < 120 && b < 120 {
+                    dark += 1;
+                }
+            }
+        }
+        assert!(dark > 5, "table border=2 should paint a visible top border, dark px = {dark}");
+    }
 }

@@ -202,6 +202,15 @@ pub struct ComputedStyle {
     /// Border color (r, g, b).
     pub border_color: (u8, u8, u8),
 
+    // --- Table properties ---
+    /// `border-collapse` (`separate` default | `collapse`). On a `display: table`, `Collapse`
+    /// switches the layout to the collapsed-borders model (cells flush, single shared edge lines).
+    /// Inherits (per CSS — it's set on the table and read by its cells in layout/paint).
+    pub border_collapse: BorderCollapse,
+    /// `border-spacing` in px (the gap between adjacent cells in the separated-borders model).
+    /// Inherits. Ignored when `border_collapse == Collapse`.
+    pub border_spacing: f32,
+
     // --- Flex container properties ---
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
@@ -283,6 +292,16 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// CSS `border-collapse`. `Separate` (default) keeps the classic spaced/double-bordered model;
+/// `Collapse` makes adjacent cells share a single border edge (a clean single-line grid). Inherits
+/// from the table down to its cells so the layout/painter can read it off any cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderCollapse {
+    #[default]
+    Separate,
+    Collapse,
 }
 
 /// `vertical-align` for inline-level content. Only the `sub`/`super` keywords (subscript /
@@ -442,6 +461,8 @@ impl Default for ComputedStyle {
             padding: Edges::default(),
             border: Edges::default(),
             border_color: (0, 0, 0), // initial border-color is currentColor (black)
+            border_collapse: BorderCollapse::Separate,
+            border_spacing: 0.0,
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,
@@ -674,6 +695,14 @@ impl ComputedStyle {
             "border-left-width" => px(self.border.left),
             "border-width" => edges_str(self.border),
 
+            // --- table ---
+            "border-collapse" => match self.border_collapse {
+                BorderCollapse::Separate => "separate",
+                BorderCollapse::Collapse => "collapse",
+            }
+            .to_string(),
+            "border-spacing" => px(self.border_spacing),
+
             // --- flex container ---
             "flex-direction" => match self.flex_direction {
                 FlexDirection::Row => "row",
@@ -752,6 +781,8 @@ impl ComputedStyle {
             "border-right-color",
             "border-bottom-color",
             "border-left-color",
+            "border-collapse",
+            "border-spacing",
             "opacity",
             "border-radius",
             "font-size",
@@ -1114,6 +1145,9 @@ fn compute_element_style<'a>(
         padding: Edges::default(),
         border: Edges::default(),
         border_color: parent.color, // initial border-color is currentColor
+        // border-collapse / border-spacing inherit (set on the table, read by cells).
+        border_collapse: parent.border_collapse,
+        border_spacing: parent.border_spacing,
         flex_direction: FlexDirection::Row,
         flex_wrap: FlexWrap::NoWrap,
         justify_content: JustifyContent::FlexStart,
@@ -1162,7 +1196,7 @@ fn compute_element_style<'a>(
     // origins. We process origins lowest-precedence-first and rely on a stable sort that puts
     // later, higher-specificity entries last so they win when applied in order.
     struct MatchEntry<'a> {
-        origin: u8, // 0 = UA, 1 = author, 2 = inline
+        origin: u8, // 0 = UA, 1 = presentational hints, 2 = author, 3 = inline
         specificity: u32,
         order: usize,
         decls: &'a [(String, String)],
@@ -1228,21 +1262,36 @@ fn compute_element_style<'a>(
         consider(e);
     }
 
+    // Cascade-origin levels (sorted ascending, winner last): 0 = UA, 1 = presentational hints,
+    // 2 = author, 3 = inline. The selector index tags UA entries 0 and author entries 1; remap
+    // author to level 2 here so presentational hints (level 1) slot strictly between UA and author —
+    // regardless of selector specificity (a UA `td { padding: 1px }` has specificity 1, but a hint
+    // must still beat it for `cellpadding` to work, so origin level — not specificity — separates
+    // them).
     for (order, (origin, specificity, decls)) in best_by_order {
-        matches.push(MatchEntry { origin, specificity, order, decls });
+        let level = if origin == 0 { 0 } else { 2 };
+        matches.push(MatchEntry { origin: level, specificity, order, decls });
     }
 
-    // Inline style is its own origin with highest precedence.
+    // Presentational hints: HTML attributes (`border`, `bgcolor`, `align`, `width`, …) mapped to
+    // CSS declarations at origin level 1 — ABOVE the UA stylesheet, BELOW all author CSS. See
+    // `presentational_hints`.
+    let hint_decls: Vec<(String, String)> = presentational_hints(doc, node_id, el);
+    if !hint_decls.is_empty() {
+        matches.push(MatchEntry { origin: 1, specificity: 0, order: usize::MAX - 1, decls: &hint_decls });
+    }
+
+    // Inline style is its own origin (level 3) with highest precedence.
     let inline_decls: Vec<(String, String)> = el
         .attrs
         .get("style")
         .map(|s| css::parse_declarations(s))
         .unwrap_or_default();
     if !inline_decls.is_empty() {
-        // Inline is the sole origin-2 entry; the sort tiebreaks on `order` only within the
+        // Inline is the sole top-level entry; the sort tiebreaks on `order` only within the
         // same origin/specificity, so the exact value is immaterial. Use MAX to keep the
         // "applied last" intent explicit.
-        matches.push(MatchEntry { origin: 2, specificity: 0, order: usize::MAX, decls: &inline_decls });
+        matches.push(MatchEntry { origin: 3, specificity: 0, order: usize::MAX, decls: &inline_decls });
     }
 
     // Sort by (origin, specificity, order) ascending so the winner is applied last.
@@ -1901,6 +1950,160 @@ fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
     Some(GridPlacement { start, end })
 }
 
+/// Map legacy HTML presentational attributes to CSS declarations ("presentational hints", per the
+/// HTML spec). The returned declarations are injected into the cascade at the very end of the UA
+/// origin — above the UA stylesheet, below all author CSS — so author rules always win while these
+/// still override UA defaults (e.g. `cellpadding` beating `td { padding: 1px }`).
+///
+/// Honored:
+/// - `<table border="N">` → `border: Npx solid` on the table AND `border: 1px solid` on every
+///   descendant `<td>`/`<th>` (resolved by walking up to the nearest ancestor `<table>`).
+/// - `<table cellspacing="N">` → `border-spacing: Npx`; `cellpadding="N">` → `padding: Npx` on each
+///   cell (again resolved from the nearest ancestor `<table>`).
+/// - `bgcolor` on `table`/`tr`/`td`/`th`/`body` → `background-color` (named, `#rgb`, `#rrggbb`).
+/// - `align=left|center|right` on `td`/`th`/`tr` → `text-align`. On `table`/`img` it is skipped
+///   (float/box alignment isn't modeled) — documented as a gap.
+/// - `valign` on `td`/`th`/`tr` → `vertical-align` (the value is mapped; layout only honors `top`).
+/// - `width`/`height` (`N` px or `N%`) on `table`/`td`/`th` → `width`/`height` (px only; `%` is
+///   mapped to a `%` string which the length parser drops — a documented gap for table/cell `%`).
+///   `<img>` width/height are handled in the replaced-element path, so they are NOT emitted here.
+/// - `<font color>` → `color`; `<font size>` is skipped (the legacy 1–7 scale is awkward) — gap.
+fn presentational_hints(
+    doc: &dom::Document,
+    node_id: dom::NodeId,
+    el: &dom::ElementData,
+) -> Vec<(String, String)> {
+    let tag = el.tag.to_ascii_lowercase();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let attr = |name: &str| el.attrs.get(name).map(|s| s.trim().to_string());
+
+    // A length attribute value: bare number → px; `N%` → percent string (length parser ignores %).
+    let len_to_css = |v: &str| -> String {
+        let t = v.trim();
+        if let Some(p) = t.strip_suffix('%') {
+            if p.trim().parse::<f32>().is_ok() {
+                return format!("{}%", p.trim());
+            }
+        }
+        // strip a trailing "px" if the author wrote one, else treat the number as px.
+        let n = t.trim_end_matches("px").trim();
+        if n.parse::<f32>().is_ok() { format!("{n}px") } else { t.to_string() }
+    };
+
+    match tag.as_str() {
+        "table" => {
+            if let Some(b) = attr("border") {
+                // `border` (even `border=""` / `border="1"`) → a solid border of N px on the table.
+                let n: f32 = b.parse().unwrap_or(1.0);
+                if n > 0.0 || b.is_empty() {
+                    let w = if b.is_empty() { 1.0 } else { n };
+                    out.push(("border".into(), format!("{w}px solid")));
+                }
+            }
+            if let Some(s) = attr("cellspacing") {
+                if let Ok(n) = s.trim_end_matches("px").trim().parse::<f32>() {
+                    out.push(("border-spacing".into(), format!("{n}px")));
+                }
+            }
+            if let Some(c) = attr("bgcolor") {
+                out.push(("background-color".into(), c));
+            }
+            if let Some(w) = attr("width") {
+                out.push(("width".into(), len_to_css(&w)));
+            }
+            if let Some(h) = attr("height") {
+                out.push(("height".into(), len_to_css(&h)));
+            }
+        }
+        "td" | "th" => {
+            // Cell-level: inherit `border`/`cellpadding` from the nearest ancestor `<table>`.
+            if let Some(tbl) = ancestor_table(doc, node_id) {
+                if let Some(b) = tbl.attrs.get("border") {
+                    let n: f32 = b.trim().parse().unwrap_or(1.0);
+                    if n > 0.0 || b.trim().is_empty() {
+                        // Per HTML rules, any non-zero table `border` puts a 1px border on cells.
+                        out.push(("border".into(), "1px solid".into()));
+                    }
+                }
+                if let Some(p) = tbl.attrs.get("cellpadding") {
+                    if let Ok(n) = p.trim().trim_end_matches("px").trim().parse::<f32>() {
+                        out.push(("padding".into(), format!("{n}px")));
+                    }
+                }
+            }
+            if let Some(a) = attr("align").map(|a| a.to_ascii_lowercase()) {
+                if matches!(a.as_str(), "left" | "center" | "right") {
+                    out.push(("text-align".into(), a));
+                }
+            }
+            if let Some(v) = attr("valign").map(|v| v.to_ascii_lowercase()) {
+                out.push(("vertical-align".into(), v));
+            }
+            if let Some(c) = attr("bgcolor") {
+                out.push(("background-color".into(), c));
+            }
+            if let Some(w) = attr("width") {
+                out.push(("width".into(), len_to_css(&w)));
+            }
+            if let Some(h) = attr("height") {
+                out.push(("height".into(), len_to_css(&h)));
+            }
+        }
+        "col" | "colgroup" => {
+            // `<col width="N">` / `<colgroup width="N">` → a column width (consumed by `layout_table`
+            // via the column's computed `width`). `span` is read directly off the attribute there.
+            if let Some(w) = attr("width") {
+                out.push(("width".into(), len_to_css(&w)));
+            }
+        }
+        "tr" => {
+            if let Some(c) = attr("bgcolor") {
+                out.push(("background-color".into(), c));
+            }
+            if let Some(a) = attr("align").map(|a| a.to_ascii_lowercase()) {
+                if matches!(a.as_str(), "left" | "center" | "right") {
+                    out.push(("text-align".into(), a));
+                }
+            }
+            if let Some(v) = attr("valign").map(|v| v.to_ascii_lowercase()) {
+                out.push(("vertical-align".into(), v));
+            }
+        }
+        "body" => {
+            if let Some(c) = attr("bgcolor") {
+                out.push(("background-color".into(), c));
+            }
+            if let Some(c) = attr("text") {
+                out.push(("color".into(), c));
+            }
+        }
+        "font" => {
+            if let Some(c) = attr("color") {
+                out.push(("color".into(), c));
+            }
+            // `size` (the legacy 1..7 / relative scale) is intentionally skipped.
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Walk up from `node_id` to the nearest ancestor `<table>` element, returning its element data
+/// (used to read `border`/`cellpadding` for a descendant cell's presentational hints).
+fn ancestor_table(doc: &dom::Document, node_id: dom::NodeId) -> Option<&dom::ElementData> {
+    let mut cur = doc.get(node_id).parent;
+    while let Some(id) = cur {
+        let node = doc.get(id);
+        if let dom::NodeData::Element(el) = &node.data {
+            if el.tag.eq_ignore_ascii_case("table") {
+                return Some(el);
+            }
+        }
+        cur = node.parent;
+    }
+    None
+}
+
 /// Apply a single declaration to `style`. Unknown properties/values are ignored silently.
 fn apply_declaration(
     style: &mut ComputedStyle,
@@ -2181,6 +2384,21 @@ fn apply_declaration(
         "border-color" => {
             if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.border_color = c;
+            }
+        }
+
+        // --- Table: border-collapse / border-spacing ---
+        "border-collapse" => {
+            style.border_collapse = match val.trim().to_ascii_lowercase().as_str() {
+                "collapse" => BorderCollapse::Collapse,
+                _ => BorderCollapse::Separate,
+            };
+        }
+        "border-spacing" => {
+            // We model border-spacing as a single scalar (the first length; the row/col
+            // distinction is collapsed to one value — a documented simplification).
+            if let Some(v) = val.split_whitespace().next().and_then(parse_length) {
+                style.border_spacing = v.max(0.0);
             }
         }
 
@@ -6766,6 +6984,105 @@ mod tests {
                 "property `{name}` listed in property_names() resolved to empty"
             );
         }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // border-collapse / presentational hints
+    // ------------------------------------------------------------------------------------------
+
+    #[test]
+    fn border_collapse_property_parses() {
+        let cs = cs_of(
+            r#"<html><body><table style="border-collapse: collapse"></table></body></html>"#,
+            "",
+            |e| e.tag == "table",
+        );
+        assert_eq!(cs.border_collapse, BorderCollapse::Collapse);
+        assert_eq!(cs.get_property("border-collapse"), "collapse");
+    }
+
+    #[test]
+    fn border_collapse_inherits_to_cells() {
+        let cs = cs_of(
+            r#"<html><body><table style="border-collapse: collapse"><tr><td>x</td></tr></table></body></html>"#,
+            "",
+            |e| e.tag == "td",
+        );
+        assert_eq!(cs.border_collapse, BorderCollapse::Collapse);
+    }
+
+    #[test]
+    fn pres_table_border_attr_borders_table_and_cells() {
+        // <table border="2"> → 2px border on the table AND 1px on each cell.
+        let doc = html::parse(r#"<html><body><table border="2"><tr><td>x</td></tr></table></body></html>"#);
+        let map = cascade(&doc, &[]);
+        let table = elem(&doc, |e| e.tag == "table");
+        let td = elem(&doc, |e| e.tag == "td");
+        assert_eq!(map[&table].border.top, 2.0, "table border attr → 2px");
+        assert_eq!(map[&td].border.top, 1.0, "table border attr → 1px on cells");
+    }
+
+    #[test]
+    fn pres_bgcolor_named_and_hex() {
+        let red = cs_of(
+            r#"<html><body><table><tr><td bgcolor="red">x</td></tr></table></body></html>"#,
+            "",
+            |e| e.tag == "td",
+        );
+        assert_eq!(red.background_color, Some((255, 0, 0)));
+        let hex = cs_of(
+            r##"<html><body><table bgcolor="#00ff00"></table></body></html>"##,
+            "",
+            |e| e.tag == "table",
+        );
+        assert_eq!(hex.background_color, Some((0, 255, 0)));
+    }
+
+    #[test]
+    fn pres_align_center_on_cell() {
+        let cs = cs_of(
+            r#"<html><body><table><tr><td align="center">x</td></tr></table></body></html>"#,
+            "",
+            |e| e.tag == "td",
+        );
+        assert_eq!(cs.text_align, TextAlign::Center);
+    }
+
+    #[test]
+    fn pres_cellpadding_and_cellspacing() {
+        let td = cs_of(
+            r#"<html><body><table cellpadding="10" cellspacing="4"><tr><td>x</td></tr></table></body></html>"#,
+            "",
+            |e| e.tag == "td",
+        );
+        assert_eq!(td.padding.top, 10.0, "cellpadding → cell padding");
+        let table = cs_of(
+            r#"<html><body><table cellpadding="10" cellspacing="4"><tr><td>x</td></tr></table></body></html>"#,
+            "",
+            |e| e.tag == "table",
+        );
+        assert_eq!(table.border_spacing, 4.0, "cellspacing → border-spacing");
+    }
+
+    #[test]
+    fn pres_width_attr_on_cell() {
+        let cs = cs_of(
+            r#"<html><body><table><tr><td width="200">x</td></tr></table></body></html>"#,
+            "",
+            |e| e.tag == "td",
+        );
+        assert_eq!(cs.width, Some(200.0));
+    }
+
+    #[test]
+    fn author_css_overrides_presentational_hint() {
+        // bgcolor="red" but author CSS sets blue → CSS wins (hints are lowest precedence).
+        let cs = cs_of(
+            r#"<html><body><table><tr><td bgcolor="red">x</td></tr></table></body></html>"#,
+            "td { background-color: blue }",
+            |e| e.tag == "td",
+        );
+        assert_eq!(cs.background_color, Some((0, 0, 255)), "author CSS should beat bgcolor attr");
     }
 }
 
