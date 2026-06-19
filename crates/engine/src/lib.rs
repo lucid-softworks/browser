@@ -595,7 +595,12 @@ impl Engine {
         let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;
 
-        paint_gradient(&mut fb);
+        // A loaded HTML page paints on a real document canvas (white by default, or the html/body
+        // background). The splash / non-HTML / error states (no layout tree) keep the chrome gradient.
+        match (&self.state, &self.layout_cache) {
+            (LoadState::Loaded { .. }, Some(cache)) => fb.clear(page_background(&cache.root)),
+            _ => paint_gradient(&mut fb),
+        }
 
         let px = 16.0 * self.scale;
         if let Some(font) = self.font.as_ref() {
@@ -1656,6 +1661,24 @@ impl Engine {
 }
 
 /// A simple computed vertical gradient — proof the pixels came from our code.
+/// The page canvas background. CSS "background propagation": the canvas takes the root element's
+/// (`<html>`) background; if that's transparent, the `<body>`'s background propagates up. Defaults
+/// to white when neither sets one. Walks the first-child chain (html → body) so it never picks up a
+/// content element's background.
+fn page_background(root: &layout::LayoutBox) -> Color {
+    let mut node = root;
+    for _ in 0..3 {
+        if let Some((r, g, b)) = node.style.background_color {
+            return Color::rgb(r, g, b);
+        }
+        match node.children.first() {
+            Some(c) => node = c,
+            None => break,
+        }
+    }
+    Color::WHITE
+}
+
 fn paint_gradient(fb: &mut Framebuffer) {
     let h = fb.height.max(1);
     for y in 0..fb.height {

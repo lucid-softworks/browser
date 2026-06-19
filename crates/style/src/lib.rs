@@ -417,7 +417,7 @@ impl SizeConstraint {
 impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle {
-            color: (216, 216, 216), // #d8d8d8 light grey (engine paints a dark background)
+            color: (0, 0, 0), // black — the page canvas defaults to white (CSS initial)
             background_color: None,
             font_size: 16.0,
             bold: false,
@@ -441,7 +441,7 @@ impl Default for ComputedStyle {
             margin: Edges::default(),
             padding: Edges::default(),
             border: Edges::default(),
-            border_color: (216, 216, 216), // mid/light grey, matching default text color
+            border_color: (0, 0, 0), // initial border-color is currentColor (black)
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,
@@ -4815,11 +4815,11 @@ fn is_empty_element(doc: &dom::Document, id: dom::NodeId) -> bool {
     true
 }
 
-/// The built-in user-agent stylesheet: sane defaults for a dark-background renderer.
+/// The built-in user-agent stylesheet: sane defaults on a white page canvas.
 fn user_agent_stylesheet() -> css::Stylesheet {
     css::parse(
-        "html { color: #d8d8d8; font-size: 16px }
-         body { color: #d8d8d8; font-size: 16px }
+        "html { color: #000; font-size: 16px }
+         body { color: #000; font-size: 16px }
          h1 { font-size: 32px; font-weight: bold; display: block; margin: 0.67em 0 }
          h2 { font-size: 26px; font-weight: bold; display: block; margin: 0.83em 0 }
          h3 { font-size: 20px; font-weight: bold; display: block; margin: 1em 0 }
@@ -6117,7 +6117,7 @@ mod tests {
         // <span class="bar">: only `*` and `.foo.bar` (no, needs foo) — none color it, so it
         // inherits the html/body UA color.
         let span = elem(&doc, |e| e.tag == "span");
-        assert_eq!(map[&span].color, (216, 216, 216));
+        assert_eq!(map[&span].color, (0, 0, 0));
         assert!(!span_is_bold(&map, &doc));
     }
 
