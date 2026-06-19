@@ -2899,6 +2899,13 @@ fn parse_length(val: &str) -> Option<f32> {
         Some(px)
     } else if let Some(pt) = num("pt") {
         Some(pt * 4.0 / 3.0)
+    } else if let Some(em) = num("rem") {
+        Some(em * 16.0)
+    } else if let Some(em) = num("em") {
+        // em is relative to the element's own font size; we don't thread that here, so approximate
+        // against the 16px default base. Without this, `.15em` borders / `0.5em` padding collapsed
+        // to 0 (e.g. browserscore.dev's fieldset card borders were invisible).
+        Some(em * 16.0)
     } else {
         v.parse::<f32>().ok()
     }
