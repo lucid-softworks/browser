@@ -255,6 +255,53 @@ const char *browser_engine_select_at(struct Engine *engine, float x, float y);
  */
 int32_t browser_engine_set_select_index(struct Engine *engine, uintptr_t node_id, uintptr_t index);
 
+/**
+ * Begin a text selection at framebuffer device-pixel `(x, y)` (viewport-relative, scroll NOT
+ * pre-added — the engine folds in the scroll offset itself, matching `browser_engine_dispatch_click`).
+ * Sets the selection anchor (collapsed) at that point.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+void browser_engine_selection_start(struct Engine *engine,
+                                    float x,
+                                    float y);
+
+/**
+ * Extend the active text selection's focus to framebuffer device-pixel `(x, y)` (viewport-relative,
+ * scroll NOT pre-added). Keeps the anchor fixed; called repeatedly as the pointer drags.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+void browser_engine_selection_extend(struct Engine *engine, float x, float y);
+
+/**
+ * Clear any active text selection.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+void browser_engine_selection_clear(struct Engine *engine);
+
+/**
+ * Whether there is a non-empty (non-collapsed) text selection. Returns 1 if so, else 0.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+int32_t browser_engine_has_selection(struct Engine *engine);
+
+/**
+ * The currently selected page text as a NUL-terminated UTF-8 C string, or null if there is no
+ * (non-collapsed) selection. Lifetime: owned by the engine handle (stored in `last_selected`);
+ * valid until the next `browser_engine_selected_text` call on this handle, or `browser_engine_free`.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_selected_text(struct Engine *engine);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

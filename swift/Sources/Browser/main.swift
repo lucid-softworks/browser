@@ -23,6 +23,14 @@ final class BitmapView: NSView {
     var onMove: ((CGPoint) -> Void)?
     /// Called with a raw mouse event kind ("mousedown"/"mouseup"/"dblclick"/"contextmenu") + point.
     var onMouseEvent: ((String, CGPoint) -> Void)?
+    /// Called on mouse-down with the view-local point to begin a text selection anchor.
+    var onSelectStart: ((CGPoint) -> Void)?
+    /// Called as the pointer drags to extend the text selection focus.
+    var onSelectExtend: ((CGPoint) -> Void)?
+    /// Called when a drag ends (the pointer moved beyond the click threshold) to finalize selection.
+    var onSelectEnd: ((CGPoint) -> Void)?
+    /// Called when the press ended WITHOUT a drag (a plain click) so any selection can be cleared.
+    var onSelectCancel: (() -> Void)?
 
     // Accept keyboard focus so typing into a page text field routes here.
     override var acceptsFirstResponder: Bool { true }
@@ -61,6 +69,13 @@ final class BitmapView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         mouseDownPoint = p
         onMouseEvent?("mousedown", p)
+        // Record the selection anchor here; an actual selection only materializes on drag.
+        onSelectStart?(p)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        onSelectExtend?(p)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -71,8 +86,14 @@ final class BitmapView: NSView {
         if let down = mouseDownPoint {
             let dx = up.x - down.x
             let dy = up.y - down.y
-            if (dx * dx + dy * dy) > 16 { return } // moved > 4pt: a drag, ignore
+            if (dx * dx + dy * dy) > 16 {
+                // A real drag: finalize the text selection and do NOT treat it as a click.
+                onSelectEnd?(up)
+                return
+            }
         }
+        // A plain click (no drag): clear any selection so clicking deselects, then handle the click.
+        onSelectCancel?()
         onClick?(up)
         if event.clickCount == 2 { onMouseEvent?("dblclick", up) }
     }
@@ -946,6 +967,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.onKeyDown = { [weak self] event in self?.handleKeyDown(event) ?? false }
         bitmapView.onMove = { [weak self] point in self?.handleContentMove(point) }
         bitmapView.onMouseEvent = { [weak self] kind, point in self?.handleMouseEvent(kind, point) }
+        bitmapView.onSelectStart = { [weak self] point in self?.handleSelectStart(point) }
+        bitmapView.onSelectExtend = { [weak self] point in self?.handleSelectExtend(point) }
+        bitmapView.onSelectEnd = { [weak self] point in self?.handleSelectExtend(point) }
+        bitmapView.onSelectCancel = { [weak self] in self?.handleSelectCancel() }
         content.addSubview(bitmapView)
 
         // MARK: DevTools panel (hidden by default; ⌘⌥I toggles)
@@ -1156,6 +1181,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         closeTabItem.target = self
         fileMenu.addItem(closeTabItem)
         fileMenuItem.submenu = fileMenu
+
+        // Edit menu — primarily so ⌘C copies the page text selection. Target `self` so the action
+        // reaches our `copy(_:)` even when the BitmapView (not a text control) has focus.
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(copy(_:)), keyEquivalent: "c")
+        copyItem.target = self
+        editMenu.addItem(copyItem)
+        editMenuItem.submenu = editMenu
 
         // View menu with navigation shortcuts.
         let viewMenuItem = NSMenuItem()
@@ -1528,6 +1563,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let fxDevice = Float(localPoint.x * scale)
         let fyDevice = Float(fyTop * scale)
         if browser_engine_dispatch_move(engine, fxDevice, fyDevice) != 0 { refresh() }
+    }
+
+    // MARK: Text selection
+
+    /// Convert a view-local point (points, bottom-left origin) to framebuffer device-pixel
+    /// (top-left origin) coords — the SAME viewport-relative, pre-scroll space `handleContentClick`
+    /// passes to the engine. The engine folds in its own `scroll_y` for selection, so the highlight
+    /// stays under the cursor as the page scrolls.
+    private func deviceCoords(_ localPoint: CGPoint) -> (Float, Float)? {
+        guard let bitmapView = bitmapView else { return nil }
+        let scale = CGFloat(window?.backingScaleFactor ?? 1)
+        let fyTop = bitmapView.bounds.height - localPoint.y
+        return (Float(localPoint.x * scale), Float(fyTop * scale))
+    }
+
+    /// Mouse-down: set the selection anchor (collapsed) at the press point. A real selection only
+    /// appears once the pointer drags (extend); a plain click clears it via `handleSelectCancel`.
+    private func handleSelectStart(_ localPoint: CGPoint) {
+        guard let tab = activeTab, let engine = tab.engine, tab.pendingLoads == 0,
+              let (x, y) = deviceCoords(localPoint) else { return }
+        browser_engine_selection_start(engine, x, y)
+    }
+
+    /// Extend the selection focus to the current pointer point and repaint so the highlight updates
+    /// live during the drag (also used as the drag-end handler — one final extend).
+    private func handleSelectExtend(_ localPoint: CGPoint) {
+        guard let tab = activeTab, let engine = tab.engine, tab.pendingLoads == 0,
+              let (x, y) = deviceCoords(localPoint) else { return }
+        browser_engine_selection_extend(engine, x, y)
+        refresh()
+    }
+
+    /// A plain click (no drag): clear any selection and repaint so the old highlight disappears.
+    private func handleSelectCancel() {
+        guard let tab = activeTab, let engine = tab.engine, tab.pendingLoads == 0 else { return }
+        // Only repaint if there was actually a selection to clear (avoid churning every click).
+        let had = browser_engine_has_selection(engine) != 0
+        browser_engine_selection_clear(engine)
+        if had { refresh() }
+    }
+
+    /// Copy the current page text selection to the pasteboard (⌘C). Returns true if it copied.
+    @discardableResult
+    private func copySelectionToPasteboard() -> Bool {
+        guard let tab = activeTab, let engine = tab.engine, tab.pendingLoads == 0,
+              browser_engine_has_selection(engine) != 0,
+              let cstr = browser_engine_selected_text(engine) else { return false }
+        let text = String(cString: cstr)
+        guard !text.isEmpty else { return false }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        return true
+    }
+
+    /// ⌘C from the Edit menu: copy the page selection if there is one. When a text control (URL
+    /// field, devtools console/REPL) holds focus, defer to its own copy so selecting-and-copying in
+    /// those fields keeps working.
+    @objc private func copy(_ sender: Any?) {
+        if let responder = window?.firstResponder, responder !== bitmapView,
+           responder is NSText || responder is NSTextView || responder is NSTextField {
+            responder.tryToPerform(#selector(NSText.copy(_:)), with: sender)
+            return
+        }
+        if copySelectionToPasteboard() { return }
+        // No page selection: let the focused responder (if any) handle a normal copy.
+        window?.firstResponder?.tryToPerform(#selector(NSText.copy(_:)), with: sender)
     }
 
     /// Route a key event to the focused page text field. Returns true if consumed. Lets anything

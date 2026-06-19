@@ -23,6 +23,7 @@ pub struct Engine {
     last_console: Option<CString>,
     last_netlog: Option<CString>,
     last_select: Option<CString>,
+    last_selected: Option<CString>,
 }
 
 /// A borrowed view of the engine's RGBA8 (straight-alpha) framebuffer.
@@ -52,6 +53,7 @@ pub extern "C" fn browser_engine_new() -> *mut Engine {
         last_console: None,
         last_netlog: None,
         last_select: None,
+        last_selected: None,
     }))
 }
 
@@ -472,5 +474,79 @@ pub unsafe extern "C" fn browser_engine_set_select_index(
     })) {
         Ok(true) => 1,
         _ => 0,
+    }
+}
+
+/// Begin a text selection at framebuffer device-pixel `(x, y)` (viewport-relative, scroll NOT
+/// pre-added — the engine folds in the scroll offset itself, matching `browser_engine_dispatch_click`).
+/// Sets the selection anchor (collapsed) at that point.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_selection_start(engine: *mut Engine, x: f32, y: f32) {
+    let Some(e) = engine.as_mut() else { return };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.selection_start(x, y)));
+}
+
+/// Extend the active text selection's focus to framebuffer device-pixel `(x, y)` (viewport-relative,
+/// scroll NOT pre-added). Keeps the anchor fixed; called repeatedly as the pointer drags.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_selection_extend(engine: *mut Engine, x: f32, y: f32) {
+    let Some(e) = engine.as_mut() else { return };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.selection_extend(x, y)));
+}
+
+/// Clear any active text selection.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_selection_clear(engine: *mut Engine) {
+    let Some(e) = engine.as_mut() else { return };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.selection_clear()));
+}
+
+/// Whether there is a non-empty (non-collapsed) text selection. Returns 1 if so, else 0.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_has_selection(engine: *mut Engine) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.has_selection())) {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
+
+/// The currently selected page text as a NUL-terminated UTF-8 C string, or null if there is no
+/// (non-collapsed) selection. Lifetime: owned by the engine handle (stored in `last_selected`);
+/// valid until the next `browser_engine_selected_text` call on this handle, or `browser_engine_free`.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_selected_text(engine: *mut Engine) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.selected_text()))
+        .unwrap_or_default();
+    if text.is_empty() {
+        e.last_selected = None;
+        return std::ptr::null();
+    }
+    match CString::new(text) {
+        Ok(cstr) => {
+            let ptr = cstr.as_ptr();
+            e.last_selected = Some(cstr);
+            ptr
+        }
+        Err(_) => {
+            e.last_selected = None;
+            std::ptr::null()
+        }
     }
 }

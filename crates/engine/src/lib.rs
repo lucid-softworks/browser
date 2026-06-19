@@ -81,6 +81,17 @@ struct LayoutCache {
 /// `width`/`height`) is in DEVICE pixels, viewport-relative (scroll already subtracted) — the
 /// caller divides by the backing scale to get points. `selected` is the 0-based index of the
 /// currently-selected option in `options`.
+/// A point in DOCUMENT space: device pixels, top-origin, with the page scroll offset already
+/// folded in (i.e. the same space the layout tree's absolute rects live in, and what
+/// `dispatch_click` hit-tests against as `x`, `y + scroll_y`). Storing the selection anchor/focus
+/// as document points (rather than run/char indices) keeps a selection valid across re-layout and
+/// scrolling — it is re-resolved to text positions at paint / copy time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Point {
+    pub x: f32,
+    pub y: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectHit {
     pub node_id: usize,
@@ -132,6 +143,10 @@ pub struct Engine {
     /// a partial/final frame is painted during a streaming `load_url`. `None` = no progressive
     /// frames (the caller only pulls the final frame via `render`).
     frame_cb: Option<(FrameCallback, *mut std::ffi::c_void)>,
+    /// Active text selection as `(anchor, focus)` DOCUMENT-space points (see [`Point`]). The anchor
+    /// is where the drag began; the focus follows the pointer. `None` = nothing selected. Resolved
+    /// to text positions (run + char) at paint/copy time so it survives scroll/re-layout.
+    selection: Option<(Point, Point)>,
 }
 
 impl Default for Engine {
@@ -158,6 +173,7 @@ impl Engine {
             prev_intersecting: HashMap::new(),
             prev_size: HashMap::new(),
             frame_cb: None,
+            selection: None,
         }
     }
 
@@ -210,6 +226,7 @@ impl Engine {
         self.prev_intersecting.clear(); // observer change-tracking is per-page
         self.prev_size.clear();
         self.session = None; // drop the previous page's runtime (stops its thread)
+        self.selection = None; // a new page starts with nothing selected
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
 
         // Stream the body: re-parse on each chunk and paint throttled partial frames. We also
@@ -435,9 +452,19 @@ impl Engine {
                         // Scroll just re-paints the cached layout at a new offset.
                         let max_scroll = (cache.content_h - viewport_height).max(0.0);
                         scroll_y = scroll_y.min(max_scroll);
+                        // Resolve the selection (if any) into a per-text-run highlight range, in the
+                        // same DFS order the painter visits text runs. A running counter in the
+                        // painter indexes into this so each run highlights its selected sub-range.
+                        let sel_ranges = if self.selection.is_some() {
+                            let runs = collect_text_runs(&cache.root);
+                            self.selection_ranges(&runs)
+                        } else {
+                            Vec::new()
+                        };
+                        let mut run_idx = 0usize;
                         paint_box(
                             &mut fb, font, &cache.root, left, header_h - scroll_y, header_h,
-                            page_max_y, images,
+                            page_max_y, images, &sel_ranges, &mut run_idx,
                         );
                     } else if doc.is_none() {
                         draw_text(
@@ -727,6 +754,132 @@ impl Engine {
             self.layout_cache = None; // selection changed the DOM → re-cascade/layout/paint
         }
         changed
+    }
+
+    /// Begin a text selection at viewport-relative device pixel `(x, y)`: set the anchor (and the
+    /// focus, so it starts collapsed) to that DOCUMENT-space point. The caller passes the SAME
+    /// pre-scroll coordinates it would pass to [`dispatch_click`]; the engine folds in `scroll_y`
+    /// here so the stored point is in document space and stays valid as the page scrolls.
+    pub fn selection_start(&mut self, x: f32, y: f32) {
+        let p = Point { x, y: y + self.scroll_y };
+        self.selection = Some((p, p));
+    }
+
+    /// Extend the active selection's focus to viewport-relative device pixel `(x, y)` (document
+    /// space after folding in `scroll_y`), keeping the anchor fixed. No-op if no selection exists.
+    pub fn selection_extend(&mut self, x: f32, y: f32) {
+        let p = Point { x, y: y + self.scroll_y };
+        if let Some((anchor, _)) = self.selection {
+            self.selection = Some((anchor, p));
+        } else {
+            self.selection = Some((p, p));
+        }
+    }
+
+    /// Clear any active text selection.
+    pub fn selection_clear(&mut self) {
+        self.selection = None;
+    }
+
+    /// Whether there is a non-empty text selection (anchor and focus resolve to different text
+    /// positions). A collapsed selection (a bare click, no drag) reports `false`.
+    pub fn has_selection(&self) -> bool {
+        !self.selected_text().is_empty()
+    }
+
+    /// Resolve the current selection (if any) into a per-text-run highlight range: a vector parallel
+    /// to [`collect_text_runs`]'s output where entry `i` is `Some((start_char, end_char))` if run `i`
+    /// has selected characters in `[start_char, end_char)`, else `None`. Empty vec when there is no
+    /// (non-collapsed) selection. The painter walks text runs in the same DFS order and consults this.
+    fn selection_ranges(&self, runs: &[TextRun]) -> Vec<Option<(usize, usize)>> {
+        let (a, f) = match self.selection {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let font = match self.font.as_ref() {
+            Some(font) => font,
+            None => return Vec::new(),
+        };
+        if runs.is_empty() {
+            return Vec::new();
+        }
+        let pa = resolve_text_position(runs, font, a);
+        let pf = resolve_text_position(runs, font, f);
+        let (start, end) = if pa <= pf { (pa, pf) } else { (pf, pa) };
+        if start == end {
+            return Vec::new();
+        }
+        let mut out = vec![None; runs.len()];
+        for (ri, slot) in out.iter_mut().enumerate() {
+            if ri < start.0 || ri > end.0 {
+                continue;
+            }
+            let len = runs[ri].text.chars().count();
+            let s = if ri == start.0 { start.1 } else { 0 };
+            let e = if ri == end.0 { end.1 } else { len };
+            let s = s.min(len);
+            let e = e.min(len);
+            if s < e {
+                *slot = Some((s, e));
+            }
+        }
+        out
+    }
+
+    /// The selected text of the current selection, resolved against the cached layout: the anchor
+    /// and focus document points are mapped to (run, char) text positions, ordered, and the runs
+    /// between them concatenated (runs on different lines joined with a newline). Empty when there
+    /// is no selection, no layout, or the selection is collapsed (zero-length).
+    pub fn selected_text(&self) -> String {
+        let (a, f) = match self.selection {
+            Some(s) => s,
+            None => return String::new(),
+        };
+        let cache = match self.layout_cache.as_ref() {
+            Some(c) => c,
+            None => return String::new(),
+        };
+        let font = match self.font.as_ref() {
+            Some(font) => font,
+            None => return String::new(),
+        };
+        let runs = collect_text_runs(&cache.root);
+        if runs.is_empty() {
+            return String::new();
+        }
+        let pa = resolve_text_position(&runs, font, a);
+        let pf = resolve_text_position(&runs, font, f);
+        // Order start <= end in (run, char) linear order.
+        let (start, end) = if pa <= pf { (pa, pf) } else { (pf, pa) };
+        if start == end {
+            return String::new();
+        }
+
+        let mut out = String::new();
+        for ri in start.0..=end.0 {
+            let run = &runs[ri];
+            let chars: Vec<char> = run.text.chars().collect();
+            let s = if ri == start.0 { start.1 } else { 0 };
+            let e = if ri == end.0 { end.1 } else { chars.len() };
+            let s = s.min(chars.len());
+            let e = e.min(chars.len());
+            if s >= e {
+                continue;
+            }
+            if !out.is_empty() {
+                // Join consecutive runs: a newline when the next run sits on a lower line (its top
+                // is clearly below the previous run's top), otherwise a space. This approximates
+                // paragraph/line breaks without true bidi/line-box reconstruction.
+                let prev = &runs[ri - 1];
+                if run.rect.y > prev.rect.y + prev.rect.height * 0.5 {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            out.extend(&chars[s..e]);
+        }
+        out
     }
 
     /// Dispatch a synthetic pointer move (device pixel coords, viewport-relative) into the live page
@@ -1432,6 +1585,119 @@ fn json_number_field(obj: &str, field: &str) -> Option<f64> {
 
 /// Map every laid-out DOM node to its border-box rect (device px). When a node appears as multiple
 /// boxes, the first (outermost in document order) wins — that's the element's principal box.
+/// One laid-out text run: its absolute (document-space) content rect and the (already
+/// whitespace-collapsed / transformed) string the painter draws. The font size used to measure /
+/// paint it is carried so advance accumulation matches exactly.
+#[derive(Debug, Clone)]
+struct TextRun {
+    rect: layout::Rect,
+    text: String,
+    font_size: f32,
+    letter_spacing: f32,
+}
+
+/// Walk the layout tree depth-first, collecting every `Text` run in reading (paint) order. Each
+/// run carries its absolute content rect (document space). This is the ordered list selection
+/// resolution and highlight painting both index into.
+fn collect_text_runs(root: &layout::LayoutBox) -> Vec<TextRun> {
+    let mut out = Vec::new();
+    fn walk(b: &layout::LayoutBox, out: &mut Vec<TextRun>) {
+        if let layout::BoxContent::Text(s) = &b.content {
+            if !s.is_empty() {
+                out.push(TextRun {
+                    rect: b.dimensions.content,
+                    text: s.clone(),
+                    font_size: b.style.font_size,
+                    letter_spacing: b.style.letter_spacing,
+                });
+            }
+        }
+        for c in &b.children {
+            walk(c, out);
+        }
+    }
+    walk(root, &mut out);
+    out
+}
+
+/// The character index within `run` nearest to document x-coordinate `x`: accumulate per-glyph
+/// advances (the same `font.advance` + `letter_spacing` the painter uses) from the run's left edge
+/// until the pen passes the midpoint of the next glyph, clamped to `[0, char_count]`.
+fn char_index_in_run(run: &TextRun, font: &SystemFont, x: f32) -> usize {
+    let px = run.font_size;
+    let mut pen = run.rect.x;
+    for (i, ch) in run.text.chars().enumerate() {
+        let adv = font.advance(ch, px) + run.letter_spacing;
+        // Click lands in this glyph's first half -> caret before it; second half -> after it.
+        if x < pen + adv * 0.5 {
+            return i;
+        }
+        pen += adv;
+    }
+    run.text.chars().count()
+}
+
+/// Resolve a DOCUMENT-space point to a text position `(run_index, char_index)` — a global linear
+/// order (run first, then char). Pick the run whose vertical band (its content rect, extended a
+/// little for inter-line slack) contains `p.y`; among candidate runs on that line, the one whose
+/// horizontal span contains `p.x`, else the nearest. Falls back to the closest run by vertical
+/// distance when the point is above/below all text.
+fn resolve_text_position(runs: &[TextRun], font: &SystemFont, p: Point) -> (usize, usize) {
+    if runs.is_empty() {
+        return (0, 0);
+    }
+    // Candidate runs whose vertical extent contains p.y (the "line" the point is on).
+    let mut best_on_line: Option<usize> = None;
+    let mut best_dx = f32::MAX;
+    for (i, r) in runs.iter().enumerate() {
+        let top = r.rect.y;
+        let bottom = r.rect.y + r.rect.height;
+        if p.y >= top && p.y < bottom {
+            // Horizontal distance from the point to this run's span (0 if inside).
+            let left = r.rect.x;
+            let right = r.rect.x + r.rect.width;
+            let dx = if p.x < left {
+                left - p.x
+            } else if p.x > right {
+                p.x - right
+            } else {
+                0.0
+            };
+            if dx < best_dx {
+                best_dx = dx;
+                best_on_line = Some(i);
+            }
+        }
+    }
+    if let Some(i) = best_on_line {
+        return (i, char_index_in_run(&runs[i], font, p.x));
+    }
+
+    // Point is on no run's line: choose the run with the smallest vertical distance, tie-broken by
+    // horizontal distance, so dragging into the margin above/below still selects sensibly.
+    let mut best = 0usize;
+    let mut best_metric = f32::MAX;
+    for (i, r) in runs.iter().enumerate() {
+        let cy = r.rect.y + r.rect.height * 0.5;
+        let dy = (p.y - cy).abs();
+        let left = r.rect.x;
+        let right = r.rect.x + r.rect.width;
+        let dx = if p.x < left {
+            left - p.x
+        } else if p.x > right {
+            p.x - right
+        } else {
+            0.0
+        };
+        let metric = dy * 1000.0 + dx; // vertical dominates; horizontal breaks ties
+        if metric < best_metric {
+            best_metric = metric;
+            best = i;
+        }
+    }
+    (best, char_index_in_run(&runs[best], font, p.x))
+}
+
 fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
     if let Some(node) = b.node {
         out.entry(node.0).or_insert_with(|| b.dimensions.border_box());
@@ -1651,11 +1917,13 @@ fn paint_box(
     clip_top: f32,
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
+    sel_ranges: &[Option<(usize, usize)>],
+    run_idx: &mut usize,
 ) {
     // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
     // declarations compose additional affines on top per-box.
     let xf = Affine::translate(ox, oy);
-    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, 1.0);
+    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, 1.0, sel_ranges, run_idx);
 }
 
 /// A 2D affine mapping a CSS-space point `(x, y)` to a device-space point: `x' = a*x + c*y + e`,
@@ -1728,6 +1996,8 @@ fn paint_box_opacity(
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
     parent_opacity: f32,
+    sel_ranges: &[Option<(usize, usize)>],
+    run_idx: &mut usize,
 ) {
     // This box's opacity multiplies into the inherited (effective) opacity for itself + subtree.
     let opacity = parent_opacity * b.style.opacity.clamp(0.0, 1.0);
@@ -1839,6 +2109,36 @@ fn paint_box_opacity(
                 let color = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ta };
                 let x = dx;
                 let baseline = dy + fs * 0.8;
+                // Selection highlight: if this run (identified by its DFS index) has a selected
+                // character sub-range, fill a translucent rect behind those glyphs BEFORE drawing
+                // the text so the glyphs stay legible on top. Advance widths use the SAME scaled
+                // font size + letter-spacing the glyph painter uses, so the band lines up exactly.
+                if !s.is_empty() {
+                    if let Some(Some((cs, ce))) = sel_ranges.get(*run_idx) {
+                        let ls = b.style.letter_spacing * scale;
+                        let mut hx0 = x;
+                        let mut pen = x;
+                        for (i, ch) in s.chars().enumerate() {
+                            if i == *cs {
+                                hx0 = pen;
+                            }
+                            pen += font.advance(ch, fs) + ls;
+                            if i + 1 == *ce {
+                                break;
+                            }
+                        }
+                        // If the range starts at 0, hx0 stays at the run's left edge.
+                        let hx1 = pen;
+                        let top = dy.round() as i32;
+                        let h = (fs * 1.25).round().max(1.0) as i32;
+                        let w = (hx1 - hx0).round() as i32;
+                        if w > 0 {
+                            // A translucent macOS-ish selection blue, composited over the text bg.
+                            let hl = Color { r: 74, g: 144, b: 255, a: scale_alpha(102, opacity) };
+                            fb.fill_rect(Rect { x: hx0.round() as i32, y: top, w, h }, hl);
+                        }
+                    }
+                }
                 let end_x = draw_run(
                     fb, font, s, x, baseline, fs, color, b.style.bold,
                     b.style.letter_spacing * scale,
@@ -1895,8 +2195,17 @@ fn paint_box_opacity(
         }
     }
 
+    // Advance the text-run counter for every non-empty Text run, INDEPENDENT of offscreen culling /
+    // opacity, so it stays in lockstep with `collect_text_runs`' DFS order (which the selection
+    // ranges were built against).
+    if let layout::BoxContent::Text(s) = &b.content {
+        if !s.is_empty() {
+            *run_idx += 1;
+        }
+    }
+
     for child in &b.children {
-        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, opacity);
+        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, opacity, sel_ranges, run_idx);
     }
 }
 
@@ -3693,6 +4002,54 @@ mod tests {
     }
 
     #[test]
+    fn drag_selects_text_and_clear_empties_it() {
+        // Two words on (likely) one line: a drag from the left of "Hello" to the middle of "world"
+        // should select "Hello wor" (or similar). Using a wide viewport keeps it on one line.
+        let html = "<html><body><p>Hello world</p></body></html>";
+        let path = std::env::temp_dir().join("browser_select_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(400, 200, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render(); // build the layout cache so text runs exist
+
+        // Find the text run for "Hello world" via the same DFS the resolver uses.
+        let cache = e.layout_cache.as_ref().expect("layout");
+        let runs = collect_text_runs(&cache.root);
+        let run = runs.iter().find(|r| r.text.contains("Hello")).expect("text run");
+        let font = e.font.as_ref().expect("font");
+
+        // Left edge of the run (start of "Hello"), at the vertical middle of the run.
+        let y_mid = run.rect.y + run.rect.height * 0.5;
+        let x_start = run.rect.x + 0.5;
+        // x at the middle of the word "world": accumulate advances through "Hello wor".
+        let target = "Hello wor";
+        let mut x_mid = run.rect.x;
+        for ch in target.chars() {
+            x_mid += font.advance(ch, run.font_size) + run.letter_spacing;
+        }
+
+        // Selection points are passed pre-scroll (scroll_y == 0 here, so document == viewport).
+        e.selection_start(x_start, y_mid);
+        e.selection_extend(x_mid, y_mid);
+        assert!(e.has_selection(), "a drag across words must produce a selection");
+        let sel = e.selected_text();
+        assert!(
+            sel.starts_with("Hello") && sel.contains("wor"),
+            "expected selection to span 'Hello'..'wor', got {sel:?}"
+        );
+        assert!(!sel.contains("world"), "selection should stop mid-word, got {sel:?}");
+
+        // Clearing empties the selection.
+        e.selection_clear();
+        assert!(!e.has_selection());
+        assert_eq!(e.selected_text(), "");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn typing_into_focused_input_updates_value() {
         // A page with a text input and a trivial inline script (so a JS session is started).
         let html = "<html><body><input id=f>\
@@ -4286,7 +4643,7 @@ mod tests {
         }
         let mut fb = Framebuffer::new(400, 300);
         let images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images);
+        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &[], &mut 0);
 
         // The root box should exist; with the parallel layout stub it may have no children yet,
         // so only assert the path completed and the root carries the viewport width.
@@ -4329,7 +4686,7 @@ mod tests {
             let mut fb = Framebuffer::new(100, 100);
             paint_gradient(&mut fb);
             let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs);
+            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &[], &mut 0);
             // Sample a pixel inside the div.
             let i = (50 * fb.stride + 50 * 4) as usize;
             [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
@@ -4374,7 +4731,7 @@ mod tests {
         let mut fb = Framebuffer::new(w, h);
         fb.clear(Color::BLACK);
         let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs);
+        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &[], &mut 0);
         fb
     }
 
