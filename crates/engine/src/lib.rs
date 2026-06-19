@@ -317,6 +317,15 @@ impl Engine {
                     images,
                 };
                 self.layout_cache = None; // partial frames left a stale (inline-only) cache
+                // Build the initial layout and push the rects to the JS Session so the first
+                // getBoundingClientRect/offsetWidth/scrollHeight reads after load see real geometry.
+                {
+                    let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
+                    let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
+                    if self.ensure_layout(dw, dh, 0.0) {
+                        self.push_layout_rects();
+                    }
+                }
                 // Fire the initial IntersectionObserver/ResizeObserver observations.
                 self.deliver_observations();
                 // Paint the FINAL frame and emit it (identical to the non-streaming render).
@@ -386,7 +395,11 @@ impl Engine {
     /// Recompute the cascade + layout for the current viewport into `layout_cache`, unless a
     /// cached tree for this exact device size is already present. This is the expensive part of
     /// rendering; keeping it out of the scroll path makes scrolling cheap (paint-only).
-    fn ensure_layout(&mut self, dw: u32, dh: u32, header_h: f32) {
+    /// Ensure `layout_cache` reflects the device viewport `(dw, dh)`. Returns `true` if the layout
+    /// was (re)built this call (so callers can push the fresh rects to the JS Session without
+    /// shipping 21k rects on every idle tick — see [`push_layout_rects`]); `false` when the cached
+    /// layout was reused unchanged.
+    fn ensure_layout(&mut self, dw: u32, dh: u32, header_h: f32) -> bool {
         // Feed the real logical viewport + scale to the cascade so @media (width/height/resolution),
         // @container, and vw/vh units evaluate against the true window — and, since this runs on
         // every viewport change, they re-evaluate on resize.
@@ -394,7 +407,7 @@ impl Engine {
         // Feed pointer/keyboard interaction state to the cascade so `:hover`/`:focus`/… match.
         style::set_interaction_state(self.hovered_node.map(|n| n.0), self.focused_node.map(|n| n.0));
         if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
-            return;
+            return false;
         }
         // Compute into owned values first so the `&self.state` borrow ends before we assign.
         let computed = if let (Some(font), LoadState::Loaded { doc: Some(d), styles, console, images, .. }) =
@@ -420,6 +433,33 @@ impl Engine {
             None
         };
         self.layout_cache = computed.map(|(root, content_h)| LayoutCache { dw, dh, root, content_h });
+        true
+    }
+
+    /// Push the freshly-built layout to the JS Session so `getBoundingClientRect()` /
+    /// `offsetWidth` / `scrollHeight` etc. return real values. Converts the engine's
+    /// document-absolute, top-origin **device-px** border-box rects to **CSS px** (÷ scale) and
+    /// fires them at the Session worker (fire-and-forget — no reply). Callers gate this on
+    /// "layout was actually rebuilt this frame" to avoid shipping the whole rect table every tick.
+    ///
+    /// Coordinate contract (all CSS px): rects are document-absolute top-origin; `scroll_y_css` is
+    /// the vertical scroll offset; `doc_height_css` is the full content height. The Session makes
+    /// `getBoundingClientRect` viewport-relative by subtracting `scroll_y_css` itself.
+    fn push_layout_rects(&self) {
+        let (session, cache) = match (&self.session, &self.layout_cache) {
+            (Some(s), Some(c)) => (s, c),
+            _ => return,
+        };
+        let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
+        collect_node_rects(&cache.root, &mut rects);
+        let inv = if self.scale > 0.0 { 1.0 / self.scale } else { 1.0 };
+        let list: Vec<(usize, f32, f32, f32, f32)> = rects
+            .iter()
+            .map(|(&id, r)| (id, r.x * inv, r.y * inv, r.width * inv, r.height * inv))
+            .collect();
+        let scroll_y_css = self.scroll_y * inv;
+        let doc_height_css = cache.content_h * inv;
+        session.set_layout_rects(list, scroll_y_css, doc_height_css);
     }
 
     /// Paint the current state into a fresh framebuffer and return a reference to it.
@@ -430,7 +470,12 @@ impl Engine {
         let header_h = 0.0;
 
         // Expensive: cascade + layout (cached across scrolls / repeated renders at this size).
-        self.ensure_layout(dw, dh, header_h);
+        // When the layout was actually (re)built (first paint, viewport resize, or a DOM mutation
+        // invalidated the cache), push the fresh rects to the JS Session so element-geometry reads
+        // stay current. Gated on the rebuild so scroll-only repaints don't re-ship the rect table.
+        if self.ensure_layout(dw, dh, header_h) {
+            self.push_layout_rects();
+        }
 
         let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;
@@ -4240,6 +4285,39 @@ mod tests {
         e.selection_clear();
         assert!(!e.has_selection());
         assert_eq!(e.selected_text(), "");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bounding_client_rect_and_metrics_report_real_geometry() {
+        // A div with an explicit 200x80 box. After load+layout the engine pushes the laid-out rects
+        // to the JS session, so getBoundingClientRect / offsetWidth / offsetHeight read real values
+        // (≈ the CSS width/height) and document.body.scrollHeight reports the full page height (>0).
+        let html = "<html><body style=\"margin:0\">\
+            <div style=\"width:200px;height:80px\"></div>\
+            <script>window.__ready = true;</script></body></html>";
+        let path = std::env::temp_dir().join("browser_bounding_rect_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(800, 600, 1.0); // scale 1 → CSS px == device px
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render(); // ensure layout is built + rects pushed
+
+        let wh = e.console_eval(
+            "var r = document.querySelector('div').getBoundingClientRect(); r.width + 'x' + r.height",
+        );
+        assert_eq!(wh, "200x80", "getBoundingClientRect width/height");
+
+        let ow = e.console_eval(
+            "var d = document.querySelector('div'); d.offsetWidth + 'x' + d.offsetHeight",
+        );
+        assert_eq!(ow, "200x80", "offsetWidth/offsetHeight");
+
+        // The body's scrollHeight reports the full document content height (> 0).
+        let sh = e.console_eval("document.body.scrollHeight > 0");
+        assert_eq!(sh, "true", "document.body.scrollHeight should be positive");
 
         let _ = std::fs::remove_file(&path);
     }

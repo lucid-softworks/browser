@@ -135,6 +135,18 @@ struct HostState {
     /// `dom_version`. Computed entirely in-Session (the JS thread holds the DOM while the engine is
     /// blocked, so we cannot reach the engine's cascade — we run `style::cascade` here ourselves).
     computed_cache: RefCell<Option<(u64, HashMap<dom::NodeId, style::ComputedStyle>)>>,
+    /// Element border-box rects pushed by the engine after each (re)layout, keyed by node id.
+    /// `(x, y, width, height)` in **CSS px**, document-absolute, top-origin. Empty until the first
+    /// `SessionCmd::SetRects`. Read by the `__rect` / `__elemMetrics` primitives that back
+    /// `getBoundingClientRect` / `offsetWidth` / `scrollHeight` etc. The engine recomputes layout;
+    /// the worker only serves what was pushed (it cannot reach the engine's layout from here).
+    layout_rects: RefCell<HashMap<usize, (f32, f32, f32, f32)>>,
+    /// Vertical scroll offset (CSS px) at the last push. `__rect` subtracts this to make
+    /// `getBoundingClientRect` viewport-relative. No horizontal scroll is tracked.
+    viewport_scroll_y: Cell<f32>,
+    /// Full document content height (CSS px) at the last push. Reported as
+    /// `documentElement.scrollHeight` / `body.scrollHeight` so pages that size off the page height work.
+    doc_height: Cell<f32>,
 }
 
 impl HostState {
@@ -163,6 +175,9 @@ impl HostState {
             observers_active: Cell::new(false),
             dom_version: Cell::new(0),
             computed_cache: RefCell::new(None),
+            layout_rects: RefCell::new(HashMap::new()),
+            viewport_scroll_y: Cell::new(0.0),
+            doc_height: Cell::new(0.0),
         })
     }
 
@@ -1131,6 +1146,110 @@ fn prim_node_type(
     rv.set_int32(ty);
 }
 
+/// `__rect(id) -> { x, y, width, height, top, left, right, bottom } | null`
+///
+/// Looks `id` up in the engine-pushed `layout_rects`. The stored rect is document-absolute
+/// (top-origin, CSS px); this returns it **viewport-relative** by subtracting `viewport_scroll_y`
+/// vertically (there is no horizontal scroll, so `left == x_abs`). Returns `null` when the node has
+/// no laid-out box (detached / display:none / before the first push), so the JS wrapper can fall
+/// back to a zero-rect rather than throw.
+fn prim_rect(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let rect = node.and_then(|n| state.layout_rects.borrow().get(&n.0).copied());
+    let (ax, ay, w, h) = match rect {
+        Some(r) => r,
+        None => {
+            rv.set_null();
+            return;
+        }
+    };
+    let scroll_y = state.viewport_scroll_y.get();
+    // Viewport-relative: subtract scroll (vertical only; no horizontal scroll tracked).
+    let left = ax;
+    let top = ay - scroll_y;
+    let obj = v8::Object::new(scope);
+    let put = |k: &str, v: f32| {
+        let key = v8::String::new(scope, k).unwrap();
+        let val = v8::Number::new(scope, v as f64);
+        obj.set(scope, key.into(), val.into());
+    };
+    put("x", left);
+    put("y", top);
+    put("left", left);
+    put("top", top);
+    put("right", left + w);
+    put("bottom", top + h);
+    put("width", w);
+    put("height", h);
+    rv.set(obj.into());
+}
+
+/// `__elemMetrics(id) -> { ow, oh, ot, ol, sw, sh } | null`
+///
+/// Box metrics for `offsetWidth/Height/Top/Left`, `clientWidth/Height`, `scrollWidth/Height`:
+/// - `ow`/`oh` = border-box width/height (offsetWidth/Height; clientWidth/Height ≈ same — we do
+///   not subtract borders/scrollbars).
+/// - `ot`/`ol` = document-absolute top/left (offsetTop/Left — a simplification; real offsetTop is
+///   relative to `offsetParent`, but we report absolute coordinates).
+/// - `sw`/`sh` = scrollWidth/Height ≈ the border-box size (no overflow tracking), EXCEPT for the
+///   document root / `<html>` / `<body>`, where `sh` is the full document height and `sw` the
+///   viewport width — so `document.documentElement.scrollHeight` reports the whole page.
+/// Returns `null` when the node has no laid-out box.
+fn prim_elem_metrics(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let rect = node.and_then(|n| state.layout_rects.borrow().get(&n.0).copied());
+    let (ax, ay, w, h) = match rect {
+        Some(r) => r,
+        None => {
+            rv.set_null();
+            return;
+        }
+    };
+    // Document-root special case: report the full page height as scrollHeight so sites that size
+    // off `documentElement.scrollHeight` / `body.scrollHeight` see the real content height.
+    let is_root = node
+        .map(|n| {
+            let doc = state.doc.borrow();
+            match &doc.get(n).data {
+                dom::NodeData::Document => true,
+                dom::NodeData::Element(e) => {
+                    e.tag.eq_ignore_ascii_case("html") || e.tag.eq_ignore_ascii_case("body")
+                }
+                _ => false,
+            }
+        })
+        .unwrap_or(false);
+    let (sw, sh) = if is_root {
+        // Viewport width ≈ the root border-box width here; full document height for scrollHeight.
+        (w, state.doc_height.get().max(h))
+    } else {
+        (w, h)
+    };
+    let obj = v8::Object::new(scope);
+    let put = |k: &str, v: f32| {
+        let key = v8::String::new(scope, k).unwrap();
+        let val = v8::Number::new(scope, v as f64);
+        obj.set(scope, key.into(), val.into());
+    };
+    put("ow", w);
+    put("oh", h);
+    put("ot", ay);
+    put("ol", ax);
+    put("sw", sw);
+    put("sh", sh);
+    rv.set(obj.into());
+}
+
 /// `__textContent(id) -> string`
 fn prim_text_content(
     scope: &mut v8::PinScope,
@@ -1641,6 +1760,8 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__parent", prim_parent);
     set_fn(scope, global, "__tag", prim_tag);
     set_fn(scope, global, "__nodeType", prim_node_type);
+    set_fn(scope, global, "__rect", prim_rect);
+    set_fn(scope, global, "__elemMetrics", prim_elem_metrics);
     set_fn(scope, global, "__textContent", prim_text_content);
     set_fn(scope, global, "__setTextContent", prim_set_text_content);
     set_fn(scope, global, "__innerHTML", prim_inner_html);
@@ -2997,8 +3118,52 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       Object.defineProperty(el, "sheet", { get: function () { if (!__sheet) { __sheet = makeStyleSheet(this); } return __sheet; }, configurable: true, enumerable: false });
     }
 
-    if (typeof el.getBoundingClientRect !== "function") { def(el, "getBoundingClientRect", makeRect); }
-    if (typeof el.getClientRects !== "function") { def(el, "getClientRects", function () { return []; }); }
+    // getBoundingClientRect / getClientRects: read the engine-pushed rect for this node
+    // (viewport-relative CSS px). Detached / not-laid-out nodes get __rect()===null, so fall back
+    // to the zero-rect (so they don't throw). toJSON returns the plain rect (DOMRect semantics).
+    def(el, "getBoundingClientRect", function () {
+      var id = this.__node;
+      var r = (typeof id === "number") ? __rect(id) : null;
+      if (!r) { return makeRect(); }
+      r.toJSON = function () { return this; };
+      return r;
+    });
+    def(el, "getClientRects", function () {
+      var id = this.__node;
+      var r = (typeof id === "number") ? __rect(id) : null;
+      if (!r) { return []; }
+      r.toJSON = function () { return this; };
+      return [r];
+    });
+    // Live element-metric getters backed by __elemMetrics(this.__node) (0 when null). Only install
+    // on real element wrappers (numeric node id) and don't clobber a page-defined accessor.
+    if (typeof node === "number") {
+      var __metricProps = {
+        offsetWidth: "ow", offsetHeight: "oh", offsetTop: "ot", offsetLeft: "ol",
+        clientWidth: "ow", clientHeight: "oh", // ≈ border box: we don't subtract borders/scrollbars
+        scrollWidth: "sw", scrollHeight: "sh"
+      };
+      for (var __mk in __metricProps) {
+        (function (prop, field) {
+          var __md = null;
+          try { __md = Object.getOwnPropertyDescriptor(el, prop); } catch (eM) {}
+          if (__md && (__md.get || __md.set)) { return; } // page already defined an accessor
+          Object.defineProperty(el, prop, {
+            get: function () { var m = __elemMetrics(this.__node); return m ? m[field] : 0; },
+            configurable: true, enumerable: true
+          });
+        })(__mk, __metricProps[__mk]);
+      }
+      // offsetParent: simple stand-in — document.body for laid-out elements, null when detached.
+      var __opd = null;
+      try { __opd = Object.getOwnPropertyDescriptor(el, "offsetParent"); } catch (eO) {}
+      if (!(__opd && (__opd.get || __opd.set))) {
+        Object.defineProperty(el, "offsetParent", {
+          get: function () { return __elemMetrics(this.__node) ? document.body : null; },
+          configurable: true, enumerable: true
+        });
+      }
+    }
     if (typeof el.scrollIntoView !== "function") { def(el, "scrollIntoView", fn); }
     if (typeof el.focus !== "function") { def(el, "focus", fn); }
     if (typeof el.blur !== "function") { def(el, "blur", fn); }
@@ -5507,6 +5672,17 @@ enum SessionCmd {
     Tick {
         reply: std::sync::mpsc::Sender<Option<(dom::Document, Vec<String>)>>,
     },
+    /// Push the engine's freshly-laid-out element rects (CSS px, document-absolute, top-origin)
+    /// onto `HostState` so `getBoundingClientRect()` / `offsetWidth` / `scrollHeight` etc. can read
+    /// real geometry. Fire-and-forget: no reply (the engine does not block on this).
+    SetRects {
+        /// `(node_id, x, y, width, height)` per laid-out node, CSS px, document-absolute.
+        rects: Vec<(usize, f32, f32, f32, f32)>,
+        /// Vertical scroll offset in CSS px (subtracted to make rects viewport-relative).
+        scroll_y_css: f32,
+        /// Full document content height in CSS px (reported as documentElement/body scrollHeight).
+        doc_height_css: f32,
+    },
     /// Stop the loop; the isolate is torn down on the thread it lives on.
     Stop,
 }
@@ -5633,6 +5809,20 @@ impl Session {
             return (dom::Document::new(), Vec::new());
         }
         reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+    }
+
+    /// Push the engine's laid-out element rects (CSS px, document-absolute, top-origin) to the
+    /// worker so element-geometry reads (`getBoundingClientRect`, `offsetWidth`, `scrollHeight`, …)
+    /// return real values. Fire-and-forget: does not block on a reply, so the engine (which holds
+    /// the DOM while the worker is idle between commands) never stalls on this. The worker stores
+    /// the rects on `HostState`; the next geometry read serves them.
+    pub fn set_layout_rects(
+        &self,
+        rects: Vec<(usize, f32, f32, f32, f32)>,
+        scroll_y_css: f32,
+        doc_height_css: f32,
+    ) {
+        let _ = self.tx.send(SessionCmd::SetRects { rects, scroll_y_css, doc_height_css });
     }
 
     /// Evaluate an arbitrary JS source string against the live context, drain the event loop, and
@@ -5886,6 +6076,22 @@ fn session_thread_main(
                 } else {
                     let _ = reply.send(None);
                 }
+            }
+            SessionCmd::SetRects { rects, scroll_y_css, doc_height_css } => {
+                // Store on HostState (no JS run needed — just update the geometry tables). Re-enter
+                // the persistent context to reach the slot. Fire-and-forget: no reply.
+                let ctx = context.clone();
+                v8::scope!(let handle_scope, &mut isolate);
+                let local_ctx = v8::Local::new(handle_scope, &ctx);
+                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let state = host_state(scope);
+                let mut map = state.layout_rects.borrow_mut();
+                map.clear();
+                for (id, x, y, w, h) in rects {
+                    map.insert(id, (x, y, w, h));
+                }
+                state.viewport_scroll_y.set(scroll_y_css);
+                state.doc_height.set(doc_height_css);
             }
             SessionCmd::Stop => break,
         }
@@ -6771,13 +6977,19 @@ mod tests {
 
     #[test]
     fn get_bounding_client_rect_shape() {
+        // Without an engine pushing rects (the bare `env_eval` path lays out nothing), the rect is
+        // the zero-rect fallback — but every DOMRect field must be present, finite, and toJSON-able.
+        // Real (non-zero) geometry is exercised in the `engine` crate's layout-rect tests.
         let out = env_eval(
             "https://example.com/",
             "var r = document.body.getBoundingClientRect(); \
-             [r.x, r.y, r.top, r.left, r.right, r.bottom, r.width, r.height].join(',')",
+             var ok = ['x','y','top','left','right','bottom','width','height'] \
+               .every(function(k){ return typeof r[k] === 'number' && isFinite(r[k]); }); \
+             ok && typeof r.toJSON === 'function' && \
+             [r.x, r.y, r.top, r.left, r.right, r.bottom, r.width, r.height].join(',') === '0,0,0,0,0,0,0,0'",
         );
         assert_eq!(out.error, None, "{out:?}");
-        assert_eq!(out.value.as_deref(), Some("0,0,0,0,0,0,0,0"));
+        assert_eq!(out.value.as_deref(), Some("true"));
     }
 
     #[test]
