@@ -2786,6 +2786,44 @@ fn build_request_fetcher(
     })
 }
 
+/// Build the host WebSocket *connector* passed into the JS [`js::Session`]: it backs the real
+/// `WebSocket` class. Given `(url, id, evt_tx)` it spawns a dedicated thread running [`net::ws_run`]
+/// for the lifetime of that socket and returns the `out` sender the JS side uses to send/close.
+/// Returns `Err` only if the thread can't be spawned (in which case the JS object fires
+/// onerror/onclose synthetically). Crosses the `js` crate boundary with PRIMITIVE tuple channels
+/// only (just like `request_fetcher`), so `js` never depends on `net`.
+///
+/// Tuple protocol (see [`net::ws_run`]): events `(id, kind, payload)` flow over `evt_tx`; outgoing
+/// commands `(kind, payload)` flow over the returned sender.
+type WsConnector = std::sync::Arc<
+    dyn Fn(
+            String,
+            u64,
+            std::sync::mpsc::Sender<(u64, u8, String)>,
+        ) -> Result<std::sync::mpsc::Sender<(u8, String)>, String>
+        + Send
+        + Sync,
+>;
+
+fn build_ws_connector() -> WsConnector {
+    std::sync::Arc::new(
+        |url: String,
+         id: u64,
+         evt_tx: std::sync::mpsc::Sender<(u64, u8, String)>|
+         -> Result<std::sync::mpsc::Sender<(u8, String)>, String> {
+            // The JS side sends/closes through `out_tx`; the worker thread owns `out_rx`.
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<(u8, String)>();
+            std::thread::Builder::new()
+                .name("ws".to_string())
+                .spawn(move || {
+                    net::ws_run(url, id, evt_tx, out_rx);
+                })
+                .map_err(|e| format!("could not start WebSocket thread: {e}"))?;
+            Ok(out_tx)
+        },
+    )
+}
+
 /// Parse a flat JSON object of `name -> string-value` (the headers JSON `fetch` builds with
 /// `JSON.stringify`) into a `Vec<(name, value)>`. Tolerant: returns an empty vec on any parse
 /// problem (a malformed header map shouldn't abort the request).
@@ -4015,8 +4053,10 @@ fn start_session(
         net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())
     });
     let request_fetcher = build_request_fetcher();
-    let (session, snapshot, results) =
-        js::Session::new(doc, classic, entries, module_sources, base, fetcher, request_fetcher);
+    let ws_connector = build_ws_connector();
+    let (session, snapshot, results) = js::Session::new(
+        doc, classic, entries, module_sources, base, fetcher, request_fetcher, ws_connector,
+    );
     for result in results {
         notes.extend(result.console);
         if let Some(err) = result.error {
@@ -5307,6 +5347,49 @@ mod tests {
             }
         }
         assert!(fired, "IntersectionObserver callback must fire once the target scrolls into view");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn websocket_unreachable_fires_close_offline() {
+        // Deterministic + offline: opening a WebSocket to an unreachable host must fire onerror then
+        // onclose (readyState → 3 CLOSED). The host socket thread fails to connect and delivers
+        // error+close events over the WS channel, which the session drains (during the load drain or
+        // a subsequent tick) and dispatches via __wsDeliver. We poll the LIVE session state (the
+        // close handler records the flags on `window`) so the assertion doesn't depend on which
+        // drain delivered the event.
+        let html = r#"<html><body>
+            <script>
+              window.__wsErr = 0; window.__wsClosed = -1;
+              var ws = new WebSocket('ws://127.0.0.1:1/');
+              ws.onerror = function () { window.__wsErr = 1; };
+              ws.onclose = function (e) { window.__wsClosed = ws.readyState; };
+            </script>
+            </body></html>"#;
+        let path = std::env::temp_dir().join("browser_ws_unreachable_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 300, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+
+        let mut closed = false;
+        for _ in 0..40 {
+            if e.console_eval("String(window.__wsClosed)") == "3" {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            e.tick();
+        }
+        assert!(closed, "WebSocket to an unreachable host must fire onclose with readyState 3");
+        assert_eq!(
+            e.console_eval("String(window.__wsErr)"),
+            "1",
+            "onerror must fire too"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

@@ -348,6 +348,220 @@ fn fetch_file(path: &str, original: &str) -> Result<Response, String> {
     Ok(Response { status: 200, content_type, body, final_url: original.to_string() })
 }
 
+// ---------------------------------------------------------------------------------------------
+// WebSocket client (pure Rust, via `tungstenite`).
+//
+// Mirrors the async-fetch model: the JS runtime spawns a dedicated thread per socket that runs
+// [`ws_run`] for the whole lifetime of the connection. The thread talks to the rest of the engine
+// over two `std::sync::mpsc` channels carrying PRIMITIVE tuples only (so the `js` crate never has to
+// depend on `net`):
+//   * `evt_tx`  — events FROM the socket: `(id, kind, payload)`.
+//       kind 0 = open       (payload "")
+//       kind 1 = text msg   (payload = the UTF-8 text)
+//       kind 2 = binary msg (payload = base64 of the bytes — a binary message is bridged as base64)
+//       kind 3 = close      (payload = "code:reason")
+//       kind 4 = error      (payload = a human-readable message)
+//   * `out_rx`  — outgoing commands TO the socket: `(kind, payload)`.
+//       kind 0 = send text   (payload = the text)
+//       kind 1 = send binary (payload = base64 of the bytes)
+//       kind 2 = close
+//
+// The loop is a non-blocking poll: drain any queued outgoing commands, attempt one non-blocking
+// read, then sleep ~10ms so we never busy-spin. `WouldBlock` from the read is the normal "no data
+// yet" case and is ignored.
+// ---------------------------------------------------------------------------------------------
+
+use base64::Engine as _;
+
+/// How long to wait for the TCP connect + WebSocket handshake before giving up.
+const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Idle sleep between poll iterations so a quiet socket doesn't burn a core.
+const WS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Run a whole WebSocket connection on the CALLING thread (the engine/Session spawns the thread).
+/// Handles both `ws://` and `wss://`. See the module-level comment above for the tuple protocol.
+///
+/// On a fatal error (connect/handshake failure or a mid-stream socket error) this emits an `error`
+/// event (kind 4) followed by a `close` event (kind 3) and returns, so the JS object fires
+/// `onerror` then `onclose`. Binary frames are base64-bridged across the primitive channel.
+pub fn ws_run(
+    url: String,
+    id: u64,
+    evt_tx: std::sync::mpsc::Sender<(u64, u8, String)>,
+    out_rx: std::sync::mpsc::Receiver<(u8, String)>,
+) {
+    use tungstenite::Message;
+
+    // Helper: emit error + close, then we're done.
+    let fail = |evt_tx: &std::sync::mpsc::Sender<(u64, u8, String)>, msg: String| {
+        let _ = evt_tx.send((id, 4, msg));
+        let _ = evt_tx.send((id, 3, "1006:".to_string()));
+    };
+
+    // --- Connect (bounded). We resolve + connect the TCP socket ourselves with a timeout so a dead
+    // host can't hang this thread forever, then let tungstenite do the (TLS +) WS handshake. The
+    // read timeout bounds the handshake; we switch to non-blocking once it succeeds.
+    let mut socket = match ws_connect(&url) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&evt_tx, e);
+            return;
+        }
+    };
+
+    // Make the underlying TcpStream non-blocking so `read()` returns `WouldBlock` instead of
+    // parking the thread (which would stall outgoing sends).
+    if let Err(e) = set_ws_nonblocking(socket.get_mut(), true) {
+        fail(&evt_tx, format!("failed to set non-blocking: {e}"));
+        return;
+    }
+
+    // Handshake done: the socket is open.
+    let _ = evt_tx.send((id, 0, String::new()));
+
+    loop {
+        // (a) Flush any queued outgoing commands.
+        let mut closing = false;
+        loop {
+            match out_rx.try_recv() {
+                Ok((0, text)) => {
+                    if socket.send(Message::Text(text)).is_err() {
+                        let _ = evt_tx.send((id, 4, "send failed".to_string()));
+                        closing = true;
+                        break;
+                    }
+                }
+                Ok((1, b64)) => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64.as_bytes())
+                        .unwrap_or_default();
+                    if socket.send(Message::Binary(bytes)).is_err() {
+                        let _ = evt_tx.send((id, 4, "send failed".to_string()));
+                        closing = true;
+                        break;
+                    }
+                }
+                Ok((2, _)) | Ok(_) => {
+                    let _ = socket.close(None);
+                    closing = true;
+                    break;
+                }
+                // No more queued commands right now.
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // The sender (the JS object's out-channel) was dropped: the page is gone. Close.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let _ = socket.close(None);
+                    closing = true;
+                    break;
+                }
+            }
+        }
+        let _ = socket.flush();
+
+        // (b) Attempt one non-blocking read.
+        match socket.read() {
+            Ok(Message::Text(t)) => {
+                let _ = evt_tx.send((id, 1, t));
+            }
+            Ok(Message::Binary(b)) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&b);
+                let _ = evt_tx.send((id, 2, b64));
+            }
+            Ok(Message::Close(frame)) => {
+                let payload = match frame {
+                    Some(f) => format!("{}:{}", u16::from(f.code), f.reason),
+                    None => "1005:".to_string(),
+                };
+                let _ = evt_tx.send((id, 3, payload));
+                return;
+            }
+            // Ping/Pong are handled by tungstenite internally on the next send/read; ignore.
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No data available yet — the normal idle case.
+            }
+            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
+                let _ = evt_tx.send((id, 3, "1000:".to_string()));
+                return;
+            }
+            Err(e) => {
+                let _ = evt_tx.send((id, 4, format!("{e}")));
+                let _ = evt_tx.send((id, 3, "1006:".to_string()));
+                return;
+            }
+        }
+
+        // If we initiated a close above, give the close handshake one read cycle then exit.
+        if closing {
+            let _ = socket.flush();
+            let _ = evt_tx.send((id, 3, "1000:".to_string()));
+            return;
+        }
+
+        // (c) Don't busy-spin.
+        std::thread::sleep(WS_POLL_INTERVAL);
+    }
+}
+
+/// Connect + run the WebSocket handshake for `url`, with a bounded TCP connect/handshake. Returns
+/// the live socket (TLS already negotiated for `wss://`) or an error string.
+fn ws_connect(
+    url: &str,
+) -> Result<tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>, String>
+{
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid WebSocket URL: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "WebSocket URL has no host".to_string())?
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(match parsed.scheme() {
+        "wss" => 443,
+        _ => 80,
+    });
+
+    // Resolve + connect with a timeout so a dead host can't hang the thread indefinitely.
+    let addrs: Vec<_> = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
+        .collect();
+    let mut last_err = "no addresses resolved".to_string();
+    let mut stream: Option<TcpStream> = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, WS_CONNECT_TIMEOUT) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(e) => last_err = format!("connect to {addr} failed: {e}"),
+        }
+    }
+    let stream = stream.ok_or(last_err)?;
+    // Bound the handshake reads/writes too (cleared to non-blocking by the caller on success).
+    let _ = stream.set_read_timeout(Some(WS_CONNECT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WS_CONNECT_TIMEOUT));
+
+    // tungstenite upgrades to TLS itself for `wss://` (rustls + webpki roots).
+    match tungstenite::client_tls(url, stream) {
+        Ok((socket, _resp)) => Ok(socket),
+        Err(e) => Err(format!("WebSocket handshake failed: {e}")),
+    }
+}
+
+/// Set the underlying `TcpStream` (whether plain or wrapped in rustls) to (non-)blocking mode.
+fn set_ws_nonblocking(
+    stream: &mut tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    nonblocking: bool,
+) -> std::io::Result<()> {
+    match stream {
+        tungstenite::stream::MaybeTlsStream::Plain(s) => s.set_nonblocking(nonblocking),
+        tungstenite::stream::MaybeTlsStream::Rustls(s) => s.get_mut().set_nonblocking(nonblocking),
+        // Other variants aren't reachable with our feature set, but stay non-fatal.
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +651,75 @@ mod tests {
         // file:// is delivered in exactly one chunk per the spec.
         assert_eq!(chunks, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ws_run_unreachable_emits_error_then_close() {
+        // Deterministic + offline: connecting to a port nothing listens on must produce an error
+        // event (kind 4) followed by a close event (kind 3) — never an open. This is the same
+        // failure path the JS WebSocket relies on to fire onerror/onclose.
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel::<(u64, u8, String)>();
+        let (_out_tx, out_rx) = std::sync::mpsc::channel::<(u8, String)>();
+        ws_run("ws://127.0.0.1:1/".to_string(), 7, evt_tx, out_rx);
+        let events: Vec<_> = evt_rx.try_iter().collect();
+        assert!(
+            events.iter().any(|(_, k, _)| *k == 4),
+            "expected an error event, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|(_, k, _)| *k == 3),
+            "expected a close event, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|(_, k, _)| *k == 0),
+            "must not open on an unreachable host, got {events:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires network; run manually with --ignored"]
+    fn ws_run_echo_round_trips() {
+        // Manual/online check against a public echo server. Tolerant: either we round-trip the
+        // message, or we cleanly error (no network) — we never hang or panic.
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel::<(u64, u8, String)>();
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<(u8, String)>();
+        let handle = std::thread::spawn(move || {
+            ws_run("wss://ws.postman-echo.com/raw".to_string(), 1, evt_tx, out_rx);
+        });
+        // Wait for open (or error), bounded.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        let mut opened = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok((_, kind, _)) = evt_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                if kind == 0 {
+                    opened = true;
+                    break;
+                }
+                if kind == 4 || kind == 3 {
+                    // Clean failure (no network): acceptable.
+                    let _ = out_tx.send((2, String::new()));
+                    let _ = handle.join();
+                    return;
+                }
+            }
+        }
+        assert!(opened, "did not open within budget");
+        let _ = out_tx.send((0, "hello".to_string()));
+        let mut echoed = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if let Ok((_, kind, payload)) =
+                evt_rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                if kind == 1 && payload == "hello" {
+                    echoed = true;
+                    break;
+                }
+            }
+        }
+        let _ = out_tx.send((2, String::new()));
+        let _ = handle.join();
+        assert!(echoed, "echo server did not return our message");
     }
 
     #[test]

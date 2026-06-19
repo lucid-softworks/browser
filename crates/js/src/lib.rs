@@ -39,6 +39,24 @@ use std::sync::Once;
 /// [`drain_event_loop`] to resolve/reject the pending JS `fetch()` promise.
 type FetchCompletion = (u64, Option<String>);
 
+/// A WebSocket event delivered from a background socket thread to the worker: `(socket id, kind,
+/// payload)`. kind `0`=open, `1`=text, `2`=binary(base64), `3`=close("code:reason"), `4`=error.
+/// Drained opportunistically (non-blocking) inside [`drain_event_loop`] and dispatched to JS via
+/// `__wsDeliver`. A socket is long-lived, so — unlike a fetch — it never touches `in_flight`.
+type WsEvent = (u64, u8, String);
+
+/// An outgoing WebSocket command from JS to a background socket thread: `(kind, payload)`.
+/// kind `0`=send text, `1`=send binary(base64), `2`=close. Sent over a per-socket channel whose
+/// receiver lives on that socket's `net::ws_run` thread.
+type WsOut = (u8, String);
+
+/// Host WebSocket connector (built by the engine, mirroring `request_fetcher`): given
+/// `(url, id, ws_evt_tx)` it spawns the socket thread and returns the per-socket outgoing sender,
+/// or `Err` if the thread couldn't start. Crosses the crate boundary with PRIMITIVE tuples only.
+type WsConnector = Arc<
+    dyn Fn(String, u64, Sender<WsEvent>) -> Result<Sender<WsOut>, String> + Send + Sync,
+>;
+
 /// A JS execution result: the value rendered as a string (if any) plus any console output
 /// captured during execution.
 #[derive(Debug, Default, Clone)]
@@ -118,6 +136,19 @@ struct HostState {
     /// Count of async fetches started but not yet drained. Keeps [`drain_event_loop`] looping (on a
     /// longer budget) while network is outstanding so the `fetch()` promise settles before snapshot.
     in_flight: Cell<usize>,
+    /// Host WebSocket connector (the engine's `build_ws_connector`). Called by `__wsConnect` to spawn
+    /// a socket thread. `Arc<… + Send + Sync>` because it captures `Send` channels. No-DOM paths
+    /// install one that always returns `Err` (no socket threads on those paths).
+    ws_connector: WsConnector,
+    /// Sender background socket threads use to deliver WebSocket events to this worker. Cloned per
+    /// socket (in `__wsConnect`) and handed to the socket thread. The matching receiver is owned by
+    /// the worker thread and drained (non-blocking) inside [`drain_event_loop`].
+    ws_evt_tx: Sender<WsEvent>,
+    /// Per-socket outgoing senders, keyed by socket id. `__wsSend`/`__wsClose` look up the id here;
+    /// a close (kind 3) event removes the entry. The socket thread closes when its receiver drops.
+    ws_senders: RefCell<HashMap<u64, Sender<WsOut>>>,
+    /// Monotonic id source for WebSocket connections (handed to JS so it can correlate events).
+    next_ws_id: AtomicU64,
     /// Queue of DOM mutations recorded for `MutationObserver`s. Only written while
     /// `observers_active` is true. Drained as JSON by `__drainMutations` and dispatched to JS.
     mutations: RefCell<Vec<MutationRec>>,
@@ -151,17 +182,29 @@ struct HostState {
 
 impl HostState {
     fn new(doc: SharedDoc) -> Rc<Self> {
-        // No-DOM paths: a dead-end channel (its receiver is dropped immediately). `__startFetch`
-        // never runs here in practice; even if it did, the send simply fails harmlessly.
+        // No-DOM paths: dead-end channels (their receivers are dropped immediately) and a connector
+        // that always errs. `__startFetch`/`__wsConnect` never run here in practice; even if they
+        // did, the sends simply fail / the connect errs harmlessly.
         let (tx, _rx) = std::sync::mpsc::channel();
-        Self::with_fetcher(doc, Rc::new(|_| None), Arc::new(|_, _, _, _| None), tx)
+        let (ws_tx, _ws_rx) = std::sync::mpsc::channel();
+        Self::with_fetcher(
+            doc,
+            Rc::new(|_| None),
+            Arc::new(|_, _, _, _| None),
+            tx,
+            Arc::new(|_, _, _| Err("no WebSocket connector".to_string())),
+            ws_tx,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_fetcher(
         doc: SharedDoc,
         fetcher: Rc<dyn Fn(&str) -> Option<String>>,
         request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
         fetch_tx: Sender<FetchCompletion>,
+        ws_connector: WsConnector,
+        ws_evt_tx: Sender<WsEvent>,
     ) -> Rc<Self> {
         Rc::new(HostState {
             doc,
@@ -171,6 +214,10 @@ impl HostState {
             fetch_tx,
             next_fetch_id: AtomicU64::new(1),
             in_flight: Cell::new(0),
+            ws_connector,
+            ws_evt_tx,
+            ws_senders: RefCell::new(HashMap::new()),
+            next_ws_id: AtomicU64::new(1),
             mutations: RefCell::new(Vec::new()),
             observers_active: Cell::new(false),
             dom_version: Cell::new(0),
@@ -1722,6 +1769,85 @@ fn prim_start_fetch(
     rv.set(v8::Number::new(scope, id as f64).into());
 }
 
+/// `__wsConnect(url) -> id (number)`
+///
+/// Backs `new WebSocket(url)`. Allocates a socket id, then asks the host `ws_connector` to spawn a
+/// background socket thread (which runs `net::ws_run`). On success the per-socket outgoing sender is
+/// stored under the id so `__wsSend`/`__wsClose` can reach the socket; on failure we synthesize an
+/// `error` (kind 4) + `close` (kind 3) event so the JS object still fires onerror/onclose. The id is
+/// always returned so the JS object can register itself in `__wsRegistry` either way.
+fn prim_ws_connect(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let raw = arg_str(scope, &args, 0);
+    // Resolve against the page URL when present (so a relative ws path works), like fetch.
+    let resolved = {
+        let global = scope.get_current_context().global(scope);
+        let key = v8::String::new(scope, "__pageURL").unwrap();
+        let base = global
+            .get(scope, key.into())
+            .filter(|v| v.is_string())
+            .map(|v| v.to_rust_string_lossy(scope));
+        match base {
+            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
+                Ok(u) => u.to_string(),
+                Err(_) => raw.clone(),
+            },
+            _ => raw.clone(),
+        }
+    };
+
+    let state = host_state(scope);
+    let id = state.next_ws_id.fetch_add(1, Ordering::Relaxed);
+    let evt_tx = state.ws_evt_tx.clone();
+    match (state.ws_connector)(resolved, id, evt_tx) {
+        Ok(out_tx) => {
+            state.ws_senders.borrow_mut().insert(id, out_tx);
+        }
+        Err(msg) => {
+            // No socket thread: synthesize the error + close so onerror/onclose still fire.
+            let _ = state.ws_evt_tx.send((id, 4, msg));
+            let _ = state.ws_evt_tx.send((id, 3, "1006:".to_string()));
+        }
+    }
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
+/// `__wsSend(id, kind, payload)` — enqueue an outgoing frame on socket `id`. kind 0 = text,
+/// 1 = binary (payload is base64). No-op if the id is unknown (already closed).
+fn prim_ws_send(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = arg_str(scope, &args, 0).parse::<u64>().unwrap_or(0);
+    let kind = arg_str(scope, &args, 1).parse::<u8>().unwrap_or(0);
+    let payload = arg_str(scope, &args, 2);
+    let state = host_state(scope);
+    // Clone the sender out (cheap; `Sender` is `Clone`) so the `RefCell` borrow ends before send.
+    let tx = state.ws_senders.borrow().get(&id).cloned();
+    if let Some(tx) = tx {
+        let _ = tx.send((kind, payload));
+    }
+}
+
+/// `__wsClose(id)` — ask socket `id` to close and forget its sender (the socket thread exits when
+/// its receiver drops / it observes the close command). No-op if the id is unknown.
+fn prim_ws_close(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = arg_str(scope, &args, 0).parse::<u64>().unwrap_or(0);
+    let state = host_state(scope);
+    let tx = state.ws_senders.borrow_mut().remove(&id);
+    if let Some(tx) = tx {
+        let _ = tx.send((2, String::new()));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Installation: register native primitives + evaluate the JS bootstrap onto a fresh context.
 // ---------------------------------------------------------------------------------------------
@@ -1860,6 +1986,9 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__fetch", prim_fetch);
     set_fn(scope, global, "__request", prim_request);
     set_fn(scope, global, "__startFetch", prim_start_fetch);
+    set_fn(scope, global, "__wsConnect", prim_ws_connect);
+    set_fn(scope, global, "__wsSend", prim_ws_send);
+    set_fn(scope, global, "__wsClose", prim_ws_close);
     set_fn(scope, global, "__observersActive", prim_observers_active);
     set_fn(scope, global, "__drainMutations", prim_drain_mutations);
     set_fn(scope, global, "__computedStyleProp", prim_computed_style_prop);
@@ -3945,8 +4074,93 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     def(globalThis, "Worker", function () { this.postMessage = fn; this.terminate = fn; this.onmessage = null; this.onerror = null; this.addEventListener = fn; this.removeEventListener = fn; });
   }
   if (typeof globalThis.WebSocket !== "function") {
-    def(globalThis, "WebSocket", function () { this.readyState = 3; this.send = fn; this.close = fn; this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null; this.addEventListener = fn; this.removeEventListener = fn; });
-    globalThis.WebSocket.CONNECTING = 0; globalThis.WebSocket.OPEN = 1; globalThis.WebSocket.CLOSING = 2; globalThis.WebSocket.CLOSED = 3;
+    // Real WebSocket: __wsConnect spawns a host socket thread (net::ws_run) and returns an id.
+    // The host delivers events via __wsDeliver(id, kind, payload) during the Rust drain; send/close
+    // go back through __wsSend/__wsClose. Binary is base64-bridged across the host boundary.
+    var __wsRegistry = Object.create(null);
+    function __wsToBase64(data) {
+      // Accept ArrayBuffer / typed array / Blob (Blob exposes __blobBytes) → base64 string.
+      var bytes;
+      if (data instanceof ArrayBuffer) { bytes = new Uint8Array(data); }
+      else if (data && data.buffer instanceof ArrayBuffer) { bytes = new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength); }
+      else if (data && data.__blobBytes) { bytes = data.__blobBytes; }
+      else { bytes = new Uint8Array(0); }
+      var s = "";
+      for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+      return (typeof btoa === "function") ? btoa(s) : "";
+    }
+    function __wsFromBase64(b64) {
+      var s = (typeof atob === "function") ? atob(b64) : "";
+      var buf = new ArrayBuffer(s.length), view = new Uint8Array(buf);
+      for (var i = 0; i < s.length; i++) { view[i] = s.charCodeAt(i) & 0xff; }
+      return buf;
+    }
+    var WebSocketCtor = function (url, protocols) {
+      this.url = String(url);
+      this.readyState = 0; // CONNECTING
+      this.bufferedAmount = 0;
+      this.protocol = "";
+      this.extensions = "";
+      this.binaryType = "blob";
+      this.onopen = null; this.onmessage = null; this.onclose = null; this.onerror = null;
+      try { installEvents(this); } catch (e) {}
+      var id = (typeof __wsConnect === "function") ? __wsConnect(this.url) : 0;
+      this.__wsid = id;
+      __wsRegistry[id] = this;
+    };
+    WebSocketCtor.prototype.send = function (data) {
+      if (this.readyState !== 1) {
+        throw new globalThis.DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", "InvalidStateError");
+      }
+      if (typeof __wsSend !== "function") { return; }
+      if (typeof data === "string") { __wsSend(this.__wsid, 0, data); }
+      else { __wsSend(this.__wsid, 1, __wsToBase64(data)); }
+    };
+    WebSocketCtor.prototype.close = function (code, reason) {
+      if (this.readyState === 3 || this.readyState === 2) { return; }
+      this.readyState = 2; // CLOSING
+      if (typeof __wsClose === "function") { __wsClose(this.__wsid); }
+    };
+    WebSocketCtor.CONNECTING = 0; WebSocketCtor.OPEN = 1; WebSocketCtor.CLOSING = 2; WebSocketCtor.CLOSED = 3;
+    WebSocketCtor.prototype.CONNECTING = 0; WebSocketCtor.prototype.OPEN = 1; WebSocketCtor.prototype.CLOSING = 2; WebSocketCtor.prototype.CLOSED = 3;
+    def(globalThis, "WebSocket", WebSocketCtor);
+
+    // Fire a handler (onX + any addEventListener listeners) with an event object on a WebSocket.
+    function __wsFire(ws, type, ev) {
+      ev.type = type; ev.target = ws; ev.currentTarget = ws;
+      var on = ws["on" + type];
+      if (typeof on === "function") { try { on.call(ws, ev); } catch (e) { (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); } }
+      if (typeof ws.dispatchEvent === "function") { try { ws.dispatchEvent(ev); } catch (e) { (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); } }
+    }
+    // Called from Rust's drain phase for each pending socket event.
+    def(globalThis, "__wsDeliver", function (id, kind, payload) {
+      var ws = __wsRegistry[id];
+      if (!ws) { return; }
+      kind = Number(kind);
+      if (kind === 0) {            // open
+        ws.readyState = 1;
+        __wsFire(ws, "open", {});
+      } else if (kind === 1) {     // text message
+        __wsFire(ws, "message", { data: payload });
+      } else if (kind === 2) {     // binary message (base64)
+        var buf = __wsFromBase64(String(payload));
+        var data = buf;
+        if (ws.binaryType === "blob" && typeof globalThis.Blob === "function") {
+          try { data = new globalThis.Blob([buf]); } catch (e) { data = buf; }
+        }
+        __wsFire(ws, "message", { data: data });
+      } else if (kind === 3) {     // close ("code:reason")
+        ws.readyState = 3;
+        var p = String(payload), ci = p.indexOf(":");
+        var code = ci >= 0 ? parseInt(p.slice(0, ci), 10) : 1005;
+        var reason = ci >= 0 ? p.slice(ci + 1) : "";
+        if (!(code >= 0)) { code = 1005; }
+        __wsFire(ws, "close", { code: code, reason: reason, wasClean: code === 1000 });
+        delete __wsRegistry[id];
+      } else if (kind === 4) {     // error
+        __wsFire(ws, "error", { message: String(payload) });
+      }
+    });
   }
   if (typeof globalThis.Headers !== "function") {
     def(globalThis, "Headers", function (init) {
@@ -4914,6 +5128,7 @@ fn drain_event_loop(
     scope: &mut v8::PinScope,
     results: &mut [EvalOutput],
     fetch_rx: Option<&Receiver<FetchCompletion>>,
+    ws_evt_rx: Option<&Receiver<WsEvent>>,
 ) -> bool {
     if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
         state.console.borrow_mut().clear();
@@ -4939,6 +5154,14 @@ fn drain_event_loop(
         // Pull any completed background fetches and settle their JS promises, then run a microtask
         // checkpoint so the `.then` chains progress within this same drain.
         if resolve_completed_fetches(scope, fetch_rx) {
+            did_work = true;
+            scope.perform_microtask_checkpoint();
+        }
+
+        // Opportunistically deliver any pending WebSocket events (non-blocking). A socket is
+        // long-lived, so this never gates the loop (no `in_flight`); events simply arrive within
+        // ~one drain pass. A delivered handler may queue microtasks, so checkpoint after.
+        if deliver_ws_events(scope, ws_evt_rx) {
             did_work = true;
             scope.perform_microtask_checkpoint();
         }
@@ -4992,6 +5215,11 @@ fn drain_event_loop(
     // One final sweep: settle any completions that landed after the loop's last check, then run a
     // microtask checkpoint so their `.then` chains progress before we snapshot.
     if resolve_completed_fetches(scope, fetch_rx) {
+        did_work = true;
+        scope.perform_microtask_checkpoint();
+    }
+    // Same final sweep for WebSocket events that arrived after the loop's last pass.
+    if deliver_ws_events(scope, ws_evt_rx) {
         did_work = true;
         scope.perform_microtask_checkpoint();
     }
@@ -5111,6 +5339,47 @@ fn deliver_fetch_completion(scope: &mut v8::PinScope, completion: FetchCompletio
     }
 }
 
+/// Drain all currently-available WebSocket events (non-blocking `try_recv`) and dispatch each to JS
+/// via `__wsDeliver(id, kind, payload)`. Returns whether any event was delivered. No-op when
+/// `ws_evt_rx` is `None` (the no-DOM / run-once paths that never open a socket). A `close` event
+/// (kind 3) also drops the socket's outgoing sender so its thread can exit.
+fn deliver_ws_events(scope: &mut v8::PinScope, ws_evt_rx: Option<&Receiver<WsEvent>>) -> bool {
+    let rx = match ws_evt_rx {
+        Some(rx) => rx,
+        None => return false,
+    };
+    let mut any = false;
+    while let Ok((id, kind, payload)) = rx.try_recv() {
+        // On close, drop the outgoing sender for this id (the socket thread is finishing).
+        if kind == 3 {
+            if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
+                state.ws_senders.borrow_mut().remove(&id);
+            }
+        }
+        deliver_ws_event(scope, id, kind, &payload);
+        any = true;
+    }
+    any
+}
+
+/// Dispatch one WebSocket event to JS by calling `__wsDeliver(id, kind, payload)` with the payload
+/// as a string argument (so user-controlled message data can't break out of a source literal).
+fn deliver_ws_event(scope: &mut v8::PinScope, id: u64, kind: u8, payload: &str) {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "__wsDeliver").unwrap();
+    let func = global
+        .get(scope, key.into())
+        .and_then(|v| v8::Local::<v8::Function>::try_from(v).ok());
+    if let Some(func) = func {
+        let id_arg = v8::Number::new(scope, id as f64).into();
+        let kind_arg = v8::Number::new(scope, kind as f64).into();
+        let payload_arg = js_str(scope, payload).into();
+        v8::tc_scope!(let tc, scope);
+        let recv = global.into();
+        func.call(tc, recv, &[id_arg, kind_arg, payload_arg]);
+    }
+}
+
 /// Evaluate an internal expression, returning its boolean coercion. Errors → false.
 fn eval_to_bool(scope: &mut v8::PinScope, source: &str) -> bool {
     v8::tc_scope!(let tc, scope);
@@ -5202,7 +5471,7 @@ pub fn eval_batch(sources: Vec<String>) -> Vec<EvalOutput> {
             let local_ctx = v8::Local::new(handle_scope, &context);
             let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
             // No async fetches on the bare eval path (no real fetcher), so pass no receiver.
-            drain_event_loop(scope, &mut results, None);
+            drain_event_loop(scope, &mut results, None, None);
             results
         });
 
@@ -5265,7 +5534,7 @@ pub fn run_with_dom(
                     results.push(eval_source(scope, source, "<script>"));
                 }
                 // run_with_dom installs no real fetcher, so no async fetches are ever started.
-                drain_event_loop(scope, &mut results, None);
+                drain_event_loop(scope, &mut results, None, None);
             }
             // Recover the owned Document. Dropping the isolate releases the context (and HostState
             // slot, which holds the only other Rc clone of `shared`), so `try_unwrap` succeeds.
@@ -5684,11 +5953,18 @@ pub fn run_modules(
                 // Share one fetcher between the module loader and the JS `fetch()` primitive.
                 let fetcher: Rc<dyn Fn(&str) -> Option<String>> =
                     Rc::new(move |u: &str| fetcher(u));
+                // The module path is run-once with no live event loop, so no real WebSocket support:
+                // a connector that always errs and a dead-end event channel.
+                let (ws_evt_tx, _ws_evt_rx) = std::sync::mpsc::channel::<WsEvent>();
+                let ws_connector: WsConnector =
+                    Arc::new(|_, _, _| Err("no WebSocket connector".to_string()));
                 let state = HostState::with_fetcher(
                     Rc::clone(&shared),
                     Rc::clone(&fetcher),
                     request_fetcher,
                     fetch_tx,
+                    ws_connector,
+                    ws_evt_tx,
                 );
                 scope.get_current_context().set_slot(state);
                 let registry = Rc::new(ModuleRegistry {
@@ -5707,7 +5983,7 @@ pub fn run_modules(
                     results.push(outcome);
                 }
 
-                drain_event_loop(scope, &mut results, Some(&fetch_rx));
+                drain_event_loop(scope, &mut results, Some(&fetch_rx), None);
             }
             drop(isolate);
             let doc = match Rc::try_unwrap(shared) {
@@ -5890,6 +6166,7 @@ impl Session {
     /// `fetcher`), drain once, and return the session plus the initial DOM snapshot + per-source
     /// [`EvalOutput`]s (one per classic script, then one per module entry — matching the order
     /// `run_with_dom`/`run_modules` would produce).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         doc: dom::Document,
         scripts: Vec<String>,
@@ -5898,6 +6175,7 @@ impl Session {
         url: &str,
         fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
         request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
+        ws_connector: WsConnector,
     ) -> (Session, dom::Document, Vec<EvalOutput>) {
         let url = url.to_string();
         let fallback = doc.clone();
@@ -5914,7 +6192,7 @@ impl Session {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     session_thread_main(
                         doc, scripts, entries, modules, url, fetcher, request_fetcher,
-                        init_tx, cmd_rx,
+                        ws_connector, init_tx, cmd_rx,
                     );
                 }));
             });
@@ -6143,6 +6421,7 @@ fn session_thread_main(
     url: String,
     fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
     request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
+    ws_connector: WsConnector,
     init_tx: std::sync::mpsc::Sender<(dom::Document, Vec<EvalOutput>)>,
     cmd_rx: std::sync::mpsc::Receiver<SessionCmd>,
 ) {
@@ -6151,6 +6430,9 @@ fn session_thread_main(
     // Background fetch threads deliver completions here; the receiver lives for the whole session
     // (used by every drain — init load and each subsequent command).
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<FetchCompletion>();
+    // Background socket threads deliver WebSocket events here; the receiver lives for the whole
+    // session and is drained (non-blocking) on every drain pass alongside the fetch channel.
+    let (ws_evt_tx, ws_evt_rx) = std::sync::mpsc::channel::<WsEvent>();
     // Keep the isolate owned by this thread for the whole session.
     let mut isolate = v8::Isolate::new(v8::CreateParams::default());
     // Register the same isolate-level callbacks run_modules uses so modules + dynamic import work.
@@ -6171,6 +6453,8 @@ fn session_thread_main(
             Rc::clone(&fetcher),
             request_fetcher,
             fetch_tx,
+            ws_connector,
+            ws_evt_tx,
         );
         scope.get_current_context().set_slot(state);
         let registry = Rc::new(ModuleRegistry {
@@ -6192,7 +6476,7 @@ fn session_thread_main(
         for entry in &entries {
             results.push(run_one_entry(scope, entry));
         }
-        drain_event_loop(scope, &mut results, Some(&fetch_rx));
+        drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
         // Load drain done; switch the timer clock to real time so subsequent ticks/events run
         // setInterval/setTimeout/rAF over actual elapsed time.
         eval_internal(scope, "if (typeof __enterRealtime === 'function') { __enterRealtime(); }", "<realtime>");
@@ -6219,7 +6503,7 @@ fn session_thread_main(
                 );
                 // Run the dispatch as one op, then drain the loop, folding console into a result.
                 let mut results = vec![eval_source(scope, &source, "<dispatch>")];
-                drain_event_loop(scope, &mut results, Some(&fetch_rx));
+                drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
@@ -6235,7 +6519,7 @@ fn session_thread_main(
                     js_string_literal(&code),
                 );
                 let mut results = vec![eval_source(scope, &source, "<key>")];
-                drain_event_loop(scope, &mut results, Some(&fetch_rx));
+                drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
@@ -6246,7 +6530,7 @@ fn session_thread_main(
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![eval_source(scope, &source, "<interact>")];
                 let first = EvalOutput { value: results[0].value.clone(), error: results[0].error.clone(), console: Vec::new() };
-                drain_event_loop(scope, &mut results, Some(&fetch_rx));
+                drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((first, shared.borrow().clone(), console));
             }
@@ -6256,7 +6540,7 @@ fn session_thread_main(
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![EvalOutput::default()];
-                let did_work = drain_event_loop(scope, &mut results, Some(&fetch_rx));
+                let did_work = drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 // Only snapshot+report when something actually ran, so idle ticks are cheap.
                 if did_work {
                     let console = results.into_iter().flat_map(|r| r.console).collect();
@@ -7329,6 +7613,11 @@ mod tests {
         Arc::new(|_m, _u, _b, _h| None)
     }
 
+    /// A WebSocket connector that always errs (default for tests not exercising `WebSocket`).
+    fn no_ws() -> WsConnector {
+        Arc::new(|_url, _id, _evt| Err("no WebSocket connector".to_string()))
+    }
+
     #[test]
     fn two_module_graph_resolves_named_import() {
         let entry = "https://x/app.js".to_string();
@@ -7514,6 +7803,7 @@ mod tests {
             "https://x/",
             no_fetch(),
             request_fetcher,
+            no_ws(),
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         let got = match &snapshot.get(body).data {
@@ -7559,6 +7849,7 @@ mod tests {
             "https://x/",
             no_fetch(),
             request_fetcher,
+            no_ws(),
         );
         let elapsed = start.elapsed();
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -7599,6 +7890,7 @@ mod tests {
             "https://x/",
             no_fetch(),
             request_fetcher,
+            no_ws(),
         );
         let console = all_console(&out);
         assert!(
@@ -7967,6 +8259,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -7991,6 +8284,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
         // Ran at least once during load.
@@ -8025,6 +8319,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -8051,6 +8346,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -8075,6 +8371,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert!(outputs.is_empty() || outputs.iter().all(|o| o.error.is_none()));
 
@@ -8103,6 +8400,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -8140,6 +8438,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert!(outputs.iter().all(|o| o.error.is_none()));
 
@@ -8173,6 +8472,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -8204,6 +8504,7 @@ mod tests {
             "https://example.com/",
             no_fetch(),
             no_request(),
+            no_ws(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
