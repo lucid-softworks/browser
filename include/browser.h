@@ -147,6 +147,17 @@ int32_t browser_engine_dispatch_key(struct Engine *engine, const char *key, cons
  */
 int32_t browser_engine_tick(struct Engine *engine);
 
+/**
+ * Move the pointer to framebuffer device-pixel `(x, y)` (viewport-relative): fires the page's
+ * hover events (`mouseover`/`mouseout`/`mouseenter`/`mouseleave`/`mousemove`) as the node under
+ * the pointer changes. Cheap no-op when the hovered node is unchanged. Returns 1 if the DOM
+ * changed (re-render), else 0.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+int32_t browser_engine_dispatch_move(struct Engine *engine, float x, float y);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

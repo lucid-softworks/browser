@@ -3033,6 +3033,94 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return !ev.defaultPrevented;
   });
 
+  // --- non-bubbling synthetic event dispatch ------------------------------------------------
+  // Fire `type` on the target node ONLY (no ancestor/document/window propagation). Used for
+  // focus/blur, mouseenter/mouseleave which do not bubble. Returns false if preventDefault().
+  def(globalThis, "__dispatchSyntheticEventNonBubbling", function (nodeId, type, props) {
+    var node = null;
+    try { node = canon(__wrapNode(nodeId)); } catch (e) { node = null; }
+    if (!node) { return true; }
+    type = String(type);
+
+    var Ctor = mouseTypes[type] ? globalThis.MouseEvent : globalThis.Event;
+    var ev;
+    try { ev = new Ctor(type, { bubbles: false, cancelable: true }); }
+    catch (e) { ev = { type: type, bubbles: false, cancelable: true, defaultPrevented: false }; }
+    if (props) { for (var k in props) { try { ev[k] = props[k]; } catch (e2) {} } }
+
+    ev.defaultPrevented = !!ev.defaultPrevented;
+    ev.preventDefault = function () { this.defaultPrevented = true; };
+    ev.stopPropagation = function () {};
+    ev.stopImmediatePropagation = function () {};
+    try { ev.target = node; ev.currentTarget = node; } catch (e4) {}
+
+    var reg = node.__listeners;
+    var list = reg ? reg[type] : null;
+    if (list) {
+      var copy = list.slice();
+      for (var i = 0; i < copy.length; i++) {
+        try { copy[i].call(node, ev); } catch (e6) { (globalThis.__timerErrors || []).push(String(e6)); }
+      }
+    }
+    var on = node["on" + type];
+    if (typeof on === "function") {
+      try { on.call(node, ev); } catch (e7) { (globalThis.__timerErrors || []).push(String(e7)); }
+    }
+    return !ev.defaultPrevented;
+  });
+
+  // mouseover/mouseout bubble; mouseenter/mouseleave do not — register the latter as non-bubbling.
+  mouseTypes.mouseenter = 1; mouseTypes.mouseleave = 1; mouseTypes.mousemove = 1;
+
+  // --- checkbox / radio toggle (driven from Rust on click) ----------------------------------
+  // Flip a checkbox's `checked`, or set a radio (unchecking same-name siblings), then fire
+  // `input` and `change` (both bubbling). The `click` has already been dispatched by the caller.
+  // No-op for disabled controls. Returns nothing; the caller reads back the snapshot.
+  def(globalThis, "__toggleCheckable", function (nodeId) {
+    var el = null;
+    try { el = canon(__wrapNode(nodeId)); } catch (e) { el = null; }
+    if (!el) { return; }
+    var tag = "";
+    try { tag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : ""; } catch (e2) {}
+    if (tag !== "input") { return; }
+    var ty = String(__getAttr(nodeId, "type") || "").toLowerCase();
+    if (ty !== "checkbox" && ty !== "radio") { return; }
+    if (__getAttr(nodeId, "disabled") != null) { return; }
+
+    if (ty === "checkbox") {
+      var on = __getAttr(nodeId, "checked") != null;
+      if (on) { __removeAttr(nodeId, "checked"); } else { __setAttr(nodeId, "checked", ""); }
+    } else {
+      // Radio: uncheck every same-name radio in the same form (or document), then check this one.
+      var name = String(__getAttr(nodeId, "name") || "");
+      // Find the enclosing <form>, if any.
+      var form = null;
+      try {
+        var c = el;
+        while (c) {
+          var t = "";
+          try { t = typeof c.tagName === "string" ? c.tagName.toLowerCase() : ""; } catch (ef) {}
+          if (t === "form") { form = c; break; }
+          c = c.parentNode;
+        }
+      } catch (e3) {}
+      var scope = form || document;
+      var radios = [];
+      try { radios = scope.querySelectorAll("input[type=radio]"); } catch (e4) { radios = []; }
+      for (var i = 0; i < radios.length; i++) {
+        var r = radios[i];
+        var rname = "";
+        try { rname = String(r.getAttribute("name") || ""); } catch (e5) {}
+        if (rname === name) {
+          try { r.removeAttribute("checked"); } catch (e6) {}
+        }
+      }
+      __setAttr(nodeId, "checked", "");
+    }
+    __dispatchSyntheticEvent(nodeId, "input", {});
+    __dispatchSyntheticEvent(nodeId, "change", {});
+  });
+
   // --- key input handler (driven from Rust on physical key presses) -------------------------
   // Fire keydown, mutate the focused text field's value (firing input), then keyup. Returns
   // nothing; the caller reads back the updated DOM snapshot. Text-like <input>/<textarea> only.
@@ -3978,6 +4066,13 @@ enum SessionCmd {
         code: String,
         reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
     },
+    /// Evaluate an arbitrary JS source string against the persistent context, drain the loop,
+    /// reply with snapshot + console. Used for the higher-level interaction helpers (checkbox
+    /// toggle, focus/blur/change/submit, hover) that drive bootstrap functions.
+    Eval {
+        source: String,
+        reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
+    },
     /// Run due timers / microtasks; reply `Some(snapshot, console)` if work ran, else `None`.
     Tick {
         reply: std::sync::mpsc::Sender<Option<(dom::Document, Vec<String>)>>,
@@ -4106,6 +4201,45 @@ impl Session {
         reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
     }
 
+    /// Evaluate an arbitrary JS source string against the live context, drain the event loop, and
+    /// return a fresh DOM snapshot + console. Backs the higher-level interaction helpers below.
+    fn eval_interact(&self, source: String) -> (dom::Document, Vec<String>) {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<String>)>();
+        if self.tx.send(SessionCmd::Eval { source, reply: reply_tx }).is_err() {
+            return (dom::Document::new(), Vec::new());
+        }
+        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+    }
+
+    /// Toggle a checkbox / radio `node_id`: flips a checkbox's `checked`, or sets a radio
+    /// (unchecking same-`name` siblings in the same form/document), then fires bubbling `input`
+    /// and `change` events. No-op for disabled / non-checkable controls. The caller is expected to
+    /// have already fired `click`. Returns a fresh DOM snapshot + console.
+    pub fn toggle_checkbox(&self, node_id: usize) -> (dom::Document, Vec<String>) {
+        self.eval_interact(format!("__toggleCheckable({node_id})"))
+    }
+
+    /// Fire a synthetic **bubbling** event of `kind` on `node_id` (empty props), drain the loop,
+    /// and return a fresh DOM snapshot + console. Used for `change`/`submit`.
+    pub fn fire_event(&self, node_id: usize, kind: &str) -> (dom::Document, Vec<String>) {
+        self.eval_interact(format!(
+            "__dispatchSyntheticEvent({}, {}, {{}})",
+            node_id,
+            js_string_literal(kind)
+        ))
+    }
+
+    /// Fire a synthetic **non-bubbling** event of `kind` on `node_id` (target only), drain the
+    /// loop, and return a fresh DOM snapshot + console. Used for `focus`/`blur`/`mouseenter`/
+    /// `mouseleave`.
+    pub fn fire_event_nonbubbling(&self, node_id: usize, kind: &str) -> (dom::Document, Vec<String>) {
+        self.eval_interact(format!(
+            "__dispatchSyntheticEventNonBubbling({}, {}, {{}})",
+            node_id,
+            js_string_literal(kind)
+        ))
+    }
+
     /// Run due timers / microtasks (e.g. for animations or deferred work) and return a fresh DOM
     /// snapshot + console. Synchronous; empty snapshot/console if the session thread is gone.
     /// Run any due timers/microtasks. Returns the updated DOM snapshot + console ONLY if work
@@ -4223,6 +4357,16 @@ fn session_thread_main(
                     js_string_literal(&code),
                 );
                 let mut results = vec![eval_source(scope, &source, "<key>")];
+                drain_event_loop(scope, &mut results);
+                let console = results.into_iter().flat_map(|r| r.console).collect();
+                let _ = reply.send((shared.borrow().clone(), console));
+            }
+            SessionCmd::Eval { source, reply } => {
+                let ctx = context.clone();
+                v8::scope!(let handle_scope, &mut isolate);
+                let local_ctx = v8::Local::new(handle_scope, &ctx);
+                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let mut results = vec![eval_source(scope, &source, "<interact>")];
                 drain_event_loop(scope, &mut results);
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
@@ -5568,5 +5712,133 @@ mod tests {
         let (after, _c) = session.dispatch_key(f.0, "Backspace", "Backspace");
         let input = find_by_id(&after, after.root(), "f").expect("input node");
         assert_eq!(attr_of(&after, input, "value").as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn session_toggle_checkbox_flips_checked_and_fires_change() {
+        let doc = html::parse(
+            "<html><body><input id=c type=checkbox></body></html>",
+        );
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            vec![r#"
+                var c = document.getElementById('c');
+                c.addEventListener('change', function () {
+                    document.body.setAttribute('data-changed', c.checked ? 'on' : 'off');
+                });
+            "#
+            .to_string()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+
+        let c = find_by_id(&snapshot, snapshot.root(), "c").expect("checkbox node");
+        // Initially unchecked.
+        assert!(attr_of(&snapshot, c, "checked").is_none());
+
+        let (after, _console) = session.toggle_checkbox(c.0);
+        let cb = find_by_id(&after, after.root(), "c").expect("checkbox node");
+        assert!(attr_of(&after, cb, "checked").is_some(), "checkbox should be checked");
+        let body = find_by_tag(&after, after.root(), "body").expect("body node");
+        assert_eq!(attr_of(&after, body, "data-changed").as_deref(), Some("on"));
+
+        // Toggling again unchecks it (and the change handler sees the new state).
+        let (after2, _c2) = session.toggle_checkbox(c.0);
+        let cb2 = find_by_id(&after2, after2.root(), "c").expect("checkbox node");
+        assert!(attr_of(&after2, cb2, "checked").is_none(), "checkbox should be unchecked");
+        let body2 = find_by_tag(&after2, after2.root(), "body").expect("body node");
+        assert_eq!(attr_of(&after2, body2, "data-changed").as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn session_toggle_radio_unchecks_same_name_sibling() {
+        let doc = html::parse(
+            "<form>\
+               <input id=a type=radio name=g checked>\
+               <input id=b type=radio name=g>\
+             </form>",
+        );
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert!(outputs.iter().all(|o| o.error.is_none()));
+
+        let a = find_by_id(&snapshot, snapshot.root(), "a").expect("radio a");
+        let b = find_by_id(&snapshot, snapshot.root(), "b").expect("radio b");
+        assert!(attr_of(&snapshot, a, "checked").is_some());
+        assert!(attr_of(&snapshot, b, "checked").is_none());
+
+        // Check b: a (same name) must become unchecked.
+        let (after, _console) = session.toggle_checkbox(b.0);
+        let aa = find_by_id(&after, after.root(), "a").expect("radio a");
+        let bb = find_by_id(&after, after.root(), "b").expect("radio b");
+        assert!(attr_of(&after, bb, "checked").is_some(), "b should be checked");
+        assert!(attr_of(&after, aa, "checked").is_none(), "a should be unchecked");
+    }
+
+    #[test]
+    fn session_hover_reaches_mouseover_listener() {
+        let doc = html::parse("<html><body><div id=menu>menu</div></body></html>");
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            vec![r#"
+                var m = document.getElementById('menu');
+                m.addEventListener('mouseover', function () {
+                    document.body.setAttribute('data-hover', 'yes');
+                });
+            "#
+            .to_string()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+
+        let menu = find_by_id(&snapshot, snapshot.root(), "menu").expect("menu node");
+        let (after, _console) = session.dispatch_event(menu.0, "mouseover", 5.0, 5.0);
+        let body = find_by_tag(&after, after.root(), "body").expect("body node");
+        assert_eq!(attr_of(&after, body, "data-hover").as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn session_nonbubbling_focus_does_not_reach_ancestor() {
+        let doc = html::parse(
+            "<html><body><div id=wrap><input id=f></div></body></html>",
+        );
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            vec![r#"
+                var f = document.getElementById('f');
+                f.addEventListener('focus', function () {
+                    document.body.setAttribute('data-target', 'focused');
+                });
+                document.getElementById('wrap').addEventListener('focus', function () {
+                    document.body.setAttribute('data-ancestor', 'reached');
+                });
+            "#
+            .to_string()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+
+        let f = find_by_id(&snapshot, snapshot.root(), "f").expect("input node");
+        let (after, _console) = session.fire_event_nonbubbling(f.0, "focus");
+        let body = find_by_tag(&after, after.root(), "body").expect("body node");
+        // The target's focus handler ran...
+        assert_eq!(attr_of(&after, body, "data-target").as_deref(), Some("focused"));
+        // ...but the ancestor's did NOT (focus does not bubble).
+        assert_eq!(attr_of(&after, body, "data-ancestor").as_deref(), None);
     }
 }

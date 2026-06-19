@@ -19,6 +19,8 @@ final class BitmapView: NSView {
     /// Called with a key event when the view has focus. Return true if the page consumed it
     /// (e.g. typing into a focused field); false to let it propagate (menu shortcuts, etc.).
     var onKeyDown: ((NSEvent) -> Bool)?
+    /// Called with a view-local point as the pointer moves, so the page's hover events can fire.
+    var onMove: ((CGPoint) -> Void)?
 
     // Accept keyboard focus so typing into a page text field routes here.
     override var acceptsFirstResponder: Bool { true }
@@ -90,6 +92,7 @@ final class BitmapView: NSView {
         } else {
             NSCursor.arrow.set()
         }
+        onMove?(p)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -514,6 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.onClick = { [weak self] point in self?.handleContentClick(point) }
         bitmapView.isLinkAt = { [weak self] point in self?.linkURL(at: point) != nil }
         bitmapView.onKeyDown = { [weak self] event in self?.handleKeyDown(event) ?? false }
+        bitmapView.onMove = { [weak self] point in self?.handleContentMove(point) }
         content.addSubview(bitmapView)
 
         // MARK: Auto Layout
@@ -959,6 +963,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // 4. Otherwise, repaint if the JS handler changed the page.
         if changed != 0 { refresh() }
+    }
+
+    /// Pointer moved over the page: fire the page's hover events (mouseover/out/enter/leave). The
+    /// engine no-ops cheaply when the hovered node is unchanged; we only repaint on a real change.
+    private func handleContentMove(_ localPoint: CGPoint) {
+        guard let tab = activeTab, let engine = tab.engine, let bitmapView = bitmapView,
+              tab.pendingLoads == 0 else { return }
+        let scale = CGFloat(window?.backingScaleFactor ?? 1)
+        let fyTop = bitmapView.bounds.height - localPoint.y
+        let fxDevice = Float(localPoint.x * scale)
+        let fyDevice = Float(fyTop * scale)
+        if browser_engine_dispatch_move(engine, fxDevice, fyDevice) != 0 { refresh() }
     }
 
     /// Route a key event to the focused page text field. Returns true if consumed. Lets anything

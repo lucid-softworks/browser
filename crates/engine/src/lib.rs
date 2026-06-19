@@ -73,6 +73,12 @@ pub struct Engine {
     /// Set when a click lands on such a control; key events are routed here. Cleared on navigation
     /// and when a click lands elsewhere.
     focused_node: Option<dom::NodeId>,
+    /// The `value` of `focused_node` captured when it was focused, used to detect a change on blur
+    /// (HTML `change` fires when an editable field loses focus and its value differs).
+    focus_value: Option<String>,
+    /// The node currently under the pointer (most recent `dispatch_move` hit). Used so hover events
+    /// (mouseover/out, mouseenter/leave) fire only on transitions. Cleared on navigation.
+    hovered_node: Option<dom::NodeId>,
 }
 
 impl Default for Engine {
@@ -94,6 +100,8 @@ impl Engine {
             framebuffer: None,
             session: None,
             focused_node: None,
+            focus_value: None,
+            hovered_node: None,
         }
     }
 
@@ -117,6 +125,8 @@ impl Engine {
         self.scroll_y = 0.0; // new navigation starts at the top
         self.layout_cache = None; // invalidate cached layout for the previous page
         self.focused_node = None; // a new page has no focused field
+        self.focus_value = None;
+        self.hovered_node = None; // and nothing is hovered
         match net::fetch(url) {
             Ok(resp) => {
                 // Parse HTML responses into a DOM; other content types just record metadata.
@@ -211,7 +221,7 @@ impl Engine {
                 .collect();
             let computed = style::cascade(d, styles);
             let root =
-                layout::layout_document(d, &computed, vw, vh, &measurer, &intrinsic_sizes);
+                layout::layout_document(d, &computed, vw, vh, &measurer, &intrinsic_sizes, self.focused_node);
             let content_h = root.dimensions.margin_box().height;
             Some((root, content_h))
         } else {
@@ -390,21 +400,131 @@ impl Engine {
         // clientX/clientY are logical (CSS) px relative to the viewport.
         let cx = (x / self.scale) as f64;
         let cy = (y / self.scale) as f64;
-        let (mut snapshot, console) = session.dispatch_event(node.0, "click", cx, cy);
+        let (mut snapshot, mut console) = session.dispatch_event(node.0, "click", cx, cy);
         snapshot.prune_invalid();
-        // Update text focus: the nearest ancestor-or-self of the hit node that is an editable
-        // text field (text-like <input> / <textarea>), else clear focus. Computed against the new
+
+        // New text focus: the nearest ancestor-or-self of the hit node that is an editable text
+        // field (text-like <input> / <textarea>), else clear focus. Computed against the new
         // snapshot so the node ids are valid in the doc we're about to store.
-        let focus = editable_text_ancestor(&snapshot, node);
+        let new_focus = editable_text_ancestor(&snapshot, node);
+        let session = self.session.as_ref().unwrap();
+
+        // Focus transition: if focus moved, fire blur (+ change if the old field's value changed)
+        // on the old field, then focus on the new field. focus/blur do not bubble.
+        if self.focused_node != new_focus {
+            if let Some(old) = self.focused_node {
+                if old.0 < snapshot.len() {
+                    // change fires first (bubbles) when the value differs from focus time.
+                    let cur_val = node_value(&snapshot, old);
+                    if self.focus_value.is_some() && self.focus_value.as_deref() != cur_val.as_deref() {
+                        let (s, c) = session.fire_event(old.0, "change");
+                        snapshot = s;
+                        snapshot.prune_invalid();
+                        console.extend(c);
+                    }
+                    let (s, c) = session.fire_event_nonbubbling(old.0, "blur");
+                    snapshot = s;
+                    snapshot.prune_invalid();
+                    console.extend(c);
+                }
+            }
+            if let Some(newf) = new_focus {
+                let (s, c) = session.fire_event_nonbubbling(newf.0, "focus");
+                snapshot = s;
+                snapshot.prune_invalid();
+                console.extend(c);
+            }
+            self.focus_value = new_focus.and_then(|n| node_value(&snapshot, n));
+        }
+        self.focused_node = new_focus;
+
+        // Checkbox / radio toggle: if the click landed on (or inside, e.g. a <label for>) a
+        // checkable input that isn't disabled, toggle it (fires input + change).
+        if let Some(target) = checkable_target(&snapshot, node) {
+            let (s, c) = session.toggle_checkbox(target.0);
+            snapshot = s;
+            snapshot.prune_invalid();
+            console.extend(c);
+        }
+
+        // Submit: a click on a submit button (<input type=submit>, <button type=submit>, or a
+        // <button> with no type) inside a form fires `submit` on the nearest ancestor <form>.
+        if let Some(form) = submit_target_form(&snapshot, node) {
+            let (s, c) = session.fire_event(form.0, "submit");
+            snapshot = s;
+            snapshot.prune_invalid();
+            console.extend(c);
+        }
+
         if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
             *doc = Some(snapshot);
             c.extend(console);
-            self.focused_node = focus;
             self.layout_cache = None; // DOM may have changed → re-cascade/layout/paint
             true
         } else {
             false
         }
+    }
+
+    /// Dispatch a synthetic pointer move (device pixel coords, viewport-relative) into the live page
+    /// JS. Hit-tests the deepest node under the pointer; if it changed since the last move, fires
+    /// `mouseout`/`mouseleave` on the old node and `mouseover`/`mouseenter`/`mousemove` on the new
+    /// one, adopts the updated snapshot, and invalidates the layout cache. Returns `true` if the
+    /// hovered node changed (a re-render may be warranted); `false` (cheap no-op) if unchanged.
+    pub fn dispatch_move(&mut self, x: f32, y: f32) -> bool {
+        let node = match self.layout_cache.as_ref() {
+            Some(cache) => deepest_node_at(&cache.root, x, y + self.scroll_y),
+            None => None,
+        };
+        // Unchanged target: no-op (hover stays cheap; we avoid per-pixel churn).
+        if node == self.hovered_node {
+            return false;
+        }
+        let session = match &self.session {
+            Some(s) => s,
+            None => {
+                self.hovered_node = node;
+                return false;
+            }
+        };
+        let cx = (x / self.scale) as f64;
+        let cy = (y / self.scale) as f64;
+
+        let old = self.hovered_node;
+        let mut snapshot: Option<dom::Document> = None;
+        let mut console: Vec<String> = Vec::new();
+        let mut run = |s: &js::Session, id: usize, kind: &str, bubbles: bool| {
+            let (mut snap, c) = if bubbles {
+                s.dispatch_event(id, kind, cx, cy)
+            } else {
+                s.fire_event_nonbubbling(id, kind)
+            };
+            snap.prune_invalid();
+            console.extend(c);
+            snapshot = Some(snap);
+        };
+
+        if let Some(h) = old {
+            run(session, h.0, "mouseout", true);
+            run(session, h.0, "mouseleave", false);
+        }
+        if let Some(n) = node {
+            run(session, n.0, "mouseover", true);
+            run(session, n.0, "mouseenter", false);
+            run(session, n.0, "mousemove", true);
+        }
+
+        self.hovered_node = node;
+        if let Some(snap) = snapshot {
+            if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+                *doc = Some(snap);
+                c.extend(console);
+                self.layout_cache = None;
+                return true;
+            }
+        }
+        // Hovered node changed but produced no snapshot (e.g. both None paths): still a change.
+        true
     }
 
     /// Deliver a physical key press to the focused text field, if any. Routes through the live JS
@@ -420,8 +540,21 @@ impl Engine {
             Some(s) => s,
             None => return false,
         };
-        let (mut snapshot, console) = session.dispatch_key(node.0, key, code);
+        let (mut snapshot, mut console) = session.dispatch_key(node.0, key, code);
         snapshot.prune_invalid();
+
+        // Enter in a single-line <input> (not <textarea>) inside a <form> fires `submit` on the
+        // nearest ancestor form (no navigation — handlers can preventDefault as usual).
+        if key == "Enter" && node.0 < snapshot.len() && is_single_line_input(&snapshot, node) {
+            if let Some(form) = ancestor_form(&snapshot, node) {
+                let session = self.session.as_ref().unwrap();
+                let (s, c) = session.fire_event(form.0, "submit");
+                snapshot = s;
+                snapshot.prune_invalid();
+                console.extend(c);
+            }
+        }
+
         if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
             *doc = Some(snapshot);
             c.extend(console);
@@ -536,6 +669,67 @@ impl Engine {
     fn first_decoded_image_size(&self) -> Option<(u32, u32)> {
         match &self.state {
             LoadState::Loaded { images, .. } => images.values().next().map(|i| (i.w, i.h)),
+            _ => None,
+        }
+    }
+
+    /// Test-only: device-pixel center of the cached layout box for `id` (inverse of the
+    /// layout→device mapping in `render`: left=0, header_h=0, so device = layout - scroll_y).
+    #[cfg(test)]
+    fn node_center_device(&self, id: dom::NodeId) -> Option<(f32, f32)> {
+        fn find(b: &layout::LayoutBox, id: dom::NodeId) -> Option<&layout::LayoutBox> {
+            // Prefer the element's own (non-text) box; recurse depth-first.
+            for c in &b.children {
+                if let Some(f) = find(c, id) {
+                    return Some(f);
+                }
+            }
+            if b.node == Some(id) {
+                Some(b)
+            } else {
+                None
+            }
+        }
+        let cache = self.layout_cache.as_ref()?;
+        let bx = find(&cache.root, id)?;
+        let r = bx.dimensions.border_box();
+        let lx = r.x + r.width / 2.0;
+        let ly = r.y + r.height / 2.0;
+        Some((lx, ly - self.scroll_y))
+    }
+
+    /// Test-only: walk the live DOM for the first element with the given `id` attribute.
+    #[cfg(test)]
+    fn node_by_attr_id(&self, attr_id: &str) -> Option<dom::NodeId> {
+        match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => find_by_attr_id(d, d.root(), attr_id),
+            _ => None,
+        }
+    }
+
+    /// Test-only: the value of attribute `name` on the live document's `<body>`.
+    #[cfg(test)]
+    fn visible_attr_body(&self, name: &str) -> Option<String> {
+        let d = match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => d,
+            _ => return None,
+        };
+        fn find_body(doc: &dom::Document, id: dom::NodeId) -> Option<dom::NodeId> {
+            if let dom::NodeData::Element(e) = &doc.get(id).data {
+                if e.tag.eq_ignore_ascii_case("body") {
+                    return Some(id);
+                }
+            }
+            for &c in &doc.get(id).children {
+                if let Some(f) = find_body(doc, c) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let body = find_body(d, d.root())?;
+        match &d.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
             _ => None,
         }
     }
@@ -683,6 +877,133 @@ fn editable_text_ancestor(doc: &dom::Document, node: dom::NodeId) -> Option<dom:
         cur = doc.get(id).parent;
     }
     None
+}
+
+/// The `value` attribute of an element node, if it is an element (used to detect `change`).
+fn node_value(doc: &dom::Document, id: dom::NodeId) -> Option<String> {
+    if id.0 >= doc.len() {
+        return None;
+    }
+    match &doc.get(id).data {
+        dom::NodeData::Element(e) => Some(e.attrs.get("value").cloned().unwrap_or_default()),
+        _ => None,
+    }
+}
+
+/// Resolve the checkable `<input type=checkbox|radio>` that a click on `node` should toggle, if
+/// any: the nearest ancestor-or-self checkable input, OR — when `node` is (inside) a `<label for>`
+/// — the input that label points at. Returns `None` for disabled controls or when none is found.
+fn checkable_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
+    fn is_checkable(doc: &dom::Document, id: dom::NodeId) -> bool {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("input") && !e.attrs.contains_key("disabled") {
+                let ty =
+                    e.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+                return ty == "checkbox" || ty == "radio";
+            }
+        }
+        false
+    }
+    // Ancestor-or-self walk for a checkable input, or a <label for>.
+    let mut cur = Some(node);
+    while let Some(id) = cur {
+        if id.0 >= doc.len() {
+            break;
+        }
+        if is_checkable(doc, id) {
+            return Some(id);
+        }
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("label") {
+                if let Some(for_id) = e.attrs.get("for") {
+                    if let Some(target) = find_by_attr_id(doc, doc.root(), for_id) {
+                        if is_checkable(doc, target) {
+                            return Some(target);
+                        }
+                    }
+                }
+            }
+        }
+        cur = doc.get(id).parent;
+    }
+    None
+}
+
+/// Depth-first search for the first element whose `id` attribute equals `id`.
+fn find_by_attr_id(doc: &dom::Document, root: dom::NodeId, id: &str) -> Option<dom::NodeId> {
+    if root.0 >= doc.len() {
+        return None;
+    }
+    if let dom::NodeData::Element(e) = &doc.get(root).data {
+        if e.attrs.get("id").map(String::as_str) == Some(id) {
+            return Some(root);
+        }
+    }
+    for &c in &doc.get(root).children {
+        if let Some(f) = find_by_attr_id(doc, c, id) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// True if `id` is a single-line `<input>` (not a `<textarea>`).
+fn is_single_line_input(doc: &dom::Document, id: dom::NodeId) -> bool {
+    matches!(&doc.get(id).data, dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("input"))
+}
+
+/// Walk up from `node` to the nearest ancestor `<form>`, if any.
+fn ancestor_form(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
+    let mut cur = Some(node);
+    while let Some(id) = cur {
+        if id.0 >= doc.len() {
+            break;
+        }
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("form") {
+                return Some(id);
+            }
+        }
+        cur = doc.get(id).parent;
+    }
+    None
+}
+
+/// If the click on `node` lands on (or inside) a submit control — `<input type=submit>`,
+/// `<button type=submit>`, or a `<button>` with no/empty `type` — that sits inside a `<form>`,
+/// return that nearest ancestor form. Otherwise `None`.
+fn submit_target_form(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
+    fn is_submit_control(doc: &dom::Document, id: dom::NodeId) -> bool {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.attrs.contains_key("disabled") {
+                return false;
+            }
+            let ty =
+                e.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+            if e.tag.eq_ignore_ascii_case("button") {
+                // A <button> defaults to type=submit.
+                return ty.is_empty() || ty == "submit";
+            }
+            if e.tag.eq_ignore_ascii_case("input") {
+                return ty == "submit";
+            }
+        }
+        false
+    }
+    // Find the nearest ancestor-or-self submit control.
+    let mut cur = Some(node);
+    let mut control = None;
+    while let Some(id) = cur {
+        if id.0 >= doc.len() {
+            break;
+        }
+        if is_submit_control(doc, id) {
+            control = Some(id);
+            break;
+        }
+        cur = doc.get(id).parent;
+    }
+    control.and_then(|c| ancestor_form(doc, c))
 }
 
 /// Recursively paint a layout box and its children, translating every box by the fixed
@@ -2157,6 +2478,107 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn clicking_checkbox_toggles_checked_and_fires_change() {
+        let html = "<html><body>\
+            <input id=c type=checkbox>\
+            <script>\
+              document.getElementById('c').addEventListener('change', function (e) {\
+                document.body.setAttribute('data-changed', e.target.checked ? 'on' : 'off');\
+              });\
+            </script></body></html>";
+        let path = std::env::temp_dir().join("browser_checkbox_click_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 120, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render(); // build the layout cache so the checkbox has a hit box
+
+        let c = e.node_by_attr_id("c").expect("checkbox node");
+        assert!(e.node_attr(c, "checked").is_none(), "starts unchecked");
+        let (cx, cy) = e.node_center_device(c).expect("checkbox laid out");
+
+        assert!(e.dispatch_click(cx, cy), "clicking the checkbox warrants a re-render");
+        let c2 = e.node_by_attr_id("c").expect("checkbox node");
+        assert!(e.node_attr(c2, "checked").is_some(), "checkbox should be checked after click");
+        // The page's change handler set a body attribute.
+        let body = e.node_by_attr_id("__nope__"); // sanity: missing id returns None
+        assert!(body.is_none());
+        assert_eq!(
+            e.visible_attr_body("data-changed").as_deref(),
+            Some("on"),
+            "change handler should have run"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hover_move_fires_page_mouseover_handler() {
+        let html = "<html><body>\
+            <div id=m style=\"width:80px;height:40px;background-color:#445566\">menu</div>\
+            <script>\
+              document.getElementById('m').addEventListener('mouseover', function () {\
+                document.body.setAttribute('data-hover', 'yes');\
+              });\
+            </script></body></html>";
+        let path = std::env::temp_dir().join("browser_hover_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 120, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+
+        let m = e.node_by_attr_id("m").expect("menu node");
+        let (cx, cy) = e.node_center_device(m).expect("menu laid out");
+        assert!(e.dispatch_move(cx, cy), "moving over a new node should change hover");
+        assert_eq!(e.visible_attr_body("data-hover").as_deref(), Some("yes"));
+
+        // Moving again to the same node is a cheap no-op (returns false).
+        let _ = e.render();
+        let m2 = e.node_by_attr_id("m").expect("menu node");
+        let (cx2, cy2) = e.node_center_device(m2).expect("menu laid out");
+        assert!(!e.dispatch_move(cx2, cy2), "hovering the same node again is a no-op");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clicking_field_then_outside_fires_blur() {
+        let html = "<html><body>\
+            <input id=f>\
+            <div id=elsewhere style=\"width:60px;height:40px;background-color:#334455\">x</div>\
+            <script>\
+              document.getElementById('f').addEventListener('blur', function () {\
+                document.body.setAttribute('data-blurred', 'yes');\
+              });\
+            </script></body></html>";
+        let path = std::env::temp_dir().join("browser_blur_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 120, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+
+        // Focus the input via the test helper, then click outside it.
+        assert!(e.focus_first_text_field());
+        let _ = e.render();
+        let other = e.node_by_attr_id("elsewhere").expect("other node");
+        let (ox, oy) = e.node_center_device(other).expect("other laid out");
+        assert!(e.dispatch_click(ox, oy));
+        assert_eq!(
+            e.visible_attr_body("data-blurred").as_deref(),
+            Some("yes"),
+            "clicking outside the field should fire blur"
+        );
+        assert!(e.focused_node_for_test().is_none(), "focus cleared after clicking outside");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn base64_encode(data: &[u8]) -> String {
         const A: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -2552,7 +2974,7 @@ mod tests {
         let measurer = TestMeasurer;
         let no_images = HashMap::new();
         let root =
-            layout::layout_document(&doc, &computed, 400.0, 600.0, &measurer, &no_images);
+            layout::layout_document(&doc, &computed, 400.0, 600.0, &measurer, &no_images, None);
 
         // The painter clips to a band; paint into a small framebuffer without a font (text is
         // skipped when no font, but background/border painting still exercises the walk). Using
@@ -2607,7 +3029,7 @@ mod tests {
             let doc = html::parse(&html);
             let (sheets, _c) = collect_stylesheets(&doc, "https://example.com/");
             let computed = style::cascade(&doc, &sheets);
-            let root = layout::layout_document(&doc, &computed, 100.0, 200.0, &M, &HashMap::new());
+            let root = layout::layout_document(&doc, &computed, 100.0, 200.0, &M, &HashMap::new(), None);
             let mut fb = Framebuffer::new(100, 100);
             paint_gradient(&mut fb);
             let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
@@ -2703,7 +3125,7 @@ mod tests {
                 px * 1.3
             }
         }
-        let root = layout::layout_document(&doc, &computed, 400.0, 300.0, &M, &intrinsic);
+        let root = layout::layout_document(&doc, &computed, 400.0, 300.0, &M, &intrinsic, None);
 
         fn find_image(b: &layout::LayoutBox) -> Option<&layout::LayoutBox> {
             if matches!(b.content, layout::BoxContent::Image(_)) {

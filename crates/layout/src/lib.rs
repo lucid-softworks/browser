@@ -161,12 +161,15 @@ pub fn layout_document(
     viewport_height: f32,
     measurer: &dyn TextMeasurer,
     intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
+    focused: Option<dom::NodeId>,
 ) -> LayoutBox {
     // 1. Build the box tree from the DOM (skipping hidden / non-rendered subtrees), inserting
     //    anonymous blocks where block and inline siblings mix. Image boxes are sized from their
-    //    intrinsic dimensions (and any CSS width/height) during layout.
+    //    intrinsic dimensions (and any CSS width/height) during layout. `focused` is the node id
+    //    of the focused text field, whose value box gets a caret ("|") appended.
     let mut root = LayoutBox::new(BoxContent::Block, PaintStyle::default(), None);
-    root.children = build_children(doc, doc.root(), styles, intrinsic_sizes);
+    let bx_ctx = BuildCtx { styles, intrinsic_sizes, focused };
+    root.children = build_children(doc, doc.root(), &bx_ctx);
 
     // 2. The root is the viewport block. Lay it out against a containing block that is the
     //    viewport: origin (0,0), width = viewport_width.
@@ -418,6 +421,37 @@ fn input_display_text(el: &dom::ElementData) -> Option<String> {
     None
 }
 
+/// If `el` is an `<input type=checkbox>` or `<input type=radio>`, return the glyph to render for
+/// its current `checked` state: checkbox uses ☑/☐, radio uses ●/○. `None` for anything else.
+fn checkable_glyph(el: &dom::ElementData) -> Option<String> {
+    if !el.tag.eq_ignore_ascii_case("input") {
+        return None;
+    }
+    let ty = el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let checked = el.attrs.contains_key("checked");
+    match ty.as_str() {
+        "checkbox" => Some(if checked { "\u{2611}" } else { "\u{2610}" }.to_string()), // ☑ / ☐
+        "radio" => Some(if checked { "\u{25CF}" } else { "\u{25CB}" }.to_string()), // ● / ○
+        _ => None,
+    }
+}
+
+/// True if `el` is a field that should show a text caret when focused: a `<textarea>` or a
+/// text-like `<input>` (mirrors `input_display_text`'s text-like set; excludes button-like inputs).
+fn is_caret_field(el: &dom::ElementData) -> bool {
+    if el.tag.eq_ignore_ascii_case("textarea") {
+        return true;
+    }
+    if !el.tag.eq_ignore_ascii_case("input") {
+        return false;
+    }
+    let ty = el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    matches!(
+        ty.as_str(),
+        "" | "text" | "search" | "email" | "url" | "tel" | "password" | "number"
+    )
+}
+
 /// Build the paint style for an element from its computed style.
 fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
     PaintStyle {
@@ -441,14 +475,23 @@ fn edges_of(e: style::Edges) -> Edges {
     Edges { top: e.top, right: e.right, bottom: e.bottom, left: e.left }
 }
 
+/// Immutable inputs threaded through the (mutually recursive) box-tree builder. Bundling them in
+/// one reference keeps the recursive `build_box`/`build_children` stack frames small (deep DOM
+/// nesting recurses here), and gives the caret/checkbox code access to the focused node id.
+struct BuildCtx<'a> {
+    styles: &'a HashMap<dom::NodeId, style::ComputedStyle>,
+    intrinsic_sizes: &'a HashMap<dom::NodeId, (f32, f32)>,
+    focused: Option<dom::NodeId>,
+}
+
 /// Build the child boxes for `parent_id`'s children, wrapping runs of inline children in
 /// anonymous blocks when the parent also contains block children.
 fn build_children(
     doc: &dom::Document,
     parent_id: dom::NodeId,
-    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
-    intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
+    bx: &BuildCtx,
 ) -> Vec<LayoutBox> {
+    let styles = bx.styles;
     // First, produce a flat list of child boxes (each tagged block vs inline).
     let mut flat: Vec<LayoutBox> = Vec::new();
     for &child in &doc.get(parent_id).children {
@@ -456,7 +499,7 @@ fn build_children(
         if child.0 >= doc.len() {
             continue;
         }
-        build_box(doc, child, styles, intrinsic_sizes, &mut flat);
+        build_box(doc, child, bx, &mut flat);
     }
 
     // Classify each box as block-level for flow purposes. A block-level Image counts as a block;
@@ -503,16 +546,85 @@ fn make_anonymous(children: Vec<LayoutBox>) -> LayoutBox {
     anon
 }
 
+/// Build the box for a replaced element (`<img>`) or a form control (`<input>`/`<textarea>`).
+/// Returns `None` only for a zero-sized image (nothing to draw). Kept out of `build_box` (and
+/// `#[inline(never)]`) so its locals don't enlarge the recursive box-builder stack frame.
+#[inline(never)]
+fn build_replaced_or_control(
+    el: &dom::ElementData,
+    id: dom::NodeId,
+    cs: &style::ComputedStyle,
+    intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
+    focused: Option<dom::NodeId>,
+) -> Option<LayoutBox> {
+    let out_of_flow = matches!(cs.position, style::Position::Absolute | style::Position::Fixed);
+    let block_display = matches!(
+        cs.display,
+        style::Display::Block | style::Display::Flex | style::Display::Grid
+    ) || (cs.display == style::Display::Inline && cs.display_block);
+    let is_block = out_of_flow || block_display;
+
+    // <img>: a replaced box sized from CSS width/height and/or intrinsic dimensions.
+    if el.tag.eq_ignore_ascii_case("img") {
+        let intrinsic = intrinsic_sizes.get(&id).copied();
+        let (cw, ch) = image_content_size(cs.width, cs.height, intrinsic);
+        if cw <= 0.0 || ch <= 0.0 {
+            return None; // nothing known to draw; skip producing a box
+        }
+        let mut bx = LayoutBox::new(BoxContent::Image(id), paint_style_of(cs), Some(id));
+        bx.dimensions.margin = edges_of(cs.margin);
+        bx.dimensions.padding = edges_of(cs.padding);
+        bx.dimensions.border = edges_of(cs.border);
+        bx.dimensions.content.width = cw;
+        bx.dimensions.content.height = ch;
+        return Some(bx);
+    }
+
+    let content = if is_block { BoxContent::Block } else { BoxContent::Inline };
+    let ps = paint_style_of(cs);
+    let mut bx = LayoutBox::new(content, ps.clone(), Some(id));
+    bx.dimensions.margin = edges_of(cs.margin);
+    bx.dimensions.padding = edges_of(cs.padding);
+    bx.dimensions.border = edges_of(cs.border);
+
+    // Checkbox / radio: a small box with a glyph (☑/☐, ●/○) reflecting the checked state.
+    if let Some(glyph) = checkable_glyph(el) {
+        let mut gps = ps;
+        if gps.font_size <= 0.0 {
+            gps.font_size = 13.0;
+        }
+        bx.children.push(LayoutBox::new(BoxContent::Text(glyph), gps, Some(id)));
+        return Some(bx);
+    }
+
+    // Text-like control: render its value/placeholder (and, when focused, a trailing caret).
+    if let Some(mut label) = input_display_text(el) {
+        if focused == Some(id) && is_caret_field(el) {
+            label.push('|');
+        }
+        if !label.is_empty() {
+            bx.children.push(LayoutBox::new(BoxContent::Text(label), ps, Some(id)));
+        }
+        return Some(bx);
+    }
+
+    // Any other input type (hidden/file/color/range/date…): a styled, empty box (matching the old
+    // fall-through to generic element layout — inputs are void, so there are no children to add).
+    Some(bx)
+}
+
 /// Build the box (or boxes) for a single DOM node, pushing into `out`. May push nothing
 /// (hidden / non-rendered / empty text) or several (an inline element contributes its own
 /// box; its rendered text/children become that box's children).
 fn build_box(
     doc: &dom::Document,
     id: dom::NodeId,
-    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
-    intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
+    bx_ctx: &BuildCtx,
     out: &mut Vec<LayoutBox>,
 ) {
+    let styles = bx_ctx.styles;
+    let intrinsic_sizes = bx_ctx.intrinsic_sizes;
+    let focused = bx_ctx.focused;
     let node = doc.get(id);
     match &node.data {
         dom::NodeData::Text(text) => {
@@ -541,48 +653,21 @@ fn build_box(
             if cs.display_none {
                 return;
             }
-            // An <img> is a replaced element: build an Image box sized by its CSS width/height
-            // and/or intrinsic dimensions. It is atomic inline-level by default (like
-            // inline-block — it flows on a line and advances the pen), or block-level if its
-            // computed display is block/flex/grid (or it is out-of-flow).
-            if el.tag.eq_ignore_ascii_case("img") {
-                let intrinsic = intrinsic_sizes.get(&id).copied();
-                let (cw, ch) = image_content_size(cs.width, cs.height, intrinsic);
-                if cw <= 0.0 || ch <= 0.0 {
-                    return; // nothing known to draw; skip producing a box
+            // Replaced elements (<img>) and form controls (<input>/<textarea>) build a dedicated
+            // box (image / glyph / value text). Handled in a non-recursive helper so this frame —
+            // which recurses for deep DOM nesting — stays small.
+            if el.tag.eq_ignore_ascii_case("img")
+                || el.tag.eq_ignore_ascii_case("input")
+                || el.tag.eq_ignore_ascii_case("textarea")
+            {
+                if let Some(produced) =
+                    build_replaced_or_control(el, id, cs, intrinsic_sizes, focused)
+                {
+                    out.push(produced);
                 }
-                let mut bx = LayoutBox::new(BoxContent::Image(id), paint_style_of(cs), Some(id));
-                bx.dimensions.margin = edges_of(cs.margin);
-                bx.dimensions.padding = edges_of(cs.padding);
-                bx.dimensions.border = edges_of(cs.border);
-                // Pre-size the content box so layout can read the replaced size back.
-                bx.dimensions.content.width = cw;
-                bx.dimensions.content.height = ch;
-                out.push(bx);
-                return;
-            }
-            // Form controls (<input>, <textarea>): build the element's own styled box, then give
-            // it a synthetic Text child rendering the live `value` (or the `placeholder`). The box
-            // still sizes from CSS (the UA stylesheet gives form controls a width); we only add the
-            // text run so typed text / labels / placeholders appear and paint inside the control.
-            if let Some(label) = input_display_text(el) {
-                let out_of_flow =
-                    matches!(cs.position, style::Position::Absolute | style::Position::Fixed);
-                let block_display = matches!(
-                    cs.display,
-                    style::Display::Block | style::Display::Flex | style::Display::Grid
-                ) || (cs.display == style::Display::Inline && cs.display_block);
-                let is_block = out_of_flow || block_display;
-                let ps = paint_style_of(cs);
-                let content = if is_block { BoxContent::Block } else { BoxContent::Inline };
-                let mut bx = LayoutBox::new(content, ps.clone(), Some(id));
-                bx.dimensions.margin = edges_of(cs.margin);
-                bx.dimensions.padding = edges_of(cs.padding);
-                bx.dimensions.border = edges_of(cs.border);
-                if !label.is_empty() {
-                    bx.children.push(LayoutBox::new(BoxContent::Text(label), ps, Some(id)));
-                }
-                out.push(bx);
+                // For these tags we never fall through to generic element layout (img has no
+                // rendered children; inputs/textareas render their value, not their DOM subtree).
+                // A `None` from the helper (e.g. a zero-sized image, or `type=hidden`) drops the box.
                 return;
             }
             // A box is block-level in its parent's flow if it generates a block-level box
@@ -604,7 +689,7 @@ fn build_box(
             bx.dimensions.margin = edges_of(cs.margin);
             bx.dimensions.padding = edges_of(cs.padding);
             bx.dimensions.border = edges_of(cs.border);
-            bx.children = build_children(doc, id, styles, intrinsic_sizes);
+            bx.children = build_children(doc, id, bx_ctx);
             out.push(bx);
         }
         _ => {
@@ -2282,7 +2367,7 @@ mod tests {
         styles.insert(a, style::ComputedStyle { display_block: true, height: Some(30.0), ..Default::default() });
         styles.insert(b, style::ComputedStyle { display_block: true, height: Some(50.0), ..Default::default() });
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         assert_eq!(abox.dimensions.content.y, 0.0);
@@ -2313,7 +2398,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let c = abox.dimensions.content;
         // content x = 0 (containing) + margin.left 10 + border.left 2 + padding.left 5 = 17.
@@ -2349,7 +2434,7 @@ mod tests {
         );
 
         // Container is 1000 wide; the box must be clamped to 200.
-        let root_box = layout_document(&doc, &styles, 1000.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 1000.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         assert_eq!(abox.dimensions.content.width, 200.0);
     }
@@ -2373,7 +2458,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         // min-width raises the 50px width to 120.
         assert_eq!(abox.dimensions.content.width, 120.0);
@@ -2398,7 +2483,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         assert_eq!(abox.dimensions.content.height, 100.0);
     }
@@ -2422,7 +2507,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
         let texts = collect_text_boxes(pbox);
         let joined: String = texts
@@ -2458,7 +2543,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
         assert!((pbox.dimensions.content.height - 40.0).abs() < 0.01,
             "expected line advance 40, got {}", pbox.dimensions.content.height);
@@ -2475,7 +2560,7 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(a, style::ComputedStyle { display_block: true, width: Some(200.0), ..Default::default() });
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         assert_eq!(abox.dimensions.content.width, 200.0);
     }
@@ -2494,7 +2579,7 @@ mod tests {
         styles.insert(p, block_style(true)); // font_size 16 default
 
         // word "three" = 5 chars * 16 * 0.6 = 48px. Width 60 fits ~one word per line.
-        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
         let lines = count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)));
         assert!(lines > 1, "expected multiple wrapped lines, got {lines}");
@@ -2523,7 +2608,7 @@ mod tests {
         styles.insert(a, style::ComputedStyle::default());
 
         // Narrow width forces wrapping so we exercise multi-line runs.
-        let root_box = layout_document(&doc, &styles, 80.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 80.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
 
         // Some emitted Text box must carry the <a>'s text node.
@@ -2577,7 +2662,7 @@ mod tests {
         styles.insert(hidden, style::ComputedStyle { display_block: true, display_none: true, ..Default::default() });
         styles.insert(shown, block_style(true));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         assert!(find_box(&root_box, &|x| x.node == Some(hidden)).is_none());
         assert!(find_box(&root_box, &|x| x.node == Some(shown)).is_some());
     }
@@ -2595,7 +2680,7 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(d, block_style(true));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let anon = count_boxes(&root_box, &|x| matches!(x.content, BoxContent::Anonymous));
         assert_eq!(anon, 1);
     }
@@ -2614,7 +2699,7 @@ mod tests {
             parent = child;
         }
         doc.append_child(parent, dom::NodeData::Text("deep".into()));
-        let _ = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let _ = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
     }
 
     #[test]
@@ -2677,7 +2762,7 @@ mod tests {
         styles.insert(b, item(50.0));
         styles.insert(d, item(50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let dbox = find_box(&root_box, &|x| x.node == Some(d)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
@@ -2729,7 +2814,7 @@ mod tests {
         );
         styles.insert(d, fixed);
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         // free = 300 - 50 - 50 - 0(basis) = 200, all goes to b.
         assert!((bbox.dimensions.content.width - 200.0).abs() < 0.01,
@@ -2758,7 +2843,7 @@ mod tests {
         styles.insert(a, item(30.0));
         styles.insert(b, item(50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         assert!(bbox.dimensions.content.y > abox.dimensions.content.y);
@@ -2798,7 +2883,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         // Centered: a.y should be container.y + (100 - 20)/2 = +40.
@@ -2843,7 +2928,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(parent)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
         let pad = pbox.dimensions.padding_box();
@@ -2878,7 +2963,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
         let cb = cbox.dimensions.border_box();
         // Anchored to viewport (0,0): border-box at (15, 10).
@@ -2923,7 +3008,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(badge)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(corner)).unwrap();
         let pad = pbox.dimensions.padding_box();
@@ -2976,7 +3061,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(parent)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
         let pad = pbox.dimensions.padding_box();
@@ -3014,7 +3099,7 @@ mod tests {
             style::ComputedStyle { display_block: true, height: Some(40.0), ..Default::default() },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         // a shifted by (25, 5).
@@ -3044,7 +3129,7 @@ mod tests {
             style::ComputedStyle { display: style::Display::InlineBlock, ..Default::default() },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         // The inline-block becomes an atomic box (node == ib) sitting in the line.
         let ibbox = find_box(&root_box, &|x| x.node == Some(ib)).unwrap();
         // Intrinsic width = "XY" = 2 chars * 16 * 0.6 = 19.2.
@@ -3087,7 +3172,7 @@ mod tests {
             );
         }
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
@@ -3122,7 +3207,7 @@ mod tests {
         );
 
         // Narrow width forces the paragraph to wrap to several lines.
-        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
         let sbox = find_box(&root_box, &|x| x.node == Some(sib)).unwrap();
 
@@ -3152,7 +3237,7 @@ mod tests {
         let mut intrinsic = HashMap::new();
         intrinsic.insert(img, (100.0, 50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
         let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
         assert_eq!(ibox.dimensions.content.width, 100.0);
         assert_eq!(ibox.dimensions.content.height, 50.0);
@@ -3174,7 +3259,7 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(input, style::ComputedStyle { width: Some(120.0), ..Default::default() });
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let txt = find_box(&root_box, &|x| matches!(&x.content, BoxContent::Text(s) if s == "hello"));
         let txt = txt.expect("input value must render as a Text box");
         // The rendered text traces back to the input element.
@@ -3199,7 +3284,7 @@ mod tests {
         let mut intrinsic = HashMap::new();
         intrinsic.insert(img, (100.0, 50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
         let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
         assert_eq!(ibox.dimensions.content.width, 200.0);
         assert!((ibox.dimensions.content.height - 100.0).abs() < 0.01,
@@ -3224,7 +3309,7 @@ mod tests {
         let mut intrinsic = HashMap::new();
         intrinsic.insert(img, (100.0, 50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
         let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
         assert_eq!(ibox.dimensions.content.width, 40.0);
         assert_eq!(ibox.dimensions.content.height, 30.0);
@@ -3253,7 +3338,7 @@ mod tests {
         let mut intrinsic = HashMap::new();
         intrinsic.insert(img, (100.0, 50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
         let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
         let sbox = find_box(&root_box, &|x| x.node == Some(sib)).unwrap();
         assert_eq!(ibox.dimensions.content.height, 50.0);
@@ -3281,7 +3366,7 @@ mod tests {
         let mut intrinsic = HashMap::new();
         intrinsic.insert(img, (20.0, 10.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
         let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
         assert_eq!(ibox.dimensions.content.width, 20.0);
         // Sits to the right of the leading "ab" word.
@@ -3301,7 +3386,7 @@ mod tests {
         styles.insert(img, style::ComputedStyle::default());
 
         let intrinsic: HashMap<dom::NodeId, (f32, f32)> = HashMap::new();
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
         assert!(find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).is_none());
     }
 
@@ -3339,7 +3424,7 @@ mod tests {
         doc.append_child(b, dom::NodeData::Text("beta".into()));
         doc.append_child(d, dom::NodeData::Text("gamma".into()));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
         let boxes: Vec<_> = [a, b, d]
             .iter()
@@ -3373,5 +3458,97 @@ mod tests {
             cbox.dimensions.content.height,
             expected_min
         );
+    }
+
+    /// Set an attribute on an element node (test helper).
+    fn set_attr(doc: &mut dom::Document, id: dom::NodeId, name: &str, value: &str) {
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(id).data {
+            e.attrs.insert(name.to_string(), value.to_string());
+        }
+    }
+
+    /// Does any text run in the subtree contain `needle`?
+    fn has_text(b: &LayoutBox, needle: &str) -> bool {
+        find_box(b, &|x| matches!(&x.content, BoxContent::Text(s) if s.contains(needle))).is_some()
+    }
+
+    #[test]
+    fn checked_checkbox_renders_checked_indicator() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let input = doc.append_element(body, "input");
+        set_attr(&mut doc, input, "type", "checkbox");
+        set_attr(&mut doc, input, "checked", "");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(input, style::ComputedStyle::default());
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
+        // The checked checkbox glyph (☑) appears in a text run under the input box.
+        assert!(has_text(ibox, "\u{2611}"), "expected ☑ checked indicator");
+    }
+
+    #[test]
+    fn unchecked_checkbox_renders_empty_indicator() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let input = doc.append_element(body, "input");
+        set_attr(&mut doc, input, "type", "checkbox");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(input, style::ComputedStyle::default());
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
+        assert!(has_text(ibox, "\u{2610}"), "expected ☐ unchecked indicator");
+        assert!(!has_text(ibox, "\u{2611}"));
+    }
+
+    #[test]
+    fn focused_text_input_shows_caret() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let input = doc.append_element(body, "input");
+        set_attr(&mut doc, input, "type", "text");
+        set_attr(&mut doc, input, "value", "hi");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(input, style::ComputedStyle::default());
+
+        // Focused: the value run ends with a caret.
+        let root_box =
+            layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), Some(input));
+        let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
+        assert!(has_text(ibox, "hi|"), "focused input should show value + caret");
+
+        // Not focused: no caret.
+        let root_box2 = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox2 = find_box(&root_box2, &|x| x.node == Some(input)).unwrap();
+        assert!(!has_text(ibox2, "|"), "unfocused input must not show a caret");
+    }
+
+    #[test]
+    fn empty_focused_input_still_shows_caret() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let input = doc.append_element(body, "input");
+        set_attr(&mut doc, input, "type", "text");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(input, style::ComputedStyle::default());
+
+        let root_box =
+            layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), Some(input));
+        let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
+        assert!(has_text(ibox, "|"), "empty focused input should still show a caret");
     }
 }

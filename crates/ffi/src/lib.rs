@@ -245,3 +245,19 @@ pub unsafe extern "C" fn browser_engine_tick(engine: *mut Engine) -> i32 {
         _ => 0,
     }
 }
+
+/// Move the pointer to framebuffer device-pixel `(x, y)` (viewport-relative): fires the page's
+/// hover events (`mouseover`/`mouseout`/`mouseenter`/`mouseleave`/`mousemove`) as the node under
+/// the pointer changes. Cheap no-op when the hovered node is unchanged. Returns 1 if the DOM
+/// changed (re-render), else 0.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_dispatch_move(engine: *mut Engine, x: f32, y: f32) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_move(x, y))) {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
