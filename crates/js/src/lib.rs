@@ -950,6 +950,48 @@ fn prim_attr_names(
     rv.set(arr);
 }
 
+/// Directory where `localStorage` buckets persist (one JSON file per origin).
+fn storage_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(".imlunahey-browser").join("localstorage")
+}
+
+/// Map a storage key (an origin like `https://example.com`) to a safe filename.
+fn storage_path(key: &str) -> std::path::PathBuf {
+    let safe: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect();
+    let safe = if safe.is_empty() { "default".to_string() } else { safe };
+    storage_dir().join(format!("{}.json", &safe[..safe.len().min(180)]))
+}
+
+/// `__storageLoad(key) -> string` — the persisted JSON for `key`, or `""`.
+fn prim_storage_load(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let key = arg_str(scope, &args, 0);
+    let content = std::fs::read_to_string(storage_path(&key)).unwrap_or_default();
+    let s = js_str(scope, &content);
+    rv.set(s);
+}
+
+/// `__storageSave(key, json)` — persist `json` for `key` (localStorage write-through).
+fn prim_storage_save(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let key = arg_str(scope, &args, 0);
+    let json = arg_str(scope, &args, 1);
+    let _ = std::fs::create_dir_all(storage_dir());
+    let _ = std::fs::write(storage_path(&key), json);
+}
+
 /// `__appendChild(parentId, childId)` — reparent child under parent.
 fn prim_append_child(
     scope: &mut v8::PinScope,
@@ -1753,6 +1795,8 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__setAttr", prim_set_attr);
     set_fn(scope, global, "__removeAttr", prim_remove_attr);
     set_fn(scope, global, "__attrNames", prim_attr_names);
+    set_fn(scope, global, "__storageLoad", prim_storage_load);
+    set_fn(scope, global, "__storageSave", prim_storage_save);
     set_fn(scope, global, "__appendChild", prim_append_child);
     set_fn(scope, global, "__insertBefore", prim_insert_before);
     set_fn(scope, global, "__removeChild", prim_remove_child);
@@ -2405,19 +2449,46 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   };
 
   // --- Storage (localStorage / sessionStorage) ---------------------------------------------
-  function makeStorage() {
+  // `persistKey` (the origin) makes the bucket write-through to disk via __storageSave and load
+  // from __storageLoad — so localStorage survives reloads/restarts. sessionStorage passes none.
+  function makeStorage(persistKey) {
     var map = Object.create(null);
+    if (persistKey && typeof __storageLoad === "function") {
+      try {
+        var saved = __storageLoad(persistKey);
+        if (saved) { var o = JSON.parse(saved); for (var k in o) { map[k] = String(o[k]); } }
+      } catch (e) {}
+    }
+    var persist = (persistKey && typeof __storageSave === "function")
+      ? function () { try { __storageSave(persistKey, JSON.stringify(map)); } catch (e) {} }
+      : function () {};
     var s = {
       getItem: function (k) { k = String(k); return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; },
-      setItem: function (k, v) { map[String(k)] = String(v); },
-      removeItem: function (k) { delete map[String(k)]; },
-      clear: function () { map = Object.create(null); },
+      setItem: function (k, v) { map[String(k)] = String(v); persist(); },
+      removeItem: function (k) { delete map[String(k)]; persist(); },
+      clear: function () { map = Object.create(null); persist(); },
       key: function (i) { var ks = Object.keys(map); return i >= 0 && i < ks.length ? ks[i] : null; }
     };
     Object.defineProperty(s, "length", { get: function () { return Object.keys(map).length; }, enumerable: false, configurable: true });
-    return s;
+    // Wrap in a Proxy so named access works too (`localStorage.foo = 1`, `localStorage.foo`,
+    // `delete localStorage.foo`, `Object.keys(localStorage)`), backed by the same map.
+    try {
+      return new Proxy(s, {
+        get: function (t, prop) { if (prop in t) { return t[prop]; } return typeof prop === "string" ? t.getItem(prop) : undefined; },
+        set: function (t, prop, val) { if (prop in t && prop !== "length") { t[prop] = val; } else { t.setItem(String(prop), val); } return true; },
+        deleteProperty: function (t, prop) { if (Object.prototype.hasOwnProperty.call(map, prop)) { t.removeItem(String(prop)); } else { delete t[prop]; } return true; },
+        has: function (t, prop) { return (prop in t) || (typeof prop === "string" && Object.prototype.hasOwnProperty.call(map, prop)); },
+        ownKeys: function () { return Object.keys(map); },
+        getOwnPropertyDescriptor: function (t, prop) {
+          if (Object.prototype.hasOwnProperty.call(map, prop)) { return { value: map[prop], writable: true, enumerable: true, configurable: true }; }
+          return undefined;
+        }
+      });
+    } catch (e) { return s; }
   }
-  globalThis.localStorage = makeStorage();
+  globalThis.localStorage = makeStorage((function () {
+    try { var o = location.origin; return (o && o !== "null") ? o : (location.protocol + location.pathname); } catch (e) { return "default"; }
+  })());
   globalThis.sessionStorage = makeStorage();
 
   // --- screen ------------------------------------------------------------------------------
