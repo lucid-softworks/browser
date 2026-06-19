@@ -135,6 +135,11 @@ pub enum BoxContent {
     /// A replaced image box for the given DOM node. Sized from CSS width/height and/or the
     /// node's intrinsic size; the painter blits the decoded pixels into its content rect.
     Image(dom::NodeId),
+    /// The text-insertion caret of a focused text-like control: a thin vertical bar. The painter
+    /// fills its content rect with the box's foreground (`style.color`); its width/height are set
+    /// at build time (a ~2px-wide bar ≈ the font's cap height). It flows inline (atomically) so it
+    /// sits immediately after the value text (or at the start of an empty field).
+    Caret,
 }
 
 /// A node in the layout tree: geometry + paint info + children.
@@ -184,7 +189,7 @@ pub fn layout_document(
     // 1. Build the box tree from the DOM (skipping hidden / non-rendered subtrees), inserting
     //    anonymous blocks where block and inline siblings mix. Image boxes are sized from their
     //    intrinsic dimensions (and any CSS width/height) during layout. `focused` is the node id
-    //    of the focused text field, whose value box gets a caret ("|") appended.
+    //    of the focused text field, which gets a `BoxContent::Caret` bar after its value text.
     let mut root = LayoutBox::new(BoxContent::Block, PaintStyle::default(), None);
     let bx_ctx = BuildCtx { styles, intrinsic_sizes, focused };
     root.children = build_children(doc, doc.root(), &bx_ctx);
@@ -724,13 +729,36 @@ fn build_replaced_or_control(
         return Some(bx);
     }
 
-    // Text-like control: render its value/placeholder (and, when focused, a trailing caret).
-    if let Some(mut label) = input_display_text(el) {
-        if focused == Some(id) && is_caret_field(el) {
-            label.push('|');
+    // Text-like control: render its value/placeholder (and, when focused, a caret bar).
+    if let Some(label) = input_display_text(el) {
+        let caret = focused == Some(id) && is_caret_field(el);
+        // The value/placeholder text. When focused on a caret field, the "label" includes the
+        // placeholder only when there's no real value; browsers hide the placeholder while editing,
+        // so suppress it and show just the caret. We can tell value from placeholder by checking
+        // the raw `value` attribute.
+        let has_value = el.attrs.get("value").map(|v| !v.is_empty()).unwrap_or(false)
+            || el.tag.eq_ignore_ascii_case("textarea");
+        let show_text = if caret && !has_value { String::new() } else { label };
+        if !show_text.is_empty() {
+            bx.children.push(LayoutBox::new(BoxContent::Text(show_text), ps.clone(), Some(id)));
         }
-        if !label.is_empty() {
-            bx.children.push(LayoutBox::new(BoxContent::Text(label), ps, Some(id)));
+        if caret {
+            // A thin vertical bar ≈ the cap height of the control's text, in the foreground color.
+            // It flows inline (atomically) so it sits right after the value text (or at the start
+            // of an empty field). Vertically centered on the line via a top margin.
+            let fs = if ps.font_size > 0.0 { ps.font_size } else { 16.0 };
+            let cps = ps;
+            let mut cbx = LayoutBox::new(BoxContent::Caret, cps.clone(), Some(id));
+            let caret_h = (fs * 0.8).round().max(1.0); // ≈ cap height
+            cbx.dimensions.content.width = 2.0;
+            cbx.dimensions.content.height = caret_h;
+            // Center the bar on the text line: the line advance is ~font line-height; split the
+            // slack above/below. Use a top margin so the atomic placement drops the bar down.
+            let line_h = cps.line_height.unwrap_or(fs * 1.2);
+            let top = ((line_h - caret_h) / 2.0).max(0.0);
+            cbx.dimensions.margin.top = top;
+            cbx.dimensions.margin.bottom = (line_h - caret_h - top).max(0.0);
+            bx.children.push(cbx);
         }
         return Some(bx);
     }
@@ -1280,6 +1308,14 @@ fn intrinsic_width(
             line_w += ww + sp;
         }
         max_inline = line_w;
+    }
+
+    // Reserve room for a focused-field caret bar (an inline atomic) so a shrink-to-fit control
+    // doesn't clip the caret that sits right after its value text.
+    for c in &boxx.children {
+        if matches!(c.content, BoxContent::Caret) {
+            max_inline += c.dimensions.margin_box().width;
+        }
     }
 
     // Block children: the box is at least as wide as its widest block child.
@@ -2406,6 +2442,14 @@ fn collect_inline_items(
                 // An atomic inline image: position its (pre-sized) content box at a tentative
                 // origin so its margin box is well-formed, then emit it as an atomic item. It
                 // advances the line by its margin-box width and is repositioned on its line.
+                let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+                layout_image_box(&mut child, containing);
+                out.push(InlineItem::Atomic(Box::new(child)));
+            }
+            BoxContent::Caret => {
+                // The focused-field caret: an atomic, pre-sized thin bar. Like an image, give it a
+                // well-formed margin box at a tentative origin, then flow it inline so it sits
+                // right after the value text (its top margin centers it on the line).
                 let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
                 layout_image_box(&mut child, containing);
                 out.push(InlineItem::Atomic(Box::new(child)));
@@ -3762,33 +3806,65 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(input, style::ComputedStyle::default());
 
-        // Focused: the value run ends with a caret.
+        // Focused: the value text is "hi" (no pipe glyph) plus a separate caret bar box. The caret
+        // is laid out as a sibling of the value run (both owned by the input), so search the tree.
         let root_box =
             layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), Some(input));
-        let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
-        assert!(has_text(ibox, "hi|"), "focused input should show value + caret");
+        assert!(has_text(&root_box, "hi"), "focused input should still show its value");
+        assert!(!has_text(&root_box, "|"), "caret must be a bar, not a pipe glyph");
+        let caret = find_box(&root_box, &|x| matches!(x.content, BoxContent::Caret))
+            .expect("focused input should have a caret bar box");
+        assert_eq!(caret.node, Some(input), "caret belongs to the focused input");
+        assert!(
+            caret.dimensions.content.width > 0.0 && caret.dimensions.content.height > 0.0,
+            "caret bar has nonzero size"
+        );
 
-        // Not focused: no caret.
+        // Not focused: no caret box, no pipe.
         let root_box2 = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
-        let ibox2 = find_box(&root_box2, &|x| x.node == Some(input)).unwrap();
-        assert!(!has_text(ibox2, "|"), "unfocused input must not show a caret");
+        assert!(has_text(&root_box2, "hi"), "unfocused input still shows its value");
+        assert!(!has_text(&root_box2, "|"), "unfocused input must not show a caret");
+        assert_eq!(
+            count_boxes(&root_box2, &|x| matches!(x.content, BoxContent::Caret)),
+            0,
+            "unfocused input must not have a caret bar box"
+        );
     }
 
     #[test]
-    fn empty_focused_input_still_shows_caret() {
+    fn empty_focused_input_shows_caret_not_placeholder() {
         let mut doc = dom::Document::new();
         let root = doc.root();
         let body = doc.append_element(root, "body");
         let input = doc.append_element(body, "input");
         set_attr(&mut doc, input, "type", "text");
+        set_attr(&mut doc, input, "placeholder", "Search");
 
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
         styles.insert(input, style::ComputedStyle::default());
 
+        // Focused + empty: a caret bar, and the placeholder is hidden (as in real browsers).
         let root_box =
             layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), Some(input));
-        let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
-        assert!(has_text(ibox, "|"), "empty focused input should still show a caret");
+        assert!(
+            count_boxes(&root_box, &|x| matches!(x.content, BoxContent::Caret)) >= 1,
+            "empty focused input should show a caret bar"
+        );
+        assert!(
+            !has_text(&root_box, "Search"),
+            "placeholder must be hidden while a focused field is being edited"
+        );
+
+        // Unfocused + empty: the placeholder shows and there's no caret.
+        let root_box2 = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox2 = find_box(&root_box2, &|x| x.node == Some(input)).unwrap();
+        assert!(has_text(ibox2, "Search"), "unfocused empty input keeps its placeholder");
+        assert_eq!(
+            count_boxes(ibox2, &|x| matches!(x.content, BoxContent::Caret)),
+            0,
+            "unfocused input has no caret"
+        );
     }
 }
+

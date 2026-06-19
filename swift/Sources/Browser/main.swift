@@ -1427,6 +1427,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let fxDevice = Float(localPoint.x * scale)
         let fyDevice = Float(fyTop * scale)
 
+        // 0. If the click landed on a <select>, pop up a native dropdown menu instead of the normal
+        // click handling. The engine returns the select's options + selected index + on-screen rect.
+        if tab.pendingLoads == 0,
+           let cstr = browser_engine_select_at(engine, fxDevice, fyDevice) {
+            presentSelectMenu(json: String(cString: cstr), engine: engine, bitmapView: bitmapView, scale: scale)
+            return
+        }
+
         // 1. Fire the page's JS click handlers (bubbling). Returns 1 if the DOM changed. Skip while
         // a load is running on the engine queue (would race the background mutation).
         let changed = tab.pendingLoads == 0 ? browser_engine_dispatch_click(engine, fxDevice, fyDevice) : 0
@@ -1446,6 +1454,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         // 4. Otherwise, repaint if the JS handler changed the page.
+        if changed != 0 { refresh() }
+    }
+
+    /// The `<select>` node id the currently-open native dropdown menu belongs to (set while a menu
+    /// from `presentSelectMenu` is up; consumed by `selectMenuItemChosen`).
+    private var openSelectNodeID: Int = -1
+
+    /// Build and pop up a native `NSMenu` for a `<select>` from the JSON returned by
+    /// `browser_engine_select_at` (`{"id","x","y","w","h","selected","options":[...]}`). The rect is
+    /// in framebuffer device px (top-origin); we convert it to the view's bottom-origin point space
+    /// and pop the menu up at the control's top-left so it overlays the select. On pick, calls
+    /// `browser_engine_set_select_index` and refreshes.
+    private func presentSelectMenu(json: String, engine: OpaquePointer, bitmapView: NSView, scale: CGFloat) {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = obj["id"] as? Int,
+              let options = obj["options"] as? [String] else { return }
+        let selected = (obj["selected"] as? Int) ?? 0
+        let rx = (obj["x"] as? Double).map { CGFloat($0) } ?? 0
+        let ry = (obj["y"] as? Double).map { CGFloat($0) } ?? 0
+
+        self.openSelectNodeID = id
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        for (i, label) in options.enumerated() {
+            let item = NSMenuItem(title: label, action: #selector(selectMenuItemChosen(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = i
+            item.state = (i == selected) ? .on : .off
+            menu.addItem(item)
+        }
+
+        // Engine rect is device px, top-origin. Convert to view points; the view is NOT flipped
+        // (bottom-left origin), so the select's TOP edge in view space is (height - ry/scale). Pop
+        // the menu up there so it overlays the control.
+        let xPts = rx / scale
+        let topInViewPts = bitmapView.bounds.height - (ry / scale)
+        let point = CGPoint(x: xPts, y: topInViewPts)
+        let preselected = (selected >= 0 && selected < menu.items.count) ? menu.items[selected] : nil
+        menu.popUp(positioning: preselected, at: point, in: bitmapView)
+    }
+
+    /// A native dropdown menu item was chosen: apply the selection to the engine's `<select>` and
+    /// re-render if it changed.
+    @objc private func selectMenuItemChosen(_ sender: NSMenuItem) {
+        guard let engine = activeTab?.engine, openSelectNodeID >= 0 else { return }
+        let index = sender.tag
+        let changed = browser_engine_set_select_index(engine, UInt(openSelectNodeID), UInt(index))
+        openSelectNodeID = -1
         if changed != 0 { refresh() }
     }
 

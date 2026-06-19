@@ -22,6 +22,7 @@ pub struct Engine {
     last_eval: Option<CString>,
     last_console: Option<CString>,
     last_netlog: Option<CString>,
+    last_select: Option<CString>,
 }
 
 /// A borrowed view of the engine's RGBA8 (straight-alpha) framebuffer.
@@ -50,6 +51,7 @@ pub extern "C" fn browser_engine_new() -> *mut Engine {
         last_eval: None,
         last_console: None,
         last_netlog: None,
+        last_select: None,
     }))
 }
 
@@ -382,6 +384,92 @@ pub unsafe extern "C" fn browser_engine_dispatch_mouse(
     }
     let kind = CStr::from_ptr(kind).to_string_lossy().into_owned();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_mouse(&kind, x, y))) {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
+
+/// Minimal JSON string escaper (quotes, backslash, control chars) for embedding option labels.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Hit-test the most recently rendered page at framebuffer device-pixel `(x, y)` (viewport-
+/// relative). If a `<select>` is under that point, returns a NUL-terminated UTF-8 JSON string
+/// `{"id":N,"x":..,"y":..,"w":..,"h":..,"selected":K,"options":["..",..]}` (rect in device px,
+/// scroll subtracted); otherwise returns null.
+///
+/// Lifetime: owned by the engine handle (stored in `last_select`); valid until the next
+/// `browser_engine_select_at` call on this handle, or until `browser_engine_free`.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_select_at(
+    engine: *mut Engine,
+    x: f32,
+    y: f32,
+) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let hit = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.select_at(x, y))) {
+        Ok(h) => h,
+        Err(_) => None,
+    };
+    match hit {
+        Some(h) => {
+            let opts: Vec<String> =
+                h.options.iter().map(|o| format!("\"{}\"", json_escape(o))).collect();
+            let json = format!(
+                "{{\"id\":{},\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"selected\":{},\"options\":[{}]}}",
+                h.node_id, h.x, h.y, h.width, h.height, h.selected, opts.join(",")
+            );
+            match CString::new(json) {
+                Ok(cstr) => {
+                    let ptr = cstr.as_ptr();
+                    e.last_select = Some(cstr);
+                    ptr
+                }
+                Err(_) => {
+                    e.last_select = None;
+                    std::ptr::null()
+                }
+            }
+        }
+        None => {
+            e.last_select = None;
+            std::ptr::null()
+        }
+    }
+}
+
+/// Pick the `index`-th `<option>` of the `<select>` whose node id is `node_id`: updates the
+/// selection + `value` and fires bubbling `input`/`change` in the live page JS (so the page's
+/// `change` handler runs). Returns 1 if the selection changed (re-render warranted), else 0.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_set_select_index(
+    engine: *mut Engine,
+    node_id: usize,
+    index: usize,
+) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.inner.set_select_index(node_id, index)
+    })) {
         Ok(true) => 1,
         _ => 0,
     }

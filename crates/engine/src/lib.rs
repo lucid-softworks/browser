@@ -76,6 +76,22 @@ struct LayoutCache {
     content_h: f32,
 }
 
+/// The result of a click landing on (or inside) a `<select>` control: enough for the platform
+/// shell to pop up a native dropdown menu and report back the chosen index. The rect (`x`/`y`/
+/// `width`/`height`) is in DEVICE pixels, viewport-relative (scroll already subtracted) — the
+/// caller divides by the backing scale to get points. `selected` is the 0-based index of the
+/// currently-selected option in `options`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectHit {
+    pub node_id: usize,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub options: Vec<String>,
+    pub selected: usize,
+}
+
 pub struct Engine {
     /// Logical viewport size in points and the backing scale factor (e.g. 2.0 on Retina).
     vp_w: u32,
@@ -639,6 +655,78 @@ impl Engine {
         } else {
             false
         }
+    }
+
+    /// Hit-test the cached layout at framebuffer device-pixel `(x, y)` (viewport-relative) and, if
+    /// the deepest box hit belongs to (or descends from) a `<select>`, return a [`SelectHit`] with
+    /// the select's option labels, the currently-selected index, and the select's on-screen rect
+    /// (DEVICE px, scroll already subtracted) so the platform shell can pop up a native dropdown.
+    /// Returns `None` when there's no cached layout/DOM, no box hit, or no enclosing `<select>`.
+    pub fn select_at(&self, x: f32, y: f32) -> Option<SelectHit> {
+        let cache = self.layout_cache.as_ref()?;
+        let doc = match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => d,
+            _ => return None,
+        };
+        // Same hit-test mapping as dispatch_click: layout coords add scroll_y.
+        let node = deepest_node_at(&cache.root, x, y + self.scroll_y)?;
+
+        // Nearest ancestor-or-self <select>.
+        let mut cur = Some(node);
+        let select_id = loop {
+            let id = cur?;
+            if id.0 < doc.len() {
+                if let dom::NodeData::Element(el) = &doc.get(id).data {
+                    if el.tag.eq_ignore_ascii_case("select")
+                        && !el.attrs.contains_key("disabled")
+                    {
+                        break id;
+                    }
+                }
+            }
+            cur = doc.get(id).parent;
+        };
+
+        // Collect descendant <option>s (depth-first, including inside <optgroup>).
+        let options = collect_options(doc, select_id);
+        if options.is_empty() {
+            return None;
+        }
+        let labels: Vec<String> = options.iter().map(|&o| option_text(doc, o)).collect();
+        let selected = selected_option_index(doc, select_id, &options);
+
+        // The select's principal box rect (device px), viewport-relative.
+        let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
+        collect_node_rects(&cache.root, &mut rects);
+        let r = rects.get(&select_id.0)?;
+        Some(SelectHit {
+            node_id: select_id.0,
+            x: fnum(r.x),
+            y: fnum(r.y - self.scroll_y),
+            width: fnum(r.width),
+            height: fnum(r.height),
+            options: labels,
+            selected,
+        })
+    }
+
+    /// Pick the `index`-th `<option>` of the `<select>` `node_id`: marks it selected (clearing the
+    /// others), updates the select's `value`, and fires bubbling `input` then `change` through the
+    /// live JS session so the page's handlers run. Adopts the updated DOM snapshot and invalidates
+    /// the layout cache (mirrors the checkbox-toggle path). Returns whether the selection changed.
+    pub fn set_select_index(&mut self, node_id: usize, index: usize) -> bool {
+        let session = match &self.session {
+            Some(s) => s,
+            None => return false,
+        };
+        let (changed, mut snapshot, console) = session.set_select_index(node_id, index);
+        snapshot.prune_invalid();
+        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            *doc = Some(snapshot);
+            c.extend(console);
+            self.layout_cache = None; // selection changed the DOM → re-cascade/layout/paint
+        }
+        changed
     }
 
     /// Dispatch a synthetic pointer move (device pixel coords, viewport-relative) into the live page
@@ -1210,6 +1298,84 @@ fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<dom::NodeId>
     }
 }
 
+/// Collect the descendant `<option>` ids of a `<select>` depth-first (including those nested in
+/// `<optgroup>`). Mirrors the layout crate's `selected_option_text` walk so the option order /
+/// indices agree between what we render and what the dropdown menu offers.
+fn collect_options(doc: &dom::Document, select_id: dom::NodeId) -> Vec<dom::NodeId> {
+    let mut out = Vec::new();
+    fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut Vec<dom::NodeId>) {
+        for &child in &doc.get(id).children {
+            if child.0 >= doc.len() {
+                continue;
+            }
+            if let dom::NodeData::Element(el) = &doc.get(child).data {
+                if el.tag.eq_ignore_ascii_case("option") {
+                    out.push(child);
+                }
+            }
+            walk(doc, child, out);
+        }
+    }
+    walk(doc, select_id, &mut out);
+    out
+}
+
+/// Collapsed text content of an `<option>` (its descendant text nodes, whitespace-collapsed) — the
+/// label shown for that option in the dropdown menu.
+fn option_text(doc: &dom::Document, opt: dom::NodeId) -> String {
+    fn gather(doc: &dom::Document, id: dom::NodeId, s: &mut String) {
+        for &child in &doc.get(id).children {
+            if child.0 >= doc.len() {
+                continue;
+            }
+            match &doc.get(child).data {
+                dom::NodeData::Text(t) => s.push_str(t),
+                dom::NodeData::Element(_) => gather(doc, child, s),
+                _ => {}
+            }
+        }
+    }
+    let mut s = String::new();
+    gather(doc, opt, &mut s);
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The 0-based index (into `options`) of the currently-selected `<option>`, using the same priority
+/// as the layout crate's `selected_option_text`: an `<option selected>`, else the option whose
+/// value matches the select's `value` attr, else the first option (index 0).
+fn selected_option_index(
+    doc: &dom::Document,
+    select_id: dom::NodeId,
+    options: &[dom::NodeId],
+) -> usize {
+    // 1. An <option selected>.
+    for (i, &opt) in options.iter().enumerate() {
+        if let dom::NodeData::Element(el) = &doc.get(opt).data {
+            if el.attrs.contains_key("selected") {
+                return i;
+            }
+        }
+    }
+    // 2. The option whose value matches the select's `value`.
+    if let dom::NodeData::Element(sel) = &doc.get(select_id).data {
+        if let Some(want) = sel.attrs.get("value") {
+            for (i, &opt) in options.iter().enumerate() {
+                if let dom::NodeData::Element(el) = &doc.get(opt).data {
+                    let val = match el.attrs.get("value") {
+                        Some(v) => v.clone(),
+                        None => option_text(doc, opt),
+                    };
+                    if &val == want {
+                        return i;
+                    }
+                }
+            }
+        }
+    }
+    // 3. The first option.
+    0
+}
+
 /// Kind of observer a target belongs to.
 #[derive(Clone, Copy, PartialEq)]
 enum ObsKind {
@@ -1690,6 +1856,14 @@ fn paint_box_opacity(
                     }
                 }
             }
+        }
+
+        // (c2) Caret: the focused-field text cursor. A solid thin bar filling the content rect in
+        // the foreground color (mapped through the affine like any other box).
+        if matches!(b.content, layout::BoxContent::Caret) {
+            let ca = scale_alpha(255, opacity);
+            let cc = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ca };
+            fill_box(fb, xf, content.x, content.y, content.width, content.height, 0.0, cc, axis);
         }
 
         // (d) Replaced image content: blit the decoded pixels into the content rect, scaled.
@@ -3646,6 +3820,57 @@ mod tests {
             "clicking outside the field should fire blur"
         );
         assert!(e.focused_node_for_test().is_none(), "focus cleared after clicking outside");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn select_at_reports_options_and_set_select_index_fires_change() {
+        let html = "<html><body>\
+            <select id=s>\
+              <option value=a>Apple</option>\
+              <option value=b selected>Banana</option>\
+              <option value=c>Cherry</option>\
+            </select>\
+            <script>\
+              document.getElementById('s').addEventListener('change', function (e) {\
+                document.body.setAttribute('data-changed', e.target.value);\
+              });\
+            </script></body></html>";
+        let path = std::env::temp_dir().join("browser_select_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 120, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+
+        let s = e.node_by_attr_id("s").expect("select node");
+        let (cx, cy) = e.node_center_device(s).expect("select laid out");
+
+        // select_at over the laid-out <select> returns its three options + selected index (Banana).
+        let hit = e.select_at(cx, cy).expect("click on <select> returns a SelectHit");
+        assert_eq!(hit.node_id, s.0);
+        assert_eq!(hit.options, vec!["Apple".to_string(), "Banana".to_string(), "Cherry".to_string()]);
+        assert_eq!(hit.selected, 1, "Banana is the pre-selected option");
+        assert!(hit.width > 0.0 && hit.height > 0.0, "rect has a size");
+
+        // Picking Cherry changes the selection, fires change (handler stamps body), and is reflected
+        // by a fresh select_at (now selected index 2).
+        assert!(e.set_select_index(s.0, 2), "selecting a different option changes it");
+        assert_eq!(
+            e.visible_attr_body("data-changed").as_deref(),
+            Some("c"),
+            "the page's change handler ran with the new value"
+        );
+        let _ = e.render();
+        let s2 = e.node_by_attr_id("s").expect("select node");
+        let (cx2, cy2) = e.node_center_device(s2).expect("select laid out");
+        let hit2 = e.select_at(cx2, cy2).expect("still a select");
+        assert_eq!(hit2.selected, 2, "Cherry is now selected");
+
+        // Re-selecting the same option reports no change.
+        assert!(!e.set_select_index(s2.0, 2), "re-picking the current option is a no-op");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -4279,6 +4279,55 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     __dispatchSyntheticEvent(nodeId, "change", {});
   });
 
+  // --- <select> option pick (driven from Rust when the native dropdown menu is used) ---------
+  // Mark the `index`-th descendant <option> as selected (clearing `selected` on the others), set
+  // the <select>'s `value` attribute to the chosen option's value (its `value` attr, else its
+  // text), then fire bubbling `input` + `change` on the <select> so the page reacts. Returns true
+  // if the selection actually changed. <optgroup>s are flattened (depth-first); single-pick only.
+  def(globalThis, "__setSelectIndex", function (nodeId, index) {
+    var sel = null;
+    try { sel = canon(__wrapNode(nodeId)); } catch (e) { sel = null; }
+    if (!sel) { return false; }
+    var tag = "";
+    try { tag = typeof sel.tagName === "string" ? sel.tagName.toLowerCase() : ""; } catch (e2) {}
+    if (tag !== "select") { return false; }
+    if (__getAttr(nodeId, "disabled") != null) { return false; }
+
+    var options = [];
+    try { options = sel.querySelectorAll("option"); } catch (e3) { options = []; }
+    if (index < 0 || index >= options.length) { return false; }
+
+    var optText = function (opt) {
+      var t = "";
+      try { t = opt.textContent == null ? "" : String(opt.textContent); } catch (e) {}
+      return t.replace(/\s+/g, " ").replace(/^ | $/g, "");
+    };
+    var optValue = function (opt) {
+      var v = null;
+      try { v = opt.getAttribute("value"); } catch (e) {}
+      return v == null ? optText(opt) : String(v);
+    };
+
+    // Was this already the selected option? (matches the layout crate's selection rule.)
+    var wasSelected = false;
+    try { wasSelected = options[index].getAttribute("selected") != null; } catch (e4) {}
+
+    for (var i = 0; i < options.length; i++) {
+      try {
+        if (i === index) { options[i].setAttribute("selected", ""); }
+        else { options[i].removeAttribute("selected"); }
+      } catch (e5) {}
+    }
+    var newValue = optValue(options[index]);
+    var prevValue = String(__getAttr(nodeId, "value") || "");
+    try { __setAttr(nodeId, "value", newValue); } catch (e6) {}
+
+    var changed = !wasSelected || prevValue !== newValue;
+    __dispatchSyntheticEvent(nodeId, "input", {});
+    __dispatchSyntheticEvent(nodeId, "change", {});
+    return changed;
+  });
+
   // --- key input handler (driven from Rust on physical key presses) -------------------------
   // Fire keydown, mutate the focused text field's value (firing input), then keyup. Returns
   // nothing; the caller reads back the updated DOM snapshot. Text-like <input>/<textarea> only.
@@ -5551,6 +5600,21 @@ impl Session {
     /// have already fired `click`. Returns a fresh DOM snapshot + console.
     pub fn toggle_checkbox(&self, node_id: usize) -> (dom::Document, Vec<String>) {
         self.eval_interact(format!("__toggleCheckable({node_id})"))
+    }
+
+    /// Pick the `index`-th `<option>` of `<select>` `node_id`: marks it selected (clearing the
+    /// others), sets the select's `value` attribute, then fires bubbling `input` + `change` so the
+    /// page's handlers run. Returns `(changed, snapshot, console)` where `changed` is whether the
+    /// selection actually changed. No-op (changed=false) for disabled / non-select / bad index.
+    pub fn set_select_index(
+        &self,
+        node_id: usize,
+        index: usize,
+    ) -> (bool, dom::Document, Vec<String>) {
+        let (out, doc, console) =
+            self.eval_full(format!("Boolean(__setSelectIndex({node_id}, {index}))"));
+        let changed = out.value.as_deref() == Some("true");
+        (changed, doc, console)
     }
 
     /// Fire a synthetic **bubbling** event of `kind` on `node_id` (empty props), drain the loop,

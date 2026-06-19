@@ -231,6 +231,30 @@ const char *browser_engine_network_log(struct Engine *engine);
  */
 int32_t browser_engine_dispatch_mouse(struct Engine *engine, const char *kind, float x, float y);
 
+/**
+ * Hit-test the most recently rendered page at framebuffer device-pixel `(x, y)` (viewport-
+ * relative). If a `<select>` is under that point, returns a NUL-terminated UTF-8 JSON string
+ * `{"id":N,"x":..,"y":..,"w":..,"h":..,"selected":K,"options":["..",..]}` (rect in device px,
+ * scroll subtracted); otherwise returns null.
+ *
+ * Lifetime: owned by the engine handle (stored in `last_select`); valid until the next
+ * `browser_engine_select_at` call on this handle, or until `browser_engine_free`.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_select_at(struct Engine *engine, float x, float y);
+
+/**
+ * Pick the `index`-th `<option>` of the `<select>` whose node id is `node_id`: updates the
+ * selection + `value` and fires bubbling `input`/`change` in the live page JS (so the page's
+ * `change` handler runs). Returns 1 if the selection changed (re-render warranted), else 0.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+int32_t browser_engine_set_select_index(struct Engine *engine, uintptr_t node_id, uintptr_t index);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
