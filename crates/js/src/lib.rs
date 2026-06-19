@@ -1949,6 +1949,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // --- DOM lifecycle dispatch (driven from Rust during the drain) --------------------------
   var readyState = "loading";
   Object.defineProperty(document, "readyState", { get: function () { return readyState; }, enumerable: true, configurable: true });
+  // The document's window. Code reads `document.defaultView` (and `node.ownerDocument.defaultView`)
+  // to reach the global — e.g. google's `_.ai = a => a ? a.defaultView : window`, then
+  // `_.ai(doc).devicePixelRatio`. Must be the same object as window/globalThis/self.
+  if (!("defaultView" in document)) { def(document, "defaultView", globalThis); }
   document.referrer = "";
   document.URL = parts.href;
   document.documentURI = parts.href;
@@ -2906,6 +2910,32 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 
   if (typeof globalThis.structuredClone !== "function") {
     def(globalThis, "structuredClone", function (v) { try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; } });
+  }
+
+  // CSS namespace: CSS.supports (feature detection — optimistic), CSS.escape (selector escaping),
+  // and no-op registerProperty. Pages reference `CSS` directly (ReferenceError otherwise).
+  if (typeof globalThis.CSS === "undefined") {
+    var CSSns = {
+      supports: function (prop, value) {
+        try {
+          if (value !== undefined) { return String(prop).length > 0 && String(value).length > 0; }
+          var c = String(prop); return c.indexOf(":") > 0 || c.indexOf("(") >= 0;
+        } catch (e) { return false; }
+      },
+      escape: function (s) {
+        s = String(s); var out = "";
+        for (var i = 0; i < s.length; i++) {
+          var ch = s.charAt(i), c = s.charCodeAt(i);
+          if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 95 || c > 127) { out += ch; }
+          else if (c === 0) { out += "�"; }
+          else { out += "\\" + ch; }
+        }
+        return out;
+      },
+      registerProperty: function () {},
+      px: function (n) { return { value: Number(n) || 0, unit: "px", toString: function () { return (Number(n) || 0) + "px"; } }; }
+    };
+    def(globalThis, "CSS", CSSns);
   }
 
   // NodeFilter constants (used with createTreeWalker / createNodeIterator below).
