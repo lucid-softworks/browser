@@ -696,6 +696,14 @@ impl Engine {
             console.extend(c);
         }
 
+        // <details>/<summary>: a click on a summary toggles the parent <details> open/closed.
+        if let Some(details) = details_toggle_target(&snapshot, node) {
+            let (s, c) = session.toggle_details(details.0);
+            snapshot = s;
+            snapshot.prune_invalid();
+            console.extend(c);
+        }
+
         // Submit: a click on a submit button (<input type=submit>, <button type=submit>, or a
         // <button> with no type) inside a form fires `submit` on the nearest ancestor <form>.
         if let Some(form) = submit_target_form(&snapshot, node) {
@@ -1957,6 +1965,35 @@ fn checkable_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeI
                         }
                     }
                 }
+            }
+        }
+        cur = doc.get(id).parent;
+    }
+    None
+}
+
+/// If the click landed on (or inside) a `<summary>`, return its nearest ancestor `<details>` so it
+/// can be toggled open/closed. `None` otherwise.
+fn details_toggle_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
+    let mut cur = Some(node);
+    while let Some(id) = cur {
+        if id.0 >= doc.len() {
+            break;
+        }
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("summary") {
+                let mut p = doc.get(id).parent;
+                while let Some(pid) = p {
+                    if pid.0 < doc.len() {
+                        if let dom::NodeData::Element(pe) = &doc.get(pid).data {
+                            if pe.tag.eq_ignore_ascii_case("details") {
+                                return Some(pid);
+                            }
+                        }
+                    }
+                    p = doc.get(pid).parent;
+                }
+                return None;
             }
         }
         cur = doc.get(id).parent;

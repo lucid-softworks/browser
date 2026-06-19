@@ -4280,6 +4280,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   });
 
   // --- <select> option pick (driven from Rust when the native dropdown menu is used) ---------
+  // Toggle a <details>'s `open` attribute (from clicking its <summary>), then fire a non-bubbling
+  // `toggle` event so the page reacts.
+  def(globalThis, "__toggleDetails", function (nodeId) {
+    var el = null;
+    try { el = canon(__wrapNode(nodeId)); } catch (e) { el = null; }
+    if (!el) { return; }
+    var tag = "";
+    try { tag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : ""; } catch (e2) {}
+    if (tag !== "details") { return; }
+    if (__getAttr(nodeId, "open") != null) { __removeAttr(nodeId, "open"); }
+    else { __setAttr(nodeId, "open", ""); }
+    __dispatchSyntheticEventNonBubbling(nodeId, "toggle", {});
+  });
+
   // Mark the `index`-th descendant <option> as selected (clearing `selected` on the others), set
   // the <select>'s `value` attribute to the chosen option's value (its `value` attr, else its
   // text), then fire bubbling `input` + `change` on the <select> so the page reacts. Returns true
@@ -5598,6 +5612,11 @@ impl Session {
     /// (unchecking same-`name` siblings in the same form/document), then fires bubbling `input`
     /// and `change` events. No-op for disabled / non-checkable controls. The caller is expected to
     /// have already fired `click`. Returns a fresh DOM snapshot + console.
+    /// Toggle a `<details>` open/closed (from a `<summary>` click) + fire `toggle`. Snapshot + console.
+    pub fn toggle_details(&self, node_id: usize) -> (dom::Document, Vec<String>) {
+        self.eval_interact(format!("__toggleDetails({node_id})"))
+    }
+
     pub fn toggle_checkbox(&self, node_id: usize) -> (dom::Document, Vec<String>) {
         self.eval_interact(format!("__toggleCheckable({node_id})"))
     }

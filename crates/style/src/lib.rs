@@ -4656,6 +4656,22 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          pre { display: block }
          table { display: block }
          tr { display: block }
+         details { display: block }
+         summary { display: block }
+         figure { display: block }
+         figcaption { display: block }
+         fieldset { display: block }
+         legend { display: block }
+         form { display: block }
+         dl { display: block }
+         dt { display: block }
+         dd { display: block }
+         address { display: block }
+         hr { display: block }
+         caption { display: block }
+         details:not([open]) > :not(summary) { display: none }
+         summary::before { content: \"\\25B8 \" }
+         details[open] > summary::before { content: \"\\25BE \" }
          b { font-weight: bold }
          strong { font-weight: bold }
          i { font-style: italic }
