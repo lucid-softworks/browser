@@ -21,6 +21,8 @@ final class BitmapView: NSView {
     var onKeyDown: ((NSEvent) -> Bool)?
     /// Called with a view-local point as the pointer moves, so the page's hover events can fire.
     var onMove: ((CGPoint) -> Void)?
+    /// Called with a raw mouse event kind ("mousedown"/"mouseup"/"dblclick"/"contextmenu") + point.
+    var onMouseEvent: ((String, CGPoint) -> Void)?
 
     // Accept keyboard focus so typing into a page text field routes here.
     override var acceptsFirstResponder: Bool { true }
@@ -56,12 +58,15 @@ final class BitmapView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        mouseDownPoint = convert(event.locationInWindow, from: nil)
+        let p = convert(event.locationInWindow, from: nil)
+        mouseDownPoint = p
+        onMouseEvent?("mousedown", p)
     }
 
     override func mouseUp(with event: NSEvent) {
         let up = convert(event.locationInWindow, from: nil)
         defer { mouseDownPoint = nil }
+        onMouseEvent?("mouseup", up)
         // Treat as a click only if the pointer barely moved (not a drag / text selection).
         if let down = mouseDownPoint {
             let dx = up.x - down.x
@@ -69,6 +74,11 @@ final class BitmapView: NSView {
             if (dx * dx + dy * dy) > 16 { return } // moved > 4pt: a drag, ignore
         }
         onClick?(up)
+        if event.clickCount == 2 { onMouseEvent?("dblclick", up) }
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        onMouseEvent?("contextmenu", convert(event.locationInWindow, from: nil))
     }
 
     // Pointing-hand cursor when hovering a link (nice-to-have).
@@ -518,6 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.isLinkAt = { [weak self] point in self?.linkURL(at: point) != nil }
         bitmapView.onKeyDown = { [weak self] event in self?.handleKeyDown(event) ?? false }
         bitmapView.onMove = { [weak self] point in self?.handleContentMove(point) }
+        bitmapView.onMouseEvent = { [weak self] kind, point in self?.handleMouseEvent(kind, point) }
         content.addSubview(bitmapView)
 
         // MARK: Auto Layout
@@ -962,6 +973,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         // 4. Otherwise, repaint if the JS handler changed the page.
+        if changed != 0 { refresh() }
+    }
+
+    /// A raw mouse event (mousedown/mouseup/dblclick/contextmenu) on the page content.
+    private func handleMouseEvent(_ kind: String, _ localPoint: CGPoint) {
+        guard let tab = activeTab, let engine = tab.engine, let bitmapView = bitmapView,
+              tab.pendingLoads == 0 else { return }
+        let scale = CGFloat(window?.backingScaleFactor ?? 1)
+        let fyTop = bitmapView.bounds.height - localPoint.y
+        let fxDevice = Float(localPoint.x * scale)
+        let fyDevice = Float(fyTop * scale)
+        let changed = kind.withCString { browser_engine_dispatch_mouse(engine, $0, fxDevice, fyDevice) }
         if changed != 0 { refresh() }
     }
 

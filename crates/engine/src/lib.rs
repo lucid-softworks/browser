@@ -384,6 +384,35 @@ impl Engine {
     /// JS: hit-tests the cached layout for the deepest node, fires the page's `click` handlers
     /// (with bubbling) in the persistent runtime, then replaces the rendered DOM with the updated
     /// snapshot and invalidates the layout cache. Returns `true` if a re-render is warranted.
+    /// Dispatch a raw mouse event of `kind` (e.g. "mousedown", "mouseup", "dblclick",
+    /// "contextmenu") to the node under `(x, y)` (device px), with bubbling — no focus/toggle/submit
+    /// side effects (those are `dispatch_click`'s job). Returns whether a re-render is warranted.
+    pub fn dispatch_mouse(&mut self, kind: &str, x: f32, y: f32) -> bool {
+        let node = match self.layout_cache.as_ref() {
+            Some(cache) => match deepest_node_at(&cache.root, x, y + self.scroll_y) {
+                Some(n) => n,
+                None => return false,
+            },
+            None => return false,
+        };
+        let session = match &self.session {
+            Some(s) => s,
+            None => return false,
+        };
+        let cx = (x / self.scale) as f64;
+        let cy = (y / self.scale) as f64;
+        let (mut snapshot, console) = session.dispatch_event(node.0, kind, cx, cy);
+        snapshot.prune_invalid();
+        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            *doc = Some(snapshot);
+            c.extend(console);
+            self.layout_cache = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn dispatch_click(&mut self, x: f32, y: f32) -> bool {
         // Hit-test in layout (document) coordinates: header_h = 0, left = 0, so add scroll_y.
         let node = match self.layout_cache.as_ref() {

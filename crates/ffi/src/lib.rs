@@ -261,3 +261,26 @@ pub unsafe extern "C" fn browser_engine_dispatch_move(engine: *mut Engine, x: f3
         _ => 0,
     }
 }
+
+/// Dispatch a raw mouse event (`kind` = "mousedown"/"mouseup"/"dblclick"/"contextmenu", NUL-
+/// terminated UTF-8) to the node at device-pixel `(x, y)`. Returns 1 if the DOM changed.
+///
+/// # Safety
+/// `engine` must be a valid handle; `kind` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_dispatch_mouse(
+    engine: *mut Engine,
+    kind: *const c_char,
+    x: f32,
+    y: f32,
+) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    if kind.is_null() {
+        return 0;
+    }
+    let kind = CStr::from_ptr(kind).to_string_lossy().into_owned();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_mouse(&kind, x, y))) {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}

@@ -158,6 +158,15 @@ int32_t browser_engine_tick(struct Engine *engine);
  */
 int32_t browser_engine_dispatch_move(struct Engine *engine, float x, float y);
 
+/**
+ * Dispatch a raw mouse event (`kind` = "mousedown"/"mouseup"/"dblclick"/"contextmenu", NUL-
+ * terminated UTF-8) to the node at device-pixel `(x, y)`. Returns 1 if the DOM changed.
+ *
+ * # Safety
+ * `engine` must be a valid handle; `kind` a valid C string.
+ */
+int32_t browser_engine_dispatch_mouse(struct Engine *engine, const char *kind, float x, float y);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
