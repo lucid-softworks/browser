@@ -18,6 +18,8 @@ fn agent() -> &'static ureq::Agent {
             .timeout_connect(std::time::Duration::from_secs(10))
             .timeout_read(std::time::Duration::from_secs(15))
             .max_idle_connections_per_host(16)
+            // Persist cookies across requests AND redirects so logins/sessions survive.
+            .cookie_store(cookie_store::CookieStore::new(None))
             .build()
     })
 }
@@ -77,6 +79,7 @@ fn record_net(entry: NetEntry) {
         }
     }
 }
+
 
 /// GET `url` and return a [`Response`], or an `Err(String)` describing the failure.
 /// Supports `http(s)://` (via the reused HTTP client) and `file://` (local read), so
