@@ -798,7 +798,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
         window.minSize = NSSize(width: 380, height: 300)
-        window.center()
+        // Remember the window's position, size, AND which monitor it was on across launches. The
+        // saved frame is in global screen coordinates, so it encodes the display; AppKit persists it
+        // to UserDefaults on every move/resize (so it's current at close) and clamps it back onto an
+        // available screen if that monitor is gone. Center only on first run (no saved frame yet).
+        window.setFrameAutosaveName("BrowserMainWindow")
+        if !window.setFrameUsingName("BrowserMainWindow") {
+            window.center()
+        }
 
         let content = NSView(frame: contentRect)
         content.wantsLayer = true
@@ -872,6 +879,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         urlField.textColor = NSColor.labelColor
         urlField.alignment = .left
         urlField.lineBreakMode = .byTruncatingTail
+        // Let the field clip (it truncates) instead of resisting compression — otherwise its text
+        // width holds the pill near its max and pins a min window width (you couldn't shrink it).
+        urlField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        urlField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         urlField.usesSingleLineMode = true
         urlField.cell?.usesSingleLineMode = true
         urlField.cell?.wraps = false
@@ -973,8 +984,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             progress.widthAnchor.constraint(equalToConstant: 16),
             progress.heightAnchor.constraint(equalToConstant: 16),
 
-            // Pill: centered, expands with sensible margins + max width.
-            pill.centerXAnchor.constraint(equalTo: toolbar.centerXAnchor),
+            // Pill: vertically centered; horizontal centering is applied below at a low priority
+            // (so it yields to the required nav/spinner gaps and the window can still shrink).
             pill.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
             pill.heightAnchor.constraint(equalToConstant: 32),
 
@@ -987,18 +998,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             urlField.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
         ])
 
-        // Pill width: grows with the window but capped, and never overlaps nav/spinner.
+        // Pill width: prefers a fixed comfortable width (capped), compressing on narrow windows.
+        // NOTE: do NOT tie this to toolbar.width (e.g. width == toolbar.width * k) — paired with the
+        // required max it pins the window's resizable WIDTH to a narrow band (you could only resize
+        // vertically). A breakable constant lets the window grow freely (pill caps, extra space sits
+        // on the sides, like Safari) and shrink until the required nav/spinner gaps stop it.
+        // The pill must NOT prefer any absolute width: a `pill.width == K` constraint (at ANY
+        // priority > the fitting threshold ~50) contributes K to the window's enforced minimum
+        // width, so the window can't shrink below it. Instead the pill FILLS the space between the
+        // nav buttons and the spinner (so it grows with the window) and is merely CAPPED at 640.
+        // Because the fill constraints are relative to nav/progress (not absolute), they add no
+        // fixed floor — the window shrinks to minSize and grows freely.
         let pillMaxWidth = pill.widthAnchor.constraint(lessThanOrEqualToConstant: 640)
         pillMaxWidth.priority = .required
-        let pillIdealWidth = pill.widthAnchor.constraint(equalTo: toolbar.widthAnchor, multiplier: 0.55)
-        pillIdealWidth.priority = .defaultHigh
+        // Never overlap nav / spinner.
         let pillLeadingGap = pill.leadingAnchor.constraint(greaterThanOrEqualTo: navStack.trailingAnchor, constant: 16)
         let pillTrailingGap = pill.trailingAnchor.constraint(lessThanOrEqualTo: progress.leadingAnchor, constant: -16)
-        // Min width is non-required so the pill compresses on narrow windows instead of
-        // blocking horizontal resize (the leading/trailing gaps still prevent overlap).
-        let pillMinWidth = pill.widthAnchor.constraint(greaterThanOrEqualToConstant: 90)
-        pillMinWidth.priority = .defaultLow
-        NSLayoutConstraint.activate([pillMaxWidth, pillIdealWidth, pillLeadingGap, pillTrailingGap, pillMinWidth])
+        // Fill: pin to nav on the left (slightly stronger so the pill stays left-anchored after the
+        // nav buttons) and stretch toward the spinner on the right — capped by the required max.
+        let pillFillLeading = pill.leadingAnchor.constraint(equalTo: navStack.trailingAnchor, constant: 16)
+        pillFillLeading.priority = NSLayoutConstraint.Priority(501)
+        let pillFillTrailing = pill.trailingAnchor.constraint(equalTo: progress.leadingAnchor, constant: -16)
+        pillFillTrailing.priority = .defaultLow
+        NSLayoutConstraint.activate([pillMaxWidth, pillLeadingGap, pillTrailingGap, pillFillLeading, pillFillTrailing])
 
         // DevTools sits below the bitmap, splitting the content area vertically. We toggle which
         // of two bitmap-bottom constraints is active: when hidden the bitmap fills to the content
