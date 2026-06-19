@@ -2653,6 +2653,27 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             }
           }
         }
+        // `src` / `href` IDL reflection (resolved to absolute URLs) for the elements that have
+        // them, so e.g. `img.src` is a STRING (google does `img.src.substring(...)`) not undefined.
+        // URL resolution falls back to the raw attribute if our URL parser can't handle it, so the
+        // value is always a string either way.
+        var __resolveURL = function (v) {
+          if (v == null || v === "") { return ""; }
+          try { return new URL(String(v), globalThis.__pageURL).href; } catch (eU) { return String(v); }
+        };
+        var __reflectURL = function (name, tags) {
+          if (!tags[__formTag]) { return; }
+          var has = false;
+          try { var d = Object.getOwnPropertyDescriptor(el, name); has = !!(d && (d.get || d.set)); } catch (eD) {}
+          if (has) { return; }
+          Object.defineProperty(el, name, {
+            get: function () { return __resolveURL(__getAttr(node, name)); },
+            set: function (v) { __setAttr(node, name, v == null ? "" : String(v)); },
+            configurable: true, enumerable: true
+          });
+        };
+        __reflectURL("src", { img: 1, script: 1, iframe: 1, source: 1, video: 1, audio: 1, embed: 1, track: 1, input: 1 });
+        __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 });
       } catch (e10) {}
     } else {
       // Detached/foreign object: fall back to inert stubs so access doesn't throw.
