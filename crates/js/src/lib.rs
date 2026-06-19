@@ -172,6 +172,11 @@ struct HostState {
     /// `getBoundingClientRect` / `offsetWidth` / `scrollHeight` etc. The engine recomputes layout;
     /// the worker only serves what was pushed (it cannot reach the engine's layout from here).
     layout_rects: RefCell<HashMap<usize, (f32, f32, f32, f32)>>,
+    /// Decoded intrinsic size of each `<img>`, keyed by node id, pushed by the engine alongside
+    /// `layout_rects`. `(natural_width, natural_height)` in CSS px from the decoded bitmap. Read by
+    /// the `__naturalSize` primitive backing `img.naturalWidth` / `img.naturalHeight`. Empty until
+    /// the first push; a missing/broken image has no entry (reports 0).
+    image_natural: RefCell<HashMap<usize, (f32, f32)>>,
     /// Vertical scroll offset (CSS px) at the last push. `__rect` subtracts this to make
     /// `getBoundingClientRect` viewport-relative. No horizontal scroll is tracked.
     viewport_scroll_y: Cell<f32>,
@@ -223,6 +228,7 @@ impl HostState {
             dom_version: Cell::new(0),
             computed_cache: RefCell::new(None),
             layout_rects: RefCell::new(HashMap::new()),
+            image_natural: RefCell::new(HashMap::new()),
             viewport_scroll_y: Cell::new(0.0),
             doc_height: Cell::new(0.0),
         })
@@ -1370,6 +1376,32 @@ fn prim_rect(
     rv.set(obj.into());
 }
 
+/// `__naturalSize(id) -> { w, h }`
+///
+/// The decoded intrinsic size of an `<img>` (CSS px), pushed by the engine alongside the layout
+/// rects from its decoded-bitmap table. Backs `img.naturalWidth` / `img.naturalHeight`. A
+/// missing/broken/not-yet-decoded image has no entry and reports `{ w: 0, h: 0 }`.
+fn prim_natural_size(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let (w, h) = node
+        .and_then(|n| state.image_natural.borrow().get(&n.0).copied())
+        .unwrap_or((0.0, 0.0));
+    let obj = v8::Object::new(scope);
+    let put = |k: &str, v: f32| {
+        let key = v8::String::new(scope, k).unwrap();
+        let val = v8::Number::new(scope, v as f64);
+        obj.set(scope, key.into(), val.into());
+    };
+    put("w", w);
+    put("h", h);
+    rv.set(obj.into());
+}
+
 /// `__elemMetrics(id) -> { ow, oh, ot, ol, sw, sh } | null`
 ///
 /// Box metrics for `offsetWidth/Height/Top/Left`, `clientWidth/Height`, `scrollWidth/Height`:
@@ -2027,6 +2059,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__tag", prim_tag);
     set_fn(scope, global, "__nodeType", prim_node_type);
     set_fn(scope, global, "__rect", prim_rect);
+    set_fn(scope, global, "__naturalSize", prim_natural_size);
     set_fn(scope, global, "__elemMetrics", prim_elem_metrics);
     set_fn(scope, global, "__textContent", prim_text_content);
     set_fn(scope, global, "__setTextContent", prim_set_text_content);
@@ -3334,13 +3367,95 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       // page-defined accessors aren't clobbered.
       try {
         var __formTag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : "";
-        if (__formTag === "input" || __formTag === "textarea" || __formTag === "select") {
+        if (__formTag === "input" || __formTag === "textarea" || __formTag === "select" || __formTag === "option") {
           var __hasValue = false;
           try { var __vd = Object.getOwnPropertyDescriptor(el, "value"); __hasValue = !!(__vd && (__vd.get || __vd.set)); } catch (e8) {}
-          if (!__hasValue) {
-            Object.defineProperty(el, "value", {
-              get: function () { var v = __getAttr(node, "value"); return v == null ? "" : String(v); },
-              set: function (v) { __setAttr(node, "value", String(v == null ? "" : v)); },
+          if (!__hasValue && __formTag !== "option") {
+            if (__formTag === "textarea") {
+              // A <textarea>'s value defaults to its text content; an explicit `value` attribute
+              // (set via the property) overrides it. The setter stores `value` so layout renders it.
+              Object.defineProperty(el, "value", {
+                get: function () {
+                  var v = __getAttr(node, "value");
+                  if (v != null) { return String(v); }
+                  var t = this.textContent;
+                  return t == null ? "" : String(t);
+                },
+                set: function (v) { __setAttr(node, "value", String(v == null ? "" : v)); },
+                configurable: true, enumerable: true
+              });
+            } else if (__formTag === "select") {
+              // A <select>'s value is the selected <option>'s value (or its text if no value attr);
+              // empty when nothing is selected. selectedIndex is the selected option's index.
+              // Setting value selects the first matching option; setting selectedIndex selects by
+              // position. Backed by the `selected` attribute on <option>s (also used by layout).
+              var __optValue = function (o) {
+                var av = o.getAttribute ? o.getAttribute("value") : null;
+                if (av != null) { return av; }
+                var t = o.textContent;
+                return t == null ? "" : String(t).replace(/^\s+|\s+$/g, "");
+              };
+              var __selIdx = function (self) {
+                var opts = self.querySelectorAll ? self.querySelectorAll("option") : [];
+                for (var i = 0; i < opts.length; i++) {
+                  if (opts[i].hasAttribute && opts[i].hasAttribute("selected")) { return i; }
+                }
+                return opts.length ? 0 : -1;
+              };
+              Object.defineProperty(el, "value", {
+                get: function () {
+                  var opts = this.querySelectorAll ? this.querySelectorAll("option") : [];
+                  var idx = __selIdx(this);
+                  if (idx < 0 || idx >= opts.length) { return ""; }
+                  return __optValue(opts[idx]);
+                },
+                set: function (v) {
+                  v = String(v == null ? "" : v);
+                  var opts = this.querySelectorAll ? this.querySelectorAll("option") : [];
+                  var found = -1;
+                  for (var i = 0; i < opts.length; i++) { if (__optValue(opts[i]) === v) { found = i; break; } }
+                  for (var j = 0; j < opts.length; j++) {
+                    if (j === found) { opts[j].setAttribute("selected", ""); }
+                    else { opts[j].removeAttribute("selected"); }
+                  }
+                },
+                configurable: true, enumerable: true
+              });
+              Object.defineProperty(el, "selectedIndex", {
+                get: function () { return __selIdx(this); },
+                set: function (v) {
+                  var idx = v | 0;
+                  var opts = this.querySelectorAll ? this.querySelectorAll("option") : [];
+                  for (var j = 0; j < opts.length; j++) {
+                    if (j === idx) { opts[j].setAttribute("selected", ""); }
+                    else { opts[j].removeAttribute("selected"); }
+                  }
+                },
+                configurable: true, enumerable: true
+              });
+            } else {
+              Object.defineProperty(el, "value", {
+                get: function () { var v = __getAttr(node, "value"); return v == null ? "" : String(v); },
+                set: function (v) { __setAttr(node, "value", String(v == null ? "" : v)); },
+                configurable: true, enumerable: true
+              });
+            }
+          }
+          // <option>.value reflects its `value` attribute, falling back to text content;
+          // <option>.selected reflects the `selected` attribute.
+          if (__formTag === "option") {
+            var __hasOptVal = false;
+            try { var __ovd = Object.getOwnPropertyDescriptor(el, "value"); __hasOptVal = !!(__ovd && (__ovd.get || __ovd.set)); } catch (eOV) {}
+            if (!__hasOptVal) {
+              Object.defineProperty(el, "value", {
+                get: function () { var v = __getAttr(node, "value"); if (v != null) { return String(v); } var t = this.textContent; return t == null ? "" : String(t).replace(/^\s+|\s+$/g, ""); },
+                set: function (v) { __setAttr(node, "value", String(v == null ? "" : v)); },
+                configurable: true, enumerable: true
+              });
+            }
+            Object.defineProperty(el, "selected", {
+              get: function () { return __getAttr(node, "selected") != null; },
+              set: function (v) { if (v) { __setAttr(node, "selected", ""); } else { __removeAttr(node, "selected"); } },
               configurable: true, enumerable: true
             });
           }
@@ -3381,6 +3496,60 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         };
         __reflectURL("src", { img: 1, script: 1, iframe: 1, source: 1, video: 1, audio: 1, embed: 1, track: 1, input: 1 });
         __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 });
+        // <img>.naturalWidth / naturalHeight: the decoded intrinsic size from the engine
+        // (0 when the image is missing/broken/not yet decoded). `width`/`height` reflect the
+        // used (rendered) size, falling back to the natural size.
+        if (__formTag === "img") {
+          var __natW = function (self) { var id = self.__node; var n = (typeof id === "number") ? __naturalSize(id) : null; return n ? n.w : 0; };
+          var __natH = function (self) { var id = self.__node; var n = (typeof id === "number") ? __naturalSize(id) : null; return n ? n.h : 0; };
+          var __defImgNum = function (prop, getter) {
+            var has = false;
+            try { var d = Object.getOwnPropertyDescriptor(el, prop); has = !!(d && (d.get || d.set)); } catch (eIN) {}
+            if (!has) { Object.defineProperty(el, prop, { get: getter, configurable: true, enumerable: true }); }
+          };
+          __defImgNum("naturalWidth", function () { return __natW(this) | 0; });
+          __defImgNum("naturalHeight", function () { return __natH(this) | 0; });
+          // width/height reflect the rendered box (border-box from layout) else the HTML attr
+          // else the natural size; setting updates the presentational attribute.
+          Object.defineProperty(el, "width", {
+            get: function () { var id = this.__node; var r = (typeof id === "number") ? __rect(id) : null; if (r && r.width) { return Math.round(r.width); } var a = __getAttr(node, "width"); if (a != null && a !== "") { return parseInt(a, 10) || 0; } return __natW(this) | 0; },
+            set: function (v) { __setAttr(node, "width", String(v | 0)); },
+            configurable: true, enumerable: true
+          });
+          Object.defineProperty(el, "height", {
+            get: function () { var id = this.__node; var r = (typeof id === "number") ? __rect(id) : null; if (r && r.height) { return Math.round(r.height); } var a = __getAttr(node, "height"); if (a != null && a !== "") { return parseInt(a, 10) || 0; } return __natH(this) | 0; },
+            set: function (v) { __setAttr(node, "height", String(v | 0)); },
+            configurable: true, enumerable: true
+          });
+        }
+        // <dialog>: show()/showModal() set the `open` attribute; close(returnValue?) removes it,
+        // stores returnValue, and fires a `close` event. `.open` reflects the attribute.
+        if (__formTag === "dialog") {
+          var __defDialog = function (prop, val) {
+            try { if (typeof el[prop] !== "function") { def(el, prop, val); } } catch (eDl) { def(el, prop, val); }
+          };
+          __defDialog("show", function () { __setAttr(node, "open", ""); });
+          __defDialog("showModal", function () { __setAttr(node, "open", ""); });
+          __defDialog("close", function (rv) {
+            if (__getAttr(node, "open") == null) { return; }
+            __removeAttr(node, "open");
+            if (rv !== undefined) { this.returnValue = String(rv); }
+            try {
+              var ev = (typeof Event === "function") ? new Event("close", { bubbles: false, cancelable: false }) : { type: "close" };
+              this.dispatchEvent(ev);
+            } catch (eEv) {}
+          });
+          var __hasOpen = false;
+          try { var __od = Object.getOwnPropertyDescriptor(el, "open"); __hasOpen = !!(__od && (__od.get || __od.set)); } catch (eOpn) {}
+          if (!__hasOpen) {
+            Object.defineProperty(el, "open", {
+              get: function () { return __getAttr(node, "open") != null; },
+              set: function (v) { if (v) { __setAttr(node, "open", ""); } else { __removeAttr(node, "open"); } },
+              configurable: true, enumerable: true
+            });
+          }
+          if (!("returnValue" in el)) { el.returnValue = ""; }
+        }
       } catch (e10) {}
     } else {
       // Detached/foreign object: fall back to inert stubs so access doesn't throw.
@@ -6490,6 +6659,9 @@ enum SessionCmd {
     SetRects {
         /// `(node_id, x, y, width, height)` per laid-out node, CSS px, document-absolute.
         rects: Vec<(usize, f32, f32, f32, f32)>,
+        /// `(node_id, natural_width, natural_height)` per decoded `<img>`, CSS px. Backs
+        /// `img.naturalWidth`/`naturalHeight`.
+        naturals: Vec<(usize, f32, f32)>,
         /// Vertical scroll offset in CSS px (subtracted to make rects viewport-relative).
         scroll_y_css: f32,
         /// Full document content height in CSS px (reported as documentElement/body scrollHeight).
@@ -6633,10 +6805,11 @@ impl Session {
     pub fn set_layout_rects(
         &self,
         rects: Vec<(usize, f32, f32, f32, f32)>,
+        naturals: Vec<(usize, f32, f32)>,
         scroll_y_css: f32,
         doc_height_css: f32,
     ) {
-        let _ = self.tx.send(SessionCmd::SetRects { rects, scroll_y_css, doc_height_css });
+        let _ = self.tx.send(SessionCmd::SetRects { rects, naturals, scroll_y_css, doc_height_css });
     }
 
     /// Evaluate an arbitrary JS source string against the live context, drain the event loop, and
@@ -6906,7 +7079,7 @@ fn session_thread_main(
                     let _ = reply.send(None);
                 }
             }
-            SessionCmd::SetRects { rects, scroll_y_css, doc_height_css } => {
+            SessionCmd::SetRects { rects, naturals, scroll_y_css, doc_height_css } => {
                 // Store on HostState (no JS run needed — just update the geometry tables). Re-enter
                 // the persistent context to reach the slot. Fire-and-forget: no reply.
                 let ctx = context.clone();
@@ -6919,6 +7092,13 @@ fn session_thread_main(
                 for (id, x, y, w, h) in rects {
                     map.insert(id, (x, y, w, h));
                 }
+                drop(map);
+                let mut nat = state.image_natural.borrow_mut();
+                nat.clear();
+                for (id, w, h) in naturals {
+                    nat.insert(id, (w, h));
+                }
+                drop(nat);
                 state.viewport_scroll_y.set(scroll_y_css);
                 state.doc_height.set(doc_height_css);
             }

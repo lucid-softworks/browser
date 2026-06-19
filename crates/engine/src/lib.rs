@@ -557,9 +557,17 @@ impl Engine {
             .iter()
             .map(|(&id, r)| (id, r.x * inv, r.y * inv, r.width * inv, r.height * inv))
             .collect();
+        // Decoded intrinsic size of each <img>, for img.naturalWidth/naturalHeight. The decoded
+        // bitmap's w/h are stored in CSS px (the same values layout seeds into intrinsic_sizes).
+        let naturals: Vec<(usize, f32, f32)> = match &self.state {
+            LoadState::Loaded { images, .. } => {
+                images.iter().map(|(id, img)| (id.0, img.w as f32, img.h as f32)).collect()
+            }
+            _ => Vec::new(),
+        };
         let scroll_y_css = self.scroll_y * inv;
         let doc_height_css = cache.content_h * inv;
-        session.set_layout_rects(list, scroll_y_css, doc_height_css);
+        session.set_layout_rects(list, naturals, scroll_y_css, doc_height_css);
     }
 
     /// Paint the current state into a fresh framebuffer and return a reference to it.
@@ -6382,4 +6390,5 @@ mod tests {
         let outside = at(fb, 5, 90);
         assert!(!(outside[2] > 200 && outside[0] < 60), "outside the triangle must not be blue, got {outside:?}");
     }
+
 }

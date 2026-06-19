@@ -832,6 +832,7 @@ fn build_replaced_or_control(
         || el.tag.eq_ignore_ascii_case("svg")
     {
         let is_canvas = el.tag.eq_ignore_ascii_case("canvas");
+        let is_img = el.tag.eq_ignore_ascii_case("img");
         let intrinsic = if is_canvas {
             // Prefer the explicit width/height attributes; fall back to the spec default 300x150.
             let aw = el.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok());
@@ -840,8 +841,40 @@ fn build_replaced_or_control(
         } else {
             intrinsic_sizes.get(&id).copied()
         };
-        let (cw, ch) = image_content_size(cs.width, cs.height, intrinsic);
+        // Presentational width/height HTML attributes on <img> set the used size (plain numbers →
+        // CSS px). CSS still wins when present: only fill in a dimension the cascade left unset.
+        let (mut css_w, mut css_h) = (cs.width, cs.height);
+        if is_img {
+            let aw = el.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok());
+            let ah = el.attrs.get("height").and_then(|v| v.trim().parse::<f32>().ok());
+            if css_w.is_none() {
+                css_w = aw;
+            }
+            if css_h.is_none() {
+                css_h = ah;
+            }
+        }
+        let (cw, ch) = image_content_size(css_w, css_h, intrinsic);
         if cw <= 0.0 || ch <= 0.0 {
+            // No drawable bitmap and no explicit size. For <img> with alt text, lay out a small
+            // box containing the alt string so a broken image isn't a 0×0 nothing.
+            if is_img {
+                if let Some(alt) = el.attrs.get("alt") {
+                    let alt = collapse_whitespace(alt);
+                    if !alt.is_empty() {
+                        let mut aps = paint_style_of(cs);
+                        if aps.font_size <= 0.0 {
+                            aps.font_size = 16.0;
+                        }
+                        let mut bx = LayoutBox::new(BoxContent::Block, aps.clone(), Some(id));
+                        bx.dimensions.margin = edges_of(cs.margin);
+                        bx.dimensions.padding = edges_of(cs.padding);
+                        bx.dimensions.border = edges_of(cs.border);
+                        bx.children.push(LayoutBox::new(BoxContent::Text(alt), aps, Some(id)));
+                        return Some(bx);
+                    }
+                }
+            }
             return None; // nothing known to draw; skip producing a box
         }
         let mut bx = LayoutBox::new(BoxContent::Image(id), paint_style_of(cs), Some(id));

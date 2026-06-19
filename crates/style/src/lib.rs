@@ -4860,6 +4860,8 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          dt { display: block }
          dd { display: block; margin-left: 40px }
          address { display: block }
+         dialog { display: none; margin: auto; padding: 1em; border: 2px solid #767676; background-color: #ffffff; color: #000000 }
+         dialog[open] { display: block }
          hr { display: block; margin: 0.5em 0; height: 1px; background-color: #888888; border-top: 1px solid #888888 }
          caption { display: table-caption }
          details:not([open]) > :not(summary) { display: none }
