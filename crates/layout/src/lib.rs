@@ -682,9 +682,19 @@ fn build_replaced_or_control(
     ) || (cs.display == style::Display::Inline && cs.display_block);
     let is_block = out_of_flow || block_display;
 
-    // <img>: a replaced box sized from CSS width/height and/or intrinsic dimensions.
-    if el.tag.eq_ignore_ascii_case("img") {
-        let intrinsic = intrinsic_sizes.get(&id).copied();
+    // <img> / <canvas>: a replaced box sized from CSS width/height and/or intrinsic dimensions.
+    // <canvas> is a replaced element whose intrinsic size is its width/height attributes (default
+    // 300x150); the engine rasterizes its display list into a bitmap and composites it like an img.
+    if el.tag.eq_ignore_ascii_case("img") || el.tag.eq_ignore_ascii_case("canvas") {
+        let is_canvas = el.tag.eq_ignore_ascii_case("canvas");
+        let intrinsic = if is_canvas {
+            // Prefer the explicit width/height attributes; fall back to the spec default 300x150.
+            let aw = el.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok());
+            let ah = el.attrs.get("height").and_then(|v| v.trim().parse::<f32>().ok());
+            Some((aw.unwrap_or(300.0).max(1.0), ah.unwrap_or(150.0).max(1.0)))
+        } else {
+            intrinsic_sizes.get(&id).copied()
+        };
         let (cw, ch) = image_content_size(cs.width, cs.height, intrinsic);
         if cw <= 0.0 || ch <= 0.0 {
             return None; // nothing known to draw; skip producing a box
@@ -845,6 +855,7 @@ fn build_box(
             // box (image / glyph / value text). Handled in a non-recursive helper so this frame —
             // which recurses for deep DOM nesting — stays small.
             if el.tag.eq_ignore_ascii_case("img")
+                || el.tag.eq_ignore_ascii_case("canvas")
                 || el.tag.eq_ignore_ascii_case("input")
                 || el.tag.eq_ignore_ascii_case("textarea")
                 || el.tag.eq_ignore_ascii_case("select")

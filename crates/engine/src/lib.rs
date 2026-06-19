@@ -5,6 +5,7 @@
 //! parse → style → layout → paint pipeline lands in later phases; the function boundaries
 //! (`html::parse`, `style`, `layout`) already exist as stubs so wiring them in is additive.
 
+mod canvas;
 mod font;
 
 use std::collections::HashMap;
@@ -150,6 +151,9 @@ pub struct Engine {
     /// DevTools "Elements" inspector highlight: the DOM node whose border box is painted with a
     /// translucent overlay AFTER the page. `None` = no highlight. Cleared on navigation.
     inspect_node: Option<dom::NodeId>,
+    /// Rasterized `<canvas>` bitmaps keyed by canvas node id. Rebuilt each `render` from the JS
+    /// 2D-context display lists (pulled via `Session::canvas_lists`); composited like decoded images.
+    canvas_bitmaps: HashMap<dom::NodeId, DecodedImage>,
 }
 
 impl Default for Engine {
@@ -178,6 +182,7 @@ impl Engine {
             frame_cb: None,
             selection: None,
             inspect_node: None,
+            canvas_bitmaps: HashMap::new(),
         }
     }
 
@@ -420,10 +425,14 @@ impl Engine {
             let vw = (dw as f32).max(1.0);
             let vh = (page_max_y - header_h).max(1.0);
             let measurer = FontMeasurer { font };
-            let intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
+            let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
                 .iter()
                 .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))
                 .collect();
+            // <canvas> intrinsic size = its width/height attributes (default 300x150). Layout's
+            // canvas branch reads attrs directly too, but seeding this keeps aspect-ratio scaling
+            // (one CSS dimension set) consistent with how <img> is handled.
+            collect_canvas_intrinsics(d, &mut intrinsic_sizes);
             let computed = style::cascade(d, styles);
             let root =
                 layout::layout_document(d, &computed, vw, vh, &measurer, &intrinsic_sizes, self.focused_node);
@@ -434,6 +443,35 @@ impl Engine {
         };
         self.layout_cache = computed.map(|(root, content_h)| LayoutCache { dw, dh, root, content_h });
         true
+    }
+
+    /// Rebuild [`Self::canvas_bitmaps`] from the JS 2D-context display lists. Pulls every canvas's
+    /// `{id,width,height,commands}` via the Session, parses the JSON, and rasterizes each command
+    /// stream into an RGBA bitmap. Guarded: returns immediately if there's no script Session or the
+    /// loaded DOM contains no `<canvas>` (the common case), so non-canvas pages pay nothing.
+    fn update_canvas_bitmaps(&mut self) {
+        let session = match &self.session {
+            Some(s) => s,
+            None => return,
+        };
+        // Guard: skip the JS round-trip unless the DOM actually has a <canvas>.
+        let has_canvas = matches!(&self.state, LoadState::Loaded { doc: Some(d), .. }
+            if (0..d.len()).any(|i| matches!(&d.get(dom::NodeId(i)).data,
+                dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("canvas"))));
+        if !has_canvas {
+            if !self.canvas_bitmaps.is_empty() {
+                self.canvas_bitmaps.clear();
+            }
+            return;
+        }
+        let json = session.canvas_lists();
+        let font = self.font.as_ref();
+        let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        for cv in canvas::parse_canvas_lists(&json) {
+            let bmp = canvas::rasterize_canvas(&cv, font);
+            next.insert(dom::NodeId(cv.id), bmp);
+        }
+        self.canvas_bitmaps = next;
     }
 
     /// Push the freshly-built layout to the JS Session so `getBoundingClientRect()` /
@@ -477,6 +515,10 @@ impl Engine {
             self.push_layout_rects();
         }
 
+        // Pull each <canvas>'s JS display list and rasterize it into a bitmap (composited below
+        // exactly like a decoded <img>). Guarded so script-free / canvas-free pages pay nothing.
+        self.update_canvas_bitmaps();
+
         let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;
 
@@ -514,7 +556,7 @@ impl Engine {
                         let mut run_idx = 0usize;
                         paint_box(
                             &mut fb, font, &cache.root, left, header_h - scroll_y, header_h,
-                            page_max_y, images, &sel_ranges, &mut run_idx,
+                            page_max_y, images, &self.canvas_bitmaps, &sel_ranges, &mut run_idx,
                         );
                     } else if doc.is_none() {
                         draw_text(
@@ -1936,6 +1978,22 @@ fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Re
     }
 }
 
+/// Seed `out` with the intrinsic size of every `<canvas>` element: its `width`/`height` attributes,
+/// or the spec default 300×150 when absent. Layout treats `<canvas>` as a replaced element and uses
+/// this (the same way an `<img>`'s decoded size is used) for aspect-ratio-preserving sizing.
+fn collect_canvas_intrinsics(doc: &dom::Document, out: &mut HashMap<dom::NodeId, (f32, f32)>) {
+    for i in 0..doc.len() {
+        let id = dom::NodeId(i);
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("canvas") {
+                let w = e.attrs.get("width").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(300.0);
+                let h = e.attrs.get("height").and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(150.0);
+                out.insert(id, (w.max(1.0), h.max(1.0)));
+            }
+        }
+    }
+}
+
 /// Format an f32 for embedding in JSON, finite-guarded (NaN/Inf → 0).
 fn fnum(v: f32) -> f32 {
     if v.is_finite() {
@@ -2175,13 +2233,14 @@ fn paint_box(
     clip_top: f32,
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
+    canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
 ) {
     // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
     // declarations compose additional affines on top per-box.
     let xf = Affine::translate(ox, oy);
-    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, 1.0, sel_ranges, run_idx);
+    paint_box_opacity(fb, font, b, &xf, clip_top, clip_bottom, images, canvas_bitmaps, 1.0, sel_ranges, run_idx);
 }
 
 /// A 2D affine mapping a CSS-space point `(x, y)` to a device-space point: `x' = a*x + c*y + e`,
@@ -2253,6 +2312,7 @@ fn paint_box_opacity(
     clip_top: f32,
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
+    canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     parent_opacity: f32,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
@@ -2430,7 +2490,9 @@ fn paint_box_opacity(
         if let layout::BoxContent::Image(node) = &b.content {
             let dst = xf_rect(xf, content.x, content.y, content.width, content.height);
             if dst.y < clip_bottom as i32 {
-                match images.get(node) {
+                // A <canvas> resolves to its rasterized display-list bitmap; everything else to a
+                // decoded <img>. Both composite identically.
+                match canvas_bitmaps.get(node).or_else(|| images.get(node)) {
                     Some(img) if opacity >= 0.999 => fb.blit_rgba(dst, &img.rgba, img.w, img.h),
                     Some(img) => {
                         let mut scaled = img.rgba.clone();
@@ -2463,7 +2525,7 @@ fn paint_box_opacity(
     }
 
     for child in &b.children {
-        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, opacity, sel_ranges, run_idx);
+        paint_box_opacity(fb, font, child, xf, clip_top, clip_bottom, images, canvas_bitmaps, opacity, sel_ranges, run_idx);
     }
 }
 
@@ -4974,7 +5036,8 @@ mod tests {
         }
         let mut fb = Framebuffer::new(400, 300);
         let images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &[], &mut 0);
+        let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images, &no_canvas, &[], &mut 0);
 
         // The root box should exist; with the parallel layout stub it may have no children yet,
         // so only assert the path completed and the root carries the viewport width.
@@ -5017,7 +5080,8 @@ mod tests {
             let mut fb = Framebuffer::new(100, 100);
             paint_gradient(&mut fb);
             let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &[], &mut 0);
+            let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs, &no_canvas, &[], &mut 0);
             // Sample a pixel inside the div.
             let i = (50 * fb.stride + 50 * 4) as usize;
             [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
@@ -5062,7 +5126,8 @@ mod tests {
         let mut fb = Framebuffer::new(w, h);
         fb.clear(Color::BLACK);
         let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
-        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &[], &mut 0);
+        let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        paint_box(&mut fb, &NF, &root, 0.0, 0.0, 0.0, h as f32, &imgs, &no_canvas, &[], &mut 0);
         fb
     }
 
@@ -5604,5 +5669,77 @@ mod tests {
         let _ = e.render();
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Render a canvas page at 1x and return the framebuffer pixel (r,g,b,a) at device (x,y).
+    fn canvas_render_px(html: &str, name: &str) -> (Engine, Box<dyn Fn(&Framebuffer, i32, i32) -> [u8; 4]>) {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, html).unwrap();
+        let mut e = Engine::new();
+        e.set_viewport(320, 240, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+        let _ = std::fs::remove_file(&path);
+        let at = |fb: &Framebuffer, x: i32, y: i32| -> [u8; 4] {
+            if x < 0 || y < 0 || x >= fb.width as i32 || y >= fb.height as i32 {
+                return [0, 0, 0, 0];
+            }
+            let i = (y as u32 * fb.stride) as usize + x as usize * 4;
+            [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2], fb.pixels[i + 3]]
+        };
+        (e, Box::new(at))
+    }
+
+    #[test]
+    fn canvas_fill_rect_paints_red_inside_only() {
+        // A 200x120 canvas at the top-left; fill a red rect at (10,10,50,40).
+        let html = "<html><body style='margin:0'><canvas id='c' width='200' height='120'></canvas>\
+            <script>var x=document.getElementById('c').getContext('2d');\
+            x.fillStyle='#ff0000';x.fillRect(10,10,50,40);</script></body></html>";
+        let (mut e, at) = canvas_render_px(html, "browser_canvas_rect.html");
+        let fb = e.render();
+        // Inside the rect (30,30): red.
+        let inside = at(fb, 30, 30);
+        assert!(inside[0] > 200 && inside[1] < 60 && inside[2] < 60, "inside should be red, got {inside:?}");
+        // Outside the rect (120,90): NOT red.
+        let outside = at(fb, 120, 90);
+        assert!(!(outside[0] > 200 && outside[1] < 60 && outside[2] < 60), "outside must not be red, got {outside:?}");
+    }
+
+    #[test]
+    fn canvas_fill_text_paints_some_pixels() {
+        let html = "<html><body style='margin:0'><canvas id='c' width='200' height='80'></canvas>\
+            <script>var x=document.getElementById('c').getContext('2d');\
+            x.fillStyle='#00ff00';x.font='40px sans-serif';x.fillText('Hi',10,50);</script></body></html>";
+        let (mut e, at) = canvas_render_px(html, "browser_canvas_text.html");
+        let fb = e.render();
+        // Scan the text region for any greenish (non-background) pixel.
+        let mut found = false;
+        for y in 10..70 {
+            for x in 5..120 {
+                let p = at(fb, x, y);
+                if p[1] > 120 && p[0] < 120 && p[2] < 120 {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "fillText should rasterize some green glyph pixels");
+    }
+
+    #[test]
+    fn canvas_fill_path_triangle_has_interior() {
+        // A filled triangle with vertices (10,10),(90,10),(50,80). Its centroid (~50,33) is interior.
+        let html = "<html><body style='margin:0'><canvas id='c' width='120' height='100'></canvas>\
+            <script>var x=document.getElementById('c').getContext('2d');\
+            x.fillStyle='#0000ff';x.beginPath();x.moveTo(10,10);x.lineTo(90,10);x.lineTo(50,80);\
+            x.closePath();x.fill();</script></body></html>";
+        let (mut e, at) = canvas_render_px(html, "browser_canvas_tri.html");
+        let fb = e.render();
+        // Centroid is inside → blue.
+        let inside = at(fb, 50, 33);
+        assert!(inside[2] > 200 && inside[0] < 60 && inside[1] < 60, "triangle interior should be blue, got {inside:?}");
+        // A corner well outside the triangle (5,90) is NOT blue.
+        let outside = at(fb, 5, 90);
+        assert!(!(outside[2] > 200 && outside[0] < 60), "outside the triangle must not be blue, got {outside:?}");
     }
 }

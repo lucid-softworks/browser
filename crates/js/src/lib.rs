@@ -3503,44 +3503,40 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         if (!("preserveAspectRatio" in el)) { def(el, "preserveAspectRatio", { baseVal: { align: 0, meetOrSlice: 0 }, animVal: { align: 0, meetOrSlice: 0 } }); }
       }
     } catch (e) {}
-    // <canvas>: provide a non-throwing 2D context stub (we don't rasterize canvas, but pages
-    // feature-detect and measure text through it). '2d' returns a stub whose methods are no-ops
-    // and whose measureText returns an approximate width; 'webgl'/'webgl2' return null so callers
-    // fall back gracefully.
+    // <canvas>: a REAL 2D context that records a display list of resolved drawing commands.
+    // The JS side maintains drawing state (styles + a 2D affine transform + path) and pushes
+    // already-transformed, color-resolved commands into the canvas's display list; the Rust engine
+    // pulls these via `__canvasLists()`, rasterizes them into a bitmap, and composites it like an
+    // <img>. 'webgl'/'webgl2' return null so callers fall back gracefully.
     try {
       var __cvTag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : "";
       if (__cvTag === "canvas" && typeof el.getContext !== "function") {
-        if (!("width" in el)) { def(el, "width", 300); }
-        if (!("height" in el)) { def(el, "height", 150); }
-        var noop = function () {};
+        // width/height reflect the canvas's content attributes (the bitmap size), defaulting to
+        // the spec 300x150. Setting them updates the attribute and resets the drawing surface.
+        (function () {
+          function rd(attr, dflt) {
+            var v = (typeof el.getAttribute === "function") ? el.getAttribute(attr) : null;
+            var n = v == null ? NaN : parseInt(v, 10);
+            return (isFinite(n) && n > 0) ? n : dflt;
+          }
+          function wr(attr, v) {
+            var n = parseInt(v, 10); if (!isFinite(n) || n < 0) { n = 0; }
+            try { if (typeof el.setAttribute === "function") { el.setAttribute(attr, String(n)); } } catch (e) {}
+            // Resetting width/height clears the canvas (per spec). Drop the recorded display list.
+            try { if (el.__ctx2d && el.__ctx2d.__list) { el.__ctx2d.__list.length = 0; } } catch (e2) {}
+          }
+          Object.defineProperty(el, "width", { get: function () { return rd("width", 300); }, set: function (v) { wr("width", v); }, configurable: true, enumerable: true });
+          Object.defineProperty(el, "height", { get: function () { return rd("height", 150); }, set: function (v) { wr("height", v); }, configurable: true, enumerable: true });
+        })();
         def(el, "getContext", function (type) {
           if (type !== "2d") { return null; }
           if (el.__ctx2d) { return el.__ctx2d; }
-          var ctx = {
-            canvas: el, fillStyle: '#000', strokeStyle: '#000', lineWidth: 1, lineCap: "butt",
-            lineJoin: "miter", miterLimit: 10, font: "10px sans-serif", textAlign: "start",
-            textBaseline: "alphabetic", direction: "ltr", globalAlpha: 1,
-            globalCompositeOperation: "source-over", imageSmoothingEnabled: true,
-            shadowBlur: 0, shadowColor: "rgba(0,0,0,0)", shadowOffsetX: 0, shadowOffsetY: 0,
-            save: noop, restore: noop, scale: noop, rotate: noop, translate: noop, transform: noop,
-            setTransform: noop, resetTransform: noop, getTransform: function () { return {}; },
-            beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop, bezierCurveTo: noop,
-            quadraticCurveTo: noop, arc: noop, arcTo: noop, ellipse: noop, rect: noop, roundRect: noop,
-            fill: noop, stroke: noop, clip: noop, isPointInPath: function () { return false; },
-            isPointInStroke: function () { return false; }, fillRect: noop, strokeRect: noop,
-            clearRect: noop, fillText: noop, strokeText: noop,
-            measureText: function (s) { var w = (s ? String(s).length : 0) * 6; return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2, fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2 }; },
-            setLineDash: noop, getLineDash: function () { return []; }, drawImage: noop, drawFocusIfNeeded: noop,
-            createImageData: function (w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; },
-            getImageData: function (x, y, w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; },
-            putImageData: noop,
-            createLinearGradient: function () { return { addColorStop: noop }; },
-            createRadialGradient: function () { return { addColorStop: noop }; },
-            createConicGradient: function () { return { addColorStop: noop }; },
-            createPattern: function () { return null; },
-            getContextAttributes: function () { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; },
-          };
+          var ctx = __makeCanvas2D(el);
           def(el, "__ctx2d", ctx);
+          try {
+            globalThis.__canvases = globalThis.__canvases || [];
+            globalThis.__canvases.push(ctx);
+          } catch (e) {}
           return ctx;
         });
         if (typeof el.toDataURL !== "function") { def(el, "toDataURL", function () { return "data:,"; }); }
@@ -5112,6 +5108,285 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     // keyup always fires.
     __dispatchSyntheticEvent(nodeId, "keyup", { key: key, code: code });
   });
+
+  // --- Canvas 2D context ---------------------------------------------------------------------
+  // A real (software) CanvasRenderingContext2D. It keeps drawing STATE (styles + a 2D affine
+  // transform + the current path) and records a DISPLAY LIST of resolved commands: every command
+  // carries already-transformed device-space coordinates and a resolved CSS color (or gradient),
+  // so the Rust engine needs no matrix/style math — it just rasterizes. `__canvasLists()` hands
+  // the engine every canvas's {id,width,height,commands}.
+  function __cnvMatMul(m, n) {
+    // m, n are [a,b,c,d,e,f]; returns m*n (apply n first, then m), matching CanvasRenderingContext2D.
+    return [
+      m[0] * n[0] + m[2] * n[1],
+      m[1] * n[0] + m[3] * n[1],
+      m[0] * n[2] + m[2] * n[3],
+      m[1] * n[2] + m[3] * n[3],
+      m[0] * n[4] + m[2] * n[5] + m[4],
+      m[1] * n[4] + m[3] * n[5] + m[5],
+    ];
+  }
+  function __cnvApply(m, x, y) {
+    return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+  }
+  // Average scale of the matrix (for lineWidth / radius scaling). sqrt(|det|).
+  function __cnvScale(m) {
+    var det = m[0] * m[3] - m[1] * m[2];
+    return Math.sqrt(Math.abs(det)) || 1;
+  }
+  function __makeCanvas2D(el) {
+    var nodeId = (el && typeof el.__node === "number") ? el.__node : -1;
+    var list = [];                 // the display list
+    var state = {                  // current drawing state
+      fillStyle: '#000000', strokeStyle: '#000000', lineWidth: 1, globalAlpha: 1,
+      font: "10px sans-serif", fontSize: 10, textAlign: "start", textBaseline: "alphabetic",
+      m: [1, 0, 0, 1, 0, 0],
+    };
+    var stack = [];                // save/restore stack
+    var subpaths = [];             // array of polylines; each polyline is [x0,y0,x1,y1,...] (device)
+    var cur = null;                // current subpath being built
+    var penX = 0, penY = 0;        // current point in USER space (pre-transform)
+    var startX = 0, startY = 0;    // subpath start (user space), for closePath
+    function clone(s) {
+      return { fillStyle: s.fillStyle, strokeStyle: s.strokeStyle, lineWidth: s.lineWidth,
+        globalAlpha: s.globalAlpha, font: s.font, fontSize: s.fontSize, textAlign: s.textAlign,
+        textBaseline: s.textBaseline, m: s.m.slice() };
+    }
+    // Resolve a fill/stroke style: a CSS color string passes through; a gradient object is encoded.
+    function resolveStyle(style) {
+      if (style && typeof style === "object" && style.__grad) {
+        var g = style;
+        var stops = g.stops.map(function (s) { return { offset: s.offset, color: s.color }; });
+        if (g.kind === "linear") {
+          var p0 = __cnvApply(state.m, g.x0, g.y0), p1 = __cnvApply(state.m, g.x1, g.y1);
+          return { gradient: "linear", x0: p0[0], y0: p0[1], x1: p1[0], y1: p1[1], stops: stops };
+        }
+        var c0 = __cnvApply(state.m, g.x0, g.y0), c1 = __cnvApply(state.m, g.x1, g.y1);
+        var sc = __cnvScale(state.m);
+        return { gradient: "radial", x0: c0[0], y0: c0[1], r0: g.r0 * sc,
+          x1: c1[0], y1: c1[1], r1: g.r1 * sc, stops: stops };
+      }
+      return { color: String(style == null ? '#000' : style) };
+    }
+    function flushSub() { if (cur && cur.length >= 2) { subpaths.push(cur); } cur = null; }
+    // Transform + emit the current set of subpaths (returns a fresh array of device polylines).
+    function devicePaths() {
+      flushSub();
+      var out = [];
+      for (var i = 0; i < subpaths.length; i++) { out.push(subpaths[i].slice()); }
+      // Rebuild cur from the last so further building keeps working (we already flushed).
+      subpaths = out.map(function (p) { return p.slice(); });
+      return out;
+    }
+    function addPoint(ux, uy) {
+      var p = __cnvApply(state.m, ux, uy);
+      if (!cur) { cur = []; }
+      cur.push(p[0], p[1]);
+      penX = ux; penY = uy;
+    }
+    var ctx = {
+      canvas: el, lineCap: "butt", lineJoin: "miter", miterLimit: 10, direction: "ltr",
+      globalCompositeOperation: "source-over", imageSmoothingEnabled: true,
+      shadowBlur: 0, shadowColor: "rgba(0,0,0,0)", shadowOffsetX: 0, shadowOffsetY: 0,
+      __nodeId: nodeId, __list: list,
+    };
+    // Styled state exposed as live properties.
+    Object.defineProperty(ctx, "fillStyle", { get: function () { return state.fillStyle; }, set: function (v) { state.fillStyle = v; }, enumerable: true });
+    Object.defineProperty(ctx, "strokeStyle", { get: function () { return state.strokeStyle; }, set: function (v) { state.strokeStyle = v; }, enumerable: true });
+    Object.defineProperty(ctx, "lineWidth", { get: function () { return state.lineWidth; }, set: function (v) { var n = +v; if (n > 0 && isFinite(n)) { state.lineWidth = n; } }, enumerable: true });
+    Object.defineProperty(ctx, "globalAlpha", { get: function () { return state.globalAlpha; }, set: function (v) { var n = +v; if (n >= 0 && n <= 1) { state.globalAlpha = n; } }, enumerable: true });
+    Object.defineProperty(ctx, "textAlign", { get: function () { return state.textAlign; }, set: function (v) { state.textAlign = String(v); }, enumerable: true });
+    Object.defineProperty(ctx, "textBaseline", { get: function () { return state.textBaseline; }, set: function (v) { state.textBaseline = String(v); }, enumerable: true });
+    Object.defineProperty(ctx, "font", { get: function () { return state.font; }, set: function (v) {
+      state.font = String(v);
+      var mm = /(\d+(?:\.\d+)?)px/.exec(state.font); // loose: just pull the px size
+      if (mm) { state.fontSize = parseFloat(mm[1]); }
+      else { var pt = /(\d+(?:\.\d+)?)pt/.exec(state.font); if (pt) { state.fontSize = parseFloat(pt[1]) * 1.333; } }
+    }, enumerable: true });
+
+    ctx.save = function () { stack.push(clone(state)); };
+    ctx.restore = function () { if (stack.length) { state = stack.pop(); } };
+    // Transform ops mutate the current matrix.
+    ctx.translate = function (x, y) { state.m = __cnvMatMul(state.m, [1, 0, 0, 1, +x || 0, +y || 0]); };
+    ctx.scale = function (x, y) { state.m = __cnvMatMul(state.m, [+x || 0, 0, 0, +y || 0, 0, 0]); };
+    ctx.rotate = function (a) { var c = Math.cos(a), s = Math.sin(a); state.m = __cnvMatMul(state.m, [c, s, -s, c, 0, 0]); };
+    ctx.transform = function (a, b, c, d, e, f) { state.m = __cnvMatMul(state.m, [+a, +b, +c, +d, +e, +f]); };
+    ctx.setTransform = function (a, b, c, d, e, f) {
+      if (a && typeof a === "object") { state.m = [a.a, a.b, a.c, a.d, a.e, a.f]; }
+      else { state.m = [+a, +b, +c, +d, +e, +f]; }
+    };
+    ctx.resetTransform = function () { state.m = [1, 0, 0, 1, 0, 0]; };
+    ctx.getTransform = function () { var m = state.m; return { a: m[0], b: m[1], c: m[2], d: m[3], e: m[4], f: m[5] }; };
+
+    // Path building. Arcs / curves are FLATTENED to polylines here, in user space, then transformed.
+    ctx.beginPath = function () { subpaths = []; cur = null; };
+    ctx.moveTo = function (x, y) { flushSub(); startX = +x; startY = +y; addPoint(+x, +y); };
+    ctx.lineTo = function (x, y) { if (!cur) { startX = +x; startY = +y; } addPoint(+x, +y); };
+    ctx.closePath = function () { if (cur && cur.length >= 2) { addPoint(startX, startY); } };
+    ctx.rect = function (x, y, w, h) {
+      flushSub(); x = +x; y = +y; w = +w; h = +h;
+      addPoint(x, y); addPoint(x + w, y); addPoint(x + w, y + h); addPoint(x, y + h); addPoint(x, y);
+      flushSub();
+    };
+    ctx.arc = function (x, y, r, a0, a1, ccw) {
+      x = +x; y = +y; r = +r; a0 = +a0; a1 = +a1;
+      var N = 24, span = a1 - a0;
+      if (ccw) { if (span > 0) { span -= 2 * Math.PI; } } else { if (span < 0) { span += 2 * Math.PI; } }
+      for (var i = 0; i <= N; i++) {
+        var a = a0 + span * (i / N);
+        var px = x + Math.cos(a) * r, py = y + Math.sin(a) * r;
+        if (i === 0 && !cur) { addPoint(px, py); } else { addPoint(px, py); }
+      }
+    };
+    ctx.ellipse = function (x, y, rx, ry, rot, a0, a1, ccw) {
+      x = +x; y = +y; rx = +rx; ry = +ry; rot = +rot || 0; a0 = +a0; a1 = +a1;
+      var N = 24, span = a1 - a0;
+      if (ccw) { if (span > 0) { span -= 2 * Math.PI; } } else { if (span < 0) { span += 2 * Math.PI; } }
+      var cr = Math.cos(rot), sr = Math.sin(rot);
+      for (var i = 0; i <= N; i++) {
+        var a = a0 + span * (i / N), ex = Math.cos(a) * rx, ey = Math.sin(a) * ry;
+        addPoint(x + ex * cr - ey * sr, y + ex * sr + ey * cr);
+      }
+    };
+    ctx.arcTo = function (x1, y1, x2, y2, r) {
+      // Approximate: line to the first tangent point, then to the second (good enough flattened).
+      ctx.lineTo(+x1, +y1); ctx.lineTo(+x2, +y2);
+    };
+    ctx.quadraticCurveTo = function (cx, cy, x, y) {
+      cx = +cx; cy = +cy; x = +x; y = +y;
+      var x0 = penX, y0 = penY, N = 16;
+      for (var i = 1; i <= N; i++) {
+        var t = i / N, u = 1 - t;
+        addPoint(u * u * x0 + 2 * u * t * cx + t * t * x, u * u * y0 + 2 * u * t * cy + t * t * y);
+      }
+    };
+    ctx.bezierCurveTo = function (c1x, c1y, c2x, c2y, x, y) {
+      c1x = +c1x; c1y = +c1y; c2x = +c2x; c2y = +c2y; x = +x; y = +y;
+      var x0 = penX, y0 = penY, N = 16;
+      for (var i = 1; i <= N; i++) {
+        var t = i / N, u = 1 - t;
+        var b0 = u * u * u, b1 = 3 * u * u * t, b2 = 3 * u * t * t, b3 = t * t * t;
+        addPoint(b0 * x0 + b1 * c1x + b2 * c2x + b3 * x, b0 * y0 + b1 * c1y + b2 * c2y + b3 * y);
+      }
+    };
+    ctx.roundRect = function (x, y, w, h) { ctx.rect(x, y, w, h); }; // corners approximated as square
+
+    // Drawing ops append resolved commands.
+    function rectCmd(op, x, y, w, h, style) {
+      x = +x; y = +y; w = +w; h = +h;
+      var p0 = __cnvApply(state.m, x, y), p1 = __cnvApply(state.m, x + w, y),
+          p2 = __cnvApply(state.m, x + w, y + h), p3 = __cnvApply(state.m, x, y + h);
+      var cmd = { op: op, quad: [p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], p3[0], p3[1]], alpha: state.globalAlpha };
+      if (op !== "clearRect") { var r = resolveStyle(style); for (var k in r) { cmd[k] = r[k]; } }
+      list.push(cmd);
+    }
+    ctx.fillRect = function (x, y, w, h) { rectCmd("fillRect", x, y, w, h, state.fillStyle); };
+    ctx.clearRect = function (x, y, w, h) {
+      // A clearRect covering the whole canvas resets the display list (bounds growth for
+      // clear+redraw animation loops). Otherwise it's an erase quad.
+      var cw = el.width | 0 || 300, chh = el.height | 0 || 150;
+      var m = state.m, axis = (Math.abs(m[1]) < 1e-6 && Math.abs(m[2]) < 1e-6);
+      if (axis && (+x) <= 0 && (+y) <= 0 && (+x + +w) >= cw && (+y + +h) >= chh) { list.length = 0; return; }
+      rectCmd("clearRect", x, y, w, h, null);
+    };
+    ctx.strokeRect = function (x, y, w, h) {
+      x = +x; y = +y; w = +w; h = +h;
+      var pts = [x, y, x + w, y, x + w, y + h, x, y + h, x, y];
+      var dev = [];
+      for (var i = 0; i < pts.length; i += 2) { var p = __cnvApply(state.m, pts[i], pts[i + 1]); dev.push(p[0], p[1]); }
+      var r = resolveStyle(state.strokeStyle);
+      var cmd = { op: "stroke", polylines: [dev], width: state.lineWidth * __cnvScale(state.m), alpha: state.globalAlpha };
+      for (var k in r) { cmd[k] = r[k]; }
+      list.push(cmd);
+    };
+    ctx.fill = function () {
+      var polys = devicePaths();
+      if (!polys.length) { return; }
+      var r = resolveStyle(state.fillStyle);
+      var cmd = { op: "fill", polygons: polys, alpha: state.globalAlpha };
+      for (var k in r) { cmd[k] = r[k]; }
+      list.push(cmd);
+    };
+    ctx.stroke = function () {
+      var polys = devicePaths();
+      if (!polys.length) { return; }
+      var r = resolveStyle(state.strokeStyle);
+      var cmd = { op: "stroke", polylines: polys, width: state.lineWidth * __cnvScale(state.m), alpha: state.globalAlpha };
+      for (var k in r) { cmd[k] = r[k]; }
+      list.push(cmd);
+    };
+    function textCmd(op, text, x, y, style) {
+      var p = __cnvApply(state.m, +x || 0, +y || 0);
+      var r = resolveStyle(style);
+      var cmd = { op: "text", text: String(text), x: p[0], y: p[1],
+        size: state.fontSize * __cnvScale(state.m), align: state.textAlign,
+        baseline: state.textBaseline, alpha: state.globalAlpha };
+      for (var k in r) { cmd[k] = r[k]; }
+      list.push(cmd);
+    }
+    ctx.fillText = function (t, x, y) { textCmd("fillText", t, x, y, state.fillStyle); };
+    ctx.strokeText = function (t, x, y) { textCmd("strokeText", t, x, y, state.strokeStyle); };
+    ctx.measureText = function (s) {
+      var w = __measureCanvasText(String(s == null ? "" : s), state.fontSize);
+      return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w,
+        actualBoundingBoxAscent: state.fontSize * 0.8, actualBoundingBoxDescent: state.fontSize * 0.2,
+        fontBoundingBoxAscent: state.fontSize * 0.8, fontBoundingBoxDescent: state.fontSize * 0.2 };
+    };
+
+    // Gradients.
+    function makeGradient(kind, x0, y0, x1, y1, r0, r1) {
+      var g = { __grad: true, kind: kind, x0: +x0, y0: +y0, x1: +x1, y1: +y1, r0: +r0 || 0, r1: +r1 || 0, stops: [] };
+      g.addColorStop = function (off, color) { g.stops.push({ offset: +off, color: String(color) }); };
+      return g;
+    }
+    ctx.createLinearGradient = function (x0, y0, x1, y1) { return makeGradient("linear", x0, y0, x1, y1, 0, 0); };
+    ctx.createRadialGradient = function (x0, y0, r0, x1, y1, r1) { return makeGradient("radial", x0, y0, x1, y1, r0, r1); };
+    ctx.createConicGradient = function () { return makeGradient("linear", 0, 0, 0, 0, 0, 0); };
+
+    // No-ops (documented): clip, shadows, drawImage, image data, patterns, line dash.
+    var noop = function () {};
+    ctx.clip = noop; ctx.drawImage = noop; ctx.putImageData = noop; ctx.drawFocusIfNeeded = noop;
+    ctx.setLineDash = noop; ctx.getLineDash = function () { return []; };
+    ctx.isPointInPath = function () { return false; }; ctx.isPointInStroke = function () { return false; };
+    ctx.createPattern = function () { return null; };
+    ctx.createImageData = function (w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; };
+    ctx.getImageData = function (x, y, w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; };
+    ctx.getContextAttributes = function () { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; };
+    return ctx;
+  }
+  globalThis.__makeCanvas2D = __makeCanvas2D;
+
+  // Approximate text advance for measureText. The JS crate has no font, so this is a proportional
+  // per-character estimate (the engine rasterizes/aligns text with the REAL system font). Narrow
+  // glyphs (i/l/.) ~0.32em, wide (m/w/W) ~0.92em, else ~0.55em — close enough for layout.
+  function __measureCanvasText(s, px) {
+    var w = 0;
+    for (var i = 0; i < s.length; i++) {
+      var ch = s[i];
+      if ("iIl.,:;'|!".indexOf(ch) >= 0) { w += 0.32; }
+      else if ("mwMW@".indexOf(ch) >= 0) { w += 0.92; }
+      else if (ch >= "A" && ch <= "Z") { w += 0.68; }
+      else if (ch === " ") { w += 0.30; }
+      else { w += 0.52; }
+    }
+    return w * px;
+  }
+
+  // The engine pulls every canvas's display list through this. Returns a JSON-ready array of
+  // { id, width, height, commands:[...] }. Guard on the engine side: only called when the DOM has
+  // a <canvas>.
+  globalThis.__canvasLists = function () {
+    var cs = globalThis.__canvases || [];
+    var out = [];
+    for (var i = 0; i < cs.length; i++) {
+      var c = cs[i];
+      if (!c || c.__nodeId < 0) { continue; }
+      var el = c.canvas;
+      out.push({ id: c.__nodeId, width: (el.width | 0) || 300, height: (el.height | 0) || 150, commands: c.__list });
+    }
+    return out;
+  };
+
 })();
 "#;
 
@@ -6377,6 +6652,15 @@ impl Session {
     pub fn observed_targets(&self) -> String {
         let (out, _doc, _console) =
             self.eval_full("JSON.stringify(__observedTargets())".to_string());
+        out.value.unwrap_or_else(|| "[]".to_string())
+    }
+
+    /// Return the JSON display lists of every `<canvas>` that has a 2D context, for the engine to
+    /// rasterize: `[{id,width,height,commands:[...]}, ...]`. Empty `[]` when no canvas has a
+    /// context. The engine gates this on the DOM actually containing a `<canvas>`.
+    pub fn canvas_lists(&self) -> String {
+        let (out, _doc, _console) =
+            self.eval_full("JSON.stringify((globalThis.__canvasLists||function(){return[]})())".to_string());
         out.value.unwrap_or_else(|| "[]".to_string())
     }
 
