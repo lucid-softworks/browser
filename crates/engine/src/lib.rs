@@ -1229,6 +1229,177 @@ pub enum StyleSource {
     External(String),
 }
 
+/// Build the host `request_fetcher` capability passed into the JS runtime: it backs the rewritten
+/// JS `fetch()` (arbitrary method + headers + body). Given `(method, resolved_url, body,
+/// headers_json)` it parses the headers JSON object, issues the request via [`net::request`], and
+/// returns a JSON *envelope* string the JS side parses into a `Response`. Returns `None` on
+/// transport error (→ `fetch` rejects with `TypeError`). Runs on the JS worker thread; blocking is
+/// fine there.
+fn build_request_fetcher() -> Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> {
+    Box::new(|method: &str, url: &str, body: &str, headers_json: &str| {
+        let headers = parse_headers_json(headers_json);
+        let body_opt: Option<&[u8]> = if body.is_empty() { None } else { Some(body.as_bytes()) };
+        let resp = net::request(method, url, body_opt, &headers).ok()?;
+        let ok = (200..300).contains(&resp.status);
+        let status_text = reason_phrase(resp.status);
+        let body_str = String::from_utf8_lossy(&resp.body);
+        Some(build_response_envelope(
+            ok,
+            resp.status,
+            status_text,
+            &resp.final_url,
+            &resp.content_type,
+            &body_str,
+        ))
+    })
+}
+
+/// Parse a flat JSON object of `name -> string-value` (the headers JSON `fetch` builds with
+/// `JSON.stringify`) into a `Vec<(name, value)>`. Tolerant: returns an empty vec on any parse
+/// problem (a malformed header map shouldn't abort the request).
+fn parse_headers_json(s: &str) -> Vec<(String, String)> {
+    let s = s.trim();
+    let inner = match s.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+        Some(i) => i.trim(),
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    // Parse a JSON string starting at `bytes[i] == '"'`, returning (decoded, next_index).
+    fn parse_str(bytes: &[u8], mut i: usize) -> Option<(String, usize)> {
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        i += 1;
+        let mut out = String::new();
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'\\' {
+                i += 1;
+                match bytes.get(i)? {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'n' => out.push('\n'),
+                    b't' => out.push('\t'),
+                    b'r' => out.push('\r'),
+                    b'b' => out.push('\u{8}'),
+                    b'f' => out.push('\u{c}'),
+                    b'u' => {
+                        let hex = std::str::from_utf8(bytes.get(i + 1..i + 5)?).ok()?;
+                        let cp = u32::from_str_radix(hex, 16).ok()?;
+                        out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+                        i += 4;
+                    }
+                    other => out.push(*other as char),
+                }
+                i += 1;
+            } else if c == b'"' {
+                return Some((out, i + 1));
+            } else {
+                // Copy a UTF-8 byte run up to the next escape/quote.
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'\\' && bytes[i] != b'"' {
+                    i += 1;
+                }
+                out.push_str(std::str::from_utf8(&bytes[start..i]).ok()?);
+            }
+        }
+        None
+    }
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let (key, ni) = match parse_str(bytes, i) {
+            Some(r) => r,
+            None => break,
+        };
+        i = ni;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b':') {
+            i += 1;
+        }
+        let (val, ni) = match parse_str(bytes, i) {
+            Some(r) => r,
+            None => break,
+        };
+        i = ni;
+        out.push((key, val));
+        while i < bytes.len() && (bytes[i] == b',' || (bytes[i] as char).is_whitespace()) {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// JSON-escape a string into `out` (control chars, quotes, backslash). No surrounding quotes.
+fn json_escape(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+}
+
+/// Build the JSON response envelope the JS `fetch()` parses into a `Response`.
+fn build_response_envelope(
+    ok: bool,
+    status: u16,
+    status_text: &str,
+    url: &str,
+    content_type: &str,
+    body: &str,
+) -> String {
+    let mut s = String::with_capacity(body.len() + 128);
+    s.push_str("{\"ok\":");
+    s.push_str(if ok { "true" } else { "false" });
+    s.push_str(",\"status\":");
+    s.push_str(&status.to_string());
+    s.push_str(",\"statusText\":\"");
+    json_escape(status_text, &mut s);
+    s.push_str("\",\"url\":\"");
+    json_escape(url, &mut s);
+    s.push_str("\",\"contentType\":\"");
+    json_escape(content_type, &mut s);
+    s.push_str("\",\"body\":\"");
+    json_escape(body, &mut s);
+    s.push_str("\"}");
+    s
+}
+
+/// A minimal reason-phrase for common HTTP status codes (empty when unknown).
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "",
+    }
+}
+
 /// Resolve `href` against `base` using the `url` crate, returning an absolute
 /// `http(s)`/`file` URL. Returns `None` for empty/fragment-only hrefs and for non-fetchable
 /// schemes (`data:`, `javascript:`, `mailto:`, …) or anything that fails to parse/join.
@@ -2106,7 +2277,8 @@ pub fn run_modules(doc: dom::Document, page_url: &str) -> (dom::Document, Vec<St
     let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
         net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())
     });
-    let (doc, results) = js::run_modules(doc, page_url, entries, sources, fetcher);
+    let request_fetcher = build_request_fetcher();
+    let (doc, results) = js::run_modules(doc, page_url, entries, sources, fetcher, request_fetcher);
     let mut out = notes;
     for result in results {
         out.extend(result.console);
@@ -2256,8 +2428,9 @@ fn start_session(
     let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
         net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())
     });
+    let request_fetcher = build_request_fetcher();
     let (session, snapshot, results) =
-        js::Session::new(doc, classic, entries, module_sources, base, fetcher);
+        js::Session::new(doc, classic, entries, module_sources, base, fetcher, request_fetcher);
     for result in results {
         notes.extend(result.console);
         if let Some(err) = result.error {

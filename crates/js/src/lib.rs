@@ -68,18 +68,30 @@ struct HostState {
     /// paths install a no-op fetcher that always returns `None`. Held as an `Rc` so the module
     /// registry on the `run_modules` path can share the very same fetcher.
     fetcher: Rc<dyn Fn(&str) -> Option<String>>,
+    /// Host network capability for arbitrary-method requests (method, url, body, headers-JSON),
+    /// backing the `__request` native primitive that powers JS `fetch()` with method/headers/body.
+    /// Returns a JSON response *envelope* (see `engine`'s builder) or `None` on transport error.
+    /// Distinct from `fetcher` (a GET-only body fetcher) which module loading still relies on.
+    /// No-DOM / `run_with_dom` paths install a no-op that always returns `None`.
+    request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>>,
 }
 
 impl HostState {
     fn new(doc: SharedDoc) -> Rc<Self> {
-        Self::with_fetcher(doc, Rc::new(|_| None))
+        Self::with_fetcher(doc, Rc::new(|_| None), Rc::new(|_, _, _, _| None))
     }
 
     fn with_fetcher(
         doc: SharedDoc,
         fetcher: Rc<dyn Fn(&str) -> Option<String>>,
+        request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>>,
     ) -> Rc<Self> {
-        Rc::new(HostState { doc, console: RefCell::new(Vec::new()), fetcher })
+        Rc::new(HostState {
+            doc,
+            console: RefCell::new(Vec::new()),
+            fetcher,
+            request_fetcher,
+        })
     }
 }
 
@@ -1091,6 +1103,51 @@ fn prim_fetch(
     }
 }
 
+/// `__request(method, url, body, headersJson) -> string | null`
+///
+/// Arbitrary-method network primitive backing the rewritten JS `fetch()`. Resolves `url` against
+/// `globalThis.__pageURL` (relative URLs join onto the page URL; absolute ones pass through), then
+/// calls the host `request_fetcher` with the (method, resolved-url, body, headers-JSON) and returns
+/// the response *envelope* JSON string the host produced. Returns `null` (JS) on transport failure
+/// or when no request fetcher is installed. Runs on the isolate's own worker thread, so the
+/// blocking host request is fine. Never panics.
+fn prim_request(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let method = arg_str(scope, &args, 0);
+    let raw = arg_str(scope, &args, 1);
+    let body = arg_str(scope, &args, 2);
+    let headers_json = arg_str(scope, &args, 3);
+    // Resolve against the page URL when present (so relative URLs work like other fetches).
+    let resolved = {
+        let global = scope.get_current_context().global(scope);
+        let key = v8::String::new(scope, "__pageURL").unwrap();
+        let base = global
+            .get(scope, key.into())
+            .filter(|v| v.is_string())
+            .map(|v| v.to_rust_string_lossy(scope));
+        match base {
+            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
+                Ok(u) => u.to_string(),
+                // Join failed: fall back to the raw URL (likely already absolute).
+                Err(_) => raw.clone(),
+            },
+            _ => raw.clone(),
+        }
+    };
+    let envelope =
+        (host_state(scope).request_fetcher)(&method, &resolved, &body, &headers_json);
+    match envelope {
+        Some(s) => {
+            let v = js_str(scope, &s);
+            rv.set(v);
+        }
+        None => rv.set_null(),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Installation: register native primitives + evaluate the JS bootstrap onto a fresh context.
 // ---------------------------------------------------------------------------------------------
@@ -1157,6 +1214,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__rootId", prim_root_id);
     set_fn(scope, global, "__titleText", prim_title_text);
     set_fn(scope, global, "__fetch", prim_fetch);
+    set_fn(scope, global, "__request", prim_request);
 }
 
 /// Compile+run a script in the current context, ignoring the result. Used for bootstraps where a
@@ -2942,36 +3000,177 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     subtle: {}
   };
 
-  // fetch: backed by the native __fetch primitive (synchronous host fetch under the hood; wrapping
-  // the result in Promise.resolve is correct for our synchronous drain model). Returns a minimal
-  // Response. Rejects with TypeError("Failed to fetch") when the host fetch fails (null body).
+  // --- FormData ----------------------------------------------------------------------------
+  // Pure-JS FormData. Backed by an array of [name, value] entries. When constructed from a
+  // <form> element, collects the form's successful named controls. NOTE: File/Blob values are
+  // not specially handled — they are stored as-is (and stringified when serialized); there is no
+  // real File support, and `fetch` serializes a FormData body as urlencoded (not multipart).
+  if (typeof globalThis.FormData !== "function") {
+    def(globalThis, "FormData", function (form) {
+      var entries = [];
+      this.__isFormData = true;
+      function add(name, value) { entries.push([String(name), value]); }
+      // Collect successful named controls from a <form> element (duck-typed via tagName).
+      if (form && typeof form === "object" && form.tagName && String(form.tagName).toUpperCase() === "FORM") {
+        var collect = function (el) {
+          var kids = el.childNodes || [];
+          for (var i = 0; i < kids.length; i++) {
+            var c = kids[i];
+            if (!c || c.nodeType !== 1) { continue; }
+            var tag = String(c.tagName || "").toUpperCase();
+            var name = c.getAttribute ? c.getAttribute("name") : null;
+            var disabled = c.getAttribute ? (c.getAttribute("disabled") != null) : false;
+            if (tag === "INPUT" && name && !disabled) {
+              var type = (c.getAttribute("type") || "text").toLowerCase();
+              if (type === "checkbox" || type === "radio") {
+                if (c.checked) { add(name, c.value != null && c.value !== "" ? c.value : "on"); }
+              } else if (type === "submit" || type === "button" || type === "reset" || type === "file" || type === "image") {
+                // not successful for our purposes
+              } else {
+                add(name, c.value != null ? c.value : "");
+              }
+            } else if (tag === "SELECT" && name && !disabled) {
+              add(name, c.value != null ? c.value : "");
+            } else if (tag === "TEXTAREA" && name && !disabled) {
+              // A <textarea>'s value defaults to its text content when no value was set.
+              var tv = (c.value != null && c.value !== "") ? c.value : (c.textContent != null ? c.textContent : "");
+              add(name, tv);
+            }
+            // Recurse into descendants (controls may be nested in wrappers).
+            if (c.childNodes && c.childNodes.length) { collect(c); }
+          }
+        };
+        collect(form);
+      }
+      this.append = function (name, value) { add(name, value); };
+      this.set = function (name, value) { name = String(name); for (var i = entries.length - 1; i >= 0; i--) { if (entries[i][0] === name) { entries.splice(i, 1); } } add(name, value); };
+      this.get = function (name) { name = String(name); for (var i = 0; i < entries.length; i++) { if (entries[i][0] === name) { return entries[i][1]; } } return null; };
+      this.getAll = function (name) { name = String(name); var out = []; for (var i = 0; i < entries.length; i++) { if (entries[i][0] === name) { out.push(entries[i][1]); } } return out; };
+      this.has = function (name) { name = String(name); for (var i = 0; i < entries.length; i++) { if (entries[i][0] === name) { return true; } } return false; };
+      this.delete = function (name) { name = String(name); for (var i = entries.length - 1; i >= 0; i--) { if (entries[i][0] === name) { entries.splice(i, 1); } } };
+      this.forEach = function (cb, thisArg) { for (var i = 0; i < entries.length; i++) { cb.call(thisArg, entries[i][1], entries[i][0], this); } };
+      this.keys = function () { return entries.map(function (e) { return e[0]; })[Symbol.iterator](); };
+      this.values = function () { return entries.map(function (e) { return e[1]; })[Symbol.iterator](); };
+      this.entries = function () { return entries.map(function (e) { return [e[0], e[1]]; })[Symbol.iterator](); };
+      this[Symbol.iterator] = function () { return this.entries(); };
+      // Internal: urlencoded serialization used by fetch (multipart is NOT implemented).
+      this.__toUrlEncoded = function () {
+        return entries.map(function (e) { return encodeURIComponent(e[0]) + "=" + encodeURIComponent(String(e[1])); }).join("&");
+      };
+    });
+  }
+
+  // Serialize a FormData-like into an application/x-www-form-urlencoded string.
+  function __formDataToUrlEncoded(fd) {
+    if (fd && typeof fd.__toUrlEncoded === "function") { return fd.__toUrlEncoded(); }
+    // Fallback: iterate entries() if available.
+    var parts = [];
+    if (fd && typeof fd.forEach === "function") {
+      fd.forEach(function (v, k) { parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v))); });
+    }
+    return parts.join("&");
+  }
+
+  // fetch: backed by the native __request primitive (synchronous host request under the hood;
+  // wrapping the result in Promise.resolve is correct for our synchronous drain model). Sends the
+  // method, headers, and serialized body; resolves a Response from the host's JSON envelope.
+  // Rejects with TypeError("Failed to fetch") when the host request fails (null envelope).
   if (typeof globalThis.fetch !== "function") {
     def(globalThis, "fetch", function (input, init) {
+      init = init || {};
       var url;
       try { url = (input && input.url) ? String(input.url) : String(input); }
       catch (e) { url = String(input); }
+      var method = String(init.method || "GET").toUpperCase();
+
       // Honor an AbortSignal: a fetch on an already-aborted signal rejects with AbortError. (Our
       // fetch is synchronous, so only pre-abort is observable.)
-      var signal = init && init.signal;
+      var signal = init.signal;
       if (signal && signal.aborted) {
         return Promise.reject(signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError"));
       }
-      var body = (typeof __fetch === "function") ? __fetch(url) : null;
-      if (body == null) {
+
+      // --- Headers: accept plain object, Headers-like (forEach), or array of pairs. ---
+      var headers = {};
+      var hdrLower = {}; // lowercased name -> canonical name present, for content-type checks
+      function setHeader(name, value) { name = String(name); headers[name] = String(value); hdrLower[name.toLowerCase()] = name; }
+      var ih = init.headers;
+      if (ih) {
+        if (Array.isArray(ih)) {
+          for (var i = 0; i < ih.length; i++) { if (ih[i]) { setHeader(ih[i][0], ih[i][1]); } }
+        } else if (typeof ih.forEach === "function" && typeof ih.get === "function") {
+          ih.forEach(function (v, k) { setHeader(k, v); });
+        } else if (typeof ih === "object") {
+          for (var k in ih) { if (Object.prototype.hasOwnProperty.call(ih, k)) { setHeader(k, ih[k]); } }
+        }
+      }
+      function hasContentType() { return hdrLower["content-type"] != null; }
+      function ensureContentType(ct) { if (!hasContentType()) { setHeader("Content-Type", ct); } }
+
+      // --- Body serialization (GET/HEAD carry no body). ---
+      var bodyStr = "";
+      var rawBody = init.body;
+      if (method !== "GET" && method !== "HEAD" && rawBody != null) {
+        if (typeof rawBody === "string") {
+          bodyStr = rawBody;
+        } else if (rawBody.__isFormData || (typeof globalThis.FormData === "function" && rawBody instanceof globalThis.FormData)) {
+          // FormData: encoded as urlencoded (real multipart/form-data is NOT implemented).
+          bodyStr = __formDataToUrlEncoded(rawBody);
+          ensureContentType("application/x-www-form-urlencoded;charset=UTF-8");
+        } else if (typeof rawBody.toString === "function" && (typeof globalThis.URLSearchParams === "function" && rawBody instanceof globalThis.URLSearchParams)) {
+          bodyStr = rawBody.toString();
+          ensureContentType("application/x-www-form-urlencoded;charset=UTF-8");
+        } else if (typeof rawBody === "object" && typeof rawBody.toString === "function" && rawBody.toString !== Object.prototype.toString) {
+          // Other stringifiable objects (e.g. URLSearchParams-likes with a custom toString).
+          bodyStr = rawBody.toString();
+        } else {
+          // Plain object / anything else: leave as String(body); don't force JSON.
+          bodyStr = String(rawBody);
+        }
+      }
+
+      var envelope = (typeof __request === "function") ? __request(method, url, bodyStr, JSON.stringify(headers)) : null;
+      if (envelope == null) {
         return Promise.reject(new TypeError("Failed to fetch"));
       }
+      var env;
+      try { env = JSON.parse(envelope); } catch (e) { return Promise.reject(new TypeError("Failed to fetch")); }
+
+      var respBody = env.body != null ? String(env.body) : "";
+      var contentType = env.contentType != null ? String(env.contentType) : "";
+      var respHeaders = {};
+      if (contentType) { respHeaders["content-type"] = contentType; }
+      var headersObj = {
+        get: function (n) { n = String(n).toLowerCase(); return respHeaders[n] != null ? respHeaders[n] : null; },
+        has: function (n) { n = String(n).toLowerCase(); return respHeaders[n] != null; },
+        forEach: function (cb, thisArg) { for (var n in respHeaders) { cb.call(thisArg, respHeaders[n], n, this); } },
+        keys: function () { return Object.keys(respHeaders)[Symbol.iterator](); },
+        values: function () { return Object.keys(respHeaders).map(function (n) { return respHeaders[n]; })[Symbol.iterator](); },
+        entries: function () { return Object.keys(respHeaders).map(function (n) { return [n, respHeaders[n]]; })[Symbol.iterator](); }
+      };
       var response = {
-        ok: true, status: 200, statusText: "OK",
-        url: url, redirected: false, type: "basic", bodyUsed: false,
-        headers: { get: function () { return null; }, has: function () { return false; },
-          forEach: fn, keys: function () { return [][Symbol.iterator](); },
-          values: function () { return [][Symbol.iterator](); },
-          entries: function () { return [][Symbol.iterator](); } },
-        text: function () { return Promise.resolve(body); },
-        json: function () { return Promise.resolve(JSON.parse(body)); },
+        ok: !!env.ok,
+        status: env.status != null ? env.status : 200,
+        statusText: env.statusText != null ? String(env.statusText) : "",
+        url: env.url != null ? String(env.url) : url,
+        redirected: false, type: "basic", bodyUsed: false,
+        headers: headersObj,
+        text: function () { return Promise.resolve(respBody); },
+        json: function () { return Promise.resolve(JSON.parse(respBody)); },
         arrayBuffer: function () { return Promise.resolve(new ArrayBuffer(0)); },
-        blob: function () { return Promise.resolve({ size: 0, type: "" }); },
-        formData: function () { return Promise.reject(new TypeError("formData not supported")); },
+        blob: function () { return Promise.resolve({ size: respBody.length, type: contentType }); },
+        formData: function () {
+          var fd = new globalThis.FormData();
+          var parts = respBody ? respBody.split("&") : [];
+          for (var i = 0; i < parts.length; i++) {
+            if (!parts[i]) { continue; }
+            var eq = parts[i].indexOf("=");
+            var k = eq < 0 ? parts[i] : parts[i].slice(0, eq);
+            var v = eq < 0 ? "" : parts[i].slice(eq + 1);
+            try { fd.append(decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))); } catch (e) { fd.append(k, v); }
+          }
+          return Promise.resolve(fd);
+        },
         clone: function () { return response; }
       };
       return Promise.resolve(response);
@@ -3949,6 +4148,7 @@ pub fn run_modules(
     entries: Vec<String>,
     modules: HashMap<String, String>,
     fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send>,
 ) -> (dom::Document, Vec<EvalOutput>) {
     let url = url.to_string();
     let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
@@ -3975,7 +4175,13 @@ pub fn run_modules(
                 // Share one fetcher between the module loader and the JS `fetch()` primitive.
                 let fetcher: Rc<dyn Fn(&str) -> Option<String>> =
                     Rc::new(move |u: &str| fetcher(u));
-                let state = HostState::with_fetcher(Rc::clone(&shared), Rc::clone(&fetcher));
+                let request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>> =
+                    Rc::new(move |m, u, b, h| request_fetcher(m, u, b, h));
+                let state = HostState::with_fetcher(
+                    Rc::clone(&shared),
+                    Rc::clone(&fetcher),
+                    request_fetcher,
+                );
                 scope.get_current_context().set_slot(state);
                 let registry = Rc::new(ModuleRegistry {
                     sources: RefCell::new(modules),
@@ -4172,6 +4378,7 @@ impl Session {
         modules: HashMap<String, String>,
         url: &str,
         fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+        request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send>,
     ) -> (Session, dom::Document, Vec<EvalOutput>) {
         let url = url.to_string();
         let fallback = doc.clone();
@@ -4186,7 +4393,10 @@ impl Session {
                 // Catch any panic so it never crosses the thread boundary; on panic the init
                 // channel is dropped and the caller falls back to an empty snapshot.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    session_thread_main(doc, scripts, entries, modules, url, fetcher, init_tx, cmd_rx);
+                    session_thread_main(
+                        doc, scripts, entries, modules, url, fetcher, request_fetcher,
+                        init_tx, cmd_rx,
+                    );
                 }));
             });
 
@@ -4342,6 +4552,7 @@ fn session_thread_main(
     modules: HashMap<String, String>,
     url: String,
     fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send>,
     init_tx: std::sync::mpsc::Sender<(dom::Document, Vec<EvalOutput>)>,
     cmd_rx: std::sync::mpsc::Receiver<SessionCmd>,
 ) {
@@ -4362,7 +4573,13 @@ fn session_thread_main(
 
         // Share one fetcher between the module loader and the JS `fetch()` primitive (as run_modules).
         let fetcher: Rc<dyn Fn(&str) -> Option<String>> = Rc::new(move |u: &str| fetcher(u));
-        let state = HostState::with_fetcher(Rc::clone(&shared), Rc::clone(&fetcher));
+        let request_fetcher: Rc<dyn Fn(&str, &str, &str, &str) -> Option<String>> =
+            Rc::new(move |m, u, b, h| request_fetcher(m, u, b, h));
+        let state = HostState::with_fetcher(
+            Rc::clone(&shared),
+            Rc::clone(&fetcher),
+            request_fetcher,
+        );
         scope.get_current_context().set_slot(state);
         let registry = Rc::new(ModuleRegistry {
             sources: RefCell::new(modules),
@@ -5356,6 +5573,11 @@ mod tests {
         Box::new(|_u: &str| None)
     }
 
+    /// A request fetcher that never serves anything (default for tests not exercising `fetch`).
+    fn no_request() -> Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> {
+        Box::new(|_m, _u, _b, _h| None)
+    }
+
     #[test]
     fn two_module_graph_resolves_named_import() {
         let entry = "https://x/app.js".to_string();
@@ -5369,7 +5591,7 @@ mod tests {
         modules.insert(util, "export const v = 42;".to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "got 42"), "console was {console:?}");
@@ -5389,7 +5611,7 @@ mod tests {
         modules.insert(leaf, r#"export function hello() { return "chained"; }"#.to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "chained"), "console was {console:?}");
@@ -5408,7 +5630,7 @@ mod tests {
 
         let (doc, _) = doc_with_body("");
         let (_doc, out) =
-            run_modules(doc, "https://x/", vec![entry.clone()], modules, no_fetch());
+            run_modules(doc, "https://x/", vec![entry.clone()], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(
@@ -5434,7 +5656,7 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         // Must not panic; the entry's evaluation surfaces an error.
         assert!(out.iter().any(|o| o.error.is_some()), "expected an error, got {out:?}");
     }
@@ -5448,7 +5670,7 @@ mod tests {
         modules.insert(dep, r#"console.log("side effect ran");"#.to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(
@@ -5469,14 +5691,20 @@ mod tests {
                 .to_string(),
         );
 
-        let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
-            // The URL is resolved against the page URL before reaching the host fetcher.
-            assert_eq!(u, "https://x/data.json", "fetch should resolve relative URLs");
-            Some(r#"{"score": 99}"#.to_string())
-        });
+        // fetch() now routes through the request fetcher (method/url/body/headers) and parses the
+        // host's JSON envelope. The URL is resolved against the page URL before it reaches us.
+        let request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> =
+            Box::new(|method, u, _b, _h| {
+                assert_eq!(method, "GET");
+                assert_eq!(u, "https://x/data.json", "fetch should resolve relative URLs");
+                Some(
+                    r#"{"ok":true,"status":200,"statusText":"OK","url":"https://x/data.json","contentType":"application/json","body":"{\"score\": 99}"}"#
+                        .to_string(),
+                )
+            });
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, fetcher);
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), request_fetcher);
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "got:99"), "console was {console:?}");
@@ -5494,12 +5722,178 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(
             console.iter().any(|l| l == "caught:TypeError:Failed to fetch"),
             "console was {console:?}"
+        );
+    }
+
+    #[test]
+    fn formdata_api_append_get_getall_has_delete_entries() {
+        // Exercise the core FormData methods purely in JS.
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var fd = new FormData();
+                fd.append("a", "1");
+                fd.append("a", "2");
+                fd.append("b", "3");
+                console.log("get:" + fd.get("a"));
+                console.log("getAll:" + fd.getAll("a").join(","));
+                console.log("has:" + fd.has("a") + "," + fd.has("z"));
+                fd.set("a", "9");
+                console.log("set:" + fd.getAll("a").join(","));
+                fd.delete("b");
+                console.log("del:" + fd.has("b"));
+                var ents = [];
+                for (var e of fd.entries()) { ents.push(e[0] + "=" + e[1]); }
+                console.log("entries:" + ents.join("&"));
+                var it = [];
+                for (var p of fd) { it.push(p[0] + "=" + p[1]); }
+                console.log("iter:" + it.join("&"));
+            "#
+            .to_string(),
+        );
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.contains(&"get:1".to_string()), "{console:?}");
+        assert!(console.contains(&"getAll:1,2".to_string()), "{console:?}");
+        assert!(console.contains(&"has:true,false".to_string()), "{console:?}");
+        assert!(console.contains(&"set:9".to_string()), "{console:?}");
+        assert!(console.contains(&"del:false".to_string()), "{console:?}");
+        // After set("a","9") (collapses a to one entry at end) and delete("b"), only a=9 remains.
+        assert!(console.contains(&"entries:a=9".to_string()), "{console:?}");
+        assert!(console.contains(&"iter:a=9".to_string()), "{console:?}");
+    }
+
+    #[test]
+    fn formdata_from_form_collects_named_controls() {
+        // Constructing FormData from a <form> collects its successful named controls.
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                document.body.innerHTML =
+                  '<form id="f">' +
+                    '<input name="user" value="luna">' +
+                    '<input name="pass" type="password" value="secret">' +
+                    '<input name="agree" type="checkbox" value="yes">' +
+                    '<input name="news" type="checkbox" value="on1" checked>' +
+                    '<input name="ignored" type="submit" value="go">' +
+                    '<textarea name="bio">hi there</textarea>' +
+                  '</form>';
+                var f = document.getElementById("f");
+                var fd = new FormData(f);
+                console.log("user:" + fd.get("user"));
+                console.log("pass:" + fd.get("pass"));
+                console.log("agree:" + fd.has("agree"));
+                console.log("news:" + fd.get("news"));
+                console.log("submit:" + fd.has("ignored"));
+                console.log("bio:" + fd.get("bio"));
+            "#
+            .to_string(),
+        );
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.contains(&"user:luna".to_string()), "{console:?}");
+        assert!(console.contains(&"pass:secret".to_string()), "{console:?}");
+        assert!(console.contains(&"agree:false".to_string()), "{console:?}");
+        assert!(console.contains(&"news:on1".to_string()), "{console:?}");
+        assert!(console.contains(&"submit:false".to_string()), "{console:?}");
+        assert!(console.contains(&"bio:hi there".to_string()), "{console:?}");
+    }
+
+    #[test]
+    fn fetch_post_forwards_method_and_body() {
+        // A custom request_fetcher records the method + body and returns a canned envelope; the
+        // Response's text()/status must reach the page (proving the round trip + Promise drain).
+        use std::sync::{Arc, Mutex};
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                fetch("submit", { method: "post", body: "hello=world",
+                    headers: { "X-Test": "1" } })
+                  .then(r => r.text().then(t => console.log("resp:" + r.status + ":" + t)));
+            "#
+            .to_string(),
+        );
+        let seen: Arc<Mutex<(String, String, String)>> =
+            Arc::new(Mutex::new((String::new(), String::new(), String::new())));
+        let seen2 = Arc::clone(&seen);
+        let request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> =
+            Box::new(move |method, url, body, headers| {
+                *seen2.lock().unwrap() =
+                    (method.to_string(), body.to_string(), headers.to_string());
+                assert_eq!(url, "https://x/submit");
+                Some(
+                    r#"{"ok":true,"status":201,"statusText":"Created","url":"https://x/submit","contentType":"text/plain","body":"done"}"#
+                        .to_string(),
+                )
+            });
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) =
+            run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), request_fetcher);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.contains(&"resp:201:done".to_string()), "{console:?}");
+        let (method, body, headers) = seen.lock().unwrap().clone();
+        assert_eq!(method, "POST", "method uppercased + forwarded");
+        assert_eq!(body, "hello=world", "body forwarded");
+        assert!(headers.contains("X-Test"), "headers forwarded: {headers}");
+    }
+
+    #[test]
+    fn fetch_with_formdata_body_sends_urlencoded() {
+        // fetch(url, { body: formData }) serializes the FormData as urlencoded and sets the
+        // Content-Type, which the request_fetcher observes.
+        use std::sync::{Arc, Mutex};
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var fd = new FormData();
+                fd.append("name", "ada lovelace");
+                fd.append("role", "math");
+                fetch("u", { method: "POST", body: fd })
+                  .then(r => r.text().then(t => console.log("ok:" + t)));
+            "#
+            .to_string(),
+        );
+        let seen: Arc<Mutex<(String, String)>> =
+            Arc::new(Mutex::new((String::new(), String::new())));
+        let seen2 = Arc::clone(&seen);
+        let request_fetcher: Box<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send> =
+            Box::new(move |_method, _url, body, headers| {
+                *seen2.lock().unwrap() = (body.to_string(), headers.to_string());
+                Some(
+                    r#"{"ok":true,"status":200,"statusText":"OK","url":"https://x/u","contentType":"text/plain","body":"ok"}"#
+                        .to_string(),
+                )
+            });
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) =
+            run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), request_fetcher);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.contains(&"ok:ok".to_string()), "{console:?}");
+        let (body, headers) = seen.lock().unwrap().clone();
+        assert_eq!(body, "name=ada%20lovelace&role=math", "urlencoded body: {body}");
+        assert!(
+            headers.to_lowercase().contains("x-www-form-urlencoded"),
+            "content-type set: {headers}"
         );
     }
 
@@ -5517,7 +5911,7 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "dims:0,0,0"), "console was {console:?}");
@@ -5534,7 +5928,7 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("orig");
-        let (doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
+        let (doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch(), no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "title:from-module"), "console was {console:?}");
@@ -5565,7 +5959,7 @@ mod tests {
         });
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, fetcher);
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, fetcher, no_request());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "dyn:99"), "console was {console:?}");
@@ -5696,6 +6090,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -5719,6 +6114,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
         // Ran at least once during load.
@@ -5752,6 +6148,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -5777,6 +6174,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -5800,6 +6198,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert!(outputs.is_empty() || outputs.iter().all(|o| o.error.is_none()));
 
@@ -5827,6 +6226,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -5863,6 +6263,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert!(outputs.iter().all(|o| o.error.is_none()));
 
@@ -5895,6 +6296,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -5925,6 +6327,7 @@ mod tests {
             HashMap::new(),
             "https://example.com/",
             no_fetch(),
+            no_request(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 

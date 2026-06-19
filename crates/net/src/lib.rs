@@ -44,14 +44,37 @@ pub struct Response {
 /// GET `url` and return a [`Response`], or an `Err(String)` describing the failure.
 /// Supports `http(s)://` (via the reused HTTP client) and `file://` (local read), so
 /// local test pages can be loaded without a server.
+///
+/// Thin wrapper over [`request`] that preserves the historical GET surface.
 pub fn fetch(url: &str) -> Result<Response, String> {
+    request("GET", url, None, &[])
+}
+
+/// Issue an HTTP request with an arbitrary `method` and return a [`Response`], or an
+/// `Err(String)` describing the failure. Supports GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS over
+/// `http(s)://` (via the reused HTTP client) and `file://` reads (GET-like, body/headers ignored).
+///
+/// `body` is sent (via `send_bytes`) for methods that carry a payload (POST/PUT/PATCH/DELETE);
+/// other methods use `.call()`. `headers` are applied verbatim (callers set Content-Type etc.).
+/// The opt-in disk cache (`NET_CACHE_DIR`) applies to GET only; non-GET requests bypass it.
+pub fn request(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(String, String)],
+) -> Result<Response, String> {
+    let method_uc = method.to_ascii_uppercase();
+
     if let Some(path) = url.strip_prefix("file://") {
+        // file:// is a local read; method/body/headers don't apply.
         return fetch_file(path, url);
     }
 
+    let is_get = method_uc == "GET";
+
     // Opt-in on-disk cache (set NET_CACHE_DIR): serve a previously-cached body so repeated runs
-    // don't re-hit the network. Off by default, so normal browsing is unaffected.
-    let cache = cache_path(url);
+    // don't re-hit the network. GET only (keyed by URL); non-GET bypasses the cache entirely.
+    let cache = if is_get { cache_path(url) } else { None };
     if let Some(p) = &cache {
         if let Ok(body) = std::fs::read(p) {
             return Ok(Response {
@@ -62,6 +85,9 @@ pub fn fetch(url: &str) -> Result<Response, String> {
             });
         }
     }
+
+    // Whether this method carries a request body.
+    let has_body = matches!(method_uc.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
 
     // Present a mainstream browser User-Agent. Many sites (Google, etc.) serve a stripped
     // or blocked page to unknown clients like ureq's default UA, so we look like a browser.
@@ -75,8 +101,8 @@ pub fn fetch(url: &str) -> Result<Response, String> {
     //     modest timeout, never the multiply-the-timeout loop.
     let mut attempt = 0;
     let resp = loop {
-        let result = agent()
-            .get(url)
+        let mut req = agent()
+            .request(&method_uc, url)
             // Bound the whole request (DNS + connect + read) so one stalled connection can't
             // hang the engine. Kept modest so a dead sub-resource fails fast.
             .timeout(std::time::Duration::from_secs(8))
@@ -85,8 +111,15 @@ pub fn fetch(url: &str) -> Result<Response, String> {
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             )
-            .set("Accept-Language", "en-US,en;q=0.9")
-            .call();
+            .set("Accept-Language", "en-US,en;q=0.9");
+        for (name, value) in headers {
+            req = req.set(name, value);
+        }
+        let result = if has_body {
+            req.send_bytes(body.unwrap_or(&[]))
+        } else {
+            req.call()
+        };
         let backoff = |a: u32| std::time::Duration::from_millis(match a { 1 => 200, 2 => 500, _ => 1000 });
         match result {
             Ok(resp) => break resp,
@@ -118,23 +151,23 @@ pub fn fetch(url: &str) -> Result<Response, String> {
         .unwrap_or("application/octet-stream")
         .to_string();
 
-    let mut body = Vec::new();
+    let mut resp_body = Vec::new();
     resp.into_reader()
         .take(MAX_BODY_BYTES)
-        .read_to_end(&mut body)
+        .read_to_end(&mut resp_body)
         .map_err(|e| format!("failed to read body: {e}"))?;
 
-    // Populate the opt-in disk cache on success.
+    // Populate the opt-in disk cache on success (GET only).
     if status == 200 {
         if let Some(p) = &cache {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(p, &body);
+            let _ = std::fs::write(p, &resp_body);
         }
     }
 
-    Ok(Response { status, content_type, body, final_url: url.to_string() })
+    Ok(Response { status, content_type, body: resp_body, final_url: url.to_string() })
 }
 
 /// Disk-cache file path for `url` under `NET_CACHE_DIR` (a stable hash of the URL), or `None`
@@ -194,5 +227,34 @@ mod tests {
     fn body_cap_exceeds_4gib() {
         // Tabs are not capped at 4 GiB; the body backstop must sit comfortably above it.
         assert!(MAX_BODY_BYTES > 4 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_get_delegates_to_file_read() {
+        // `request("GET", file://…)` reads local disk exactly like `fetch` (delegation path).
+        let mut path = std::env::temp_dir();
+        path.push(format!("net_request_test_{}.txt", std::process::id()));
+        std::fs::write(&path, b"hello body").unwrap();
+        let url = format!("file://{}", path.display());
+        let r = request("GET", &url, None, &[]).expect("file read");
+        assert_eq!(r.body, b"hello body");
+        // fetch() delegates to request("GET", …): identical result.
+        let r2 = fetch(&url).expect("fetch delegate");
+        assert_eq!(r2.body, b"hello body");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn request_post_to_file_is_read() {
+        // Non-GET to file:// still reads (method/body ignored for local files); proves the
+        // method/body/headers plumbing compiles and routes through `request`.
+        let mut path = std::env::temp_dir();
+        path.push(format!("net_request_post_{}.txt", std::process::id()));
+        std::fs::write(&path, b"payload").unwrap();
+        let url = format!("file://{}", path.display());
+        let headers = vec![("Content-Type".to_string(), "text/plain".to_string())];
+        let r = request("POST", &url, Some(b"ignored"), &headers).expect("file read");
+        assert_eq!(r.body, b"payload");
+        let _ = std::fs::remove_file(&path);
     }
 }
