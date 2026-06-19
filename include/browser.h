@@ -302,6 +302,39 @@ int32_t browser_engine_has_selection(struct Engine *engine);
  */
 const char *browser_engine_selected_text(struct Engine *engine);
 
+/**
+ * The current document's DOM tree as a NUL-terminated UTF-8 JSON string for the DevTools "Elements"
+ * tab (nested `{"id","type","tag","attrs","text","children"}` objects); `"{}"` when no document is
+ * loaded. Lifetime: owned by the engine handle (stored in `last_domtree`); valid until the next
+ * `browser_engine_dom_tree` call on this handle, or until `browser_engine_free`.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_dom_tree(struct Engine *engine);
+
+/**
+ * Hit-test the most recently rendered page at framebuffer device-pixel `(x, y)` (viewport-relative)
+ * and return the NodeId of the nearest enclosing element, or -1 if there's no element there (no
+ * layout/DOM, or the point misses all laid-out content). For the right-click "Inspect Element" flow.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+int64_t browser_engine_node_at_point(struct Engine *engine,
+                                     float x,
+                                     float y);
+
+/**
+ * Set (or clear) the DevTools "Elements" inspector highlight: when `node_id` is non-negative, the
+ * next `browser_engine_render` draws a translucent overlay over that node's laid-out border box. A
+ * negative `node_id` clears the highlight. An out-of-range id is ignored.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+void browser_engine_set_inspect_node(struct Engine *engine, int64_t node_id);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

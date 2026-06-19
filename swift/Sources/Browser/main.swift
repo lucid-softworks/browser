@@ -450,7 +450,7 @@ final class DevToolsView: NSView {
     /// on navigation (a REPL session is per page).
     private var replLines: [String] = []
 
-    private let segmented = NSSegmentedControl(labels: ["Console", "Network"], trackingMode: .selectOne, target: nil, action: nil)
+    private let segmented = NSSegmentedControl(labels: ["Console", "Network", "Elements"], trackingMode: .selectOne, target: nil, action: nil)
     private let header = NSTextField(labelWithString: "")
 
     // Console tab
@@ -465,6 +465,16 @@ final class DevToolsView: NSView {
     private let netTable = NSTableView()
     private var netContainer = NSView()
     private var netRows: [NetRow] = []
+
+    // Elements tab
+    private let elementsScroll = NSScrollView()
+    private let elementsOutline = NSOutlineView()
+    private var elementsContainer = NSView()
+    /// Root of the parsed DOM tree shown in the outline (nil until first built).
+    private var domRoot: DOMNode?
+    /// Snapshot of the DOM tree JSON the current `domRoot` was built from, to skip rebuilds when the
+    /// page hasn't changed.
+    private var domTreeJSON: String = ""
 
     private static let bg = NSColor(calibratedRed: 0.10, green: 0.10, blue: 0.11, alpha: 1.0)
     private static let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
@@ -503,6 +513,7 @@ final class DevToolsView: NSView {
 
         buildConsoleTab()
         buildNetworkTab()
+        buildElementsTab()
 
         NSLayoutConstraint.activate([
             divider.topAnchor.constraint(equalTo: topAnchor),
@@ -525,6 +536,11 @@ final class DevToolsView: NSView {
             netContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
             netContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
             netContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            elementsContainer.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 6),
+            elementsContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            elementsContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            elementsContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
         showTab(0)
@@ -631,6 +647,42 @@ final class DevToolsView: NSView {
         ])
     }
 
+    private func buildElementsTab() {
+        elementsContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(elementsContainer)
+
+        let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("node"))
+        col.title = "DOM"
+        col.resizingMask = [.autoresizingMask]
+        elementsOutline.addTableColumn(col)
+        elementsOutline.outlineTableColumn = col
+        elementsOutline.headerView = nil
+        elementsOutline.dataSource = self
+        elementsOutline.delegate = self
+        elementsOutline.backgroundColor = DevToolsView.bg
+        elementsOutline.usesAlternatingRowBackgroundColors = false
+        elementsOutline.rowHeight = 18
+        elementsOutline.indentationPerLevel = 14
+        elementsOutline.autoresizesOutlineColumn = false
+        elementsOutline.action = #selector(elementsRowClicked)
+        elementsOutline.target = self
+
+        elementsScroll.documentView = elementsOutline
+        elementsScroll.hasVerticalScroller = true
+        elementsScroll.hasHorizontalScroller = true
+        elementsScroll.drawsBackground = true
+        elementsScroll.backgroundColor = DevToolsView.bg
+        elementsScroll.translatesAutoresizingMaskIntoConstraints = false
+        elementsContainer.addSubview(elementsScroll)
+
+        NSLayoutConstraint.activate([
+            elementsScroll.topAnchor.constraint(equalTo: elementsContainer.topAnchor),
+            elementsScroll.leadingAnchor.constraint(equalTo: elementsContainer.leadingAnchor),
+            elementsScroll.trailingAnchor.constraint(equalTo: elementsContainer.trailingAnchor),
+            elementsScroll.bottomAnchor.constraint(equalTo: elementsContainer.bottomAnchor),
+        ])
+    }
+
     // MARK: Tab switching
 
     @objc private func tabChanged() { showTab(segmented.selectedSegment) }
@@ -638,10 +690,19 @@ final class DevToolsView: NSView {
     private func showTab(_ index: Int) {
         consoleContainer.isHidden = index != 0
         netContainer.isHidden = index != 1
+        elementsContainer.isHidden = index != 2
+        // Leaving the Elements tab clears the on-page highlight.
+        if index != 2 {
+            if let engine = engineProvider?() {
+                browser_engine_set_inspect_node(engine, -1)
+            }
+            onRefreshPage?()
+        }
         refreshVisible()
     }
 
     var isConsoleTab: Bool { segmented.selectedSegment == 0 }
+    var isElementsTab: Bool { segmented.selectedSegment == 2 }
 
     // MARK: REPL
 
@@ -680,7 +741,36 @@ final class DevToolsView: NSView {
     /// Refresh whichever tab is currently visible. Cheap; called on the render/tick path.
     func refreshVisible() {
         guard !isHidden else { return }
-        if isConsoleTab { refreshConsole() } else { refreshNetwork() }
+        if isConsoleTab {
+            refreshConsole()
+        } else if isElementsTab {
+            refreshElements()
+        } else {
+            refreshNetwork()
+        }
+    }
+
+    /// Rebuild the DOM outline from the engine when the page changed, then refresh the row count
+    /// header. Only runs while the Elements tab is visible (cheap-guard); rebuilds only when the DOM
+    /// tree JSON differs from what's currently shown, so it's not re-parsed every tick.
+    private func refreshElements(force: Bool = false) {
+        guard !isHidden, isElementsTab else { return }
+        var json = "{}"
+        if let engine = engineProvider?(), let c = browser_engine_dom_tree(engine) {
+            json = String(cString: c)
+        }
+        if force || json != domTreeJSON || domRoot == nil {
+            domTreeJSON = json
+            domRoot = DOMNode.parse(json)
+            elementsOutline.reloadData()
+            // Expand the top couple of levels so the tree isn't a single collapsed root.
+            if let root = domRoot {
+                elementsOutline.expandItem(root)
+                for child in root.children { elementsOutline.expandItem(child) }
+            }
+        }
+        let count = domRoot?.descendantCount ?? 0
+        header.stringValue = "\(count) node\(count == 1 ? "" : "s")"
     }
 
     private func refreshConsole() {
@@ -743,6 +833,41 @@ final class DevToolsView: NSView {
         header.stringValue = "\(rows.count) request\(rows.count == 1 ? "" : "s")"
         netTable.reloadData()
     }
+
+    // MARK: Elements selection / inspect
+
+    /// Selection in the outline → highlight the node on the page. Clicking empty space clears it.
+    @objc private func elementsRowClicked() {
+        let row = elementsOutline.selectedRow
+        guard let engine = engineProvider?() else { return }
+        if row >= 0, let node = elementsOutline.item(atRow: row) as? DOMNode {
+            browser_engine_set_inspect_node(engine, Int64(node.id))
+        } else {
+            browser_engine_set_inspect_node(engine, -1)
+        }
+        onRefreshPage?()
+    }
+
+    /// "Inspect Element" entry point: switch to the Elements tab, (re)build the tree if needed, then
+    /// find, expand-to, select, scroll-to, and highlight the row for `nodeId`.
+    func inspect(nodeId: Int) {
+        segmented.selectedSegment = 2
+        showTab(2)
+        refreshElements(force: true)
+        guard let root = domRoot, let target = root.find(id: nodeId) else { return }
+        // Expand every ancestor so the target row is visible, then select + scroll to it.
+        for ancestor in root.ancestors(of: target) {
+            elementsOutline.expandItem(ancestor)
+        }
+        let row = elementsOutline.row(forItem: target)
+        guard row >= 0 else { return }
+        elementsOutline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        elementsOutline.scrollRowToVisible(row)
+        if let engine = engineProvider?() {
+            browser_engine_set_inspect_node(engine, Int64(target.id))
+        }
+        onRefreshPage?()
+    }
 }
 
 extension DevToolsView: NSTableViewDataSource, NSTableViewDelegate {
@@ -779,6 +904,174 @@ extension DevToolsView: NSTableViewDataSource, NSTableViewDelegate {
         cell.textColor = color
         cell.toolTip = r.url
         return cell
+    }
+}
+
+// MARK: - DOM tree model (Elements tab)
+
+/// A lightweight, reference-typed node parsed from the engine's `browser_engine_dom_tree` JSON.
+/// Reference type so `NSOutlineView` can use the instances as opaque items (identity-based).
+final class DOMNode {
+    let id: Int
+    let isElement: Bool
+    let tag: String
+    let attrs: [(String, String)]
+    let text: String
+    let children: [DOMNode]
+    weak var parent: DOMNode?
+
+    init(id: Int, isElement: Bool, tag: String, attrs: [(String, String)], text: String, children: [DOMNode]) {
+        self.id = id
+        self.isElement = isElement
+        self.tag = tag
+        self.attrs = attrs
+        self.text = text
+        self.children = children
+        for c in children { c.parent = self }
+    }
+
+    /// Parse the engine's DOM tree JSON (a single nested object) into a `DOMNode`, or nil on
+    /// `"{}"` / malformed input.
+    static func parse(_ json: String) -> DOMNode? {
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return build(obj)
+    }
+
+    private static func build(_ o: [String: Any]) -> DOMNode? {
+        let id = (o["id"] as? NSNumber)?.intValue ?? -1
+        let type = o["type"] as? String ?? ""
+        if type == "text" {
+            return DOMNode(id: id, isElement: false, tag: "", attrs: [],
+                           text: o["text"] as? String ?? "", children: [])
+        }
+        guard type == "element" else { return nil }
+        var attrs: [(String, String)] = []
+        if let a = o["attrs"] as? [String: Any] {
+            // Preferred order: id, class, then the rest alphabetically.
+            let ordered = a.keys.sorted { lhs, rhs in
+                func rank(_ k: String) -> Int { k == "id" ? 0 : (k == "class" ? 1 : 2) }
+                let (rl, rr) = (rank(lhs), rank(rhs))
+                return rl != rr ? rl < rr : lhs < rhs
+            }
+            for k in ordered { attrs.append((k, (a[k] as? String) ?? "")) }
+        }
+        var kids: [DOMNode] = []
+        if let cs = o["children"] as? [[String: Any]] {
+            for c in cs { if let n = build(c) { kids.append(n) } }
+        }
+        return DOMNode(id: id, isElement: true, tag: o["tag"] as? String ?? "", attrs: attrs,
+                       text: "", children: kids)
+    }
+
+    /// Total node count of this subtree (including self), for the header label.
+    var descendantCount: Int {
+        1 + children.reduce(0) { $0 + $1.descendantCount }
+    }
+
+    /// Depth-first search for a node by its engine NodeId.
+    func find(id target: Int) -> DOMNode? {
+        if id == target { return self }
+        for c in children { if let f = c.find(id: target) { return f } }
+        return nil
+    }
+
+    /// The chain of ancestors of `node` (root-first, excluding `node` itself).
+    func ancestors(of node: DOMNode) -> [DOMNode] {
+        var chain: [DOMNode] = []
+        var cur = node.parent
+        while let c = cur { chain.append(c); cur = c.parent }
+        return chain.reversed()
+    }
+}
+
+extension DevToolsView: NSOutlineViewDataSource, NSOutlineViewDelegate {
+    func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+        guard let node = item as? DOMNode else { return domRoot == nil ? 0 : 1 }
+        return node.children.count
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+        guard let node = item as? DOMNode else { return domRoot! }
+        return node.children[index]
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+        (item as? DOMNode).map { !$0.children.isEmpty } ?? false
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+        guard let node = item as? DOMNode else { return nil }
+        let id = NSUserInterfaceItemIdentifier("domCell")
+        let cell: NSTextField
+        if let reused = outlineView.makeView(withIdentifier: id, owner: self) as? NSTextField {
+            cell = reused
+        } else {
+            cell = NSTextField(labelWithString: "")
+            cell.identifier = id
+            cell.font = DevToolsView.mono
+            cell.lineBreakMode = .byTruncatingTail
+            cell.drawsBackground = false
+        }
+        if node.isElement {
+            cell.attributedStringValue = DevToolsView.elementRow(node)
+        } else {
+            // Text node: quoted, truncated, muted.
+            let t = DevToolsView.truncate(node.text, 80)
+            cell.stringValue = "\"\(t)\""
+            cell.textColor = NSColor(white: 0.55, alpha: 1.0)
+        }
+        return cell
+    }
+
+    func outlineViewSelectionDidChange(_ notification: Notification) {
+        // Selection can change via keyboard too; mirror the click handler.
+        let row = elementsOutline.selectedRow
+        guard let engine = engineProvider?() else { return }
+        if row >= 0, let node = elementsOutline.item(atRow: row) as? DOMNode {
+            browser_engine_set_inspect_node(engine, Int64(node.id))
+        } else {
+            browser_engine_set_inspect_node(engine, -1)
+        }
+        onRefreshPage?()
+    }
+
+    // MARK: Row rendering
+
+    /// An HTML-ish opening tag for an element row, e.g. `<div id="main" class="box">`, with the tag
+    /// name and attribute names/values colored.
+    static func elementRow(_ node: DOMNode) -> NSAttributedString {
+        let tagColor = NSColor(calibratedRed: 0.45, green: 0.75, blue: 1.0, alpha: 1.0)
+        let attrNameColor = NSColor(calibratedRed: 0.85, green: 0.65, blue: 0.45, alpha: 1.0)
+        let attrValColor = NSColor(calibratedRed: 0.55, green: 0.80, blue: 0.55, alpha: 1.0)
+        let punct = NSColor(white: 0.55, alpha: 1.0)
+        let font = DevToolsView.mono
+
+        let s = NSMutableAttributedString()
+        func add(_ str: String, _ color: NSColor) {
+            s.append(NSAttributedString(string: str, attributes: [.font: font, .foregroundColor: color]))
+        }
+        add("<", punct)
+        add(node.tag, tagColor)
+        // Show up to a few attributes (already ordered id, class, then the rest); truncate values.
+        for (k, v) in node.attrs.prefix(6) {
+            add(" ", punct)
+            add(k, attrNameColor)
+            add("=\"", punct)
+            add(truncate(v, 40), attrValColor)
+            add("\"", punct)
+        }
+        if node.attrs.count > 6 { add(" …", punct) }
+        add(">", punct)
+        return s
+    }
+
+    static func truncate(_ s: String, _ max: Int) -> String {
+        let collapsed = s.replacingOccurrences(of: "\n", with: " ")
+        if collapsed.count <= max { return collapsed }
+        return String(collapsed.prefix(max)) + "…"
     }
 }
 
@@ -1697,6 +1990,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Returning focus to the page lets page typing work again.
             window.makeFirstResponder(bitmapView)
         }
+    }
+
+    /// Open DevTools (if hidden) on the Elements tab and inspect the element at a view-local point —
+    /// the "Inspect Element" entry point (the right-click menu that calls this is wired separately).
+    func inspectElement(at localPoint: CGPoint) {
+        guard let tab = activeTab, let engine = tab.engine, let bitmapView = bitmapView,
+              tab.pendingLoads == 0 else { return }
+        let scale = CGFloat(window?.backingScaleFactor ?? 1)
+        let fyTop = bitmapView.bounds.height - localPoint.y
+        let fxDevice = Float(localPoint.x * scale)
+        let fyDevice = Float(fyTop * scale)
+        let nodeId = browser_engine_node_at_point(engine, fxDevice, fyDevice)
+        guard nodeId >= 0 else { return }
+        if !devToolsVisible { toggleDevTools() }
+        devTools.inspect(nodeId: Int(nodeId))
     }
 
     // MARK: Rendering

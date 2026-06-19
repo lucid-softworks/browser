@@ -147,6 +147,9 @@ pub struct Engine {
     /// is where the drag began; the focus follows the pointer. `None` = nothing selected. Resolved
     /// to text positions (run + char) at paint/copy time so it survives scroll/re-layout.
     selection: Option<(Point, Point)>,
+    /// DevTools "Elements" inspector highlight: the DOM node whose border box is painted with a
+    /// translucent overlay AFTER the page. `None` = no highlight. Cleared on navigation.
+    inspect_node: Option<dom::NodeId>,
 }
 
 impl Default for Engine {
@@ -174,6 +177,7 @@ impl Engine {
             prev_size: HashMap::new(),
             frame_cb: None,
             selection: None,
+            inspect_node: None,
         }
     }
 
@@ -227,6 +231,7 @@ impl Engine {
         self.prev_size.clear();
         self.session = None; // drop the previous page's runtime (stops its thread)
         self.selection = None; // a new page starts with nothing selected
+        self.inspect_node = None; // and nothing highlighted in the Elements inspector
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
 
         // Stream the body: re-parse on each chunk and paint throttled partial frames. We also
@@ -481,6 +486,32 @@ impl Engine {
                               16.0 * self.scale, baseline, px, Color::rgb(255, 120, 120));
                     draw_text(&mut fb, font, error, 16.0 * self.scale,
                               baseline + px * 1.4, px, Color::rgb(255, 180, 180));
+                }
+            }
+        }
+
+        // DevTools "Elements" inspector overlay: AFTER the page, draw a translucent fill + 1px
+        // outline over the highlighted node's border box (document→screen by subtracting scroll_y,
+        // matching the rest of paint). Only when a node is set and it has a laid-out rect.
+        if let Some(node) = self.inspect_node {
+            if let Some(cache) = &self.layout_cache {
+                let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
+                collect_node_rects(&cache.root, &mut rects);
+                if let Some(r) = rects.get(&node.0) {
+                    let x = r.x.round() as i32;
+                    let y = (r.y - scroll_y).round() as i32;
+                    let w = r.width.round().max(0.0) as i32;
+                    let h = r.height.round().max(0.0) as i32;
+                    if w > 0 && h > 0 {
+                        let fill = Color { r: 90, g: 160, b: 255, a: 64 }; // rgba(90,160,255,0.25)
+                        let line = Color { r: 90, g: 160, b: 255, a: 230 }; // rgba(90,160,255,0.9)
+                        fb.fill_rect(Rect { x, y, w, h }, fill);
+                        // 1px solid outline around the border box.
+                        fb.fill_rect(Rect { x, y, w, h: 1 }, line);
+                        fb.fill_rect(Rect { x, y: y + h - 1, w, h: 1 }, line);
+                        fb.fill_rect(Rect { x, y, w: 1, h }, line);
+                        fb.fill_rect(Rect { x: x + w - 1, y, w: 1, h }, line);
+                    }
                 }
             }
         }
@@ -1209,6 +1240,74 @@ impl Engine {
         s
     }
 
+    /// Serialize the current document's tree as nested JSON for the DevTools "Elements" tab. Each
+    /// node is `{"id":N,"type":"element"|"text","tag":..,"attrs":{..},"text":..,"children":[..]}`.
+    /// Text nodes carry the whitespace-collapsed/trimmed string and no children; empty/all-whitespace
+    /// text nodes are skipped. Elements carry `tag`, all `attrs`, and their (recursively serialized)
+    /// children. The serialized root is the document root's element subtree (`<html>`). Returns `"{}"`
+    /// when there is no document. Depth is capped (`MAX_DOM_DEPTH`) to guard pathological nesting.
+    pub fn dom_tree_json(&self) -> String {
+        let doc = match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => d,
+            _ => return "{}".to_string(),
+        };
+        // Find the root element to start at (the first <html> element child, else the first element
+        // child of the document root, else the document root itself).
+        let root = doc.root();
+        let start = doc
+            .get(root)
+            .children
+            .iter()
+            .copied()
+            .find(|&c| matches!(&doc.get(c).data, dom::NodeData::Element(_)))
+            .unwrap_or(root);
+        let mut out = String::new();
+        if !serialize_dom_node(doc, start, 0, &mut out) {
+            // Start node was a skipped/empty text node (unlikely for the root); emit empty object.
+            return "{}".to_string();
+        }
+        out
+    }
+
+    /// The element NodeId under DEVICE-pixel point `(x, y)` (viewport-relative): hit-test the cached
+    /// layout in document space (`y + scroll_y`), then walk up to the nearest element. Used for the
+    /// right-click "Inspect Element" flow. `None` if there's no layout/DOM or no element is hit.
+    pub fn node_at_point(&self, x: f32, y: f32) -> Option<usize> {
+        let cache = self.layout_cache.as_ref()?;
+        let doc = match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => d,
+            _ => return None,
+        };
+        let node = deepest_node_at(&cache.root, x, y + self.scroll_y)?;
+        // Walk up to the nearest ancestor-or-self that is an element.
+        let mut cur = Some(node);
+        while let Some(id) = cur {
+            if id.0 < doc.len() {
+                if let dom::NodeData::Element(_) = &doc.get(id).data {
+                    return Some(id.0);
+                }
+            }
+            cur = doc.get(id).parent;
+        }
+        None
+    }
+
+    /// Set (or clear, with `None`) the DevTools Elements highlight node. The next `render` draws a
+    /// translucent overlay over that node's laid-out border box. An out-of-range id is ignored.
+    pub fn set_inspect_node(&mut self, node: Option<usize>) {
+        self.inspect_node = match node {
+            Some(id) => {
+                let valid = matches!(&self.state, LoadState::Loaded { doc: Some(d), .. } if id < d.len());
+                if valid {
+                    Some(dom::NodeId(id))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+    }
+
     /// Test-only: focus the first editable text field in the live document (by walking the DOM),
     /// returning whether one was found. Sidesteps coordinate-precise click-to-focus in tests.
     #[cfg(test)]
@@ -1696,6 +1795,65 @@ fn resolve_text_position(runs: &[TextRun], font: &SystemFont, p: Point) -> (usiz
         }
     }
     (best, char_index_in_run(&runs[best], font, p.x))
+}
+
+/// Maximum DOM depth serialized by [`Engine::dom_tree_json`]; deeper subtrees are truncated (their
+/// children omitted) to guard against pathologically nested documents.
+const MAX_DOM_DEPTH: usize = 512;
+
+/// Serialize a single DOM node (and its subtree) into `out` as the JSON object documented on
+/// [`Engine::dom_tree_json`]. Returns `false` (and writes nothing) when the node is an empty /
+/// all-whitespace text node (or a non-rendered node kind), so callers can skip it.
+fn serialize_dom_node(doc: &dom::Document, id: dom::NodeId, depth: usize, out: &mut String) -> bool {
+    if id.0 >= doc.len() {
+        return false;
+    }
+    match &doc.get(id).data {
+        dom::NodeData::Text(t) => {
+            let collapsed = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            if collapsed.is_empty() {
+                return false;
+            }
+            out.push_str(&format!("{{\"id\":{},\"type\":\"text\",\"text\":", id.0));
+            out.push_str(&json_str(&collapsed));
+            out.push('}');
+            true
+        }
+        dom::NodeData::Element(el) => {
+            out.push_str(&format!("{{\"id\":{},\"type\":\"element\",\"tag\":", id.0));
+            out.push_str(&json_str(&el.tag));
+            out.push_str(",\"attrs\":{");
+            // Deterministic attribute order (HashMap iteration is unordered).
+            let mut keys: Vec<&String> = el.attrs.keys().collect();
+            keys.sort();
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_str(k));
+                out.push(':');
+                out.push_str(&json_str(&el.attrs[*k]));
+            }
+            out.push_str("},\"children\":[");
+            if depth < MAX_DOM_DEPTH {
+                let mut first = true;
+                for &child in &doc.get(id).children {
+                    let mut child_out = String::new();
+                    if serialize_dom_node(doc, child, depth + 1, &mut child_out) {
+                        if !first {
+                            out.push(',');
+                        }
+                        out.push_str(&child_out);
+                        first = false;
+                    }
+                }
+            }
+            out.push_str("]}");
+            true
+        }
+        // Document / Comment nodes aren't part of the rendered element tree we expose.
+        _ => false,
+    }
 }
 
 fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
@@ -5155,6 +5313,79 @@ mod tests {
         let text = e.visible_text();
         assert!(text.contains("Title"), "visible text must contain the heading: {text:?}");
         assert!(text.contains("Body text here."), "visible text must contain the paragraph: {text:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn dom_tree_json_has_tags_attrs_and_nesting() {
+        let html = "<html><body>\
+            <div class=\"box\" id=\"main\"><p>Hello world</p>  \n  </div></body></html>";
+        let path = std::env::temp_dir().join("browser_domtree_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 150, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+
+        let json = e.dom_tree_json();
+        // Structure: root is <html> with type "element".
+        assert!(json.starts_with("{\"id\":"), "tree must start with a node object: {json}");
+        assert!(json.contains("\"type\":\"element\""), "elements tagged: {json}");
+        assert!(json.contains("\"tag\":\"html\""), "root tag html: {json}");
+        assert!(json.contains("\"tag\":\"body\""), "body nested: {json}");
+        assert!(json.contains("\"tag\":\"div\""), "div nested: {json}");
+        assert!(json.contains("\"tag\":\"p\""), "p nested: {json}");
+        // Attributes preserved.
+        assert!(json.contains("\"class\":\"box\""), "class attr: {json}");
+        assert!(json.contains("\"id\":\"main\""), "id attr: {json}");
+        // Text node: whitespace-collapsed, tagged as text.
+        assert!(json.contains("\"type\":\"text\""), "text node present: {json}");
+        assert!(json.contains("\"text\":\"Hello world\""), "collapsed text: {json}");
+        // The all-whitespace trailing text node was skipped (no empty text node).
+        assert!(!json.contains("\"text\":\"\""), "empty text nodes skipped: {json}");
+        // It parses as a single JSON value (balanced braces/brackets).
+        assert!(json.matches('{').count() == json.matches('}').count(), "balanced braces: {json}");
+
+        // No document loaded → "{}".
+        let empty = Engine::new();
+        assert_eq!(empty.dom_tree_json(), "{}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn node_at_point_returns_element_and_inspect_overlay_changes_pixels() {
+        // A tall colored block so a hit-test over the body content lands on a laid-out element, and
+        // the inspect overlay visibly changes pixels.
+        let html = "<html><body>\
+            <div id=\"target\" style=\"height:120px;background-color:#202020\"></div>\
+            </body></html>";
+        let path = std::env::temp_dir().join("browser_inspect_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(120, 200, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let before = center_column(e.render()).clone();
+
+        // A point well inside the block: returns some element id.
+        let node = e.node_at_point(60.0, 40.0);
+        assert!(node.is_some(), "node_at_point over laid-out content returns an element id");
+
+        // Highlight that node; the render must differ where the overlay draws.
+        e.set_inspect_node(node);
+        let after = center_column(e.render()).clone();
+        assert_ne!(before, after, "inspect overlay must change pixels");
+
+        // Clearing the highlight restores the original render.
+        e.set_inspect_node(None);
+        let cleared = center_column(e.render()).clone();
+        assert_eq!(before, cleared, "clearing the inspect node restores the render");
+
+        // Setting an out-of-range node id is ignored (no panic, no overlay).
+        e.set_inspect_node(Some(usize::MAX));
+        let _ = e.render();
 
         let _ = std::fs::remove_file(&path);
     }

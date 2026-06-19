@@ -24,6 +24,7 @@ pub struct Engine {
     last_netlog: Option<CString>,
     last_select: Option<CString>,
     last_selected: Option<CString>,
+    last_domtree: Option<CString>,
 }
 
 /// A borrowed view of the engine's RGBA8 (straight-alpha) framebuffer.
@@ -54,6 +55,7 @@ pub extern "C" fn browser_engine_new() -> *mut Engine {
         last_netlog: None,
         last_select: None,
         last_selected: None,
+        last_domtree: None,
     }))
 }
 
@@ -549,4 +551,57 @@ pub unsafe extern "C" fn browser_engine_selected_text(engine: *mut Engine) -> *c
             std::ptr::null()
         }
     }
+}
+
+/// The current document's DOM tree as a NUL-terminated UTF-8 JSON string for the DevTools "Elements"
+/// tab (nested `{"id","type","tag","attrs","text","children"}` objects); `"{}"` when no document is
+/// loaded. Lifetime: owned by the engine handle (stored in `last_domtree`); valid until the next
+/// `browser_engine_dom_tree` call on this handle, or until `browser_engine_free`.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_dom_tree(engine: *mut Engine) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let json = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dom_tree_json()))
+        .unwrap_or_else(|_| "{}".to_string());
+    match CString::new(json) {
+        Ok(cstr) => {
+            let ptr = cstr.as_ptr();
+            e.last_domtree = Some(cstr);
+            ptr
+        }
+        Err(_) => {
+            e.last_domtree = None;
+            std::ptr::null()
+        }
+    }
+}
+
+/// Hit-test the most recently rendered page at framebuffer device-pixel `(x, y)` (viewport-relative)
+/// and return the NodeId of the nearest enclosing element, or -1 if there's no element there (no
+/// layout/DOM, or the point misses all laid-out content). For the right-click "Inspect Element" flow.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_node_at_point(engine: *mut Engine, x: f32, y: f32) -> i64 {
+    let Some(e) = engine.as_mut() else { return -1 };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.node_at_point(x, y))) {
+        Ok(Some(id)) => id as i64,
+        _ => -1,
+    }
+}
+
+/// Set (or clear) the DevTools "Elements" inspector highlight: when `node_id` is non-negative, the
+/// next `browser_engine_render` draws a translucent overlay over that node's laid-out border box. A
+/// negative `node_id` clears the highlight. An out-of-range id is ignored.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_set_inspect_node(engine: *mut Engine, node_id: i64) {
+    let Some(e) = engine.as_mut() else { return };
+    let node = if node_id < 0 { None } else { Some(node_id as usize) };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.set_inspect_node(node)));
 }
