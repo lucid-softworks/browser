@@ -1039,6 +1039,17 @@ fn prim_storage_save(
     let _ = std::fs::write(storage_path(&key), json);
 }
 
+/// `__scrollY() -> number` — the page's current vertical scroll offset (CSS px), so `window.scrollY`
+/// / `pageYOffset` / `scrollingElement.scrollTop` report the real position the engine is showing.
+fn prim_scroll_y(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let y = host_state(scope).viewport_scroll_y.get();
+    rv.set(v8::Number::new(scope, y as f64).into());
+}
+
 /// Fill `buf` with cryptographically-random bytes from the OS (`/dev/urandom`), falling back to a
 /// time/address-seeded PRNG only if that's unreadable.
 fn fill_random(buf: &mut [u8]) {
@@ -1959,6 +1970,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__storageLoad", prim_storage_load);
     set_fn(scope, global, "__storageSave", prim_storage_save);
     set_fn(scope, global, "__cryptoRandom", prim_crypto_random);
+    set_fn(scope, global, "__scrollY", prim_scroll_y);
     set_fn(scope, global, "__appendChild", prim_append_child);
     set_fn(scope, global, "__insertBefore", prim_insert_before);
     set_fn(scope, global, "__removeChild", prim_remove_child);
@@ -2670,8 +2682,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   globalThis.innerWidth = __iw; globalThis.innerHeight = __ih;
   globalThis.outerWidth = __iw; globalThis.outerHeight = __ih + 40;
   globalThis.devicePixelRatio = (typeof globalThis.__devicePixelRatio === "number" && globalThis.__devicePixelRatio > 0) ? globalThis.__devicePixelRatio : 2;
-  globalThis.scrollX = 0; globalThis.scrollY = 0;
-  globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
+  globalThis.scrollX = 0; globalThis.pageXOffset = 0; // no horizontal scroll
+  // scrollY / pageYOffset reflect the engine's real vertical scroll (updated as the page scrolls).
+  try {
+    Object.defineProperty(globalThis, "scrollY", { get: function () { try { return __scrollY(); } catch (e) { return 0; } }, configurable: true });
+    Object.defineProperty(globalThis, "pageYOffset", { get: function () { try { return __scrollY(); } catch (e) { return 0; } }, configurable: true });
+  } catch (e) { globalThis.scrollY = 0; globalThis.pageYOffset = 0; }
   globalThis.screenX = 0; globalThis.screenY = 0; globalThis.screenLeft = 0; globalThis.screenTop = 0;
   globalThis.scrollTo = fn; globalThis.scrollBy = fn; globalThis.scroll = fn;
   globalThis.moveTo = fn; globalThis.moveBy = fn; globalThis.resizeTo = fn; globalThis.resizeBy = fn;
