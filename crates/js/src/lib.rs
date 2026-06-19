@@ -3149,10 +3149,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // --- DOMException + AbortController/AbortSignal -------------------------------------------
   // A real DOMException carrying `name`/`message` (AbortError, TimeoutError, …).
   (function () {
+    // Map a DOMException name to its legacy numeric `code` (0 when the name has no legacy code).
+    var __domCodes = {
+      IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4,
+      InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8,
+      NotSupportedError: 9, InUseAttributeError: 10, InvalidStateError: 11,
+      SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+      InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18,
+      NetworkError: 19, AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22,
+      TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25
+    };
     var DOMExceptionCtor = function (message, name) {
       this.message = message === undefined ? "" : String(message);
       this.name = name === undefined ? "Error" : String(name);
-      this.code = 0;
+      this.code = __domCodes[this.name] || 0;
       try { this.stack = new Error(this.message).stack; } catch (e) {}
     };
     DOMExceptionCtor.prototype = Object.create(Error.prototype);
@@ -3367,35 +3377,153 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       });
     } catch (e) { return base; }
   }
+  // A snapshot ES iterator over `arr`, mapping each (index, value) via `pick`.
+  function makeIter(arr, pick) {
+    var i = 0;
+    var it = { next: function () { return i < arr.length ? { value: pick(i, arr[i++]), done: false } : { value: undefined, done: true }; } };
+    try { it[Symbol.iterator] = function () { return this; }; } catch (e) {}
+    return it;
+  }
+  // A spec-complete DOMTokenList over an element's `class` attribute (DOM standard §7.1).
+  // The token set is the live `class` attribute parsed on ASCII whitespace
+  // ([\t\n\f\r ]), order-preserving and de-duplicated. Reads always reparse the live
+  // attribute (so external className/setAttribute changes are reflected); the mutating
+  // methods run the spec "update steps" which serialize the ordered set back to `class`.
   function makeClassList(node) {
-    function read() { var c = document.__getAttr(node, "class"); return c ? String(c).split(/\s+/).filter(Boolean) : []; }
-    function write(arr) {
-      var seen = Object.create(null), out = [];
-      for (var i = 0; i < arr.length; i++) { if (!seen[arr[i]]) { seen[arr[i]] = 1; out.push(arr[i]); } }
-      document.__setAttr(node, "class", out.join(" "));
+    // ASCII whitespace per the HTML spec: TAB, LF, FF, CR, SPACE.
+    function splitTokens(s) {
+      var out = [], i = 0, n = s.length;
+      while (i < n) {
+        var c = s[i];
+        if (c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r") { i++; continue; }
+        var start = i;
+        while (i < n) { var d = s[i]; if (d === " " || d === "\t" || d === "\n" || d === "\f" || d === "\r") break; i++; }
+        out.push(s.slice(start, i));
+      }
+      return out;
     }
+    function hasWhitespace(s) {
+      for (var i = 0; i < s.length; i++) { var c = s[i]; if (c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r") return true; }
+      return false;
+    }
+    // Throw a DOMException that satisfies WPT assert_throws_dom (correct .name/.code, and
+    // `instanceof DOMException`).
+    function syntaxErr() { throw new globalThis.DOMException("The token provided must not be empty.", "SyntaxError"); }
+    function invalidCharErr() { throw new globalThis.DOMException("The token provided contains HTML space characters, which are not valid in tokens.", "InvalidCharacterError"); }
+    function validateToken(t) {
+      if (t === "") { syntaxErr(); }
+      if (hasWhitespace(t)) { invalidCharErr(); }
+    }
+    // Raw `class` attribute string, or null when the attribute is absent.
+    function rawAttr() { var c = document.__getAttr(node, "class"); return c == null ? null : String(c); }
+    // The ordered token set (de-duplicated, first occurrence wins).
+    function tokenSet() {
+      var raw = rawAttr();
+      if (raw == null || raw === "") { return []; }
+      var toks = splitTokens(raw), seen = Object.create(null), out = [];
+      for (var i = 0; i < toks.length; i++) { var t = toks[i]; if (!seen[t]) { seen[t] = 1; out.push(t); } }
+      return out;
+    }
+    // The "update steps": serialize the ordered set and write it back to `class`, unless the
+    // attribute is absent and the set is empty (in which case do nothing).
+    function update(set) {
+      if (rawAttr() == null && set.length === 0) { return; }
+      document.__setAttr(node, "class", set.join(" "));
+    }
+
     var cl = {
-      add: function () { var c = read(); for (var i = 0; i < arguments.length; i++) { var n = String(arguments[i]); if (c.indexOf(n) < 0) c.push(n); } write(c); },
-      remove: function () { var c = read(); for (var i = 0; i < arguments.length; i++) { var x = c.indexOf(String(arguments[i])); if (x >= 0) c.splice(x, 1); } write(c); },
-      toggle: function (n, force) {
-        n = String(n); var c = read(); var x = c.indexOf(n);
-        if (force === true) { if (x < 0) { c.push(n); write(c); } return true; }
-        if (force === false) { if (x >= 0) { c.splice(x, 1); write(c); } return false; }
-        if (x >= 0) { c.splice(x, 1); write(c); return false; } c.push(n); write(c); return true;
+      item: function (i) { i = i >>> 0; var s = tokenSet(); return i < s.length ? s[i] : null; },
+      contains: function (token) { return tokenSet().indexOf(String(token)) >= 0; },
+      add: function () {
+        var s = tokenSet();
+        for (var i = 0; i < arguments.length; i++) {
+          var t = String(arguments[i]); validateToken(t);
+          if (s.indexOf(t) < 0) { s.push(t); }
+        }
+        update(s);
       },
-      replace: function (oldC, newC) { var c = read(); var x = c.indexOf(String(oldC)); if (x >= 0) { c[x] = String(newC); write(c); return true; } return false; },
-      contains: function (n) { return read().indexOf(String(n)) >= 0; },
-      item: function (i) { var c = read(); return i >= 0 && i < c.length ? c[i] : null; },
-      forEach: function (cb, thisArg) { var c = read(); for (var i = 0; i < c.length; i++) { cb.call(thisArg, c[i], i, this); } },
-      toString: function () { return read().join(" "); }
+      remove: function () {
+        var s = tokenSet();
+        for (var i = 0; i < arguments.length; i++) {
+          var t = String(arguments[i]); validateToken(t);
+          var x = s.indexOf(t); if (x >= 0) { s.splice(x, 1); }
+        }
+        update(s);
+      },
+      toggle: function (token, force) {
+        token = String(token); validateToken(token);
+        var s = tokenSet(), x = s.indexOf(token);
+        if (x >= 0) {
+          // token present
+          if (force === undefined || force === false) { s.splice(x, 1); update(s); return false; }
+          return true; // force === true: no-op, no update
+        }
+        // token absent
+        if (force === undefined || force === true) { s.push(token); update(s); return true; }
+        return false; // force === false: no-op, no update
+      },
+      replace: function (token, newToken) {
+        token = String(token); newToken = String(newToken);
+        // Per spec, the empty-string (SyntaxError) check runs for BOTH tokens before the
+        // whitespace (InvalidCharacterError) check for either.
+        if (token === "" || newToken === "") { syntaxErr(); }
+        if (hasWhitespace(token) || hasWhitespace(newToken)) { invalidCharErr(); }
+        var s = tokenSet(), x = s.indexOf(token);
+        if (x < 0) { return false; }
+        var y = s.indexOf(newToken);
+        if (y >= 0 && y !== x) {
+          // newToken already in set: replace in place, then drop the duplicate.
+          s[x] = newToken;
+          var dup = s.indexOf(newToken); // earliest occurrence
+          for (var j = s.length - 1; j >= 0; j--) { if (s[j] === newToken && j !== dup) { s.splice(j, 1); } }
+        } else {
+          s[x] = newToken;
+        }
+        update(s);
+        return true;
+      },
+      supports: function () {
+        // `class` has no supported-tokens allow-list, so per spec supports() throws TypeError.
+        throw new TypeError("DOMTokenList has no supported tokens.");
+      },
+      forEach: function (cb, thisArg) {
+        if (typeof cb !== "function") { throw new TypeError("The callback provided as parameter 1 is not a function."); }
+        var s = tokenSet();
+        for (var i = 0; i < s.length; i++) { cb.call(thisArg, s[i], i, cl); }
+      },
+      keys: function () { return makeIter(tokenSet(), function (i, v) { return i; }); },
+      values: function () { return makeIter(tokenSet(), function (i, v) { return v; }); },
+      entries: function () { return makeIter(tokenSet(), function (i, v) { return [i, v]; }); },
+      toString: function () { var c = rawAttr(); return c == null ? "" : c; }
     };
-    Object.defineProperty(cl, "length", { get: function () { return read().length; }, enumerable: false, configurable: true });
+    // for...of / Symbol.iterator over the token values.
+    try { cl[Symbol.iterator] = cl.values; } catch (e) {}
+
+    Object.defineProperty(cl, "length", { get: function () { return tokenSet().length; }, enumerable: false, configurable: true });
+    // `value` (the stringifier behaviour): get returns the raw attribute (""/absent => ""),
+    // set assigns the `class` attribute verbatim.
     Object.defineProperty(cl, "value", {
-      get: function () { return read().join(" "); },
-      set: function (v) { document.__setAttr(node, "class", String(v)); },
+      get: function () { var c = rawAttr(); return c == null ? "" : c; },
+      set: function (v) { document.__setAttr(node, "class", v == null ? "" : String(v)); },
       enumerable: false, configurable: true
     });
-    return cl;
+    // Live integer-indexed access: classList[i] => i-th token (or undefined). Reparses on each
+    // read via a Proxy so the indices stay live with the attribute.
+    try {
+      return new Proxy(cl, {
+        get: function (t, p, r) {
+          if (typeof p === "string" && p.length && /^[0-9]+$/.test(p)) {
+            var i = p >>> 0, s = tokenSet();
+            return i < s.length ? s[i] : undefined;
+          }
+          return Reflect.get(t, p, r);
+        },
+        has: function (t, p) {
+          if (typeof p === "string" && p.length && /^[0-9]+$/.test(p)) { return (p >>> 0) < tokenSet().length; }
+          return p in t;
+        }
+      });
+    } catch (e) { return cl; }
   }
   function makeDataset(node) {
     // Live view over data-* attributes. dataset.fooBar <-> data-foo-bar.
@@ -3529,7 +3657,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     if (typeof node === "number") {
       def(el, "style", makeStyle(node));
-      def(el, "classList", makeClassList(node));
+      // classList is [SameObject, PutForwards=value]: a per-element cached DOMTokenList whose
+      // getter always returns the same object, and assigning `el.classList = x` forwards to
+      // `el.classList.value = x` (so it never replaces the object and never throws in strict mode).
+      (function () {
+        var __cl = makeClassList(node);
+        Object.defineProperty(el, "classList", {
+          get: function () { return __cl; },
+          set: function (v) { __cl.value = v; },
+          enumerable: true, configurable: true
+        });
+      })();
       def(el, "dataset", makeDataset(node));
       // Form-control `value` / `checked` reflection: back them by element ATTRIBUTES so that
       // reading/writing `el.value` (and `el.checked`) is visible to layout, which renders the
@@ -4109,6 +4247,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       __syncObserversActive();
     });
     def(globalThis.MutationObserver.prototype, "takeRecords", function () {
+      // Per spec, takeRecords() must synchronously return the records observed so far. Drain any
+      // pending Rust-side mutations into every observer's queue first, then empty *our* queue.
+      try { globalThis.__collectMutations(); } catch (e) {}
       var q = this._entry.queue; this._entry.queue = []; return q;
     });
   }
@@ -4123,16 +4264,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return false;
   }
 
-  // Called (as a microtask) after a task when Rust has queued mutations. Drains them, matches each
-  // against every observer's registered targets, builds MutationRecords, and invokes callbacks.
-  def(globalThis, "__deliverMutations", function () {
+  // Drain any pending Rust-side mutations, match each against every observer's registered targets,
+  // build MutationRecords, and APPEND them to each matching observer's queue. Idempotent: once the
+  // Rust queue is empty it does nothing. Shared by takeRecords() (synchronous) and the post-task
+  // microtask delivery below.
+  def(globalThis, "__collectMutations", function () {
     var recs;
     try { recs = JSON.parse(__drainMutations()); } catch (e) { recs = []; }
     if (!recs.length) { return; }
     var reg = globalThis.__moRegistry;
     for (var o = 0; o < reg.length; o++) {
       var entry = reg[o];
-      var batch = [];
       for (var r = 0; r < recs.length; r++) {
         var rec = recs[r];
         for (var ti = 0; ti < entry.targets.length; ti++) {
@@ -4160,14 +4302,24 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             for (var a = 0; a < rec.added.length; a++) { var w = __nodeWrap(rec.added[a]); if (w) { mr.addedNodes.push(w); } }
             for (var rm = 0; rm < rec.removed.length; rm++) { var w2 = __nodeWrap(rec.removed[rm]); if (w2) { mr.removedNodes.push(w2); } }
           }
-          batch.push(mr);
+          entry.queue.push(mr);
           break; // one record per mutation per observer
         }
       }
-      if (batch.length) {
-        try { entry.observer.callback.call(entry.observer, batch, entry.observer); }
-        catch (e) { try { (globalThis.__timerErrors || (globalThis.__timerErrors = [])).push("MutationObserver: " + (e && e.message || e)); } catch (e2) {} }
-      }
+    }
+  });
+
+  // Called (as a microtask) after a task when Rust has queued mutations. Collects them into each
+  // observer's queue, then flushes non-empty queues to their callbacks.
+  def(globalThis, "__deliverMutations", function () {
+    try { globalThis.__collectMutations(); } catch (e) {}
+    var reg = globalThis.__moRegistry.slice();
+    for (var o = 0; o < reg.length; o++) {
+      var entry = reg[o];
+      if (!entry.queue.length) { continue; }
+      var batch = entry.queue; entry.queue = [];
+      try { entry.observer.callback.call(entry.observer, batch, entry.observer); }
+      catch (e) { try { (globalThis.__timerErrors || (globalThis.__timerErrors = [])).push("MutationObserver: " + (e && e.message || e)); } catch (e2) {} }
     }
   });
 
@@ -8237,6 +8389,175 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("red|true|a b"));
+    }
+
+    #[test]
+    fn mutation_observer_take_records_is_synchronous() {
+        // takeRecords() must return mutations observed so far synchronously, within the same task —
+        // here a classList.replace() that sets the `class` attribute once.
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); el.setAttribute('class','a b c'); \
+             var obs = new MutationObserver(function(){}); obs.observe(el, {attributes:true, attributeOldValue:true}); \
+             var r = el.classList.replace('b','d'); \
+             var recs = obs.takeRecords(); obs.disconnect(); \
+             [r, recs.length, recs[0].type, recs[0].attributeName, recs[0].oldValue, el.getAttribute('class')].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("true|1|attributes|class|a b c|a d c"));
+    }
+
+    #[test]
+    fn classlist_is_live_with_classname_and_setattribute() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); \
+             el.className = 'a b'; var r1 = el.classList.contains('a') + ':' + el.classList.length; \
+             el.setAttribute('class', 'x y z'); var r2 = el.classList.contains('y') + ':' + el.classList.length; \
+             el.classList.add('w'); var r3 = el.className; \
+             [r1, r2, r3].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("true:2|true:3|x y z w"));
+    }
+
+    #[test]
+    fn classlist_length_index_item_and_value() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); \
+             el.setAttribute('class', '\\t\\n\\f\\r a\\t\\n\\f\\r b\\t\\n\\f\\r '); \
+             [el.classList.length, el.classList[0], el.classList[1], \
+              (el.classList[2] === undefined), el.classList.item(0), \
+              (el.classList.item(5) === null), el.classList.value].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // length=2, [0]=a, [1]=b, [2]===undefined, item(0)=a, item(5)===null, value=raw attr
+        assert_eq!(
+            out.value.as_deref(),
+            Some("2|a|b|true|a|true|\t\n\u{c}\r a\t\n\u{c}\r b\t\n\u{c}\r ")
+        );
+    }
+
+    #[test]
+    fn classlist_add_remove_serialize_normalizes() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); \
+             el.setAttribute('class', '   a  a b'); el.classList.add('c'); var r1 = el.getAttribute('class'); \
+             el.setAttribute('class', 'a b  c'); el.classList.remove('d'); var r2 = el.getAttribute('class'); \
+             [r1, r2].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("a b c|a b c"));
+    }
+
+    #[test]
+    fn classlist_toggle_force_variants() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); el.setAttribute('class', 'a b'); \
+             var t1 = el.classList.toggle('a'); var v1 = el.getAttribute('class'); \
+             var t2 = el.classList.toggle('a'); var v2 = el.getAttribute('class'); \
+             el.setAttribute('class', 'a b'); var t3 = el.classList.toggle('a', true); var v3 = el.getAttribute('class'); \
+             var t4 = el.classList.toggle('c', false); var v4 = el.getAttribute('class'); \
+             [t1, v1, t2, v2, t3, v3, t4, v4].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // toggle('a')->false 'b'; toggle('a')->true 'b a'; toggle('a',true)->true 'a b'; toggle('c',false)->false 'a b'
+        assert_eq!(out.value.as_deref(), Some("false|b|true|b a|true|a b|false|a b"));
+    }
+
+    #[test]
+    fn classlist_replace_semantics() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); \
+             el.setAttribute('class', 'a b c'); var r1 = el.classList.replace('c', 'a') + ':' + el.getAttribute('class'); \
+             el.setAttribute('class', 'a a a  b'); var r2 = el.classList.replace('c', 'd') + ':' + el.getAttribute('class'); \
+             el.setAttribute('class', 'a b a'); var r3 = el.classList.replace('a', 'c') + ':' + el.getAttribute('class'); \
+             [r1, r2, r3].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // replace c->a dedups to 'a b'; replace c (absent)->d returns false, raw unchanged; replace a->c => 'c b'
+        assert_eq!(out.value.as_deref(), Some("true:a b|false:a a a  b|true:c b"));
+    }
+
+    #[test]
+    fn classlist_assignment_forwards_to_value_same_object() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); var ref = el.classList; \
+             el.classList = 'foo bar'; \
+             [el.classList === ref, el.getAttribute('class'), el.classList.length].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("true|foo bar|2"));
+    }
+
+    #[test]
+    fn classlist_empty_token_throws_syntax_error_domexception() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); var ok = false, name = '', code = -1, isDOM = false; \
+             try { el.classList.add(''); } catch (e) { ok = true; name = e.name; code = e.code; isDOM = (e instanceof DOMException); } \
+             [ok, name, code, isDOM, el.getAttribute('class')].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // SyntaxError DOMException, code 12, attribute unchanged (still null -> 'null' via join)
+        assert_eq!(out.value.as_deref(), Some("true|SyntaxError|12|true|"));
+    }
+
+    #[test]
+    fn classlist_whitespace_token_throws_invalid_character_error_domexception() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); var ok = false, name = '', code = -1, isDOM = false; \
+             try { el.classList.add('a b'); } catch (e) { ok = true; name = e.name; code = e.code; isDOM = (e instanceof DOMException); } \
+             [ok, name, code, isDOM].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // InvalidCharacterError DOMException, code 5
+        assert_eq!(out.value.as_deref(), Some("true|InvalidCharacterError|5|true"));
+    }
+
+    #[test]
+    fn classlist_supports_throws_type_error() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); var isType = false; \
+             try { el.classList.supports('a'); } catch (e) { isType = (e instanceof TypeError); } \
+             String(isType)",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn classlist_iteration_for_of_and_foreach() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); el.setAttribute('class', 'a b c'); \
+             var fo = []; for (var t of el.classList) { fo.push(t); } \
+             var fe = []; el.classList.forEach(function (t, i) { fe.push(i + ':' + t); }); \
+             var ks = []; var it = el.classList.keys(); var n; while (!(n = it.next()).done) { ks.push(n.value); } \
+             [fo.join(','), fe.join(','), ks.join(',')].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("a,b,c|0:a,1:b,2:c|0,1,2"));
+    }
+
+    #[test]
+    fn classlist_remove_absent_on_null_attr_is_noop() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); \
+             el.classList.remove('a'); \
+             String(el.hasAttribute('class'))",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // Removing from an absent attribute with empty resulting set must NOT create the attribute.
+        assert_eq!(out.value.as_deref(), Some("false"));
     }
 
     #[test]
