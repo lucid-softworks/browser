@@ -6,8 +6,16 @@
 
 use paint::{GlyphBitmap, GlyphRasterizer};
 
-/// Candidate single-file TTFs shipped with macOS, tried in order.
+/// Candidate single-file TTFs shipped with macOS, tried in order. Prefer modern fonts with a
+/// proper UNICODE cmap: legacy Mac fonts like Monaco/Geneva carry a Mac-Roman cmap where byte
+/// 0xB7 is `∑`, so `·` (U+00B7) and most non-ASCII glyphs (é, α, →, €…) map to the WRONG glyph.
+/// SF Mono keeps a monospace look; San Francisco / Arial Unicode are broad-coverage fallbacks.
 const FONT_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    // Legacy single-file fonts (Mac-Roman cmap) — last resort only.
     "/System/Library/Fonts/Monaco.ttf",
     "/System/Library/Fonts/Geneva.ttf",
     "/System/Library/Fonts/NewYork.ttf",
