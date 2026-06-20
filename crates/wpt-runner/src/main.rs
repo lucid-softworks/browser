@@ -266,6 +266,16 @@ th{{position:sticky;top:0;background:#fafafa;font-size:12px;color:#666}}
 .b{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;color:#fff}}
 .b.pass{{background:#2a2}} .b.fail{{background:#d33}} .b.timeout{{background:#999}} .b.error{{background:#a0a}}
 tr.pass td.name{{color:#444}}
+@media (prefers-color-scheme: dark) {{
+  body{{background:#15171a;color:#e6e6e6}}
+  header{{border-bottom-color:#2a2d31}}
+  .sub,.meta,.score small{{color:#9aa0a6}}
+  .track{{background:#2a2d31}}
+  td,th{{border-bottom-color:#23262a}}
+  th{{background:#1b1e22;color:#9aa0a6}}
+  .name{{color:#cfd3d7}} tr.pass td.name{{color:#8b9096}}
+  .num.bad{{color:#ff6b6b}} .det{{color:#ff8a8a}}
+}}
 </style></head><body>
 <header>
 <h1>Web Platform Tests — <code>{subpath}</code></h1>
