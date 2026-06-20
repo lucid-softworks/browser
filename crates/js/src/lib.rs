@@ -2242,7 +2242,11 @@ fn prim_elem_metrics(
         let val = v8::Number::new(scope, v as f64);
         obj.set(scope, key.into(), val.into());
     };
-    let (cw, ch) = client_box.unwrap_or((w, h));
+    // For the document root (`<html>`/`<body>`/Document), `clientWidth`/`clientHeight` are the
+    // viewport's content box — approximated by the laid-out border box (`w`/`h`) — rather than the
+    // cascade `width`/`height` (which are `auto` → 0 for an unsized root). Without this,
+    // `documentElement.clientWidth` would read 0 and break viewport-bounds math (CSSOM-View tests).
+    let (cw, ch) = if is_root { (w, h) } else { client_box.unwrap_or((w, h)) };
     put("ow", w);
     put("oh", h);
     put("cw", cw);
@@ -3509,6 +3513,12 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       get: function () { try { return __innerHTML(__parent(id) >= 0 ? id : id); } catch (e) { return ""; } },
       enumerable: true, configurable: true
     });
+    // setHTMLUnsafe(html): parse `html` and replace this element's children, like innerHTML but
+    // without sanitization (we do not sanitize anyway). The `template`/shadowroot semantics of the
+    // real algorithm are not modeled; a plain reparse covers the WPT callers that use it as a
+    // convenience to install markup. getHTML() serializes back (≈ innerHTML).
+    def(el, "setHTMLUnsafe", function (html) { __setInnerHTML(id, html == null ? "" : String(html)); });
+    def(el, "getHTML", function () { return __innerHTML(id); });
 
     // id / className are DOMString reflections: null/undefined stringify to "null"/"undefined".
     Object.defineProperty(el, "id", {
@@ -8472,7 +8482,21 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           try { __md = Object.getOwnPropertyDescriptor(el, prop); } catch (eM) {}
           if (__md && (__md.get || __md.set)) { return; } // page already defined an accessor
           Object.defineProperty(el, prop, {
-            get: function () { var m = __elemMetrics(this.__node); return m ? m[field] : 0; },
+            get: function () {
+              var m = __elemMetrics(this.__node);
+              var v = m ? m[field] : 0;
+              // The document root (<html>) often has no pushed box, so its width/height metrics read
+              // 0. clientWidth/clientHeight of the root must be the viewport size (CSSOM-View), so
+              // fall back to innerWidth/innerHeight there.
+              if ((!v || v === 0)) {
+                var nid = this.__node;
+                if (nid === __documentElementId() || nid === __bodyId()) {
+                  if (field === "cw" || field === "ow" || field === "sw") { var iw = Number(globalThis.innerWidth) || 0; if (iw > 0) { return iw; } }
+                  if (field === "ch" || field === "oh") { var ih = Number(globalThis.innerHeight) || 0; if (ih > 0) { return ih; } }
+                }
+              }
+              return v;
+            },
             configurable: true, enumerable: true
           });
         })(__mk, __metricProps[__mk]);
@@ -8679,6 +8703,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         doc = {
           nodeType: 9, nodeName: '#document', documentElement: htmlEl, head: headEl, body: bodyEl, title: title ? String(title) : "",
           doctype: null,
+          // A document created off to the side has no associated browsing context / viewport, so per
+          // CSSOM-View these always return null regardless of the coordinates passed.
+          caretPositionFromPoint: function () { return null; },
+          caretRangeFromPoint: function () { return null; },
+          elementFromPoint: function () { return null; },
+          elementsFromPoint: function () { return []; },
           lookupNamespaceURI: function () { return htmlEl && htmlEl.lookupNamespaceURI ? htmlEl.lookupNamespaceURI.apply(htmlEl, arguments) : null; },
           lookupPrefix: function () { return htmlEl && htmlEl.lookupPrefix ? htmlEl.lookupPrefix.apply(htmlEl, arguments) : null; },
           isDefaultNamespace: function () { return htmlEl && htmlEl.isDefaultNamespace ? htmlEl.isDefaultNamespace.apply(htmlEl, arguments) : (arguments[0] == null || arguments[0] === ""); },
@@ -8781,30 +8811,141 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // the right interface (prototype chain intact); unknown names throw NotSupportedError. The real
   // implementation lives in globalThis.__createEvent (defined alongside the Event constructors).
   def(document, "createEvent", function (name) { return globalThis.__createEvent(name); });
-  if (typeof document.elementFromPoint !== "function") { def(document, "elementFromPoint", function () { return null; }); }
-  // caretRangeFromPoint(x, y): a collapsed Range at the caret nearest (x, y). We don't hit-test
-  // glyph offsets, so return a Range collapsed at offset 0 inside the element at the point (the
-  // document's root element as a fallback). Enough for callers that just need a Range back.
-  if (typeof document.caretRangeFromPoint !== "function") {
-    def(document, "caretRangeFromPoint", function (x, y) {
-      var el = null;
-      try { el = document.elementFromPoint(x, y); } catch (e) {}
-      if (!el) { el = document.documentElement || document.body || null; }
-      if (!el) {
-        // Fall back to the document's first element child (handles a replaced/removed root element).
-        try {
-          var kids = __children(__documentRootId());
-          for (var i = 0; i < kids.length; i++) { if (__nodeType(kids[i]) === 1) { el = __nodeById(kids[i]); break; } }
-        } catch (e) {}
-      }
-      if (!el) { return null; }
-      var R = globalThis.Range;
-      var r = (R && R.prototype) ? Object.create(R.prototype) : {};
-      r.startContainer = el; r.endContainer = el; r.commonAncestorContainer = el;
-      r.startOffset = 0; r.endOffset = 0; r.collapsed = true;
+
+  // --- hit-testing: elementFromPoint / caretPositionFromPoint / caretRangeFromPoint -----------
+  //
+  // The engine lays out the page and pushes every box's border-box rect (CSS px, document-absolute,
+  // top-origin) to this worker as `layout_rects`, read here via `__rect(id)` (which already returns
+  // the rect VIEWPORT-relative, i.e. with the vertical scroll subtracted). We cannot reach the
+  // engine's live layout tree synchronously from the JS thread, so the hit-test runs here against
+  // those pushed rects, using the live DOM (`__children`/`__parent`/`__nodeType`) for tree depth.
+  //
+  // `__elementAtPoint(x, y)` — x/y are CSS px, viewport-relative — returns the deepest ELEMENT node
+  // id whose laid-out box contains the point, or -1 when the point is outside the viewport or hits
+  // no box. It is the native primitive the three public methods are built on.
+  function __viewportClientWidth() {
+    var w = Number(globalThis.innerWidth) || 0;
+    if (w > 0) { return w; }
+    try { var c = document.documentElement && document.documentElement.clientWidth; if (typeof c === "number" && c > 0) { return c; } } catch (e) {}
+    return 0;
+  }
+  function __viewportClientHeight() {
+    var h = Number(globalThis.innerHeight) || 0;
+    if (h > 0) { return h; }
+    try { var c = document.documentElement && document.documentElement.clientHeight; if (typeof c === "number" && c > 0) { return c; } } catch (e) {}
+    return 0;
+  }
+  // Deepest node (element OR text) whose engine-pushed rect contains the viewport point. Walks the
+  // DOM tree; a child hit wins over its ancestor (deepest box on top). Ignores pointer-events (the
+  // pushed rects carry no paint/pointer metadata) — adequate for the WPT cases, which only need the
+  // node the point geometrically lands in. The pushed rects are the UNTRANSFORMED border boxes, so
+  // hit-testing through CSS transforms (translate/rotate/scale) uses the pre-transform box — an
+  // approximation that matches the painter only for the identity transform. Returns a node id or -1.
+  function __deepestNodeAtPoint(x, y) {
+    function rectOf(nodeId) {
+      var r = null;
+      try { r = __rect(nodeId); } catch (e) {}
       return r;
+    }
+    function contains(r) { return r && x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
+    // Depth-first; recurse into children first so deeper boxes take precedence, matching the
+    // engine's `deepest_node_at`. Returns the deepest descendant-or-self node that contains the
+    // point, or -1.
+    function visit(nodeId) {
+      var kids;
+      try { kids = __children(nodeId); } catch (e) { kids = []; }
+      for (var i = kids.length - 1; i >= 0; i--) {
+        var hit = visit(kids[i]);
+        if (hit >= 0) { return hit; }
+      }
+      var t = __nodeType(nodeId);
+      // Only element (1) and text (3) boxes are candidates; skip comments / others.
+      if (t === 1 || t === 3) {
+        if (contains(rectOf(nodeId))) { return nodeId; }
+      }
+      return -1;
+    }
+    var rootId = __documentRootId();
+    return visit(rootId);
+  }
+  // Public native: deepest ELEMENT at the viewport point (text hits climb to their element parent),
+  // or -1 when outside the viewport / no box.
+  def(globalThis, "__elementAtPoint", function (x, y) {
+    x = Number(x); y = Number(y);
+    if (!isFinite(x) || !isFinite(y)) { return -1; }
+    if (x < 0 || y < 0 || x >= __viewportClientWidth() || y >= __viewportClientHeight()) { return -1; }
+    var n = __deepestNodeAtPoint(x, y);
+    while (n >= 0) {
+      if (__nodeType(n) === 1) { return n; }
+      var p = __parent(n);
+      if (p < 0) { break; }
+      n = p;
+    }
+    return -1;
+  });
+
+  if (typeof document.elementFromPoint !== "function") {
+    def(document, "elementFromPoint", function (x, y) {
+      var id = globalThis.__elementAtPoint(x, y);
+      return id >= 0 ? __nodeFor(id) : null;
     });
   }
+  if (typeof document.elementsFromPoint !== "function") {
+    // Best-effort: the topmost element, then its ancestor chain (the engine pushes no z-order, so we
+    // approximate the stack by the ancestor chain of the deepest hit).
+    def(document, "elementsFromPoint", function (x, y) {
+      var out = [];
+      var id = globalThis.__elementAtPoint(x, y);
+      while (id >= 0) {
+        if (__nodeType(id) === 1) { out.push(__nodeFor(id)); }
+        id = __parent(id);
+      }
+      return out;
+    });
+  }
+
+  // caretPositionFromPoint(x, y): per CSSOM-View, the caret position (a CaretPosition with
+  // offsetNode + character offset) for the point. Throws TypeError if called with fewer than two
+  // arguments; returns null when the point is outside the viewport. offsetNode prefers the TEXT node
+  // at the point (else the element); `offset` is the character index nearest the point, derived from
+  // the text run's box width (a monospaced/uniform approximation — we have no per-glyph metrics).
+  def(document, "caretPositionFromPoint", function (x, y) {
+    if (arguments.length < 2) { throw new TypeError("Failed to execute 'caretPositionFromPoint' on 'Document': 2 arguments required, but only " + arguments.length + " present."); }
+    x = Number(x); y = Number(y);
+    if (!isFinite(x) || !isFinite(y)) { throw new TypeError("Failed to execute 'caretPositionFromPoint' on 'Document': argument is not a finite number."); }
+    if (x < 0 || y < 0 || x >= __viewportClientWidth() || y >= __viewportClientHeight()) { return null; }
+    return globalThis.__makeCaretAt(x, y);
+  });
+
+  // caretRangeFromPoint(x, y): a collapsed Range at the caret position for the point. With no/zero
+  // coordinates it returns a Range collapsed at (root element, 0). Outside the viewport → null.
+  def(document, "caretRangeFromPoint", function (x, y) {
+    if (arguments.length >= 1) {
+      var nx = Number(x), ny = Number(y);
+      if (isFinite(nx) && isFinite(ny) && (nx < 0 || ny < 0 || nx >= __viewportClientWidth() || ny >= __viewportClientHeight())) {
+        return null;
+      }
+    }
+    var caret = globalThis.__makeCaretAt(x, y);
+    var node, offset;
+    if (caret) { node = caret.offsetNode; offset = caret.offset; }
+    if (!node) {
+      // No hit (no/zero coords, or empty layout): collapse at the root element, offset 0.
+      var rootEl = document.documentElement || document.body || null;
+      if (!rootEl) {
+        try {
+          var kids = __children(__documentRootId());
+          for (var i = 0; i < kids.length; i++) { if (__nodeType(kids[i]) === 1) { rootEl = __nodeFor(kids[i]); break; } }
+        } catch (e) {}
+      }
+      node = rootEl; offset = 0;
+    }
+    if (!node) { return null; }
+    var r = new globalThis.Range();
+    r.setStart(node, offset);
+    r.setEnd(node, offset);
+    return r;
+  });
   if (typeof document.hasFocus !== "function") { def(document, "hasFocus", function () { return true; }); }
   if (!("activeElement" in document)) { Object.defineProperty(document, "activeElement", { get: function () { try { return document.body; } catch (e) { return null; } }, enumerable: true, configurable: true }); }
   if (!("visibilityState" in document)) { document.visibilityState = "visible"; }
@@ -9287,6 +9428,191 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "TimeRanges", "ValidityState", "HTMLFormControlsCollection", "RadioNodeList",
   ];
   for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
+
+  // --- DOMRect factory + real Range + CaretPosition (caret hit-testing support) ---------------
+  // A DOMRect instance (prototype-correct, so `r instanceof DOMRect`) holding x/y/width/height plus
+  // the derived top/right/bottom/left and a toJSON. Used by Range.getBoundingClientRect and
+  // CaretPosition.getClientRect so callers get a real DOMRect, not a plain object.
+  function __makeDOMRect(x, y, w, h) {
+    x = Number(x) || 0; y = Number(y) || 0; w = Number(w) || 0; h = Number(h) || 0;
+    var DR = globalThis.DOMRect;
+    var r = (DR && DR.prototype) ? Object.create(DR.prototype) : {};
+    r.x = x; r.y = y; r.width = w; r.height = h;
+    r.left = w < 0 ? x + w : x; r.top = h < 0 ? y + h : y;
+    r.right = w < 0 ? x : x + w; r.bottom = h < 0 ? y : y + h;
+    r.toJSON = function () { return { x: this.x, y: this.y, width: this.width, height: this.height, top: this.top, right: this.right, bottom: this.bottom, left: this.left }; };
+    return r;
+  }
+  def(globalThis, "__makeDOMRect", __makeDOMRect);
+
+  // Wrap a node id into its CANONICAL wrapper (stable identity: the same object getElementById /
+  // createElement / firstChild hand out), so `caret.offsetNode === el.firstChild` etc. hold.
+  function __nodeFor(id) {
+    if (typeof id !== "number" || id < 0) { return null; }
+    var cached = (typeof globalThis.__nodeById === "function") ? globalThis.__nodeById(id) : null;
+    if (cached) { return cached; }
+    var w = __wrapNode(id);
+    return (typeof globalThis.__canonNode === "function") ? globalThis.__canonNode(w) : w;
+  }
+  def(globalThis, "__nodeFor", __nodeFor);
+
+  // The node id behind a wrapper (or a raw id), or -1.
+  function __idOf(node) {
+    if (node == null) { return -1; }
+    if (typeof node === "number") { return node; }
+    var n = node.__node;
+    return (typeof n === "number") ? n : -1;
+  }
+  // Length of a node for Range offset bounds: text/comment -> character count, element -> child count.
+  function __nodeLength(id) {
+    if (id < 0) { return 0; }
+    var t = __nodeType(id);
+    if (t === 3 || t === 8) { var s = __textContent(id); return s ? s.length : 0; }
+    try { return __children(id).length; } catch (e) { return 0; }
+  }
+  // Viewport-relative caret geometry for (textNodeId, offset): the text run's box gives the line
+  // top/height; the caret x interpolates across the run by character fraction (uniform-advance
+  // approximation — no per-glyph metrics are available here). Returns {x, top, height} or null.
+  function __caretGeometry(containerId, offset) {
+    var r = null; try { r = __rect(containerId); } catch (e) {}
+    if (!r) {
+      // Fall back to the parent element's box when the text node itself has no pushed rect.
+      var p = __parent(containerId);
+      if (p >= 0) { try { r = __rect(p); } catch (e2) {} }
+    }
+    if (!r) { return null; }
+    var len = 0;
+    if (__nodeType(containerId) === 3) { var s = __textContent(containerId); len = s ? s.length : 0; }
+    var frac = len > 0 ? (Math.max(0, Math.min(offset, len)) / len) : 0;
+    return { x: r.left + (r.right - r.left) * frac, top: r.top, height: r.bottom - r.top };
+  }
+
+  // A real Range: collapsed by default, supporting setStart/setEnd/collapse, toString (text between
+  // boundary points within a single text container), getBoundingClientRect/getClientRects (caret or
+  // text-span geometry), and cloneRange. Enough for the CSSOM caret tests and common callers.
+  var AbstractRangeProto = (globalThis.AbstractRange && globalThis.AbstractRange.prototype) || Object.prototype;
+  function Range() {
+    this._sc = null; this._so = 0; this._ec = null; this._eo = 0;
+  }
+  Range.prototype = Object.create(AbstractRangeProto);
+  Range.prototype.constructor = Range;
+  Object.defineProperty(Range.prototype, "startContainer", { get: function () { return this._sc; }, enumerable: true, configurable: true });
+  Object.defineProperty(Range.prototype, "endContainer", { get: function () { return this._ec; }, enumerable: true, configurable: true });
+  Object.defineProperty(Range.prototype, "startOffset", { get: function () { return this._so; }, enumerable: true, configurable: true });
+  Object.defineProperty(Range.prototype, "endOffset", { get: function () { return this._eo; }, enumerable: true, configurable: true });
+  Object.defineProperty(Range.prototype, "collapsed", { get: function () { return this._sc === this._ec && this._so === this._eo; }, enumerable: true, configurable: true });
+  Object.defineProperty(Range.prototype, "commonAncestorContainer", { get: function () {
+    if (this._sc === this._ec) { return this._sc; }
+    // Nearest common ancestor of the two boundary nodes (by walking start's ancestor chain).
+    var aId = __idOf(this._sc), bId = __idOf(this._ec);
+    if (aId < 0) { return this._ec; }
+    if (bId < 0) { return this._sc; }
+    var aChain = {}; var c = aId;
+    while (c >= 0) { aChain[c] = true; c = __parent(c); }
+    c = bId;
+    while (c >= 0) { if (aChain[c]) { return __nodeFor(c); } c = __parent(c); }
+    return this._sc;
+  }, enumerable: true, configurable: true });
+  Range.prototype.setStart = function (node, offset) {
+    this._sc = node; this._so = offset | 0;
+    // If start is now after end (or end unset), collapse end onto start.
+    if (this._ec == null || (this._sc === this._ec && this._so > this._eo)) { this._ec = node; this._eo = this._so; }
+  };
+  Range.prototype.setEnd = function (node, offset) {
+    this._ec = node; this._eo = offset | 0;
+    if (this._sc == null || (this._sc === this._ec && this._eo < this._so)) { this._sc = node; this._so = this._eo; }
+  };
+  Range.prototype.setStartBefore = function (node) { var id = __idOf(node); var p = __parent(id); this.setStart(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) : 0); };
+  Range.prototype.setStartAfter = function (node) { var id = __idOf(node); var p = __parent(id); this.setStart(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) + 1 : 0); };
+  Range.prototype.setEndBefore = function (node) { var id = __idOf(node); var p = __parent(id); this.setEnd(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) : 0); };
+  Range.prototype.setEndAfter = function (node) { var id = __idOf(node); var p = __parent(id); this.setEnd(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) + 1 : 0); };
+  Range.prototype.collapse = function (toStart) {
+    if (toStart) { this._ec = this._sc; this._eo = this._so; }
+    else { this._sc = this._ec; this._so = this._eo; }
+  };
+  Range.prototype.selectNode = function (node) { this.setStartBefore(node); this.setEndAfter(node); };
+  Range.prototype.selectNodeContents = function (node) { this.setStart(node, 0); this.setEnd(node, __nodeLength(__idOf(node))); };
+  Range.prototype.cloneRange = function () { var r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; };
+  Range.prototype.detach = function () {};
+  Range.prototype.toString = function () {
+    // Only the common single-text-container case is modeled (the caret tests' usage): substring of
+    // the text node between the two offsets.
+    if (this._sc === this._ec && this._sc != null) {
+      var id = __idOf(this._sc);
+      if (id >= 0 && __nodeType(id) === 3) {
+        var s = __textContent(id) || "";
+        return s.substring(Math.min(this._so, this._eo), Math.max(this._so, this._eo));
+      }
+    }
+    return "";
+  };
+  Range.prototype.getClientRects = function () {
+    var r = this.getBoundingClientRect();
+    return [r];
+  };
+  Range.prototype.getBoundingClientRect = function () {
+    var scId = __idOf(this._sc);
+    if (scId < 0) { return __makeDOMRect(0, 0, 0, 0); }
+    var g0 = __caretGeometry(scId, this._so);
+    if (!g0) { return __makeDOMRect(0, 0, 0, 0); }
+    if (this._sc === this._ec && this._so === this._eo) {
+      // Collapsed: a zero-width caret rect at the boundary.
+      return __makeDOMRect(g0.x, g0.top, 0, g0.height);
+    }
+    if (this._sc === this._ec) {
+      var g1 = __caretGeometry(scId, this._eo);
+      var x0 = Math.min(g0.x, g1 ? g1.x : g0.x), x1 = Math.max(g0.x, g1 ? g1.x : g0.x);
+      return __makeDOMRect(x0, g0.top, x1 - x0, g0.height);
+    }
+    // Cross-node span: approximate with the start container's box.
+    var rr = null; try { rr = __rect(scId); } catch (e) {}
+    if (rr) { return __makeDOMRect(rr.left, rr.top, rr.right - rr.left, rr.bottom - rr.top); }
+    return __makeDOMRect(g0.x, g0.top, 0, g0.height);
+  };
+  // Install as the global Range, keeping `range instanceof Range` working. defClass already made an
+  // empty Range earlier; overwrite it with this functional constructor (its prototype still chains to
+  // AbstractRange).
+  try { def(globalThis, "Range", Range); } catch (e) {}
+
+  // CaretPosition: { offsetNode, offset, getClientRect() }. getClientRect() returns a FRESH DOMRect
+  // each call (the WPT test asserts identity differs between calls).
+  function CaretPosition(offsetNode, offset, geom) {
+    this.offsetNode = offsetNode; this.offset = offset; this._geom = geom || null;
+  }
+  CaretPosition.prototype.getClientRect = function () {
+    var g = this._geom;
+    if (!g) { return __makeDOMRect(0, 0, 0, 0); }
+    return __makeDOMRect(g.x, g.top, 0, g.height); // collapsed caret: zero width
+  };
+  try { def(globalThis, "CaretPosition", CaretPosition); } catch (e) {}
+
+  // __makeCaretAt(x, y): the CaretPosition at the viewport point. offsetNode prefers the deepest TEXT
+  // node at the point (else the deepest element); offset is the nearest character index inside that
+  // text run (uniform-advance approximation). Returns null when no box is hit. Media/replaced
+  // elements (audio/video/canvas/input) and element hits resolve to offset 0.
+  def(globalThis, "__makeCaretAt", function (x, y) {
+    x = Number(x); y = Number(y);
+    if (!isFinite(x) || !isFinite(y)) { return null; }
+    var hit = __deepestNodeAtPoint(x, y);
+    if (hit < 0) { return null; }
+    var t = __nodeType(hit);
+    if (t === 3) {
+      // Text node: compute the character offset from the run box and the x coordinate.
+      var r = null; try { r = __rect(hit); } catch (e) {}
+      var s = __textContent(hit) || "";
+      var offset = 0;
+      if (r && s.length > 0 && r.right > r.left) {
+        var charW = (r.right - r.left) / s.length;
+        offset = Math.round((x - r.left) / charW);
+        if (offset < 0) { offset = 0; } else if (offset > s.length) { offset = s.length; }
+      }
+      var node = __nodeFor(hit);
+      return new CaretPosition(node, offset, __caretGeometry(hit, offset));
+    }
+    // Element hit (no text run at the point). Caret resolves to the element, offset 0.
+    var node = __nodeFor(hit);
+    return new CaretPosition(node, 0, __caretGeometry(hit, 0));
+  });
 
   // --- CSSOM interface hierarchy + CSSRule type constants ------------------------------------
   // StyleSheet <- CSSStyleSheet; CSSRule <- {CSSStyleRule, CSSGroupingRule <- {CSSMediaRule,
@@ -12350,6 +12676,7 @@ impl Session {
     /// [`EvalOutput`]s (one per classic script, then one per module entry — matching the order
     /// `run_with_dom`/`run_modules` would produce).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn new(
         doc: dom::Document,
         scripts: Vec<String>,
@@ -12359,6 +12686,16 @@ impl Session {
         fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
         request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
         ws_connector: WsConnector,
+        // Layout rects to seed into HostState BEFORE the page's scripts run, so synchronous
+        // layout-dependent reads during load see real geometry. `(rects, naturals, insets,
+        // scroll_y_css, doc_height_css)` (CSS px). `None` to seed nothing.
+        initial_rects: Option<(
+            Vec<(usize, f32, f32, f32, f32)>,
+            Vec<(usize, f32, f32)>,
+            Vec<(usize, f32, f32, f32, f32)>,
+            f32,
+            f32,
+        )>,
     ) -> (Session, dom::Document, Vec<EvalOutput>) {
         let url = url.to_string();
         let fallback = doc.clone();
@@ -12375,7 +12712,7 @@ impl Session {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     session_thread_main(
                         doc, scripts, entries, modules, url, fetcher, request_fetcher,
-                        ws_connector, init_tx, cmd_rx,
+                        ws_connector, init_tx, cmd_rx, initial_rects,
                     );
                 }));
             });
@@ -12664,6 +13001,13 @@ fn session_thread_main(
     ws_connector: WsConnector,
     init_tx: std::sync::mpsc::Sender<(dom::Document, Vec<EvalOutput>)>,
     cmd_rx: std::sync::mpsc::Receiver<SessionCmd>,
+    initial_rects: Option<(
+        Vec<(usize, f32, f32, f32, f32)>,
+        Vec<(usize, f32, f32)>,
+        Vec<(usize, f32, f32, f32, f32)>,
+        f32,
+        f32,
+    )>,
 ) {
     ensure_v8_initialized();
     let shared: SharedDoc = Rc::new(RefCell::new(doc));
@@ -12706,6 +13050,36 @@ fn session_thread_main(
         });
         scope.get_current_context().set_slot(registry);
         install_browser_environment(scope, &url);
+
+        // Seed the engine-computed layout rects BEFORE scripts run, so synchronous
+        // getBoundingClientRect / elementFromPoint / caret*FromPoint reads during page load see real
+        // geometry (the rect table is otherwise empty until the engine's first post-load push).
+        if let Some((rects, naturals, insets, scroll_y_css, doc_height_css)) = initial_rects {
+            let state = host_state(scope);
+            {
+                let mut map = state.layout_rects.borrow_mut();
+                map.clear();
+                for (id, x, y, w, h) in rects {
+                    map.insert(id, (x, y, w, h));
+                }
+            }
+            {
+                let mut ins = state.used_insets.borrow_mut();
+                ins.clear();
+                for (id, t, r, b, l) in insets {
+                    ins.insert(id, (t, r, b, l));
+                }
+            }
+            {
+                let mut nat = state.image_natural.borrow_mut();
+                nat.clear();
+                for (id, w, h) in naturals {
+                    nat.insert(id, (w, h));
+                }
+            }
+            state.viewport_scroll_y.set(scroll_y_css);
+            state.doc_height.set(doc_height_css);
+        }
 
         // Run initial classic scripts in order, then the module graph, exactly as the load path.
         let mut results: Vec<EvalOutput> =
@@ -15416,6 +15790,7 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         let got = match &snapshot.get(body).data {
@@ -15462,6 +15837,7 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            None,
         );
         let elapsed = start.elapsed();
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
@@ -15503,6 +15879,7 @@ mod tests {
             no_fetch(),
             request_fetcher,
             no_ws(),
+            None,
         );
         let console = all_console(&out);
         assert!(
@@ -15932,6 +16309,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -15957,6 +16335,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
         // Ran at least once during load.
@@ -15992,6 +16371,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -16019,6 +16399,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -16044,6 +16425,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert!(outputs.is_empty() || outputs.iter().all(|o| o.error.is_none()));
 
@@ -16073,6 +16455,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -16111,6 +16494,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert!(outputs.iter().all(|o| o.error.is_none()));
 
@@ -16145,6 +16529,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 
@@ -16177,6 +16562,7 @@ mod tests {
             no_fetch(),
             no_request(),
             no_ws(),
+            None,
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
 

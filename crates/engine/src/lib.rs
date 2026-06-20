@@ -352,9 +352,28 @@ impl Engine {
 
                 let mut console: Vec<String> = Vec::new();
                 let doc = if looks_html {
+                    // Pre-layout the parsed document (inline-CSS only, no network) so the JS session
+                    // can seed `layout_rects` BEFORE its scripts run. Synchronous layout-dependent
+                    // reads during load (getBoundingClientRect / elementFromPoint / caret*FromPoint)
+                    // then see real geometry instead of 0/null. Best-effort: external CSS/images
+                    // aren't loaded yet, and the engine re-lays-out + re-pushes authoritatively after.
+                    let initial_rects = {
+                        let inline_styles = collect_inline_stylesheets(&final_doc, &base);
+                        let no_images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+                        compute_initial_rects(
+                            &final_doc,
+                            &inline_styles,
+                            &no_images,
+                            self.font.as_ref(),
+                            self.vp_w,
+                            self.vp_h,
+                            self.scale,
+                            self.is_dark,
+                        )
+                    };
                     // Start a persistent JS runtime: runs classic scripts + ES modules and stays
                     // alive so event handlers/timers keep working. Returns the initial snapshot.
-                    let (session, mut snapshot, sess_console) = start_session(final_doc, &base);
+                    let (session, mut snapshot, sess_console) = start_session(final_doc, &base, initial_rects);
                     console.extend(sess_console);
                     // Page JS can leave stale node ids; drop any out of the arena.
                     snapshot.prune_invalid();
@@ -1374,6 +1393,19 @@ impl Engine {
     /// Run any due timers / microtasks in the live page JS (e.g. deferred work, animation steps)
     /// and adopt the updated DOM snapshot. Returns `true` if a re-render is warranted.
     pub fn tick(&mut self) -> bool {
+        // Make sure the JS side has up-to-date element geometry BEFORE this tick runs page script.
+        // Scripts execute inside `session.tick()` and may synchronously read layout-dependent APIs
+        // (`getBoundingClientRect`, `elementFromPoint`, `caretPositionFromPoint`, `caretRangeFromPoint`,
+        // …) which are served from the engine-pushed `layout_rects`. Headless drivers (e.g. the WPT
+        // runner) never call `render()`, so without this the rect table would stay empty and those
+        // reads return 0/null. Cheap when the cache is already valid (`ensure_layout` → false, no push).
+        if self.session.is_some() {
+            let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
+            let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
+            if self.ensure_layout(dw, dh, 0.0) {
+                self.push_layout_rects();
+            }
+        }
         let session = match &self.session {
             Some(s) => s,
             None => return false,
@@ -2299,6 +2331,62 @@ fn collect_used_insets(b: &layout::LayoutBox, out: &mut HashMap<usize, [f32; 4]>
     for c in &b.children {
         collect_used_insets(c, out);
     }
+}
+
+/// Standalone layout pass that produces the per-node rect table (CSS px, document-absolute) for a
+/// `doc` + `styles`, WITHOUT touching `Engine` state. Used to seed the JS session's `layout_rects`
+/// BEFORE its scripts run, so synchronous layout-dependent reads during page load
+/// (`getBoundingClientRect`, `elementFromPoint`, `caretPositionFromPoint`, `caretRangeFromPoint`, …)
+/// see real geometry rather than 0/null. The engine recomputes the authoritative layout after
+/// scripts/external CSS load and re-pushes; this is the best-effort first frame using whatever
+/// stylesheets/images are available at parse time. Returns
+/// `(rects, naturals, insets, scroll_y_css, doc_height_css)` in the exact shape `set_layout_rects`
+/// expects (CSS px). `None` when there's no font (then nothing is seeded).
+#[allow(clippy::type_complexity)]
+fn compute_initial_rects(
+    doc: &dom::Document,
+    styles: &[css::Stylesheet],
+    images: &HashMap<dom::NodeId, DecodedImage>,
+    font: Option<&SystemFont>,
+    vp_w: u32,
+    vp_h: u32,
+    scale: f32,
+    is_dark: bool,
+) -> Option<(
+    Vec<(usize, f32, f32, f32, f32)>,
+    Vec<(usize, f32, f32)>,
+    Vec<(usize, f32, f32, f32, f32)>,
+    f32,
+    f32,
+)> {
+    let font = font?;
+    let dw = ((vp_w as f32) * scale).round().max(1.0) as u32;
+    let dh = ((vp_h as f32) * scale).round().max(1.0) as u32;
+    style::set_viewport_metrics(vp_w as f32, vp_h as f32, scale);
+    style::set_interaction_state(None, None);
+    let vw = (dw as f32).max(1.0);
+    let vh = (dh as f32).max(1.0);
+    let measurer = FontMeasurer { font };
+    let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> =
+        images.iter().map(|(&id, img)| (id, (img.w as f32, img.h as f32))).collect();
+    collect_canvas_intrinsics(doc, &mut intrinsic_sizes);
+    collect_svg_intrinsics(doc, &mut intrinsic_sizes);
+    let (computed, _root_scheme_dark) = style::cascade_with_root_scheme(doc, styles, is_dark);
+    let root = layout::layout_document(doc, &computed, vw, vh, &measurer, &intrinsic_sizes, None);
+    let content_h = root.dimensions.margin_box().height;
+
+    let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
+    collect_node_rects(&root, &mut rects);
+    let inv = if scale > 0.0 { 1.0 / scale } else { 1.0 };
+    let rect_list: Vec<(usize, f32, f32, f32, f32)> =
+        rects.iter().map(|(&id, r)| (id, r.x * inv, r.y * inv, r.width * inv, r.height * inv)).collect();
+    let naturals: Vec<(usize, f32, f32)> =
+        images.iter().map(|(&id, img)| (id.0, img.w as f32, img.h as f32)).collect();
+    let mut insets: HashMap<usize, [f32; 4]> = HashMap::new();
+    collect_used_insets(&root, &mut insets);
+    let inset_list: Vec<(usize, f32, f32, f32, f32)> =
+        insets.iter().map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv)).collect();
+    Some((rect_list, naturals, inset_list, 0.0, content_h * inv))
 }
 
 /// Collect every masked box: its node id, border-box rect (device px), and the resolved
@@ -4852,9 +4940,17 @@ pub fn run_scripts(doc: dom::Document, base: &str) -> (dom::Document, Vec<String
 /// Returns the session (None if the page has no scripts/modules), the initial DOM snapshot, and
 /// console/error/note lines. Mirrors the gathering in [`run_scripts`]/[`run_modules`] but hands the
 /// work to a long-lived runtime instead of a run-once worker.
+#[allow(clippy::type_complexity)]
 fn start_session(
     doc: dom::Document,
     base: &str,
+    initial_rects: Option<(
+        Vec<(usize, f32, f32, f32, f32)>,
+        Vec<(usize, f32, f32)>,
+        Vec<(usize, f32, f32, f32, f32)>,
+        f32,
+        f32,
+    )>,
 ) -> (Option<js::Session>, dom::Document, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
 
@@ -4908,6 +5004,7 @@ fn start_session(
     let ws_connector = build_ws_connector();
     let (session, snapshot, results) = js::Session::new(
         doc, classic, entries, module_sources, base, fetcher, request_fetcher, ws_connector,
+        initial_rects,
     );
     for result in results {
         notes.extend(result.console);
@@ -5363,6 +5460,55 @@ mod tests {
         // The body's scrollHeight reports the full document content height (> 0).
         let sh = e.console_eval("document.body.scrollHeight > 0");
         assert_eq!(sh, "true", "document.body.scrollHeight should be positive");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hit_testing_apis_element_and_caret_from_point() {
+        // A div with an explicit 200x80 box flush at the top-left. The engine lays it out and seeds
+        // the JS session's rect table, so the hit-testing APIs resolve against real geometry.
+        let html = "<html><body style=\"margin:0\">\
+            <div id=\"box\" style=\"width:200px;height:80px\">hello</div>\
+            <script>window.__ready = true;</script></body></html>";
+        let path = std::env::temp_dir().join("browser_hit_test_apis.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(800, 600, 1.0); // scale 1 → CSS px == device px
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render(); // ensure layout is built + rects pushed
+
+        // elementFromPoint inside the box (CSS px, viewport-relative) returns the div.
+        let id = e.console_eval(
+            "var el = document.elementFromPoint(20, 20); el ? el.id : 'null'",
+        );
+        assert_eq!(id, "box", "elementFromPoint(20,20) should return the div#box");
+
+        // A point outside the viewport yields null.
+        let outside = e.console_eval("document.elementFromPoint(-5, 5) === null");
+        assert_eq!(outside, "true", "elementFromPoint outside the viewport is null");
+
+        // caretPositionFromPoint throws TypeError with too few arguments (arity check).
+        let arity = e.console_eval(
+            "var t = false; try { document.caretPositionFromPoint(); } catch (e) { t = (e instanceof TypeError); } t",
+        );
+        assert_eq!(arity, "true", "caretPositionFromPoint() with no args throws TypeError");
+
+        // caretRangeFromPoint(0, 0) returns a collapsed Range with offsets 0/0.
+        let range = e.console_eval(
+            "var r = document.caretRangeFromPoint(0, 0); \
+             (r instanceof Range) + ',' + r.startOffset + ',' + r.endOffset + ',' + r.collapsed",
+        );
+        assert_eq!(range, "true,0,0,true", "caretRangeFromPoint(0,0) is a collapsed Range at 0/0");
+
+        // caretPositionFromPoint over the box returns a CaretPosition whose offsetNode is contained
+        // by the div (the text node "hello" or the div itself).
+        let caret = e.console_eval(
+            "var p = document.caretPositionFromPoint(20, 20); \
+             (p instanceof CaretPosition) + ',' + (p && document.getElementById('box').contains(p.offsetNode))",
+        );
+        assert_eq!(caret, "true,true", "caretPositionFromPoint over the box returns a CaretPosition inside it");
 
         let _ = std::fs::remove_file(&path);
     }
