@@ -9952,6 +9952,53 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
   } catch (e) {}
 
+  // Minimal <iframe> content document: a lightweight Document facade backed by a detached <body>
+  // subtree (the iframe doesn't get a real nested browsing context / rendering, but its DOM +
+  // CSSOM work). Enough for scripts that read `frame.contentDocument.body`, build a sub-DOM, and
+  // use a <style>'s `.sheet`. `contentWindow.eval` runs with `document` bound to that facade.
+  try {
+    if (globalThis.HTMLIFrameElement && globalThis.HTMLIFrameElement.prototype) {
+      var IFP = globalThis.HTMLIFrameElement.prototype;
+      Object.defineProperty(IFP, "contentDocument", {
+        get: function () {
+          if (!this.__cdoc) {
+            var body = document.createElement("body");
+            var doc = {
+              body: body, head: body, documentElement: body, nodeType: 9,
+              querySelector: function (s) { return body.querySelector(s); },
+              querySelectorAll: function (s) { return body.querySelectorAll(s); },
+              getElementById: function (id) { try { return body.querySelector('#' + id); } catch (e) { return null; } },
+              getElementsByTagName: function (t) { return body.getElementsByTagName(t); },
+              createElement: function (t) { return document.createElement(t); },
+              createTextNode: function (t) { return document.createTextNode(t); },
+              createDocumentFragment: function () { return document.createDocumentFragment(); },
+              adoptedStyleSheets: [], styleSheets: { length: 0, item: function () { return null; } },
+              defaultView: null,
+            };
+            this.__cdoc = doc;
+          }
+          return this.__cdoc;
+        },
+        enumerable: true, configurable: true
+      });
+      Object.defineProperty(IFP, "contentWindow", {
+        get: function () {
+          var d = this.contentDocument;
+          if (!this.__cwin) {
+            this.__cwin = {
+              document: d,
+              // Run code with `document` bound to the iframe's facade document (direct eval sees it).
+              eval: function (code) { var document = d; return eval(code); },
+            };
+            d.defaultView = this.__cwin;
+          }
+          return this.__cwin;
+        },
+        enumerable: true, configurable: true
+      });
+    }
+  } catch (e) {}
+
   // --- Image / Audio / media element constructors ------------------------------------------
   if (typeof globalThis.Image !== "function") {
     def(globalThis, "Image", function (w, h) {
