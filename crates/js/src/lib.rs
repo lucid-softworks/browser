@@ -4503,21 +4503,22 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       else if (pos === "afterbegin") { var k = __children(id); __insertBefore(id, nid, k.length ? k[0] : -1); }
       else if (pos === "beforeend") { __appendChild(id, nid); }
       else if (pos === "afterend") { p = __parent(id); if (p >= 0) { var sibs = __children(p); var idx = sibs.indexOf(id); var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1; __insertBefore(p, nid, ref); } }
-      else { throw new SyntaxError("Failed to execute 'insertAdjacentElement': '" + position + "' is not a valid value."); }
+      else { throw new globalThis.DOMException("Failed to execute 'insertAdjacentElement': '" + position + "' is not a valid value.", "SyntaxError"); }
       return node;
     });
 
     def(el, "insertAdjacentHTML", function (position, html) {
       var pos = String(position == null ? "" : position).toLowerCase();
       if (pos !== "beforebegin" && pos !== "afterbegin" && pos !== "beforeend" && pos !== "afterend") {
-        throw new SyntaxError("Failed to execute 'insertAdjacentHTML': '" + position + "' is not a valid value.");
+        throw new globalThis.DOMException("Failed to execute 'insertAdjacentHTML': '" + position + "' is not a valid value.", "SyntaxError");
       }
       // Parse the HTML fragment into real nodes via a temp container, then move them.
       var tmp = __createElement("template");
       __setInnerHTML(tmp, html == null ? "" : String(html));
       var parsed = __children(tmp).slice();
       if (pos === "beforebegin") {
-        var p = __parent(id); if (p < 0) { return; }
+        var p = __parent(id);
+        if (p < 0 || __nodeType(p) === 9) { throw new globalThis.DOMException("Cannot insert adjacent to a node with no parent element.", "NoModificationAllowedError"); }
         for (var i = 0; i < parsed.length; i++) { __insertBefore(p, parsed[i], id); }
       } else if (pos === "afterbegin") {
         var k = __children(id); var ref = k.length ? k[0] : -1;
@@ -4525,7 +4526,8 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       } else if (pos === "beforeend") {
         for (var i = 0; i < parsed.length; i++) { __appendChild(id, parsed[i]); }
       } else { // afterend
-        var p2 = __parent(id); if (p2 < 0) { return; }
+        var p2 = __parent(id);
+        if (p2 < 0 || __nodeType(p2) === 9) { throw new globalThis.DOMException("Cannot insert adjacent to a node with no parent element.", "NoModificationAllowedError"); }
         var sibs = __children(p2); var idx = sibs.indexOf(id);
         var ref2 = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
         for (var i = 0; i < parsed.length; i++) { __insertBefore(p2, parsed[i], ref2); }
