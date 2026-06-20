@@ -6688,6 +6688,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           if (p === "cssText") { t.cssText = v; return true; }
           if (p in t) { t[p] = v; return true; }
           setVal(normPropName(p), v, false); return true;
+        },
+        // CSS properties are WebIDL attributes (on the prototype) — `"color" in decl` is true even
+        // though there's no own property for it (CSSStyleDeclaration-properties test).
+        has: function (t, p) {
+          if (typeof p === "string" && isKnownProperty(normPropName(p))) { return true; }
+          return p in t;
         }
       });
     } catch (e) { return base; }
