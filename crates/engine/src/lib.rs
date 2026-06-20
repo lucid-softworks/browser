@@ -2867,6 +2867,16 @@ fn paint_box_opacity(
     };
     let offscreen = bottom < clip_top || top >= clip_bottom;
 
+    // Cull the whole offscreen subtree — don't even recurse — so a long page (e.g. browserscore's
+    // 14M-px DOM with every <details> open) doesn't walk thousands of off-viewport boxes per frame.
+    // In-flow children are contained in their parent's (affine-mapped) vertical extent, so an
+    // offscreen box's descendants are offscreen too. Skipped only when there's no active text
+    // selection: the selection highlight indexes text runs by global DFS position, and skipping a
+    // subtree would desync that counter (when nothing is selected, `run_idx` is unused).
+    if offscreen && sel_ranges.is_empty() {
+        return;
+    }
+
     if !offscreen && opacity > 0.0 {
         // (0) OUTER box-shadows: painted BEFORE the background so the box sits on top.
         if let Some(ex) = extras {
