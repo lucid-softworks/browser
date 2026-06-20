@@ -1165,6 +1165,39 @@ fn with_cascade_map<R>(
     f(&doc, map)
 }
 
+/// Compute the requested pseudo-element's `ComputedStyle` for node `id` and run `f` over it
+/// (`None` when `id` isn't an element). `pseudo_key` is the canonical key from
+/// [`style::parse_gcs_pseudo`] (`"before"`, `"marker"`, `"highlight(x)"`, …). Recomputes the
+/// element cascade if stale (same freshness check as [`with_computed_style`]), then derives the
+/// pseudo style on demand from the element's cascaded style + the author sheets.
+fn with_pseudo_style<R>(
+    state: &HostState,
+    id: dom::NodeId,
+    pseudo_key: &str,
+    f: impl FnOnce(Option<&style::ComputedStyle>) -> R,
+) -> R {
+    let version = state.dom_version.get();
+    {
+        let mut cache = state.computed_cache.borrow_mut();
+        let fresh = matches!(&*cache, Some((v, _)) if *v == version);
+        if !fresh {
+            let doc = state.doc.borrow();
+            let sheets = collect_author_sheets(&doc);
+            let map = style::cascade(&doc, &sheets);
+            *cache = Some((version, map));
+        }
+    }
+    let cache = state.computed_cache.borrow();
+    let map = cache.as_ref().map(|(_, m)| m).expect("cascade just populated");
+    let doc = state.doc.borrow();
+    let element_style = map.get(&id);
+    let pseudo = element_style.and_then(|es| {
+        let sheets = collect_author_sheets(&doc);
+        style::compute_pseudo_style(&doc, &sheets, id, es, pseudo_key)
+    });
+    f(pseudo.as_ref())
+}
+
 /// The content-box and padding-box extents (width, height) of an element's box, derived from its
 /// computed style. Standard box-sizing: `width`/`height` are the content box; the padding box adds
 /// the padding edges. Used as the percentage basis / containing-block extent when resolving insets.
@@ -1305,24 +1338,32 @@ fn prim_computed_style_prop(
 ) {
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
+    let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 2));
     let state = host_state(scope);
-    // Inset longhands need the CSSOM resolved-value algorithm (position + containing block), which
-    // reads more than one element's style — handle them via the cascade map directly.
-    let inset_side = match name.as_str() {
-        "top" => Some(style::EdgeSide::Top),
-        "right" => Some(style::EdgeSide::Right),
-        "bottom" => Some(style::EdgeSide::Bottom),
-        "left" => Some(style::EdgeSide::Left),
-        _ => None,
-    };
-    let value = match (node, inset_side) {
-        (Some(n), Some(side)) => with_cascade_map(&state, |doc, map| {
-            resolved_inset_value(doc, map, n, side).unwrap_or_default()
-        }),
-        (Some(n), None) => with_computed_style(&state, n, |cs| {
+    let value = match (node, &pseudo) {
+        (None, _) | (_, style::GcsPseudo::Invalid) => String::new(),
+        (Some(n), style::GcsPseudo::Pseudo(key)) => with_pseudo_style(&state, n, key, |cs| {
             cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
         }),
-        (None, _) => String::new(),
+        (Some(n), style::GcsPseudo::Element) => {
+            // Inset longhands need the CSSOM resolved-value algorithm (position + containing
+            // block), which reads more than one element's style — handle them via the cascade map.
+            let inset_side = match name.as_str() {
+                "top" => Some(style::EdgeSide::Top),
+                "right" => Some(style::EdgeSide::Right),
+                "bottom" => Some(style::EdgeSide::Bottom),
+                "left" => Some(style::EdgeSide::Left),
+                _ => None,
+            };
+            match inset_side {
+                Some(side) => with_cascade_map(&state, |doc, map| {
+                    resolved_inset_value(doc, map, n, side).unwrap_or_default()
+                }),
+                None => with_computed_style(&state, n, |cs| {
+                    cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
+                }),
+            }
+        }
     };
     let s = js_str(scope, &value);
     rv.set(s);
@@ -1336,13 +1377,18 @@ fn prim_computed_style_names(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let node = arg_node(scope, &args, 0);
+    let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 1));
     let state = host_state(scope);
-    let names: Vec<String> = match node {
-        Some(n) => with_computed_style(&state, n, |cs| {
+    let names: Vec<String> = match (node, &pseudo) {
+        (None, _) | (_, style::GcsPseudo::Invalid) => Vec::new(),
+        (Some(n), style::GcsPseudo::Pseudo(key)) => with_pseudo_style(&state, n, key, |cs| {
             cs.map(|cs| cs.property_names().iter().map(|s| s.to_string()).collect())
                 .unwrap_or_default()
         }),
-        None => Vec::new(),
+        (Some(n), style::GcsPseudo::Element) => with_computed_style(&state, n, |cs| {
+            cs.map(|cs| cs.property_names().iter().map(|s| s.to_string()).collect())
+                .unwrap_or_default()
+        }),
     };
     let arr = js_str_array(scope, &names);
     rv.set(arr);
@@ -4396,10 +4442,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       }
     }
 
-    function makeDeclaration(id) {
+    function makeDeclaration(id, pseudo) {
+      pseudo = pseudo || "";
       var names = null; // lazily fetched list of populated property names
-      function getNames() { if (names === null) { try { names = __computedStyleNames(id) || []; } catch (e) { names = []; } } return names; }
-      function get(prop) { try { return __computedStyleProp(id, String(prop).toLowerCase()); } catch (e) { return ""; } }
+      function getNames() { if (names === null) { try { names = __computedStyleNames(id, pseudo) || []; } catch (e) { names = []; } } return names; }
+      function get(prop) { try { return __computedStyleProp(id, String(prop).toLowerCase(), pseudo); } catch (e) { return ""; } }
 
       var decl = {
         getPropertyValue: function (name) { return get(name); },
@@ -4426,6 +4473,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           has: function (target, prop) {
             if (prop in target) { return true; }
             return get(camelToKebab(prop)) !== "";
+          },
+          // A computed-style CSSStyleDeclaration is read-only: writing a CSS property throws
+          // NoModificationAllowedError (per CSSOM). Symbol writes pass through.
+          set: function (target, prop, value) {
+            if (typeof prop === "symbol") { target[prop] = value; return true; }
+            throw new globalThis.DOMException(
+              "Cannot modify the computed (resolved) style.", "NoModificationAllowedError");
           }
         });
       } catch (e) {
@@ -4444,10 +4498,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       }
     }
 
-    globalThis.getComputedStyle = function (el) {
+    globalThis.getComputedStyle = function (el, pseudoElt) {
       var id = (el && typeof el.__node === "number") ? el.__node : null;
       if (id === null) { return emptyDeclaration(); }
-      return makeDeclaration(id);
+      // The pseudo-element argument is normalized in Rust (`parse_gcs_pseudo`); pass it through as a
+      // string. null/undefined → the element itself.
+      var pseudo = (pseudoElt === null || pseudoElt === undefined) ? "" : String(pseudoElt);
+      return makeDeclaration(id, pseudo);
     };
   })();
 
@@ -11789,6 +11846,64 @@ mod tests {
         let v = out[0].value.as_deref().unwrap();
         assert!(v.ends_with("|rgb(1, 2, 3)"), "expected new color after mutation, got {v}");
         assert_ne!(v, "rgb(1, 2, 3)|rgb(1, 2, 3)", "before should differ from after");
+    }
+
+    #[test]
+    fn computed_style_pseudo_element_argument() {
+        // getComputedStyle(el, "::before") reflects the pseudo's cascaded style; an unknown
+        // double-colon pseudo yields an empty style; the no-arg form is unchanged.
+        let (mut doc, body) = doc_with_body("");
+        let head = doc.get(doc.get(body).parent.unwrap()).children[0];
+        let style_el = doc.append_element(head, "style");
+        doc.append_child(
+            style_el,
+            dom::NodeData::Text("#x { color: rgb(0, 0, 1) } #x::before { color: red; content: \"x\" }".to_string()),
+        );
+        let el = doc.append_element(body, "div");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(el).data {
+            e.attrs.insert("id".to_string(), "x".to_string());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var el = document.querySelectorAll('div')[0];
+                   var b = getComputedStyle(el, "::before");
+                   [
+                     b.color,                              // pseudo's cascaded color
+                     b.content,                            // pseudo's content
+                     getComputedStyle(el, ":before").color,// legacy single-colon
+                     String(getComputedStyle(el, "::totallynotapseudo").length), // unknown -> empty
+                     String(getComputedStyle(el, "before").color === getComputedStyle(el).color), // no-colon -> element
+                     getComputedStyle(el).color            // no-arg unchanged
+                   ].join("|")"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("rgb(255, 0, 0)|\"x\"|rgb(255, 0, 0)|0|true|rgb(0, 0, 1)"),
+        );
+    }
+
+    #[test]
+    fn computed_style_pseudo_is_immutable() {
+        // Writing a CSS property on a computed style throws NoModificationAllowedError.
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var s = getComputedStyle(document.querySelectorAll('div')[0], "::before");
+                   try { s.color = "1"; "no-throw"; }
+                   catch (e) { e.name; }"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("NoModificationAllowedError"));
     }
 
     #[test]

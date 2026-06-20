@@ -736,6 +736,12 @@ impl ComputedStyle {
                 Position::Sticky => "sticky",
             }
             .to_string(),
+            // `content` is meaningful for pseudo-elements; `None` (no generated content) serializes
+            // as the initial `normal`, otherwise as a quoted string.
+            "content" => match &self.content {
+                Some(s) => serialize_css_string(s),
+                None => "normal".to_string(),
+            },
 
             // --- color / paint ---
             "color" => rgb_str(self.color),
@@ -1077,6 +1083,22 @@ impl ComputedStyle {
         // Every name here maps to a tracked field, so all are non-empty.
         NAMES.to_vec()
     }
+}
+
+/// Serialize a string value as a CSS `<string>` (double-quoted, with `"` and `\` escaped) — the
+/// form `getComputedStyle(...).content` returns for a pseudo-element's generated text.
+fn serialize_css_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn size_constraint_str(c: SizeConstraint) -> String {
@@ -1659,13 +1681,17 @@ fn compute_element_style<'a>(
         if !complex_matches(doc, node_id, &entry.compiled.selector) {
             return;
         }
-        match entry.compiled.pseudo_element {
+        match &entry.compiled.pseudo_element {
             Some(PseudoElement::Before) => {
                 before_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
             }
             Some(PseudoElement::After) => {
                 after_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
             }
+            // Other pseudo-elements (`::marker`, `::highlight(x)`, …) don't generate layout boxes
+            // here and don't apply to the originating element; they're resolved on demand by
+            // `compute_pseudo_style` for `getComputedStyle`.
+            Some(PseudoElement::Other(_)) => {}
             None => {
                 best_by_order
                     .entry(entry.order)
@@ -1905,6 +1931,207 @@ fn cascade_pseudo(
         Display::Block | Display::Flex | Display::Grid | Display::None
     );
     Some(Box::new(ps))
+}
+
+/// Gather the candidate index entries for `el` (its id/class/type buckets + the universal bucket),
+/// the same set `cascade_node` considers. Returned in bucket order; callers filter + sort.
+fn candidate_entries<'i, 'a>(index: &'i SelectorIndex<'a>, el: &dom::ElementData) -> Vec<&'i Entry<'a>> {
+    let mut out: Vec<&'i Entry<'a>> = Vec::new();
+    if let Some(id) = el.id() {
+        if let Some(bucket) = index.by_id.get(id) {
+            out.extend(bucket.iter());
+        }
+    }
+    for class in el.classes() {
+        if let Some(bucket) = index.by_class.get(class) {
+            out.extend(bucket.iter());
+        }
+    }
+    let tag_lower = el.tag.to_lowercase();
+    if let Some(bucket) = index.by_type.get(&tag_lower) {
+        out.extend(bucket.iter());
+    }
+    out.extend(index.universal.iter());
+    out
+}
+
+/// Compute the cascaded computed style of a pseudo-element of `node_id`, for `getComputedStyle`.
+///
+/// `element_style` is the originating element's already-cascaded style (the inheritance source).
+/// `pseudo_key` is the canonical key from [`parse_gcs_pseudo`] (`"before"`, `"marker"`,
+/// `"highlight(x)"`, …). Returns `None` only if `node_id` isn't an element; otherwise it always
+/// returns a (possibly rule-less, but non-empty) pseudo style — matching browsers, which expose a
+/// full computed style for any tree-abiding pseudo-element of any element.
+///
+/// Box / non-inherited properties start at their initial values (the pseudo is a fresh box that
+/// merely inherits typography/color from the originating element); matching author + UA rules for
+/// that pseudo then cascade on top. `content` is *not* required (unlike layout box generation) —
+/// `getComputedStyle(el, "::before")` reports a style even when there's no generated box.
+pub fn compute_pseudo_style(
+    doc: &dom::Document,
+    sheets: &[css::Stylesheet],
+    node_id: dom::NodeId,
+    element_style: &ComputedStyle,
+    pseudo_key: &str,
+) -> Option<ComputedStyle> {
+    let el = el_of(doc, node_id)?.clone();
+    let ua = user_agent_stylesheet();
+    let index = SelectorIndex::build(&ua, sheets);
+
+    // Collect every rule whose compound matches the originating element AND whose pseudo-element
+    // equals the requested key. Mirror `cascade_node`'s bucketed lookup.
+    let mut matches: Vec<(u8, u32, usize, &[(String, String)], Option<&str>)> = Vec::new();
+    for entry in candidate_entries(&index, &el) {
+        if !matches!(&entry.compiled.pseudo_element, Some(pe) if pe.key() == pseudo_key) {
+            continue;
+        }
+        if !complex_matches(doc, node_id, &entry.compiled.selector) {
+            continue;
+        }
+        let origin = if entry.origin == 0 { 0 } else { 2 };
+        matches.push((origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
+    }
+
+    // Inherit typography/color from the originating element, then reset the box / non-inherited
+    // fields to their initial values (same reset list as `cascade_pseudo`).
+    let mut ps = element_style.clone();
+    ps.background_color = None;
+    ps.background_gradient = None;
+    ps.mask_image = None;
+    ps.box_shadows = Vec::new();
+    ps.transform = None;
+    ps.transform_origin = (0.5, 0.5);
+    ps.margin = Edges::default();
+    ps.padding = Edges::default();
+    ps.border = Edges::default();
+    ps.border_color = element_style.color;
+    ps.width = None;
+    ps.height = None;
+    ps.min_width = None;
+    ps.max_width = None;
+    ps.min_height = None;
+    ps.max_height = None;
+    ps.position = Position::Static;
+    ps.top = None;
+    ps.right = None;
+    ps.bottom = None;
+    ps.left = None;
+    ps.z_index = None;
+    ps.opacity = 1.0;
+    ps.border_radius = 0.0;
+    ps.display = Display::Inline; // generated content is inline by default
+    ps.display_block = false;
+    ps.display_none = false;
+    ps.content = None;
+    ps.before = None;
+    ps.after = None;
+
+    // The originating element's custom-property environment is inherited by its pseudos. Rebuild it
+    // here from the element's matching declarations (the cascade doesn't expose the stored map).
+    let vars = element_vars(doc, node_id, &el, &index);
+
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let inherited_color = element_style.color;
+    // `parse_length` drops percentage width/height (it has no basis at cascade time). For a
+    // pseudo-element the containing block IS the originating element's box, which we know here, so
+    // track the winning percentage and resolve it against the element's content extents.
+    let mut width_pct: Option<f32> = None;
+    let mut height_pct: Option<f32> = None;
+    for (_, _, _, decls, base) in &matches {
+        for (prop, val) in *decls {
+            if prop.starts_with("--") {
+                continue;
+            }
+            let resolved = resolve_vars(val, &vars);
+            let current_color = ps.color;
+            match prop.as_str() {
+                "width" => width_pct = parse_percent(&resolved),
+                "height" => height_pct = parse_percent(&resolved),
+                _ => {}
+            }
+            apply_declaration(&mut ps, prop, &resolved, element_style, current_color, inherited_color, *base);
+        }
+    }
+    // Resolve a tracked percentage width/height against the originating element's content box. Only
+    // when `apply_declaration` left the field as `None` (i.e. it was a percentage it couldn't store).
+    if let Some(p) = width_pct {
+        if ps.width.is_none() {
+            if let Some(basis) = element_style.width {
+                ps.width = Some(p / 100.0 * basis);
+            }
+        }
+    }
+    if let Some(p) = height_pct {
+        if ps.height.is_none() {
+            if let Some(basis) = element_style.height {
+                ps.height = Some(p / 100.0 * basis);
+            }
+        }
+    }
+
+    // Resolve `content`'s `attr()` now that we have the element (if any content was set).
+    if let Some(content) = ps.content.take() {
+        ps.content = Some(resolve_content_attr(&content, &el));
+    }
+
+    // Item-based blockification: a pseudo-element child of a flex/grid container is blockified.
+    if matches!(element_style.display, Display::Flex | Display::Grid)
+        && matches!(ps.display, Display::Inline)
+    {
+        ps.display = Display::Block;
+    }
+
+    // Keep derived display flags consistent for downstream readers.
+    ps.display_none = ps.display == Display::None;
+    ps.display_block = matches!(
+        ps.display,
+        Display::Block | Display::Flex | Display::Grid | Display::None
+    );
+    Some(ps)
+}
+
+/// Rebuild an element's custom-property (`--name`) environment by cascading its own matching
+/// declarations. Used to give a pseudo-element the same `var()` environment as its originating
+/// element (the cascade keeps the map internally and doesn't expose it on `ComputedStyle`).
+fn element_vars(
+    doc: &dom::Document,
+    node_id: dom::NodeId,
+    el: &dom::ElementData,
+    index: &SelectorIndex,
+) -> HashMap<String, String> {
+    let mut entries: Vec<(u8, u32, usize, &[(String, String)])> = Vec::new();
+    for entry in candidate_entries(index, el) {
+        if entry.compiled.pseudo_element.is_some() {
+            continue;
+        }
+        if !complex_matches(doc, node_id, &entry.compiled.selector) {
+            continue;
+        }
+        let origin = if entry.origin == 0 { 0 } else { 2 };
+        entries.push((origin, entry.compiled.specificity, entry.order, entry.decls));
+    }
+    // Inline style vars too.
+    let inline_decls: Vec<(String, String)> = el
+        .attrs
+        .get("style")
+        .map(|s| css::parse_declarations(s))
+        .unwrap_or_default();
+
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut vars = HashMap::new();
+    for (_, _, _, decls) in &entries {
+        for (prop, val) in *decls {
+            if let Some(name) = prop.strip_prefix("--") {
+                vars.insert(format!("--{name}"), val.clone());
+            }
+        }
+    }
+    for (prop, val) in &inline_decls {
+        if let Some(name) = prop.strip_prefix("--") {
+            vars.insert(format!("--{name}"), val.clone());
+        }
+    }
+    vars
 }
 
 /// Resolve `var(--name, fallback)` references in `value` against `vars`, recursively (vars can
@@ -4565,6 +4792,11 @@ fn parse_number(tok: &str) -> Option<f32> {
 }
 
 /// Parse a value that may be a percentage (`50%` → 0.5) or a unitless number used as-is.
+/// Parse a bare `<percentage>` token (`"50%"` → `Some(50.0)`); `None` for anything else.
+fn parse_percent(val: &str) -> Option<f32> {
+    val.trim().strip_suffix('%').and_then(|p| p.trim().parse::<f32>().ok())
+}
+
 fn parse_percent_or_unit(tok: &str) -> Option<f32> {
     if let Some(p) = tok.strip_suffix('%') {
         return p.trim().parse::<f32>().ok().map(|v| v / 100.0);
@@ -4859,11 +5091,28 @@ enum BucketKey {
     Universal,
 }
 
-/// A CSS pseudo-element (only the two that generate content boxes are modeled).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A CSS pseudo-element. `Before`/`After` generate content boxes during layout; everything else is
+/// modeled as `Other(key)` so author rules targeting it can still match (for `getComputedStyle`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PseudoElement {
     Before,
     After,
+    /// Any other pseudo-element (`::marker`, `::placeholder`, `::highlight(name)`,
+    /// `::picker(select)`, …), stored as its normalized key (lowercased name, plus a normalized
+    /// `(arg)` for functional pseudos). These don't generate layout boxes here, but they DO match
+    /// author rules so `getComputedStyle(el, "::marker")` can return the pseudo's cascaded style.
+    Other(String),
+}
+
+impl PseudoElement {
+    /// The canonical key two selectors / a getComputedStyle arg compare equal on.
+    pub fn key(&self) -> String {
+        match self {
+            PseudoElement::Before => "before".to_string(),
+            PseudoElement::After => "after".to_string(),
+            PseudoElement::Other(k) => k.clone(),
+        }
+    }
 }
 
 /// A compiled selector ready for the index: the parsed [`ComplexSelector`] plus its bucket key.
@@ -4925,7 +5174,7 @@ fn compile_selector(sel: &str) -> Option<Compiled> {
         // Purely `[attr]`/`:pseudo`/`*` subject → universal bucket.
         BucketKey::Universal
     };
-    let pseudo_element = selector.pseudo_element;
+    let pseudo_element = selector.pseudo_element.clone();
     Some(Compiled { selector, key, specificity, pseudo_element })
 }
 
@@ -5151,25 +5400,60 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)>
                 }
                 let pe_name: String = chars[name_start..j].iter().collect();
                 let pe_name_l = pe_name.to_ascii_lowercase();
-                let pe = match pe_name_l.as_str() {
-                    "before" => Some(PseudoElement::Before),
-                    "after" => Some(PseudoElement::After),
-                    _ => None,
+                // A pseudo-element may be functional (`::highlight(name)`, `::picker(select)`); its
+                // `(arg)` is part of the pseudo-element token.
+                let mut after_pe = j;
+                let pe_arg: Option<String> = if after_pe < n && chars[after_pe] == '(' {
+                    let astart = after_pe + 1;
+                    let mut depth = 1i32;
+                    let mut k = astart;
+                    while k < n && depth > 0 {
+                        match chars[k] {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    if k >= n {
+                        return None;
+                    }
+                    let a: String = chars[astart..k].iter().collect();
+                    after_pe = k + 1;
+                    Some(a)
+                } else {
+                    None
                 };
-                if let Some(pe) = pe {
-                    // Must be the last token in the compound (no class/attr/etc. after a
-                    // pseudo-element). `::before:hover`-style follow-ons are out of scope.
-                    if j != n {
+                // `::before` / `:before` and `::after` / `:after` are the box-generating pseudos.
+                // Single-colon is legacy CSS2 syntax, valid only for the four original pseudo-
+                // elements; every other pseudo-element requires double-colon.
+                let legacy_single = matches!(pe_name_l.as_str(), "before" | "after" | "first-line" | "first-letter");
+                let known_pe = if !double_colon && !legacy_single {
+                    None
+                } else {
+                    match pe_name_l.as_str() {
+                        "before" if pe_arg.is_none() => Some(PseudoElement::Before),
+                        "after" if pe_arg.is_none() => Some(PseudoElement::After),
+                        _ => pseudo_element_key(&pe_name_l, pe_arg.as_deref()).map(PseudoElement::Other),
+                    }
+                };
+                if let Some(pe) = known_pe {
+                    // A pseudo-element must be the rightmost token in the compound.
+                    if after_pe != n {
                         return None;
                     }
                     pseudo_element = Some(pe);
                     // A pseudo-element contributes one type-level (c) specificity unit.
                     spec.c += 1;
-                    i = j;
+                    i = after_pe;
                     continue;
                 }
-                // Any other double-colon pseudo-element (`::first-line`, `::marker`, …) stays out
-                // of scope → reject the whole selector.
+                // Double-colon syntax is *only* for pseudo-elements; an unrecognized one is invalid.
                 if double_colon {
                     return None;
                 }
@@ -5180,10 +5464,6 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)>
                 }
                 let name: String = chars[start..i].iter().collect();
                 let name_l = name.to_ascii_lowercase();
-                // Other single-colon legacy pseudo-elements are also out of scope.
-                if matches!(name_l.as_str(), "first-line" | "first-letter" | "placeholder" | "marker" | "selection" | "backdrop") {
-                    return None;
-                }
                 // Functional pseudo with `(...)`.
                 let arg = if i < n && chars[i] == '(' {
                     let astart = i + 1;
@@ -5226,6 +5506,223 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)>
         }
     }
     Some((compound, spec, pseudo_element))
+}
+
+/// Validate and normalize a pseudo-element `name` (already lowercased) plus its optional functional
+/// `arg` into a canonical key. Returns `None` for unrecognized pseudo-elements or malformed args.
+/// `before`/`after` are handled by the caller as their own enum variants; this covers the rest.
+///
+/// The key is the lowercased name, plus `(arg)` for functional pseudos where `arg` is the
+/// normalized (unescaped, lowercased ident) argument. The accepted set mirrors the WPT corpus.
+fn pseudo_element_key(name: &str, arg: Option<&str>) -> Option<String> {
+    // Functional pseudo-elements: name -> validator for the argument.
+    //   ::highlight(<ident>), ::view-transition-*(<ident>|*), ::picker(<ident>)
+    let functional: &[&str] = &[
+        "highlight",
+        "view-transition-group",
+        "view-transition-image-pair",
+        "view-transition-old",
+        "view-transition-new",
+        "picker",
+    ];
+    // Tree-structural / plain pseudo-elements (no argument).
+    let plain: &[&str] = &[
+        "first-line",
+        "first-letter",
+        "marker",
+        "placeholder",
+        "selection",
+        "backdrop",
+        "file-selector-button",
+        "grammar-error",
+        "spelling-error",
+        "target-text",
+        "view-transition",
+        "checkmark",
+        "picker-icon",
+    ];
+
+    match arg {
+        Some(raw) => {
+            if !functional.contains(&name) {
+                return None; // a non-functional pseudo got an argument → invalid
+            }
+            // The argument must be a single CSS identifier. Surrounding whitespace is allowed;
+            // escapes are decoded. (`*` is NOT accepted for view-transition-* in getComputedStyle.)
+            let trimmed = raw.trim_matches(|c: char| c.is_ascii_whitespace());
+            let ident = decode_css_ident(trimmed).filter(|s| is_css_ident(s))?;
+            // `::picker(...)` only accepts the literal `select` keyword as its argument.
+            if name == "picker" && ident.to_ascii_lowercase() != "select" {
+                return None;
+            }
+            Some(format!("{name}({})", ident.to_lowercase()))
+        }
+        None => {
+            if plain.contains(&name) {
+                Some(name.to_string())
+            } else {
+                None // functional pseudo without an argument, or unknown name
+            }
+        }
+    }
+}
+
+/// Whether `s` is a valid CSS identifier: non-empty, may not start with a digit (nor `-` followed
+/// by a digit), and contains only name characters. Used to validate pseudo-element arguments.
+fn is_css_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else { return false };
+    let valid_start = |c: char| c.is_ascii_alphabetic() || c == '_' || c == '-' || !c.is_ascii();
+    if !valid_start(first) {
+        return false;
+    }
+    // `-` alone, or `-` followed by a digit, is not a valid identifier start.
+    if first == '-' {
+        match s.chars().nth(1) {
+            None => return false,
+            Some(c) if c.is_ascii_digit() => return false,
+            _ => {}
+        }
+    }
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+}
+
+/// Decode a CSS identifier that may contain escapes (`\61`, `\ `, …). Returns `None` if the input
+/// isn't a valid identifier (contains a raw delimiter, etc.). Used to normalize pseudo-element
+/// names and functional arguments coming from `getComputedStyle`'s string argument.
+fn decode_css_ident(s: &str) -> Option<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            // CSS escape: either a hex sequence (1-6 hex digits, optional trailing whitespace) or
+            // a literal escaped character.
+            if i + 1 >= chars.len() {
+                return None; // trailing backslash
+            }
+            let next = chars[i + 1];
+            if next.is_ascii_hexdigit() {
+                let mut hex = String::new();
+                let mut k = i + 1;
+                while k < chars.len() && hex.len() < 6 && chars[k].is_ascii_hexdigit() {
+                    hex.push(chars[k]);
+                    k += 1;
+                }
+                // One optional whitespace terminates the hex escape.
+                if k < chars.len() && chars[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                let cp = u32::from_str_radix(&hex, 16).ok()?;
+                out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                i = k;
+            } else {
+                out.push(next);
+                i += 2;
+            }
+        } else if c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii() {
+            out.push(c);
+            i += 1;
+        } else {
+            return None; // raw delimiter (space, comma, paren, …) is not part of an identifier
+        }
+    }
+    Some(out)
+}
+
+/// The result of normalizing `getComputedStyle`'s second (`pseudoElt`) argument per CSSOM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GcsPseudo {
+    /// No pseudo (empty / null / a token that doesn't start with `:`) — use the element's own style.
+    Element,
+    /// A valid, recognized pseudo-element. Carries the canonical key (`"before"`, `"highlight(x)"`).
+    Pseudo(String),
+    /// A syntactically-valid-looking but unrecognized/invalid pseudo — yields an empty style.
+    Invalid,
+}
+
+/// Normalize the `pseudoElt` argument of `getComputedStyle(elt, pseudoElt)` per the CSSOM
+/// "legacy pseudo-element parsing" rules:
+///   - empty / no leading `:` → ignore (use the element).
+///   - one or two leading colons + a valid pseudo-element identifier (and nothing else) → that
+///     pseudo-element; single-colon is legacy and only valid for before/after/first-line/first-letter.
+///   - anything else (trailing tokens, unknown identifier, double-colon-required pseudos with a
+///     single colon, malformed functional args) → invalid (empty style).
+pub fn parse_gcs_pseudo(arg: &str) -> GcsPseudo {
+    let chars: Vec<char> = arg.chars().collect();
+    let n = chars.len();
+    if n == 0 || chars[0] != ':' {
+        return GcsPseudo::Element;
+    }
+    let double = n >= 2 && chars[1] == ':';
+    let name_start = if double { 2 } else { 1 };
+    // Read the identifier (name chars, including escapes — a backslash escapes the next run).
+    let mut i = name_start;
+    while i < n {
+        let c = chars[i];
+        if c == '\\' {
+            // Consume the escape (hex run or single char) as part of the ident token.
+            i += 1;
+            if i < n && chars[i].is_ascii_hexdigit() {
+                let mut len = 0;
+                while i < n && len < 6 && chars[i].is_ascii_hexdigit() {
+                    i += 1;
+                    len += 1;
+                }
+                if i < n && chars[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            } else if i < n {
+                i += 1;
+            }
+        } else if c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii() {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let name_raw: String = chars[name_start..i].iter().collect();
+    let Some(name) = decode_css_ident(&name_raw) else {
+        return GcsPseudo::Invalid;
+    };
+    let name_l = name.to_ascii_lowercase();
+
+    // Optional functional argument. Per the CSSOM legacy-pseudo grammar, an unterminated `(` is
+    // tolerated (auto-closed at end of input): `::highlight(\nname` parses like `::highlight(name)`.
+    let arg_opt: Option<String> = if i < n && chars[i] == '(' {
+        let astart = i + 1;
+        let mut k = astart;
+        while k < n && chars[k] != ')' {
+            k += 1;
+        }
+        let a: String = chars[astart..k].iter().collect();
+        // Consume the `)` if present; otherwise we're at end of input (auto-closed).
+        i = if k < n { k + 1 } else { k };
+        Some(a)
+    } else {
+        None
+    };
+
+    // Nothing (except trailing whitespace? no — CSSOM forbids trailing tokens) may follow.
+    if i != n {
+        return GcsPseudo::Invalid;
+    }
+
+    // before/after (both colon forms) and the legacy four (single colon ok); everything else needs
+    // double colon.
+    let legacy_single = matches!(name_l.as_str(), "before" | "after" | "first-line" | "first-letter");
+    if !double && !legacy_single {
+        return GcsPseudo::Invalid;
+    }
+    match name_l.as_str() {
+        "before" if arg_opt.is_none() => GcsPseudo::Pseudo("before".to_string()),
+        "after" if arg_opt.is_none() => GcsPseudo::Pseudo("after".to_string()),
+        _ => match pseudo_element_key(&name_l, arg_opt.as_deref()) {
+            Some(key) => GcsPseudo::Pseudo(key),
+            None => GcsPseudo::Invalid,
+        },
+    }
 }
 
 /// Parse the inside of `[...]` into an [`AttrSel`].
@@ -7546,6 +8043,61 @@ mod tests {
         let d = elem(&doc, |e| e.tag == "div");
         // `.x::before` (class) wins over `div::before` (type) → "b".
         assert_eq!(map[&d].before.as_ref().unwrap().content.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn parse_gcs_pseudo_normalization() {
+        use GcsPseudo::*;
+        // No leading colon / empty → use the element.
+        assert_eq!(parse_gcs_pseudo(""), Element);
+        assert_eq!(parse_gcs_pseudo("before"), Element);
+        assert_eq!(parse_gcs_pseudo("totallynotapseudo"), Element);
+        // Recognized pseudos (both colon forms for the legacy four).
+        assert_eq!(parse_gcs_pseudo("::before"), Pseudo("before".into()));
+        assert_eq!(parse_gcs_pseudo(":before"), Pseudo("before".into()));
+        assert_eq!(parse_gcs_pseudo("::after"), Pseudo("after".into()));
+        assert_eq!(parse_gcs_pseudo("::marker"), Pseudo("marker".into()));
+        // Functional pseudos.
+        assert_eq!(parse_gcs_pseudo("::highlight(name)"), Pseudo("highlight(name)".into()));
+        assert_eq!(parse_gcs_pseudo("::highlight( name "), Pseudo("highlight(name)".into())); // auto-closed
+        assert_eq!(parse_gcs_pseudo("::picker(select)"), Pseudo("picker(select)".into()));
+        // CSS escapes resolve.
+        assert_eq!(parse_gcs_pseudo(r":bef\oRE"), Pseudo("before".into()));
+        // Invalid forms → empty style.
+        assert_eq!(parse_gcs_pseudo("::totallynotapseudo"), Invalid);
+        assert_eq!(parse_gcs_pseudo(":totallynotapseudo"), Invalid);
+        assert_eq!(parse_gcs_pseudo("::before,"), Invalid);
+        assert_eq!(parse_gcs_pseudo("::before@after"), Invalid);
+        assert_eq!(parse_gcs_pseudo("::marker"), Pseudo("marker".into()));
+        assert_eq!(parse_gcs_pseudo(":marker"), Invalid); // needs double colon
+        assert_eq!(parse_gcs_pseudo("::highlight(1)"), Invalid); // arg not an ident
+        assert_eq!(parse_gcs_pseudo("::highlight()"), Invalid);
+        assert_eq!(parse_gcs_pseudo("::picker(div)"), Invalid); // picker only takes `select`
+        assert_eq!(parse_gcs_pseudo("::view-transition-group(*)"), Invalid); // `*` not accepted
+    }
+
+    #[test]
+    fn compute_pseudo_style_cascades_pseudo_values() {
+        let sheet = css::parse(
+            r#"#x { color: rgb(0, 0, 1) }
+               #x::before { color: red; content: "x" }
+               #x::highlight(foo) { color: rgb(0, 128, 0) }"#,
+        );
+        let doc = html::parse(r#"<html><body><div id="x">d</div></body></html>"#);
+        let map = cascade(&doc, &[sheet.clone()]);
+        let x = elem(&doc, |e| e.tag == "div");
+        let es = &map[&x];
+        // ::before: cascaded color + content.
+        let before = compute_pseudo_style(&doc, &[sheet.clone()], x, es, "before").unwrap();
+        assert_eq!(before.get_property("color"), "rgb(255, 0, 0)");
+        assert_eq!(before.get_property("content"), "\"x\"");
+        // ::highlight(foo): a named-highlight rule cascades onto the pseudo.
+        let hi = compute_pseudo_style(&doc, &[sheet.clone()], x, es, "highlight(foo)").unwrap();
+        assert_eq!(hi.get_property("color"), "rgb(0, 128, 0)");
+        // A pseudo with no matching rules still yields a (non-empty) style inheriting from the el.
+        let marker = compute_pseudo_style(&doc, &[sheet], x, es, "marker").unwrap();
+        assert_eq!(marker.get_property("color"), "rgb(0, 0, 1)"); // inherited
+        assert!(!marker.property_names().is_empty());
     }
 
     #[test]
