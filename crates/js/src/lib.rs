@@ -4639,28 +4639,50 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   // document.styleSheets: a StyleSheetList of the CSSStyleSheet objects for each <style> and
   // <link rel=stylesheet> element, in document order. Each entry is the element's own `.sheet`
   // (SameObject), so `styleSheets[i] === el.sheet`.
-  Object.defineProperty(document, "styleSheets", {
-    get: function () {
-      var els = document.querySelectorAll("style, link");
-      var sheets = [];
-      for (var i = 0; i < els.length; i++) {
-        var el = els[i];
-        var tag = (el.tagName || "").toLowerCase();
-        // The internal mirror for adoptedStyleSheets is not part of document.styleSheets.
-        if (el.getAttribute && el.getAttribute("data-adopted-stylesheets") != null) { continue; }
-        if (tag === "link") {
-          var rel = (el.getAttribute && el.getAttribute("rel") || "").toLowerCase();
-          if (rel.split(/\s+/).indexOf("stylesheet") < 0) { continue; }
-        }
-        // A `<link disabled>` / disabled sheet is not represented in document.styleSheets.
-        if (el.__sheetDisabled || (el.getAttribute && el.getAttribute("disabled") != null && tag === "link")) { continue; }
-        try { var s = el.sheet; if (s) { sheets.push(s); } } catch (e) {}
+  // The current document.styleSheets entries: each <style>/<link rel=stylesheet>'s `.sheet`, in
+  // tree order (excluding the adopted-sheets mirror and disabled links).
+  function __collectDocSheets() {
+    var els = document.querySelectorAll("style, link");
+    var sheets = [];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      var tag = (el.tagName || "").toLowerCase();
+      if (el.getAttribute && el.getAttribute("data-adopted-stylesheets") != null) { continue; }
+      if (tag === "link") {
+        var rel = (el.getAttribute && el.getAttribute("rel") || "").toLowerCase();
+        if (rel.split(/\s+/).indexOf("stylesheet") < 0) { continue; }
       }
-      var list = sheets;
-      list.item = function (n) { n = n >>> 0; return n < this.length ? this[n] : null; };
-      try { if (globalThis.StyleSheetList && globalThis.StyleSheetList.prototype) { Object.setPrototypeOf(list, globalThis.StyleSheetList.prototype); } } catch (e) {}
-      return list;
+      if (el.__sheetDisabled || (el.getAttribute && el.getAttribute("disabled") != null && tag === "link")) { continue; }
+      try { var s = el.sheet; if (s) { sheets.push(s); } } catch (e) {}
+    }
+    return sheets;
+  }
+  // document.styleSheets is a LIVE StyleSheetList: a single object whose length / indexing / item /
+  // iteration all re-read the DOM, so a captured reference reflects added/removed sheets (CSSOM).
+  var __docSheetList = Object.create((globalThis.StyleSheetList && globalThis.StyleSheetList.prototype) || Object.prototype);
+  Object.defineProperty(__docSheetList, "length", { get: function () { return __collectDocSheets().length; }, enumerable: false, configurable: true });
+  __docSheetList.item = function (n) { var s = __collectDocSheets(); n = n >>> 0; return n < s.length ? s[n] : null; };
+  try {
+    __docSheetList[Symbol.iterator] = function () {
+      var s = __collectDocSheets(), i = 0;
+      var it = { next: function () { return i < s.length ? { value: s[i++], done: false } : { value: undefined, done: true }; } };
+      it[Symbol.iterator] = function () { return this; };
+      return it;
+    };
+  } catch (e) {}
+  var __docSheetListProxy = new Proxy(__docSheetList, {
+    get: function (t, p) {
+      // Indexed getter: out-of-range returns `undefined` (WebIDL), unlike item() which returns null.
+      if (typeof p === "string" && /^[0-9]+$/.test(p)) { var s = __collectDocSheets(); var n = Number(p); return n < s.length ? s[n] : undefined; }
+      return t[p];
     },
+    has: function (t, p) {
+      if (typeof p === "string" && /^[0-9]+$/.test(p)) { return Number(p) < t.length; }
+      return p in t;
+    }
+  });
+  Object.defineProperty(document, "styleSheets", {
+    get: function () { return __docSheetListProxy; },
     enumerable: true, configurable: true
   });
 
