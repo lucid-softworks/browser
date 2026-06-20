@@ -6154,6 +6154,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (kind === "@font-face") { return makeFontFaceRule(struct, sheet, parentRule); }
     if (kind === "@namespace") { return makeNamespaceRule(struct, sheet, parentRule); }
     if (kind === "@supports") { return makeSupportsRule(struct, sheet, parentRule); }
+    if (kind === "@container") { return makeContainerRule(struct, sheet, parentRule); }
     if (kind === "@keyframes" || kind === "@-webkit-keyframes") { return makeKeyframesRule(struct, sheet, parentRule); }
     if (kind === "@page") { return makePageRule(struct, sheet, parentRule); }
     // Unknown at-rule: a generic rule that serializes its raw text.
@@ -6239,6 +6240,32 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     defOn(rule, "cssText", { get: function () {
       var inner = ""; for (var i = 0; i < childList.length; i++) { inner += "  " + childList[i].cssText + "\n"; }
       return "@supports " + struct.prelude.trim() + " {\n" + inner + "}";
+    }, enumerable: true });
+    return rule;
+  }
+  // Split a `@container` prelude into an optional container-name + the container query.
+  // `sidebar (min-width: 100px)` -> {name:"sidebar", query:"(min-width: 100px)"}; a query that
+  // starts with `(`/`not`/`style(`/`scroll-state(` has no name.
+  function parseContainerPrelude(prelude) {
+    var s = String(prelude).trim();
+    var m = /^([-\w -￿]+)\s+([\s\S]+)$/.exec(s);
+    if (m && m[1].charAt(0) !== "(" && !/^(not|and|or|style|scroll-state)$/i.test(m[1])) {
+      return { name: m[1], query: m[2].trim() };
+    }
+    return { name: "", query: s };
+  }
+  function makeContainerRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSContainerRule", 0, sheet, parentRule);
+    var childList = makeRuleList(parseRuleStructs(struct.body), sheet, rule);
+    defOn(rule, "containerName", { get: function () { return parseContainerPrelude(struct.prelude).name; }, enumerable: true });
+    defOn(rule, "containerQuery", { get: function () { return parseContainerPrelude(struct.prelude).query; }, enumerable: true });
+    defOn(rule, "conditionText", { get: function () { return struct.prelude.trim(); }, enumerable: true });
+    defOn(rule, "cssRules", { get: function () { return childList; }, enumerable: true });
+    defOn(rule, "insertRule", { value: function (text, index) { return childList.__insert(String(text), index); }, enumerable: true });
+    defOn(rule, "deleteRule", { value: function (index) { return childList.__delete(index); }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var inner = ""; for (var i = 0; i < childList.length; i++) { inner += "  " + childList[i].cssText + "\n"; }
+      return "@container " + struct.prelude.trim() + " {\n" + inner + "}";
     }, enumerable: true });
     return rule;
   }
@@ -8240,6 +8267,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   defClass("CSSConditionRule", CSSGroupingCtor);
   defClass("CSSMediaRule", globalThis.CSSConditionRule);
   defClass("CSSSupportsRule", globalThis.CSSConditionRule);
+  defClass("CSSContainerRule", globalThis.CSSConditionRule);
   defClass("CSSImportRule", CSSRuleCtor);
   defClass("CSSFontFaceRule", CSSRuleCtor);
   defClass("CSSPageRule", CSSGroupingCtor);
