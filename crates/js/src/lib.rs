@@ -1850,12 +1850,14 @@ fn prim_computed_style_prop(
 
 /// The computed-style property names for one element: the standard tracked longhands plus this
 /// element's resolved custom properties (`--name`), which `getComputedStyle(el)` enumerates per
-/// CSSOM. Custom props are appended (sorted) after the standard names so iteration order is stable.
+/// CSSOM in lexicographical order — with vendor-prefixed / custom names (leading `-`) sorted last.
 fn computed_names_with_custom(cs: &style::ComputedStyle) -> Vec<String> {
     let mut names: Vec<String> = cs.property_names().iter().map(|s| s.to_string()).collect();
-    let mut custom: Vec<String> = cs.custom_props.keys().cloned().collect();
-    custom.sort();
-    names.extend(custom);
+    names.extend(cs.custom_props.keys().cloned());
+    names.sort_by(|a, b| {
+        // A leading `-` (vendor prefix / `--custom`) sorts after unprefixed; then lexicographic.
+        a.starts_with('-').cmp(&b.starts_with('-')).then_with(|| a.cmp(b))
+    });
     names
 }
 
