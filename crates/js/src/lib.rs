@@ -1614,25 +1614,29 @@ fn resolved_inset_value(
             };
             let cb_node = containing_block_node(doc, map, id, kind);
             let static_off = static_position_offset(doc, map, id, cb_node, want_height);
-            // start side (top/left) = the static offset; end side (bottom/right) = cb extent minus
-            // the static offset minus the box's margin-box size on this axis.
-            let used_val = match side {
-                style::EdgeSide::Top | style::EdgeSide::Left => static_off,
-                _ => {
-                    let cb_extent = containing_block_extent(doc, map, id, kind, want_height);
-                    let mb_size = if want_height {
-                        cs.height.unwrap_or(0.0)
-                            + cs.padding.top + cs.padding.bottom
-                            + cs.border.top + cs.border.bottom
-                            + cs.margin.top + cs.margin.bottom
-                    } else {
-                        cs.width.unwrap_or(0.0)
-                            + cs.padding.left + cs.padding.right
-                            + cs.border.left + cs.border.right
-                            + cs.margin.left + cs.margin.right
-                    };
-                    cb_extent - static_off - mb_size
-                }
+            let cb_extent = containing_block_extent(doc, map, id, kind, want_height);
+            let mb_size = if want_height {
+                cs.height.unwrap_or(0.0)
+                    + cs.padding.top + cs.padding.bottom
+                    + cs.border.top + cs.border.bottom
+                    + cs.margin.top + cs.margin.bottom
+            } else {
+                cs.width.unwrap_or(0.0)
+                    + cs.padding.left + cs.padding.right
+                    + cs.border.left + cs.border.right
+                    + cs.margin.left + cs.margin.right
+            };
+            // Map the static position to the *containing block's* writing mode: a physical side that
+            // is the cb's block- or inline-START takes the static offset directly; the opposite side
+            // measures from the far edge (cb extent − offset − the box's margin-box size).
+            let (block_start, inline_start) = cb_node
+                .and_then(|n| map.get(&n))
+                .map(|c| c.writing_mode.start_edges(c.direction))
+                .unwrap_or((style::EdgeSide::Top, style::EdgeSide::Left));
+            let used_val = if side == block_start || side == inline_start {
+                static_off
+            } else {
+                cb_extent - static_off - mb_size
             };
             return Some(style::serialize_px(used_val));
         }

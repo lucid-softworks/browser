@@ -201,9 +201,46 @@ impl Default for GridPlacement {
     }
 }
 
+/// CSS `direction` (inline base direction). Inherited.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Direction {
+    Ltr,
+    Rtl,
+}
+
+/// CSS `writing-mode` (block flow direction). Inherited. We don't lay vertical modes out, but the
+/// value is tracked so the CSSOM resolved value of insets (static position) maps logical→physical.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WritingMode {
+    HorizontalTb,
+    VerticalRl,
+    VerticalLr,
+}
+
+impl WritingMode {
+    /// The physical edges (block-start, inline-start) for this writing mode + `direction`.
+    pub fn start_edges(self, dir: Direction) -> (EdgeSide, EdgeSide) {
+        let rtl = dir == Direction::Rtl;
+        match self {
+            WritingMode::HorizontalTb => {
+                (EdgeSide::Top, if rtl { EdgeSide::Right } else { EdgeSide::Left })
+            }
+            WritingMode::VerticalLr => {
+                (EdgeSide::Left, if rtl { EdgeSide::Bottom } else { EdgeSide::Top })
+            }
+            WritingMode::VerticalRl => {
+                (EdgeSide::Right, if rtl { EdgeSide::Bottom } else { EdgeSide::Top })
+            }
+        }
+    }
+}
+
 /// The computed style for a single element.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
+    /// `direction` / `writing-mode` (both inherited); used for the CSSOM resolved value of insets.
+    pub direction: Direction,
+    pub writing_mode: WritingMode,
     /// Text color (r, g, b).
     pub color: (u8, u8, u8),
     /// Background color, if any (r, g, b). `None` means transparent.
@@ -617,6 +654,8 @@ impl Default for ComputedStyle {
             // Initial text color: black on a light canvas, or a light grey when the root opted into
             // a dark `color-scheme` (resolved before the cascade — see `root_used_scheme_dark`). The
             // root inherits this, so every box gets themed default text unless author CSS overrides.
+            direction: Direction::Ltr,
+            writing_mode: WritingMode::HorizontalTb,
             color: ua_default_text_color(),
             background_color: None,
             font_size: 16.0,
@@ -826,6 +865,15 @@ impl ComputedStyle {
             // affect our layout); report the initial computed keyword so getComputedStyle reads work.
             "direction" => "ltr".to_string(),
             "unicode-bidi" => "normal".to_string(),
+            "direction" => match self.direction {
+                Direction::Ltr => "ltr".to_string(),
+                Direction::Rtl => "rtl".to_string(),
+            },
+            "writing-mode" => match self.writing_mode {
+                WritingMode::HorizontalTb => "horizontal-tb".to_string(),
+                WritingMode::VerticalRl => "vertical-rl".to_string(),
+                WritingMode::VerticalLr => "vertical-lr".to_string(),
+            },
             "text-align" => match self.text_align {
                 TextAlign::Left => "left",
                 TextAlign::Center => "center",
@@ -1865,6 +1913,8 @@ fn compute_element_style<'a>(
     // Start from inherited values; non-inherited properties get reset below.
     let mut style = ComputedStyle {
         custom_props: HashMap::new(),
+        direction: parent.direction,       // inherited
+        writing_mode: parent.writing_mode, // inherited
         color: parent.color,
         background_color: None, // not inherited
         font_size: parent.font_size,
@@ -3275,6 +3325,19 @@ fn apply_declaration(
             "baseline" => style.vertical_align = VerticalAlign::Baseline,
             _ => {}
         },
+        "direction" => match val.trim().to_ascii_lowercase().as_str() {
+            "ltr" => style.direction = Direction::Ltr,
+            "rtl" => style.direction = Direction::Rtl,
+            _ => {}
+        },
+        "writing-mode" => match val.trim().to_ascii_lowercase().as_str() {
+            "horizontal-tb" | "lr" | "lr-tb" | "rl" => style.writing_mode = WritingMode::HorizontalTb,
+            "vertical-rl" | "tb" | "tb-rl" | "sideways-rl" => {
+                style.writing_mode = WritingMode::VerticalRl
+            }
+            "vertical-lr" | "sideways-lr" => style.writing_mode = WritingMode::VerticalLr,
+            _ => {}
+        },
         "display" => match val.trim().to_ascii_lowercase().as_str() {
             "none" => style.display = Display::None,
             "block" => style.display = Display::Block,
@@ -4448,7 +4511,7 @@ fn parse_transform_origin(val: &str) -> (f32, f32) {
 }
 
 /// Which side(s) of a box a value targets.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum EdgeSide {
     Top,
     Right,
