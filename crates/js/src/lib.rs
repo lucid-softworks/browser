@@ -5842,7 +5842,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "align-items", "align-content", "align-self", "justify-items", "justify-content", "justify-self",
     "row-gap", "column-gap", "outline-width", "outline-style", "outline-color",
     // Reset by `all` too (every property except direction / unicode-bidi / custom props).
-    "border-collapse", "border-spacing", "order", "grid-template-columns", "grid-template-rows"
+    "border-collapse", "border-spacing", "order", "grid-template-columns", "grid-template-rows",
+    // Logical longhands — also covered by `all` (so they collapse into it on serialization).
+    "inline-size", "block-size", "min-inline-size", "min-block-size", "max-inline-size", "max-block-size",
+    "margin-block-start", "margin-block-end", "margin-inline-start", "margin-inline-end",
+    "padding-block-start", "padding-block-end", "padding-inline-start", "padding-inline-end",
+    "inset-block-start", "inset-block-end", "inset-inline-start", "inset-inline-end",
+    "border-block-start-width", "border-block-end-width", "border-inline-start-width", "border-inline-end-width",
+    "border-block-start-style", "border-block-end-style", "border-inline-start-style", "border-inline-end-style",
+    "border-block-start-color", "border-block-end-color", "border-inline-start-color", "border-inline-end-color"
   ];
   // A custom property is `--*`; case-sensitive, value kept raw (whitespace-trimmed).
   function isCustomProp(name) { return name.length >= 2 && name[0] === "-" && name[1] === "-"; }

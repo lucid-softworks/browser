@@ -780,6 +780,66 @@ impl ComputedStyle {
     ///
     /// Both common longhands and the few cheaply-assembled shorthands (`margin`, `padding`,
     /// `border-width`, `inset`, `gap`) are mapped.
+    /// Map a CSS *logical* longhand (`block-size`, `margin-inline-start`, …) to the physical property
+    /// it resolves to for this element's writing mode + direction. Returns `None` for non-logical
+    /// names. Logical *shorthands* (`margin-block`, `padding-inline`, …) are intentionally not mapped.
+    fn physical_for_logical(&self, name: &str) -> Option<String> {
+        let (block_start, inline_start) = self.writing_mode.start_edges(self.direction);
+        let opp = |e: EdgeSide| match e {
+            EdgeSide::Top => EdgeSide::Bottom,
+            EdgeSide::Bottom => EdgeSide::Top,
+            EdgeSide::Left => EdgeSide::Right,
+            EdgeSide::Right => EdgeSide::Left,
+            EdgeSide::All => EdgeSide::All,
+        };
+        let side = |e: EdgeSide| match e {
+            EdgeSide::Top => "top",
+            EdgeSide::Right => "right",
+            EdgeSide::Bottom => "bottom",
+            EdgeSide::Left => "left",
+            EdgeSide::All => "top",
+        };
+        let (bs, be, is, ie) = (block_start, opp(block_start), inline_start, opp(inline_start));
+        // The inline axis is horizontal in horizontal-tb, vertical otherwise.
+        let inline_horiz = matches!(self.writing_mode, WritingMode::HorizontalTb);
+        let size = |inline: bool| -> &'static str {
+            if inline == inline_horiz { "width" } else { "height" }
+        };
+        Some(match name {
+            "inline-size" => size(true).to_string(),
+            "block-size" => size(false).to_string(),
+            "min-inline-size" => format!("min-{}", size(true)),
+            "min-block-size" => format!("min-{}", size(false)),
+            "max-inline-size" => format!("max-{}", size(true)),
+            "max-block-size" => format!("max-{}", size(false)),
+            "margin-block-start" => format!("margin-{}", side(bs)),
+            "margin-block-end" => format!("margin-{}", side(be)),
+            "margin-inline-start" => format!("margin-{}", side(is)),
+            "margin-inline-end" => format!("margin-{}", side(ie)),
+            "padding-block-start" => format!("padding-{}", side(bs)),
+            "padding-block-end" => format!("padding-{}", side(be)),
+            "padding-inline-start" => format!("padding-{}", side(is)),
+            "padding-inline-end" => format!("padding-{}", side(ie)),
+            "inset-block-start" => side(bs).to_string(),
+            "inset-block-end" => side(be).to_string(),
+            "inset-inline-start" => side(is).to_string(),
+            "inset-inline-end" => side(ie).to_string(),
+            "border-block-start-width" => format!("border-{}-width", side(bs)),
+            "border-block-end-width" => format!("border-{}-width", side(be)),
+            "border-inline-start-width" => format!("border-{}-width", side(is)),
+            "border-inline-end-width" => format!("border-{}-width", side(ie)),
+            "border-block-start-style" => format!("border-{}-style", side(bs)),
+            "border-block-end-style" => format!("border-{}-style", side(be)),
+            "border-inline-start-style" => format!("border-{}-style", side(is)),
+            "border-inline-end-style" => format!("border-{}-style", side(ie)),
+            "border-block-start-color" => format!("border-{}-color", side(bs)),
+            "border-block-end-color" => format!("border-{}-color", side(be)),
+            "border-inline-start-color" => format!("border-{}-color", side(is)),
+            "border-inline-end-color" => format!("border-{}-color", side(ie)),
+            _ => return None,
+        })
+    }
+
     pub fn get_property(&self, name: &str) -> String {
         // Custom properties are case-sensitive and read straight from the resolved environment.
         let trimmed = name.trim();
@@ -788,6 +848,10 @@ impl ComputedStyle {
         }
         // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
         let name = trimmed.to_ascii_lowercase();
+        // Logical longhands resolve to a physical property for this element's writing mode.
+        if let Some(phys) = self.physical_for_logical(&name) {
+            return self.get_property(&phys);
+        }
         match name.as_str() {
             // --- display / box model mode ---
             "display" => match self.display {
@@ -979,6 +1043,12 @@ impl ComputedStyle {
             "border-bottom-width" => px(self.border.bottom),
             "border-left-width" => px(self.border.left),
             "border-width" => edges_str(self.border),
+            // Border style isn't tracked separately; approximate from the (rendered) width: a border
+            // with a non-zero width is drawn solid, otherwise the initial `none`.
+            "border-top-style" => if self.border.top > 0.0 { "solid" } else { "none" }.to_string(),
+            "border-right-style" => if self.border.right > 0.0 { "solid" } else { "none" }.to_string(),
+            "border-bottom-style" => if self.border.bottom > 0.0 { "solid" } else { "none" }.to_string(),
+            "border-left-style" => if self.border.left > 0.0 { "solid" } else { "none" }.to_string(),
 
             // --- table ---
             "border-collapse" => match self.border_collapse {
@@ -1240,6 +1310,37 @@ impl ComputedStyle {
             // iterating computed longhands sees them. Their values come from `get_property` below.
             "direction",
             "unicode-bidi",
+            // Logical longhands are enumerated in computed style (logical shorthands are not).
+            "inline-size",
+            "block-size",
+            "min-inline-size",
+            "min-block-size",
+            "max-inline-size",
+            "max-block-size",
+            "margin-block-start",
+            "margin-block-end",
+            "margin-inline-start",
+            "margin-inline-end",
+            "padding-block-start",
+            "padding-block-end",
+            "padding-inline-start",
+            "padding-inline-end",
+            "inset-block-start",
+            "inset-block-end",
+            "inset-inline-start",
+            "inset-inline-end",
+            "border-block-start-width",
+            "border-block-end-width",
+            "border-inline-start-width",
+            "border-inline-end-width",
+            "border-block-start-style",
+            "border-block-end-style",
+            "border-inline-start-style",
+            "border-inline-end-style",
+            "border-block-start-color",
+            "border-block-end-color",
+            "border-inline-start-color",
+            "border-inline-end-color",
         ];
         // Every name here maps to a tracked field, so all are non-empty.
         NAMES.to_vec()
