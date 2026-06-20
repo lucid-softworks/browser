@@ -277,6 +277,7 @@ fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
     match &doc.get(id).data {
         dom::NodeData::Text(t) => return t.clone(),
         dom::NodeData::Comment(c) => return c.clone(),
+        dom::NodeData::ProcessingInstruction(p) => return p.data.clone(),
         _ => {}
     }
     let mut out = String::new();
@@ -337,6 +338,18 @@ fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
                     out.push('>');
                 }
             }
+            dom::NodeData::DocumentType(d) => {
+                out.push_str("<!DOCTYPE ");
+                out.push_str(&d.name);
+                out.push('>');
+            }
+            dom::NodeData::ProcessingInstruction(p) => {
+                out.push_str("<?");
+                out.push_str(&p.target);
+                out.push(' ');
+                out.push_str(&p.data);
+                out.push('>');
+            }
             dom::NodeData::Document | dom::NodeData::DocumentFragment => {
                 for &child in &doc.get(id).children {
                     serialize_node(doc, child, out);
@@ -362,6 +375,10 @@ fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
         }
         dom::NodeData::Comment(c) => {
             *c = text.to_string();
+            return;
+        }
+        dom::NodeData::ProcessingInstruction(p) => {
+            p.data = text.to_string();
             return;
         }
         _ => {}
@@ -489,6 +506,60 @@ impl Compound {
     }
 }
 
+/// Is `c` a CSS hex digit?
+fn is_hex(c: char) -> bool {
+    c.is_ascii_hexdigit()
+}
+
+/// Read a CSS identifier (class / id / type name) starting at `i`, consuming CSS escape sequences
+/// (`\` + 1-6 hex digits with optional trailing whitespace, or `\` + any other char as a literal).
+/// Stops at an *unescaped* selector delimiter (`.` `#` `[` `:` `>` `+` `~` `,` ` `). Returns the
+/// unescaped value and the index just past the identifier.
+fn read_css_ident(bytes: &[char], mut i: usize) -> (String, usize) {
+    let mut out = String::new();
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == '\\' {
+            // Escape sequence.
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            if is_hex(bytes[i]) {
+                // Up to 6 hex digits, then an optional single whitespace.
+                let mut hex = String::new();
+                let mut k = 0;
+                while i < bytes.len() && k < 6 && is_hex(bytes[i]) {
+                    hex.push(bytes[i]);
+                    i += 1;
+                    k += 1;
+                }
+                if i < bytes.len() && matches!(bytes[i], ' ' | '\t' | '\n' | '\r' | '\u{0C}') {
+                    i += 1; // consume one trailing whitespace
+                }
+                if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                    // Per CSS: a NULL, an out-of-range, or a surrogate codepoint => U+FFFD.
+                    let ch = if cp == 0 || cp > 0x10FFFF || (0xD800..=0xDFFF).contains(&cp) {
+                        '\u{FFFD}'
+                    } else {
+                        char::from_u32(cp).unwrap_or('\u{FFFD}')
+                    };
+                    out.push(ch);
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        } else if matches!(ch, '.' | '#' | '[' | ':' | '>' | '+' | '~' | ',') || ch.is_whitespace() {
+            break;
+        } else {
+            out.push(ch);
+            i += 1;
+        }
+    }
+    (out, i)
+}
+
 /// Parse a single compound selector (no combinators).
 fn parse_compound(s: &str) -> Option<Compound> {
     let s = s.trim();
@@ -503,11 +574,8 @@ fn parse_compound(s: &str) -> Option<Compound> {
         match ch {
             '.' | '#' => {
                 i += 1;
-                let start = i;
-                while i < bytes.len() && !matches!(bytes[i], '.' | '#' | '[' | ':') {
-                    i += 1;
-                }
-                let name: String = bytes[start..i].iter().collect();
+                let (name, ni) = read_css_ident(&bytes, i);
+                i = ni;
                 if name.is_empty() {
                     return None;
                 }
@@ -551,11 +619,13 @@ fn parse_compound(s: &str) -> Option<Compound> {
                 c.any = true;
             }
             _ => {
-                let start = i;
-                while i < bytes.len() && !matches!(bytes[i], '.' | '#' | '[' | ':') {
+                let (tag, ni) = read_css_ident(&bytes, i);
+                if ni == i {
+                    // Not a valid identifier start (e.g. stray char); skip it to avoid a loop.
                     i += 1;
+                    continue;
                 }
-                let tag: String = bytes[start..i].iter().collect();
+                i = ni;
                 let tag = tag.trim().to_string();
                 if !tag.is_empty() {
                     c.tag = Some(tag);
@@ -572,15 +642,60 @@ fn parse_compound(s: &str) -> Option<Compound> {
 }
 
 /// A complex selector: a chain of compounds joined by descendant combinators (whitespace).
+/// Splitting is escape-aware so a CSS escape that contains whitespace (`#\30 foo`) or a combinator
+/// character stays within its compound; only *unescaped* combinators/whitespace separate compounds.
 fn parse_complex(s: &str) -> Option<Vec<Compound>> {
-    let normalized: String = s
-        .chars()
-        .map(|c| if matches!(c, '>' | '+' | '~') { ' ' } else { c })
-        .collect();
-    let parts: Vec<Compound> = normalized
-        .split_whitespace()
-        .filter_map(parse_compound)
-        .collect();
+    let bytes: Vec<char> = s.chars().collect();
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    let mut bracket_depth = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == '\\' {
+            // Keep the whole escape verbatim for parse_compound to unescape. A hex escape is
+            // backslash + 1-6 hex digits + an optional single trailing whitespace; that trailing
+            // whitespace must NOT be treated as a descendant combinator here.
+            cur.push(ch);
+            i += 1;
+            if i < bytes.len() && is_hex(bytes[i]) {
+                let mut k = 0;
+                while i < bytes.len() && k < 6 && is_hex(bytes[i]) {
+                    cur.push(bytes[i]);
+                    i += 1;
+                    k += 1;
+                }
+                if i < bytes.len() && matches!(bytes[i], ' ' | '\t' | '\n' | '\r' | '\u{0C}') {
+                    cur.push(bytes[i]);
+                    i += 1;
+                }
+            } else if i < bytes.len() {
+                cur.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '[' {
+            bracket_depth += 1;
+        } else if ch == ']' && bracket_depth > 0 {
+            bracket_depth -= 1;
+        }
+        if bracket_depth == 0 && (matches!(ch, '>' | '+' | '~') || ch.is_whitespace()) {
+            if !cur.trim().is_empty() {
+                segments.push(std::mem::take(&mut cur));
+            } else {
+                cur.clear();
+            }
+            i += 1;
+            continue;
+        }
+        cur.push(ch);
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        segments.push(cur);
+    }
+    let parts: Vec<Compound> = segments.iter().filter_map(|s| parse_compound(s)).collect();
     if parts.is_empty() {
         None
     } else {
@@ -777,7 +892,7 @@ fn prim_create_element(
     let tag = arg_str(scope, &args, 0);
     let state = host_state(scope);
     let id = state.doc.borrow_mut().alloc(
-        dom::NodeData::Element(dom::ElementData { tag, attrs: HashMap::new() }),
+        dom::NodeData::Element(dom::ElementData { tag, attrs: Default::default() }),
         None,
     );
     rv.set_double(id.0 as f64);
@@ -816,6 +931,92 @@ fn prim_create_document_fragment(
     let state = host_state(scope);
     let id = state.doc.borrow_mut().alloc(dom::NodeData::DocumentFragment, None);
     rv.set_double(id.0 as f64);
+}
+
+/// `__createDocumentType(name, publicId, systemId) -> id` — a parentless `DocumentType` node.
+fn prim_create_document_type(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = arg_str(scope, &args, 0);
+    let public_id = arg_str(scope, &args, 1);
+    let system_id = arg_str(scope, &args, 2);
+    let state = host_state(scope);
+    let id = state.doc.borrow_mut().alloc(
+        dom::NodeData::DocumentType(dom::DoctypeData { name, public_id, system_id }),
+        None,
+    );
+    rv.set_double(id.0 as f64);
+}
+
+/// `__createProcessingInstruction(target, data) -> id` — a parentless PI node.
+fn prim_create_processing_instruction(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let target = arg_str(scope, &args, 0);
+    let data = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    let id = state.doc.borrow_mut().alloc(
+        dom::NodeData::ProcessingInstruction(dom::ProcessingInstructionData { target, data }),
+        None,
+    );
+    rv.set_double(id.0 as f64);
+}
+
+/// `__doctypeInfo(id) -> { name, publicId, systemId } | null` for a DocumentType node.
+fn prim_doctype_info(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let info = node.and_then(|n| match &state.doc.borrow().get(n).data {
+        dom::NodeData::DocumentType(d) => {
+            Some((d.name.clone(), d.public_id.clone(), d.system_id.clone()))
+        }
+        _ => None,
+    });
+    match info {
+        Some((name, public_id, system_id)) => {
+            let obj = v8::Object::new(scope);
+            let k = v8::String::new(scope, "name").unwrap();
+            let v = js_str(scope, &name);
+            obj.set(scope, k.into(), v.into());
+            let k = v8::String::new(scope, "publicId").unwrap();
+            let v = js_str(scope, &public_id);
+            obj.set(scope, k.into(), v.into());
+            let k = v8::String::new(scope, "systemId").unwrap();
+            let v = js_str(scope, &system_id);
+            obj.set(scope, k.into(), v.into());
+            rv.set(obj.into());
+        }
+        None => rv.set_null(),
+    }
+}
+
+/// `__piTarget(id) -> string | null` — a ProcessingInstruction node's target.
+fn prim_pi_target(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let target = node.and_then(|n| match &state.doc.borrow().get(n).data {
+        dom::NodeData::ProcessingInstruction(p) => Some(p.target.clone()),
+        _ => None,
+    });
+    match target {
+        Some(t) => {
+            let s = js_str(scope, &t);
+            rv.set(s);
+        }
+        None => rv.set_null(),
+    }
 }
 
 /// Deep/shallow clone of `id` in the arena. The clone is parentless. Element attributes are copied;
@@ -1202,7 +1403,9 @@ fn prim_remove_attr(
             None
         };
         if let dom::NodeData::Element(e) = &mut state.doc.borrow_mut().get_mut(n).data {
-            e.attrs.remove(&name);
+            // shift_remove preserves the insertion order of the remaining attributes (swap_remove,
+            // the `remove` alias on IndexMap, would not — the DOM exposes attributes in order).
+            e.attrs.shift_remove(&name);
         }
         state.record_mutation(MutationRec {
             kind: "attributes",
@@ -1570,6 +1773,8 @@ fn prim_node_type(
             dom::NodeData::Comment(_) => 8,
             dom::NodeData::Document => 9,
             dom::NodeData::DocumentFragment => 11,
+            dom::NodeData::ProcessingInstruction(_) => 7,
+            dom::NodeData::DocumentType(_) => 10,
         })
         .unwrap_or(1);
     rv.set_int32(ty);
@@ -2404,6 +2609,10 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__createText", prim_create_text);
     set_fn(scope, global, "__createComment", prim_create_comment);
     set_fn(scope, global, "__createDocumentFragment", prim_create_document_fragment);
+    set_fn(scope, global, "__createDocumentType", prim_create_document_type);
+    set_fn(scope, global, "__createProcessingInstruction", prim_create_processing_instruction);
+    set_fn(scope, global, "__doctypeInfo", prim_doctype_info);
+    set_fn(scope, global, "__piTarget", prim_pi_target);
     set_fn(scope, global, "__cloneNode", prim_clone_node);
     set_fn(scope, global, "__getAttr", prim_get_attr);
     set_fn(scope, global, "__setAttr", prim_set_attr);
@@ -2713,6 +2922,80 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     return out;
   }
 
+  // --- Namespace lookup (DOM standard §node tree) ---------------------------------------------
+  // These operate on raw node ids so they can be shared by Element / Document / Attr / DocumentType
+  // wrappers. xmlns declarations live as ordinary attributes in the arena ("xmlns" / "xmlns:prefix").
+  // "locate a namespace prefix" for an element id given a namespace.
+  function locateNamespacePrefix(eid, ns) {
+    if (elNamespace(eid) === ns && elMetaPrefix(eid) !== null) { return elMetaPrefix(eid); }
+    var names = __attrNames(eid);
+    for (var i = 0; i < names.length; i++) {
+      var k = names[i];
+      if (k === "xmlns") { continue; }
+      if (k.indexOf("xmlns:") === 0 && __getAttr(eid, k) === ns) { return k.slice(6); }
+    }
+    var p = __parent(eid);
+    if (p >= 0 && __nodeType(p) === 1) { return locateNamespacePrefix(p, ns); }
+    return null;
+  }
+  // "locate a namespace" for a node id given a prefix (null/"" => default namespace).
+  function locateNamespace(nid, prefix) {
+    if (nid < 0) { return null; }
+    var t = __nodeType(nid);
+    if (t === 1) { // element
+      // The `xml` / `xmlns` prefixes are bound to fixed namespaces (per browser behaviour). These
+      // only resolve in an element context; for a bare DocumentFragment they stay null.
+      if (prefix === "xml") { return XML_NS; }
+      if (prefix === "xmlns") { return XMLNS_NS; }
+      var elNs = elNamespace(nid);
+      if (elNs != null && elMetaPrefix(nid) === (prefix == null ? null : prefix)) { return elNs; }
+      var names = __attrNames(nid);
+      for (var i = 0; i < names.length; i++) {
+        var k = names[i];
+        if (prefix != null && k === ("xmlns:" + prefix)) { var v = __getAttr(nid, k); return v === "" ? null : v; }
+        if (prefix == null && k === "xmlns") { var v2 = __getAttr(nid, k); return v2 === "" ? null : v2; }
+      }
+      var p = __parent(nid);
+      if (p >= 0 && __nodeType(p) === 1) { return locateNamespace(p, prefix); }
+      return null;
+    }
+    if (t === 9) { // document → documentElement
+      var de = __documentElementId();
+      return de >= 0 ? locateNamespace(de, prefix) : null;
+    }
+    if (t === 10 || t === 7) { return null; } // DocumentType / PI
+    // Text/Comment/Fragment: defer to the parent element.
+    var pp = __parent(nid);
+    if (pp >= 0 && __nodeType(pp) === 1) { return locateNamespace(pp, prefix); }
+    return null;
+  }
+  function elMetaPrefix(eid) {
+    var m = __nsMeta[eid];
+    return m ? m.prefix : null;
+  }
+  function nodeLookupNamespaceURI(nid, prefix) {
+    var p = (prefix === undefined || prefix === null || prefix === "") ? null : String(prefix);
+    return locateNamespace(nid, p);
+  }
+  function nodeLookupPrefix(nid, ns) {
+    if (ns == null || ns === "") { return null; }
+    var t = __nodeType(nid);
+    var startEl = -1;
+    if (t === 1) { startEl = nid; }
+    else if (t === 9) { startEl = __documentElementId(); }
+    else { var p = __parent(nid); if (p >= 0 && __nodeType(p) === 1) { startEl = p; } }
+    if (startEl < 0) { return null; }
+    return locateNamespacePrefix(startEl, String(ns));
+  }
+  function nodeIsDefaultNamespace(nid, ns) {
+    var want = (ns == null || ns === "") ? null : String(ns);
+    var def = locateNamespace(nid, null);
+    return def === want;
+  }
+  def(globalThis, "__nodeLookupNamespaceURI", nodeLookupNamespaceURI);
+  def(globalThis, "__nodeLookupPrefix", nodeLookupPrefix);
+  def(globalThis, "__nodeIsDefaultNamespace", nodeIsDefaultNamespace);
+
   // --- DOM mutation shared helpers (used across the ChildNode/ParentNode mixins) --------------
   function hierarchyRequestError(msg) {
     throw new globalThis.DOMException(msg || "The operation would yield an incorrect node tree.", "HierarchyRequestError");
@@ -2920,8 +3203,19 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       if (t === 8) { return "#comment"; }
       if (t === 9) { return "#document"; }
       if (t === 11) { return "#document-fragment"; }
+      if (t === 10) { var di = __doctypeInfo(id); return di ? di.name : ""; }   // DocumentType: nodeName === name
+      if (t === 7) { return __piTarget(id); }                                   // PI: nodeName === target
       return elTagName();
     }, enumerable: true, configurable: true });
+    // DocumentType reflection (name / publicId / systemId) and ProcessingInstruction.target.
+    if (__nodeType(id) === 10) {
+      Object.defineProperty(el, "name", { get: function () { var d = __doctypeInfo(id); return d ? d.name : ""; }, enumerable: true, configurable: true });
+      Object.defineProperty(el, "publicId", { get: function () { var d = __doctypeInfo(id); return d ? d.publicId : ""; }, enumerable: true, configurable: true });
+      Object.defineProperty(el, "systemId", { get: function () { var d = __doctypeInfo(id); return d ? d.systemId : ""; }, enumerable: true, configurable: true });
+    }
+    if (__nodeType(id) === 7) {
+      Object.defineProperty(el, "target", { get: function () { return __piTarget(id); }, enumerable: true, configurable: true });
+    }
     Object.defineProperty(el, "namespaceURI", { get: function () {
       var m = __nsMeta[id];
       if (m) { return m.namespaceURI; }
@@ -2997,8 +3291,15 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       return __getAttr(id, nm);
     });
     def(el, "setAttribute", function (name, value) {
-      // HTML elements ASCII-lowercase the attribute's qualified name.
       var nm = String(name);
+      // "validate" the qualified name: reject the empty string and any name containing whitespace
+      // or '>' (matching the lenient Name production browsers/WPT accept).
+      if (nm.length === 0) { invalidCharacterError(); }
+      for (var vi = 0; vi < nm.length; vi++) {
+        var vc = nm.charCodeAt(vi);
+        if (vc === 0x3E || vc === 0x20 || vc === 0x09 || vc === 0x0A || vc === 0x0C || vc === 0x0D) { invalidCharacterError(); }
+      }
+      // HTML elements ASCII-lowercase the attribute's qualified name.
       if (elIsHtml()) { nm = asciiLower(nm); }
       // `value` is a non-nullable DOMString in WebIDL: undefined -> "undefined", null -> "null".
       __setAttr(id, nm, String(value));
@@ -3006,7 +3307,8 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     def(el, "removeAttribute", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      __removeAttr(id, nm); delete __attrNs[nm];
+      __detachCachedAttr(nm);
+      __removeAttr(id, nm); delete __attrNs[nm]; delete __attrNodeCache[nm];
     });
     def(el, "hasAttribute", function (name) {
       var nm = String(name);
@@ -3049,49 +3351,207 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
         var meta = __attrNs[k];
         var kNs = meta ? meta.namespaceURI : null;
         var kLocal = meta ? meta.localName : k;
-        if (kNs === want && kLocal === ln) { __removeAttr(id, k); delete __attrNs[k]; return; }
+        if (kNs === want && kLocal === ln) { __detachCachedAttr(k); __removeAttr(id, k); delete __attrNs[k]; delete __attrNodeCache[k]; return; }
       }
     });
 
     // A LIVE NamedNodeMap: React (and others) do `for (var a = el.attributes; a.length;)
     // el.removeAttributeNode(a[0])`, capturing the map once and relying on removals shrinking it —
     // so length/index must re-query the node each access (a static snapshot would infinite-loop).
+    // A *bound* Attr node, keyed by its qualified-name storage key. `ownerElement` is live (becomes
+    // null once the attribute is removed), and value get/set reads/writes the live arena attribute.
+    // Cached per storage key so `el.attributes[0] === el.getAttributeNode(name)` (object identity).
+    var __attrNodeCache = {};
     var makeAttr = function (attrName) {
+      if (__attrNodeCache[attrName]) { return __attrNodeCache[attrName]; }
       var meta = __attrNs[attrName];
-      return { name: attrName, nodeName: attrName, nodeType: 2,
+      var attr = { nodeName: attrName, name: attrName, nodeType: 2,
                namespaceURI: meta ? meta.namespaceURI : null,
                prefix: meta ? meta.prefix : null,
                localName: meta ? meta.localName : attrName,
-               specified: true, ownerElement: el,
-               get value() { return __getAttr(id, attrName); },
-               set value(v) { __setAttr(id, attrName, v == null ? "" : String(v)); } };
+               specified: true };
+      Object.defineProperty(attr, "ownerElement", {
+        get: function () { return __getAttr(id, attrName) == null ? null : el; },
+        enumerable: true, configurable: true
+      });
+      var setVal = function (v) { __setAttr(id, attrName, v == null ? "" : String(v)); };
+      var getVal = function () { var v = __getAttr(id, attrName); return v == null ? "" : v; };
+      Object.defineProperty(attr, "value", { get: getVal, set: setVal, enumerable: true, configurable: true });
+      Object.defineProperty(attr, "nodeValue", { get: getVal, set: setVal, enumerable: true, configurable: true });
+      Object.defineProperty(attr, "textContent", { get: getVal, set: setVal, enumerable: true, configurable: true });
+      def(attr, "lookupNamespaceURI", function (prefix) { return nodeLookupNamespaceURI(id, prefix); });
+      def(attr, "lookupPrefix", function (ns) { return nodeLookupPrefix(id, ns); });
+      def(attr, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(id, ns); });
+      try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
+      __attrNodeCache[attrName] = attr;
+      return attr;
     };
+    // If a cached Attr node exists for `key`, snapshot its current value into a standalone closure
+    // and null its ownerElement. Call BEFORE removing the arena attribute so the detached node keeps
+    // the value it had while connected (per spec, an Attr retains its value after removal).
+    function __detachCachedAttr(key) {
+      var a = __attrNodeCache[key];
+      if (!a) { return; }
+      var stored = __getAttr(id, key); if (stored == null) { stored = ""; }
+      try {
+        var dget = function () { return stored; };
+        var dset = function (v) { stored = v == null ? "" : String(v); };
+        Object.defineProperty(a, "value", { get: dget, set: dset, configurable: true, enumerable: true });
+        Object.defineProperty(a, "nodeValue", { get: dget, set: dset, configurable: true, enumerable: true });
+        Object.defineProperty(a, "textContent", { get: dget, set: dset, configurable: true, enumerable: true });
+        Object.defineProperty(a, "ownerElement", { value: null, configurable: true, enumerable: true, writable: true });
+      } catch (e) {}
+    }
+    // Find the storage key of an attribute by (namespace, localName); null if absent.
+    function attrKeyByNs(want, ln) {
+      var names = __attrNames(id);
+      for (var i = 0; i < names.length; i++) {
+        var k = names[i], meta = __attrNs[k];
+        var kNs = meta ? meta.namespaceURI : null;
+        var kLocal = meta ? meta.localName : k;
+        if (kNs === want && kLocal === ln) { return k; }
+      }
+      return null;
+    }
     var attrMap = new Proxy({}, {
       get: function (t, prop) {
         if (prop === "length") { return __attrNames(id).length; }
-        if (prop === "item") { return function (i) { var n = __attrNames(id)[i]; return n == null ? null : makeAttr(n); }; }
-        if (prop === "getNamedItem") { return function (nm) { nm = String(nm); return __getAttr(id, nm) == null ? null : makeAttr(nm); }; }
+        if (prop === "item") { return function (i) { var n = __attrNames(id)[i >>> 0]; return n == null ? null : makeAttr(n); }; }
+        if (prop === "getNamedItem") { return function (nm) { return el.getAttributeNode(nm); }; }
+        if (prop === "getNamedItemNS") { return function (ns, ln) { return el.getAttributeNodeNS(ns, ln); }; }
+        if (prop === "setNamedItem" || prop === "setNamedItemNS") { return function (attr) { return el.setAttributeNode(attr); }; }
+        if (prop === "removeNamedItem") { return function (nm) {
+          var a = el.getAttributeNode(nm);
+          if (a == null) { notFoundError("No attribute named '" + nm + "'."); }
+          return el.removeAttributeNode(a);
+        }; }
+        if (prop === "removeNamedItemNS") { return function (ns, ln) {
+          var a = el.getAttributeNodeNS(ns, ln);
+          if (a == null) { notFoundError("No such attribute."); }
+          return el.removeAttributeNode(a);
+        }; }
         if (prop === Symbol.iterator) { return function () { return __attrNames(id).map(makeAttr)[Symbol.iterator](); }; }
         if (typeof prop === "string" && /^\d+$/.test(prop)) { var n = __attrNames(id)[+prop]; return n == null ? undefined : makeAttr(n); }
+        // Named property access: getNamedItem(prop).
+        if (typeof prop === "string" && __getAttr(id, prop) != null) { return makeAttr(prop); }
         return t[prop];
       },
       has: function (t, prop) {
-        if (prop === "length" || prop === "item" || prop === "getNamedItem") { return true; }
+        if (prop === "length" || prop === "item" || prop === "getNamedItem" || prop === "getNamedItemNS" ||
+            prop === "setNamedItem" || prop === "setNamedItemNS" || prop === "removeNamedItem" || prop === "removeNamedItemNS") { return true; }
         if (typeof prop === "string" && /^\d+$/.test(prop)) { return +prop < __attrNames(id).length; }
         return prop in t;
+      },
+      // Own-property enumeration: getOwnPropertyNames(attrs) === [indices..., qualifiedNames...].
+      // Indices are enumerable; the named (qualified-name) keys are non-enumerable own properties.
+      ownKeys: function () {
+        var names = __attrNames(id), keys = [];
+        for (var i = 0; i < names.length; i++) { keys.push(String(i)); }
+        var seen = Object.create(null);
+        for (var j = 0; j < names.length; j++) { if (!seen[names[j]]) { seen[names[j]] = 1; keys.push(names[j]); } }
+        return keys;
+      },
+      getOwnPropertyDescriptor: function (t, prop) {
+        if (typeof prop === "string" && /^\d+$/.test(prop)) {
+          var nm = __attrNames(id)[+prop];
+          if (nm != null) { return { value: makeAttr(nm), writable: false, enumerable: true, configurable: true }; }
+          return undefined;
+        }
+        if (prop === "length") { return { value: __attrNames(id).length, writable: false, enumerable: false, configurable: true }; }
+        if (typeof prop === "string" && __getAttr(id, prop) != null) {
+          // A named (qualified-name) own property: non-enumerable, holds the Attr.
+          return { value: makeAttr(prop), writable: false, enumerable: false, configurable: true };
+        }
+        return Object.getOwnPropertyDescriptor(t, prop);
       }
     });
     Object.defineProperty(el, "attributes", { get: function () { return attrMap; }, configurable: true });
     def(el, "removeAttributeNode", function (attr) {
-      if (attr && attr.name != null) { __removeAttr(id, String(attr.name)); }
+      // Spec: if attr's element isn't this element, throw NotFoundError. Then remove it and detach
+      // the SAME Attr object (it keeps its last value/name; ownerElement becomes null).
+      if (!attr || attr.nodeType !== 2) { throw new TypeError("parameter is not an Attr."); }
+      var key = (attr.__attrKey != null) ? attr.__attrKey : String(attr.name);
+      if (__getAttr(id, key) == null) { notFoundError("The attribute is not part of this element."); }
+      var finalVal = __getAttr(id, key);
+      __removeAttr(id, key); delete __attrNs[key]; delete __attrNodeCache[key];
+      // Re-bind the node's value/ownerElement to a standalone (detached) state.
+      try {
+        var stored = finalVal == null ? "" : String(finalVal);
+        var dget = function () { return stored; };
+        var dset = function (v) { stored = v == null ? "" : String(v); };
+        Object.defineProperty(attr, "value", { get: dget, set: dset, configurable: true, enumerable: true });
+        Object.defineProperty(attr, "nodeValue", { get: dget, set: dset, configurable: true, enumerable: true });
+        Object.defineProperty(attr, "textContent", { get: dget, set: dset, configurable: true, enumerable: true });
+        Object.defineProperty(attr, "ownerElement", { value: null, configurable: true, enumerable: true, writable: true });
+      } catch (e) {}
       return attr;
     });
     def(el, "getAttributeNode", function (name) {
-      name = String(name); return __getAttr(id, name) == null ? null : makeAttr(name);
+      var nm = String(name);
+      if (elIsHtml()) { nm = asciiLower(nm); }
+      return __getAttr(id, nm) == null ? null : makeAttr(nm);
     });
-    def(el, "setAttributeNode", function (attr) {
-      if (attr && attr.name != null) { __setAttr(id, String(attr.name), attr.value == null ? "" : String(attr.value)); }
-      return attr;
+    def(el, "getAttributeNodeNS", function (ns, localName) {
+      var want = (ns === undefined || ns === null || ns === "") ? null : String(ns);
+      var key = attrKeyByNs(want, String(localName));
+      return key == null ? null : makeAttr(key);
+    });
+    // setAttributeNode(attr): set/replace the attribute named by attr; per spec, throw
+    // InUseAttributeError if attr is already owned by a *different* element. Returns the previously
+    // set Attr (or null). For a same-name replacement, returns the old attr value.
+    function setAttrNodeImpl(attr) {
+      if (!attr || attr.nodeType !== 2) { throw new TypeError("parameter is not an Attr."); }
+      var owner = attr.ownerElement;
+      if (owner != null && owner !== el) {
+        throw new globalThis.DOMException("The attribute is in use by another element.", "InUseAttributeError");
+      }
+      var ns = attr.namespaceURI || null;
+      var ln = attr.localName != null ? String(attr.localName) : String(attr.name);
+      var key = String(attr.name);
+      // Existing attribute with the same namespace + localName?
+      var oldKey = attrKeyByNs(ns, ln);
+      var oldAttr = null;
+      if (oldKey != null) {
+        oldAttr = makeAttr(oldKey);
+        if (oldKey !== key) { __removeAttr(id, oldKey); delete __attrNs[oldKey]; delete __attrNodeCache[oldKey]; }
+      }
+      var newVal = attr.value == null ? "" : String(attr.value);
+      __setAttr(id, key, newVal);
+      __attrNs[key] = { namespaceURI: ns, prefix: attr.prefix || null, localName: ln };
+      // Adopt the SAME Attr object: re-bind its value / ownerElement getters to this element's live
+      // arena attribute, and register it as the canonical cached node so getAttributeNode /
+      // el.attributes[i] return the identical object (per spec the node is moved, not copied).
+      try { def(attr, "__attrKey", key); } catch (e) {}
+      try {
+        var bget = function () { var v = __getAttr(id, key); return v == null ? "" : v; };
+        var bset = function (v) { __setAttr(id, key, v == null ? "" : String(v)); };
+        Object.defineProperty(attr, "value", { get: bget, set: bset, configurable: true, enumerable: true });
+        Object.defineProperty(attr, "nodeValue", { get: bget, set: bset, configurable: true, enumerable: true });
+        Object.defineProperty(attr, "textContent", { get: bget, set: bset, configurable: true, enumerable: true });
+        Object.defineProperty(attr, "ownerElement", { get: function () { return __getAttr(id, key) == null ? null : el; }, configurable: true, enumerable: true });
+      } catch (e) {}
+      __attrNodeCache[key] = attr;
+      return oldAttr;
+    }
+    def(el, "setAttributeNode", setAttrNodeImpl);
+    def(el, "setAttributeNodeNS", setAttrNodeImpl);
+    def(el, "toggleAttribute", function (name, force) {
+      var qn = String(name);
+      // "validate" only rejects names that don't match the (lenient) Name production: the empty
+      // string and any name containing whitespace or '>' (matching setAttribute's behaviour).
+      if (qn.length === 0) { invalidCharacterError(); }
+      for (var vi = 0; vi < qn.length; vi++) {
+        var vc = qn.charCodeAt(vi);
+        if (vc === 0x3E || vc === 0x20 || vc === 0x09 || vc === 0x0A || vc === 0x0C || vc === 0x0D) { invalidCharacterError(); }
+      }
+      if (elIsHtml()) { qn = asciiLower(qn); }
+      var present = __getAttr(id, qn) != null;
+      if (!present) {
+        if (force === undefined || force === true) { __setAttr(id, qn, ""); return true; }
+        return false;
+      }
+      if (force === undefined || force === false) { __removeAttr(id, qn); delete __attrNs[qn]; return false; }
+      return true;
     });
 
     def(el, "appendChild", function (child) {
@@ -3269,6 +3729,11 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     Object.defineProperty(el, "nextElementSibling", { get: function () { return sibling(true, true); }, enumerable: true, configurable: true });
     Object.defineProperty(el, "previousElementSibling", { get: function () { return sibling(false, true); }, enumerable: true, configurable: true });
 
+    // Namespace lookup mixin (Node). DocumentType/PI/DocumentFragment wrappers also get these.
+    def(el, "lookupNamespaceURI", function (prefix) { return nodeLookupNamespaceURI(id, prefix); });
+    def(el, "lookupPrefix", function (ns) { return nodeLookupPrefix(id, ns); });
+    def(el, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(id, ns); });
+
     return el;
   }
   def(globalThis, "__wrapNode", wrap);
@@ -3312,8 +3777,8 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   });
   // createAttribute / createAttributeNS return an Attr node (not arena-backed) with the correct
   // name/localName/namespaceURI/prefix/value reflection.
-  function makeAttrNode(namespaceURI, prefix, localName, qualifiedName) {
-    var value = "";
+  function makeAttrNode(namespaceURI, prefix, localName, qualifiedName, initialValue) {
+    var value = initialValue == null ? "" : String(initialValue);
     var attr = {
       nodeType: 2,
       namespaceURI: namespaceURI,
@@ -3339,6 +3804,17 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       set: function (v) { value = v == null ? "" : String(v); },
       enumerable: true, configurable: true
     });
+    // Attr namespace lookup delegates to the owner element (null when disconnected).
+    def(attr, "lookupNamespaceURI", function (prefix) {
+      var oe = this.ownerElement; return oe && oe.lookupNamespaceURI ? oe.lookupNamespaceURI(prefix) : null;
+    });
+    def(attr, "lookupPrefix", function (ns) {
+      var oe = this.ownerElement; return oe && oe.lookupPrefix ? oe.lookupPrefix(ns) : null;
+    });
+    def(attr, "isDefaultNamespace", function (ns) {
+      var oe = this.ownerElement; return oe && oe.isDefaultNamespace ? oe.isDefaultNamespace(ns) : (ns == null || ns === "");
+    });
+    try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
     return attr;
   }
   def(document, "createAttribute", function (localName) {
@@ -3356,6 +3832,23 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   // Expose the Attr factory + the validation helpers so the off-document (XML) document objects
   // built by document.implementation.createDocument can offer case-preserving createAttribute.
   def(globalThis, "__makeAttrNode", makeAttrNode);
+  // createDocumentType: validate the qualified name (QName), then build a real DocumentType arena
+  // node. Per spec a bad name is an InvalidCharacterError; a bad prefix split is a NamespaceError.
+  def(globalThis, "__createDocumentTypeNode", function (qualifiedName, publicId, systemId) {
+    var qn = String(qualifiedName);
+    // createDocumentType's "validate" step only checks the QName matches the (lenient) Name
+    // production. Per the behaviour browsers/WPT implement, every codepoint must be a NameChar:
+    // any non-whitespace, non-'>' character is accepted mid-name (colons included), and the empty
+    // string is allowed. A '>' or ASCII whitespace anywhere => InvalidCharacterError.
+    for (var i = 0; i < qn.length; i++) {
+      var cc = qn.charCodeAt(i);
+      if (cc === 0x3E || cc === 0x20 || cc === 0x09 || cc === 0x0A || cc === 0x0C || cc === 0x0D) {
+        invalidCharacterError();
+      }
+    }
+    var nid = __createDocumentType(qn, publicId == null ? "" : String(publicId), systemId == null ? "" : String(systemId));
+    return wrap(nid);
+  });
   def(globalThis, "__validateAndExtractName", validateAndExtract);
   def(globalThis, "__invalidCharacterError", invalidCharacterError);
   // Create an element carrying explicit namespace metadata (used by XML-flavoured documents from
@@ -3401,10 +3894,38 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     },
     enumerable: true, configurable: true
   });
+  // Document namespace lookup delegates to the document element (node id 0 is the Document root).
+  def(document, "lookupNamespaceURI", function (prefix) { return nodeLookupNamespaceURI(0, prefix); });
+  def(document, "lookupPrefix", function (ns) { return nodeLookupPrefix(0, ns); });
+  def(document, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(0, ns); });
+  // document.doctype: the first DocumentType child of the document root (node id 0), or null.
+  Object.defineProperty(document, "doctype", {
+    get: function () {
+      var kids = __children(0);
+      for (var i = 0; i < kids.length; i++) { if (__nodeType(kids[i]) === 10) { return wrap(kids[i]); } }
+      return null;
+    },
+    enumerable: true, configurable: true
+  });
+  def(document, "createProcessingInstruction", function (target, data) {
+    var t = String(target);
+    if (!isValidNameImpl(t, true)) { invalidCharacterError(); }
+    if (String(data).indexOf("?>") >= 0) {
+      throw new globalThis.DOMException("The data must not contain '?>'.", "InvalidCharacterError");
+    }
+    return wrap(__createProcessingInstruction(t, String(data)));
+  });
+  def(document, "createDocumentType", function (qualifiedName, publicId, systemId) {
+    return globalThis.__createDocumentTypeNode(String(qualifiedName),
+      publicId == null ? "" : String(publicId), systemId == null ? "" : String(systemId));
+  });
   Object.defineProperty(document, "body", { get: function () { var n = __bodyId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
   Object.defineProperty(document, "documentElement", { get: function () { var n = __documentElementId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
   Object.defineProperty(document, "head", { get: function () { var n = __headId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
   def(document, "nodeType", 9);
+  // A Document's textContent / nodeValue are null (it's not CharacterData or an Element).
+  Object.defineProperty(document, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
+  Object.defineProperty(document, "nodeValue", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
 
   globalThis.document = document;
 })();
@@ -4344,7 +4865,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // ([\t\n\f\r ]), order-preserving and de-duplicated. Reads always reparse the live
   // attribute (so external className/setAttribute changes are reflected); the mutating
   // methods run the spec "update steps" which serialize the ordered set back to `class`.
-  function makeClassList(node) {
+  function makeClassList(node) { return makeTokenList(node, "class", null); }
+  // A DOMTokenList over an arbitrary reflected attribute (`attrName`). `supported` is an optional
+  // allow-list of tokens for `supports()` (null => supports() throws TypeError, like `class`).
+  function makeTokenList(node, attrName, supported) {
     // ASCII whitespace per the HTML spec: TAB, LF, FF, CR, SPACE.
     function splitTokens(s) {
       var out = [], i = 0, n = s.length;
@@ -4369,8 +4893,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (t === "") { syntaxErr(); }
       if (hasWhitespace(t)) { invalidCharErr(); }
     }
-    // Raw `class` attribute string, or null when the attribute is absent.
-    function rawAttr() { var c = document.__getAttr(node, "class"); return c == null ? null : String(c); }
+    // Raw reflected-attribute string, or null when the attribute is absent.
+    function rawAttr() { var c = document.__getAttr(node, attrName); return c == null ? null : String(c); }
     // The ordered token set (de-duplicated, first occurrence wins).
     function tokenSet() {
       var raw = rawAttr();
@@ -4383,7 +4907,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     // attribute is absent and the set is empty (in which case do nothing).
     function update(set) {
       if (rawAttr() == null && set.length === 0) { return; }
-      document.__setAttr(node, "class", set.join(" "));
+      document.__setAttr(node, attrName, set.join(" "));
     }
 
     var cl = {
@@ -4437,9 +4961,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         update(s);
         return true;
       },
-      supports: function () {
-        // `class` has no supported-tokens allow-list, so per spec supports() throws TypeError.
-        throw new TypeError("DOMTokenList has no supported tokens.");
+      supports: function (token) {
+        // With no supported-tokens allow-list (e.g. `class`/`rel`), supports() throws TypeError.
+        // Otherwise it ASCII-lowercases the token and checks membership.
+        if (supported == null) { throw new TypeError("DOMTokenList has no supported tokens."); }
+        return supported.indexOf(asciiLower(String(token))) >= 0;
       },
       forEach: function (cb, thisArg) {
         if (typeof cb !== "function") { throw new TypeError("The callback provided as parameter 1 is not a function."); }
@@ -4451,6 +4977,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       entries: function () { return makeIter(tokenSet(), function (i, v) { return [i, v]; }); },
       toString: function () { var c = rawAttr(); return c == null ? "" : c; }
     };
+    // Object.prototype.toString.call(list) === "[object DOMTokenList]".
+    try { cl[Symbol.toStringTag] = "DOMTokenList"; } catch (e) {}
     // for...of / Symbol.iterator over the token values.
     try { cl[Symbol.iterator] = cl.values; } catch (e) {}
 
@@ -4459,7 +4987,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     // set assigns the `class` attribute verbatim.
     Object.defineProperty(cl, "value", {
       get: function () { var c = rawAttr(); return c == null ? "" : c; },
-      set: function (v) { document.__setAttr(node, "class", v == null ? "" : String(v)); },
+      set: function (v) { document.__setAttr(node, attrName, v == null ? "" : String(v)); },
       enumerable: false, configurable: true
     });
     // Live integer-indexed access: classList[i] => i-th token (or undefined). Reparses on each
@@ -5459,6 +5987,30 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           enumerable: true, configurable: true
         });
       })();
+      // Other DOMTokenList-reflecting attributes (HTML). Each is a [SameObject, PutForwards=value]
+      // token list that exists only on the supporting element(s); on other elements the property is
+      // absent (=== undefined). relList is also defined on the SVG `a` element.
+      (function () {
+        var HTML = "http://www.w3.org/1999/xhtml";
+        var SVG = "http://www.w3.org/2000/svg";
+        var ln = null, ns = null;
+        try { ln = el.localName; ns = el.namespaceURI; } catch (e) {}
+        function install(prop, contentAttr) {
+          var tl = makeTokenList(node, contentAttr, null);
+          Object.defineProperty(el, prop, {
+            get: function () { return tl; },
+            set: function (v) { tl.value = v; },
+            enumerable: true, configurable: true
+          });
+        }
+        // relList: on HTML a/area/link, and on SVG a.
+        if ((ns === HTML && (ln === "a" || ln === "area" || ln === "link")) || (ns === SVG && ln === "a")) {
+          install("relList", "rel");
+        }
+        if (ns === HTML && ln === "output") { install("htmlFor", "for"); }
+        if (ns === HTML && ln === "iframe") { install("sandbox", "sandbox"); }
+        if (ns === HTML && ln === "link") { install("sizes", "sizes"); }
+      })();
       def(el, "dataset", makeDataset(node));
       // Form-control `value` / `checked` reflection: back them by element ATTRIBUTES so that
       // reading/writing `el.value` (and `el.checked`) is visible to layout, which renders the
@@ -5952,16 +6504,24 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     def(document, "createDocumentFragment", function () {
       // Real arena-backed DocumentFragment (nodeType 11): its children move on insertion, and it
       // supports the full ParentNode mixin (append/prepend/replaceChildren/appendChild/insertBefore).
-      return __wrapNode(__createDocumentFragment());
+      // Canonicalize so navigation accessors (firstChild) return enriched, prototype-correct nodes.
+      return canon(__wrapNode(__createDocumentFragment()));
     });
   }
   // document.implementation.createHTMLDocument — used to build/parse HTML off to the side (e.g.
   // sanitizers, template parsing). We back it with real (detached) arena nodes so innerHTML /
   // appendChild / querySelector work on the returned document's tree.
   if (typeof document.implementation === "undefined" || !document.implementation) {
+    // Build a real (arena-backed) DocumentType whose ownerDocument is `ownerDoc`. The arena node is
+    // created via the validating factory; we override its ownerDocument to the requested document.
+    function makeDoctypeFor(ownerDoc, name, pub, sys) {
+      var dt = globalThis.__createDocumentTypeNode(String(name), pub == null ? "" : String(pub), sys == null ? "" : String(sys));
+      try { Object.defineProperty(dt, "ownerDocument", { value: ownerDoc, configurable: true, enumerable: true }); } catch (e) {}
+      return dt;
+    }
     def(document, "implementation", {
       hasFeature: function () { return true; },
-      createDocumentType: function (name, pub, sys) { return { nodeType: 10, name: String(name), publicId: pub || "", systemId: sys || "" }; },
+      createDocumentType: function (name, pub, sys) { return makeDoctypeFor(document, name, pub, sys); },
       createHTMLDocument: function (title) {
         var htmlEl = document.createElement("html");
         var headEl = document.createElement("head");
@@ -5970,8 +6530,23 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         if (title !== undefined && title !== null) {
           var t = document.createElement("title"); t.textContent = String(title); headEl.appendChild(t);
         }
-        return {
-          nodeType: 9, documentElement: htmlEl, head: headEl, body: bodyEl, title: title ? String(title) : "",
+        var doc;
+        doc = {
+          nodeType: 9, nodeName: '#document', documentElement: htmlEl, head: headEl, body: bodyEl, title: title ? String(title) : "",
+          doctype: null,
+          lookupNamespaceURI: function () { return htmlEl && htmlEl.lookupNamespaceURI ? htmlEl.lookupNamespaceURI.apply(htmlEl, arguments) : null; },
+          lookupPrefix: function () { return htmlEl && htmlEl.lookupPrefix ? htmlEl.lookupPrefix.apply(htmlEl, arguments) : null; },
+          isDefaultNamespace: function () { return htmlEl && htmlEl.isDefaultNamespace ? htmlEl.isDefaultNamespace.apply(htmlEl, arguments) : (arguments[0] == null || arguments[0] === ""); },
+          implementation: {
+            hasFeature: function () { return true; },
+            createDocumentType: function (n, p, s) { return makeDoctypeFor(doc, n, p, s); },
+            createHTMLDocument: function (t2) { return document.implementation.createHTMLDocument(t2); },
+            createDocument: function (ns, q, dt) { return document.implementation.createDocument(ns, q, dt); },
+          },
+          cloneNode: function (deep) {
+            var c = document.implementation.createHTMLDocument(this.title);
+            return c;
+          },
           createElement: function (tag) { return document.createElement(tag); },
           createElementNS: function (ns, tag) { return document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag); },
           createAttribute: function (name) {
@@ -5986,12 +6561,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           createTextNode: function (s) { return document.createTextNode(s); },
           createComment: function (s) { return document.createComment(s); },
           createDocumentFragment: function () { return document.createDocumentFragment(); },
+          createProcessingInstruction: function (target, data) { return document.createProcessingInstruction(target, data); },
           importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
           getElementById: function (id) { return htmlEl.querySelector ? htmlEl.querySelector('#' + id) : null; },
           querySelector: function (s) { return htmlEl.querySelector ? htmlEl.querySelector(s) : null; },
           querySelectorAll: function (s) { return htmlEl.querySelectorAll ? htmlEl.querySelectorAll(s) : []; },
           getElementsByTagName: function (t) { return htmlEl.getElementsByTagName ? htmlEl.getElementsByTagName(t) : []; },
         };
+        // A Document's textContent / nodeValue are null; setting them is a no-op.
+        Object.defineProperty(doc, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
+        Object.defineProperty(doc, "nodeValue", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
+        return doc;
       },
       createDocument: function (namespace) {
         // An XML document: like createHTMLDocument but case-preserving for createAttribute, and
@@ -6408,6 +6988,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   var DocumentCtor = defClass("Document", NodeCtor);
   defClass("HTMLDocument", DocumentCtor);
   defClass("XMLDocument", DocumentCtor);
+  // A bare `new Document()` has no documentElement, so namespace lookups all return null. (The
+  // page's live `document` overrides these via its own delegating methods.)
+  try {
+    if (DocumentCtor && DocumentCtor.prototype) {
+      def(DocumentCtor.prototype, "lookupNamespaceURI", function () { return null; });
+      def(DocumentCtor.prototype, "lookupPrefix", function () { return null; });
+      def(DocumentCtor.prototype, "isDefaultNamespace", function (ns) { return ns == null || ns === ""; });
+    }
+  } catch (e) {}
   defClass("Window", globalThis.EventTarget);
   defClass("AbstractRange"); defClass("Range", globalThis.AbstractRange); defClass("StaticRange", globalThis.AbstractRange);
   var domIfaces = [
@@ -6784,13 +7373,35 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           var c = String(prop); return c.indexOf(":") > 0 || c.indexOf("(") >= 0;
         } catch (e) { return false; }
       },
-      escape: function (s) {
-        s = String(s); var out = "";
-        for (var i = 0; i < s.length; i++) {
-          var ch = s.charAt(i), c = s.charCodeAt(i);
-          if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 45 || c === 95 || c > 127) { out += ch; }
-          else if (c === 0) { out += "�"; }
-          else { out += "\\" + ch; }
+      escape: function (value) {
+        // CSSOM "serialize an identifier" (https://drafts.csswg.org/cssom/#serialize-an-identifier).
+        var s = String(value), out = "";
+        var len = s.length;
+        for (var i = 0; i < len; i++) {
+          var c = s.charCodeAt(i);
+          if (c === 0x0000) {
+            // U+0000 NULL -> U+FFFD REPLACEMENT CHARACTER.
+            out += "�";
+          } else if ((c >= 0x0001 && c <= 0x001F) || c === 0x007F) {
+            // Control characters -> "\" + hex + " ".
+            out += "\\" + c.toString(16) + " ";
+          } else if (i === 0 && c >= 0x0030 && c <= 0x0039) {
+            // A leading digit -> "\" + hex + " ".
+            out += "\\" + c.toString(16) + " ";
+          } else if (i === 1 && c >= 0x0030 && c <= 0x0039 && s.charCodeAt(0) === 0x002D) {
+            // A digit as the second char when the first is "-" -> escaped.
+            out += "\\" + c.toString(16) + " ";
+          } else if (i === 0 && c === 0x002D && len === 1) {
+            // A lone "-" -> "\-".
+            out += "\\" + s.charAt(i);
+          } else if (c >= 0x0080 || c === 0x002D || c === 0x005F ||
+                     (c >= 0x0030 && c <= 0x0039) || (c >= 0x0041 && c <= 0x005A) || (c >= 0x0061 && c <= 0x007A)) {
+            // >= U+0080, "-", "_", 0-9, A-Z, a-z -> the character itself.
+            out += s.charAt(i);
+          } else {
+            // Any other character -> "\" + the character.
+            out += "\\" + s.charAt(i);
+          }
         }
         return out;
       },
@@ -10723,6 +11334,133 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("y|a b"));
+    }
+
+    #[test]
+    fn lookup_namespace_uri_and_is_default() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var e = document.createElementNS('fooNamespace', 'prefix:elem');
+              var r = [];
+              r.push(e.lookupNamespaceURI('prefix'));          // fooNamespace
+              r.push(e.lookupNamespaceURI('xml'));             // XML built-in
+              r.push(String(e.lookupNamespaceURI('nope')));    // null
+              r.push(e.isDefaultNamespace('http://www.w3.org/1999/xhtml')); // false here
+              e.setAttributeNS('http://www.w3.org/2000/xmlns/', 'xmlns', 'bazURI');
+              r.push(e.lookupNamespaceURI(null));              // bazURI
+              r.push(e.lookupPrefix('fooNamespace'));          // prefix
+              r.join('|')
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("fooNamespace|http://www.w3.org/XML/1998/namespace|null|false|bazURI|prefix")
+        );
+    }
+
+    #[test]
+    fn create_document_type_and_doctype() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var dt = document.implementation.createDocumentType('html', 'pub', 'sys');
+              [dt.name, dt.nodeName, dt.publicId, dt.systemId, dt.nodeType,
+               String(dt.nodeValue), String(dt.textContent)].join('|')
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("html|html|pub|sys|10|null|null"));
+    }
+
+    #[test]
+    fn parsed_doctype_is_document_doctype() {
+        // The parser produces a DocumentType node named "html" for `<!DOCTYPE html>`.
+        let doc = html::parse("<!DOCTYPE html><html><head></head><body></body></html>");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec!["document.doctype ? document.doctype.name + '|' + document.doctype.nodeType : 'none'".to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("html|10"));
+    }
+
+    #[test]
+    fn css_escape_serializes_identifier() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"[CSS.escape(".foo#bar"), CSS.escape("0abc"), CSS.escape("-")].join('|')"#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // "." and "#" are escaped with a backslash; a leading digit becomes "\\3N "; lone "-" -> "\\-".
+        assert_eq!(out[0].value.as_deref(), Some(r#"\.foo\#bar|\30 abc|\-"#));
+    }
+
+    #[test]
+    fn get_and_set_attribute_node() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              el.setAttribute('foo', 'bar');
+              var a = el.getAttributeNode('foo');
+              var same = a === el.attributes[0];
+              el.removeAttributeNode(a);                // detaches, keeps value
+              var el2 = document.createElement('div');
+              el2.setAttributeNode(a);
+              [same, a.value, el2.getAttribute('foo'), a.ownerElement === el2,
+               a === el2.getAttributeNode('foo')].join('|')
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|bar|bar|true|true"));
+    }
+
+    #[test]
+    fn rel_list_reflects_rel_attribute() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var a = document.createElement('a');
+              a.relList.add('noopener');
+              a.relList.add('noreferrer');
+              var area = document.createElement('div');     // div has no relList
+              [a.getAttribute('rel'), Object.prototype.toString.call(a.relList),
+               (area.relList === undefined)].join('|')
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("noopener noreferrer|[object DOMTokenList]|true"));
+    }
+
+    #[test]
+    fn attribute_insertion_order_preserved() {
+        // IndexMap-backed attrs expose attributes in insertion order.
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              el.toggleAttribute('a'); el.toggleAttribute('b');
+              el.setAttribute('a', 'thing'); el.toggleAttribute('c');
+              el.getAttributeNames().join(',')
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("a,b,c"));
     }
 
     // --- Browser environment (`install_browser_env`) ------------------------------------

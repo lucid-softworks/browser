@@ -4911,7 +4911,9 @@ fn collect_text(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
                 collect_text(doc, child, out);
             }
         }
-        dom::NodeData::Comment(_) => {}
+        dom::NodeData::Comment(_)
+        | dom::NodeData::DocumentType(_)
+        | dom::NodeData::ProcessingInstruction(_) => {}
     }
 }
 

@@ -4,7 +4,11 @@
 //!
 //! Phase 0: just the data model. The HTML tree builder (in the `html` crate) populates it.
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
+
+/// Element attributes, preserving insertion order (the DOM exposes attributes in source / set
+/// order via `element.attributes`, `getAttributeNames()`, etc.).
+pub type AttrMap = IndexMap<String, String>;
 
 /// Index of a node within a [`Document`]'s arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -22,12 +26,31 @@ pub enum NodeData {
     Comment(String),
     /// A `DocumentFragment` — a parentless container whose children move on insertion.
     DocumentFragment,
+    /// A `<!DOCTYPE ...>` node (nodeType 10). Carries the name and the (usually empty) public/system
+    /// identifiers. Not rendered; present so `document.doctype` and the ChildNode mixin work.
+    DocumentType(DoctypeData),
+    /// A processing instruction `<?target data?>` (nodeType 7). Created via
+    /// `document.createProcessingInstruction`; not produced by the HTML parser.
+    ProcessingInstruction(ProcessingInstructionData),
+}
+
+#[derive(Debug, Clone)]
+pub struct DoctypeData {
+    pub name: String,
+    pub public_id: String,
+    pub system_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProcessingInstructionData {
+    pub target: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct ElementData {
     pub tag: String,
-    pub attrs: HashMap<String, String>,
+    pub attrs: AttrMap,
 }
 
 impl ElementData {
@@ -119,7 +142,7 @@ impl Document {
     pub fn append_element(&mut self, parent: NodeId, tag: &str) -> NodeId {
         self.append_child(
             parent,
-            NodeData::Element(ElementData { tag: tag.to_string(), attrs: HashMap::new() }),
+            NodeData::Element(ElementData { tag: tag.to_string(), attrs: Default::default() }),
         )
     }
 }

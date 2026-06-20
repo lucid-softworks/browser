@@ -22,8 +22,6 @@
 //! The goal is to produce a sensible tree for typical real-world pages and to *never panic*
 //! on malformed input.
 
-use std::collections::HashMap;
-
 use dom::{Document, ElementData, NodeData, NodeId};
 
 /// Elements that never have children and need no end tag.
@@ -209,7 +207,7 @@ impl<'a> Parser<'a> {
         let root = self.doc.root();
         let html = self.doc.append_child(
             root,
-            NodeData::Element(ElementData { tag: "html".into(), attrs: HashMap::new() }),
+            NodeData::Element(ElementData { tag: "html".into(), attrs: Default::default() }),
         );
         self.html = Some(html);
         self.open.push(html);
@@ -227,7 +225,7 @@ impl<'a> Parser<'a> {
         let html = self.ensure_html();
         let head = self.doc.append_child(
             html,
-            NodeData::Element(ElementData { tag: "head".into(), attrs: HashMap::new() }),
+            NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default() }),
         );
         self.head = Some(head);
         self.open.push(head);
@@ -255,14 +253,14 @@ impl<'a> Parser<'a> {
         if self.head.is_none() {
             let head = self.doc.append_child(
                 html,
-                NodeData::Element(ElementData { tag: "head".into(), attrs: HashMap::new() }),
+                NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default() }),
             );
             self.head = Some(head);
         }
         self.pop_head();
         let body = self.doc.append_child(
             html,
-            NodeData::Element(ElementData { tag: "body".into(), attrs: HashMap::new() }),
+            NodeData::Element(ElementData { tag: "body".into(), attrs: Default::default() }),
         );
         self.body = Some(body);
         self.open.push(body);
@@ -515,9 +513,34 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_doctype(&mut self) {
-        // Consume up to and including '>'. We ignore the doctype entirely.
+        // cursor on "<!doctype". Skip the keyword, capture the name token (e.g. "html"), then
+        // consume the rest up to '>'. Public/system identifiers are not parsed (left empty).
+        self.pos += "<!doctype".len();
+        self.skip_whitespace();
+        let start = self.pos;
+        while self.pos < self.input.len() {
+            let b = self.input[self.pos];
+            if b == b'>' || b.is_ascii_whitespace() {
+                break;
+            }
+            self.pos += 1;
+        }
+        let name = std::str::from_utf8(&self.input[start..self.pos])
+            .unwrap_or("")
+            .to_ascii_lowercase();
         self.consume_until_byte(b'>');
         self.consume_byte();
+        // A doctype is only inserted before the root element (Initial insertion mode). Append it to
+        // the document root so `document.doctype` reflects it.
+        let root = self.doc.root();
+        self.doc.append_child(
+            root,
+            NodeData::DocumentType(dom::DoctypeData {
+                name,
+                public_id: String::new(),
+                system_id: String::new(),
+            }),
+        );
     }
 
     // ---- tags ----
@@ -530,7 +553,7 @@ impl<'a> Parser<'a> {
             // Shouldn't happen given the caller's check, but be defensive.
             return;
         }
-        let mut attrs: HashMap<String, String> = HashMap::new();
+        let mut attrs: dom::AttrMap = dom::AttrMap::new();
         let mut self_closing = false;
 
         loop {
@@ -627,7 +650,7 @@ impl<'a> Parser<'a> {
 
     /// Merge `attrs` onto an existing element, keeping already-present attributes (first wins,
     /// matching how duplicate `<html>`/`<body>` start tags behave).
-    fn merge_attrs(&mut self, node: NodeId, attrs: HashMap<String, String>) {
+    fn merge_attrs(&mut self, node: NodeId, attrs: dom::AttrMap) {
         if attrs.is_empty() {
             return;
         }
@@ -1261,12 +1284,16 @@ mod tests {
     }
 
     #[test]
-    fn doctype_is_ignored() {
+    fn doctype_produces_node() {
         let doc = parse("<!DOCTYPE html><html></html>");
         let kids = children(&doc, doc.root());
-        // Only the html element, no doctype/text node.
-        assert_eq!(kids.len(), 1);
-        assert_eq!(tag_of(&doc, kids[0]), "html");
+        // A DocumentType node (named "html") followed by the html element.
+        assert_eq!(kids.len(), 2);
+        match &doc.get(kids[0]).data {
+            NodeData::DocumentType(d) => assert_eq!(d.name, "html"),
+            other => panic!("expected DocumentType, got {other:?}"),
+        }
+        assert_eq!(tag_of(&doc, kids[1]), "html");
     }
 
     #[test]

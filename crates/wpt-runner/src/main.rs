@@ -30,8 +30,12 @@ add_completion_callback(function (tests, status) {
   window.__wpt_harness_msg = status.message || "";
   // First failure detail, for quick triage.
   window.__wpt_firstfail = "";
+  window.__wpt_allfails = "";
   for (var j = 0; j < tests.length; j++) {
-    if (tests[j].status === 1) { window.__wpt_firstfail = tests[j].name + ": " + (tests[j].message || ""); break; }
+    if (tests[j].status === 1) {
+      if (!window.__wpt_firstfail) { window.__wpt_firstfail = tests[j].name + ": " + (tests[j].message || ""); }
+      window.__wpt_allfails += tests[j].name + " :: " + (tests[j].message || "") + "\n";
+    }
   }
   window.__wpt_done = 1;
 });
@@ -216,6 +220,9 @@ fn main() {
             println!("{mark} [{p}/{}]  {short}", p + f);
         } else {
             println!("{mark} [{p}/{}]  {short}  — {detail}", p + f);
+            if std::env::var("WPT_ALLFAILS").is_ok() {
+                println!("{}", e.console_eval("window.__wpt_allfails"));
+            }
         }
         rows.push((short, p as i64, f as i64, if f == 0 { "pass" } else { "fail" }, detail));
     }
