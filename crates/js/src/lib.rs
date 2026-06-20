@@ -10064,9 +10064,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         if (!sh || sh.disabled) { continue; }
         try {
           var t = sh.cssText;
-          // For a shadow root, rewrite `:host`/`:host(X)` to target the host element (the mirror is a
-          // global <style>, where `:host` matches nothing). `host.__hostSel` is the host's marker.
-          if (host && host.__hostSel) { t = t.replace(/:host\(([^)]*)\)/g, host.__hostSel + "$1").replace(/:host\b/g, host.__hostSel); }
+          // For a shadow root, scope every rule to the host's subtree so adopted styles don't leak
+          // into the rest of the document (the mirror is a single global <style>). `:host` targets
+          // the host element; other selectors become descendants of it. `host.__hostSel` is the marker.
+          if (host && host.__hostSel && typeof globalThis.__scopeShadowCss === "function") {
+            t = globalThis.__scopeShadowCss(t, host.__hostSel);
+          }
           s += (s ? "\n" : "") + t;
         } catch (e) {}
       }
@@ -10344,6 +10347,40 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // maps to that frame's document, otherwise the main document. Moving a node thus updates its
   // ownerDocument, and moving it into a *frame* document clears the moved shadow roots' adopted
   // sheets (construct-stylesheets adoption steps) — but moving into a template does not.
+  // Scope a shadow root's adopted-sheet CSS to the host's subtree: prefix each style rule's selector
+  // with the host marker (so `.x` becomes a descendant of the host) and rewrite `:host`/`:host(X)` to
+  // the host element itself. @-rules are passed through unscoped (their nested rules aren't rewritten
+  // — rare for shadow-adopted sheets). Keeps shadow styles from leaking into the rest of the document.
+  def(globalThis, "__scopeShadowCss", function (css, hostSel) {
+    function scopeSel(sel) {
+      if (!sel) { return sel; }
+      if (/^:host(\b|\()/.test(sel)) {
+        return sel.replace(/:host\(([^)]*)\)/g, hostSel + "$1").replace(/:host\b/g, hostSel);
+      }
+      return hostSel + " " + sel;
+    }
+    try {
+      var out = "", i = 0, n = css.length;
+      while (i < n) {
+        var brace = css.indexOf("{", i);
+        if (brace < 0) { break; }
+        var sel = css.slice(i, brace).trim();
+        var depth = 1, j = brace + 1;
+        while (j < n && depth > 0) { var ch = css.charAt(j); if (ch === "{") { depth++; } else if (ch === "}") { depth--; } j++; }
+        var body = css.slice(brace, j);
+        if (sel.charAt(0) === "@") {
+          out += sel + " " + body + "\n";
+        } else {
+          var parts = sel.split(","), scoped = [];
+          for (var k = 0; k < parts.length; k++) { scoped.push(scopeSel(parts[k].trim())); }
+          out += scoped.join(", ") + " " + body + "\n";
+        }
+        i = j;
+      }
+      return out;
+    } catch (e) { return css; }
+  });
+
   try {
     // Resolve a node id to its canonical, fully-enriched element wrapper (the one that carries
     // tag prototype + __shadow/__frameDoc). __wrapNode builds a bare wrapper; __canonNode enriches
