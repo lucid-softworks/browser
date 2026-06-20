@@ -9076,7 +9076,7 @@ impl Runtime {
     /// `eval` calls via the owned global context.
     pub fn new() -> Self {
         ensure_v8_initialized();
-        let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+        let mut isolate = new_guarded_isolate();
         let context = {
             v8::scope!(let handle_scope, &mut isolate);
             let context = v8::Context::new(handle_scope, Default::default());
@@ -9172,7 +9172,7 @@ pub fn run_with_dom(
             let result: (dom::Document, Vec<EvalOutput>) = (move || {
             ensure_v8_initialized();
             let shared: SharedDoc = Rc::new(RefCell::new(doc));
-            let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+            let mut isolate = new_guarded_isolate();
             let mut results: Vec<EvalOutput> = Vec::with_capacity(sources.len());
             {
                 v8::scope!(let handle_scope, &mut isolate);
@@ -9589,7 +9589,7 @@ pub fn run_modules(
             let shared: SharedDoc = Rc::new(RefCell::new(doc));
             // Background fetch threads deliver completions here; the receiver stays on this worker.
             let (fetch_tx, fetch_rx) = std::sync::mpsc::channel::<FetchCompletion>();
-            let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+            let mut isolate = new_guarded_isolate();
             isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
             isolate.set_promise_reject_callback(promise_reject_callback);
             // Populate `import.meta.url` for every module the first time it touches `import.meta`,
@@ -10099,6 +10099,34 @@ impl Drop for Session {
 
 /// Body of the session runtime thread: owns the isolate + persistent context for the whole session.
 #[allow(clippy::too_many_arguments)]
+/// Per-isolate V8 heap ceiling. A runaway page (infinite DOM growth, a script that allocates without
+/// bound) is terminated at this point rather than being allowed to grow until V8 calls
+/// `FatalProcessOutOfMemory`, which aborts the WHOLE process (the crash this guards against).
+const SESSION_HEAP_MAX: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+/// V8 near-heap-limit callback. Fired on the isolate's own thread when the heap approaches
+/// [`SESSION_HEAP_MAX`]. We terminate the running script (so one tab's runaway allocation can't take
+/// the browser down) and return a slightly raised limit so V8 has headroom to unwind the stack and
+/// deliver the termination, instead of OOM-aborting before it can.
+unsafe extern "C" fn near_heap_limit_cb(
+    data: *mut std::ffi::c_void,
+    current: usize,
+    _initial: usize,
+) -> usize {
+    let handle = &*(data as *const v8::IsolateHandle);
+    handle.terminate_execution();
+    current + 256 * 1024 * 1024
+}
+
+/// Create a V8 isolate with a bounded heap + the graceful-OOM guard, so a single page can't crash
+/// the process. The leaked `IsolateHandle` lives as long as the isolate (one per session).
+fn new_guarded_isolate() -> v8::OwnedIsolate {
+    let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, SESSION_HEAP_MAX));
+    let handle = Box::into_raw(Box::new(isolate.thread_safe_handle()));
+    isolate.add_near_heap_limit_callback(near_heap_limit_cb, handle as *mut std::ffi::c_void);
+    isolate
+}
+
 fn session_thread_main(
     doc: dom::Document,
     scripts: Vec<String>,
@@ -10120,7 +10148,7 @@ fn session_thread_main(
     // session and is drained (non-blocking) on every drain pass alongside the fetch channel.
     let (ws_evt_tx, ws_evt_rx) = std::sync::mpsc::channel::<WsEvent>();
     // Keep the isolate owned by this thread for the whole session.
-    let mut isolate = v8::Isolate::new(v8::CreateParams::default());
+    let mut isolate = new_guarded_isolate();
     // Register the same isolate-level callbacks run_modules uses so modules + dynamic import work.
     isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
     isolate.set_promise_reject_callback(promise_reject_callback);
