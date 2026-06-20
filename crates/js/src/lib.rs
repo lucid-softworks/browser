@@ -5401,6 +5401,16 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         try { __lk.dispatchEvent(new Event("load")); } catch (e) {}
       }
     } catch (e) {}
+    // <style> elements fire `load` once their style block is processed (synchronously available).
+    try {
+      var __sts = document.querySelectorAll("style");
+      for (var __j = 0; __j < __sts.length; __j++) {
+        var __st = __sts[__j];
+        if (__st.__loadFired) { continue; }
+        def(__st, "__loadFired", true);
+        try { __st.dispatchEvent(new Event("load")); } catch (e) {}
+      }
+    } catch (e) {}
     fireOn(window, "load");
     fireOn(document, "load");
     fireOn(window, "pageshow");
