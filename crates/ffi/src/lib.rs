@@ -159,6 +159,25 @@ pub unsafe extern "C" fn browser_engine_scroll_by(engine: *mut Engine, dy: f32) 
     }
 }
 
+/// V8 heap used by this tab's JS, in bytes (0 if no live session). For the tab tooltip.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_heap_bytes(engine: *mut Engine) -> u64 {
+    engine.as_ref().map(|e| e.inner.heap_bytes()).unwrap_or(0)
+}
+
+/// Cumulative active JS time on this tab's thread, in nanoseconds (0 if no session). The UI samples
+/// deltas over wall-clock to display a CPU %.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_cpu_ns(engine: *mut Engine) -> u64 {
+    engine.as_ref().map(|e| e.inner.cpu_ns()).unwrap_or(0)
+}
+
 /// The loaded page's `<title>` as a NUL-terminated UTF-8 C string, or null if none.
 ///
 /// Lifetime: owned by the engine handle (stored in `last_title`); valid until the next

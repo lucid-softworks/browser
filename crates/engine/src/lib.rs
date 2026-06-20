@@ -877,6 +877,17 @@ impl Engine {
         self.framebuffer.as_ref()
     }
 
+    /// V8 heap used by this tab's JS, in bytes (0 if no live session). For the tab tooltip.
+    pub fn heap_bytes(&self) -> u64 {
+        self.session.as_ref().map(|s| s.heap_bytes()).unwrap_or(0)
+    }
+
+    /// Cumulative active JS time on this tab's thread, in nanoseconds (0 if no session). The UI
+    /// samples deltas over wall-clock to display a CPU %.
+    pub fn cpu_ns(&self) -> u64 {
+        self.session.as_ref().map(|s| s.cpu_ns()).unwrap_or(0)
+    }
+
     /// The page's `<title>` text (whitespace-collapsed), if the loaded page has one.
     pub fn title(&self) -> Option<String> {
         let doc = match &self.state {

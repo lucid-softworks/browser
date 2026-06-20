@@ -250,6 +250,28 @@ final class Tab {
     /// current generation, so a slow earlier load can't clobber a newer navigation.
     var loadGeneration: Int = 0
 
+    // Live runtime stats for the tab tooltip, sampled ~1s by the AppDelegate's stats timer.
+    var memBytes: UInt64 = 0
+    var cpuPercent: Double = 0
+    private var lastCpuNs: UInt64 = 0
+    private var lastSampleTS: TimeInterval = 0
+
+    /// Read the engine's heap-used + cumulative-JS-time counters and derive a CPU % over the elapsed
+    /// wall-clock since the last sample. Called on the main thread (cheap atomic reads).
+    func sampleStats() {
+        guard let engine = engine else { return }
+        let nowCpu = browser_engine_cpu_ns(engine)
+        let nowTS = ProcessInfo.processInfo.systemUptime
+        if lastSampleTS > 0 {
+            let dCpu = Double(nowCpu &- lastCpuNs)                 // ns of active JS
+            let dWall = (nowTS - lastSampleTS) * 1_000_000_000     // ns elapsed
+            if dWall > 0 { cpuPercent = max(0, min(100, 100 * dCpu / dWall)) }
+        }
+        lastCpuNs = nowCpu
+        lastSampleTS = nowTS
+        memBytes = browser_engine_heap_bytes(engine)
+    }
+
     init() {
         engine = browser_engine_new()
         // Receive progressive frames while pages stream in. ctx is this Tab (unretained: the Tab
@@ -355,7 +377,14 @@ final class TabButton: NSView {
 
     func updateTitle() {
         titleLabel.stringValue = tab.title.isEmpty ? "New Tab" : tab.title
-        toolTip = tab.urlString.isEmpty ? tab.title : tab.urlString
+        refreshStatsTooltip()
+    }
+
+    /// Set the hover tooltip to the URL/title plus the tab's live memory + CPU usage.
+    func refreshStatsTooltip() {
+        let base = tab.urlString.isEmpty ? (tab.title.isEmpty ? "New Tab" : tab.title) : tab.urlString
+        let mb = Double(tab.memBytes) / (1024.0 * 1024.0)
+        toolTip = String(format: "%@\n%.1f MB · %.0f%% CPU", base, mb, tab.cpuPercent)
     }
 
     private func updateAppearance() {
@@ -1509,10 +1538,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                   tab.pendingLoads == 0 else { return }
             if browser_engine_tick(engine) != 0 { self.refresh() }
         }
+
+        // Sample each tab's memory + CPU once a second and refresh the tab tooltips, so hovering a
+        // tab shows its current usage.
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            for tab in self.tabs { tab.sampleStats() }
+            for button in self.tabButtons { button.refreshStatsTooltip() }
+        }
     }
 
     /// Repeating timer that pumps the active page's JS event loop. Retained for the app's lifetime.
     private var tickTimer: Timer?
+    /// Repeating timer that samples per-tab CPU/memory for the tab tooltips.
+    private var statsTimer: Timer?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true

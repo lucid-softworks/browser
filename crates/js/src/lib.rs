@@ -12817,9 +12817,30 @@ enum SessionCmd {
 /// on a dedicated thread; [`dispatch_event`](Session::dispatch_event) and [`tick`](Session::tick)
 /// post commands to that thread and block on the reply, returning a fresh DOM snapshot each time.
 /// The session keeps mutating the live document; callers render the returned clone.
+/// Per-tab runtime stats, sampled on the session thread and read lock-free by the engine/UI (for the
+/// tab tooltip). `heap_bytes` is the V8 heap used size; `cpu_ns` is cumulative time spent actively
+/// running JS on this tab's thread — a CPU proxy, since the thread is otherwise blocked on `recv`.
+#[derive(Default)]
+pub struct TabStats {
+    pub heap_bytes: AtomicU64,
+    pub cpu_ns: AtomicU64,
+}
+
 pub struct Session {
     tx: std::sync::mpsc::Sender<SessionCmd>,
     handle: Option<std::thread::JoinHandle<()>>,
+    stats: Arc<TabStats>,
+}
+
+impl Session {
+    /// V8 heap used by this tab (bytes).
+    pub fn heap_bytes(&self) -> u64 {
+        self.stats.heap_bytes.load(Ordering::Relaxed)
+    }
+    /// Cumulative active JS time on this tab's thread (ns); the UI samples deltas to show a CPU %.
+    pub fn cpu_ns(&self) -> u64 {
+        self.stats.cpu_ns.load(Ordering::Relaxed)
+    }
 }
 
 impl Session {
@@ -12855,6 +12876,8 @@ impl Session {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SessionCmd>();
         // One-shot channel for the initial snapshot + per-source outputs.
         let (init_tx, init_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
+        let stats = Arc::new(TabStats::default());
+        let stats_thread = stats.clone();
 
         let spawn = std::thread::Builder::new()
             .name("js-session".to_string())
@@ -12865,7 +12888,7 @@ impl Session {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     session_thread_main(
                         doc, scripts, entries, modules, url, fetcher, request_fetcher,
-                        ws_connector, init_tx, cmd_rx, initial_rects,
+                        ws_connector, init_tx, cmd_rx, initial_rects, stats_thread,
                     );
                 }));
             });
@@ -12874,7 +12897,7 @@ impl Session {
             Ok(h) => h,
             Err(e) => {
                 return (
-                    Session { tx: cmd_tx, handle: None },
+                    Session { tx: cmd_tx, handle: None, stats },
                     fallback,
                     vec![EvalOutput {
                         value: None,
@@ -12900,7 +12923,7 @@ impl Session {
             ),
         };
 
-        (Session { tx: cmd_tx, handle: Some(handle) }, snapshot, outputs)
+        (Session { tx: cmd_tx, handle: Some(handle), stats }, snapshot, outputs)
     }
 
     /// Dispatch a synthetic bubbling event to `node_id`, drain the event loop, and return a fresh
@@ -13161,6 +13184,7 @@ fn session_thread_main(
         f32,
         f32,
     )>,
+    stats: Arc<TabStats>,
 ) {
     ensure_v8_initialized();
     let shared: SharedDoc = Rc::new(RefCell::new(doc));
@@ -13255,6 +13279,7 @@ fn session_thread_main(
 
     // Command loop: each op re-enters the persistent context via Local::new(global).
     for cmd in cmd_rx {
+        let __cmd_t0 = std::time::Instant::now();
         match cmd {
             SessionCmd::Dispatch { node_id, kind, x, y, reply } => {
                 let ctx = context.clone();
@@ -13361,6 +13386,10 @@ fn session_thread_main(
             }
             SessionCmd::Stop => break,
         }
+        // Per-tab stats for the tab tooltip: active JS time this command (CPU proxy — the thread is
+        // otherwise blocked on recv) + the V8 heap used size. Cheap, sampled once per command.
+        stats.cpu_ns.fetch_add(__cmd_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        stats.heap_bytes.store(isolate.get_heap_statistics().used_heap_size() as u64, Ordering::Relaxed);
     }
     // Loop ended (Stop or sender dropped). Drop the isolate on its own thread.
     drop(context);
