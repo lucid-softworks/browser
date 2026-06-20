@@ -2274,6 +2274,17 @@ fn prim_document_element_id(
     rv.set_double(found.map(|n| n.0 as f64).unwrap_or(-1.0));
 }
 
+/// `__documentRootId() -> id` — the Document node itself (arena root). Always valid, even when the
+/// root element has been replaced/removed, so JS can find the document's children directly.
+fn prim_document_root_id(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let root = host_state(scope).doc.borrow().root();
+    rv.set_double(root.0 as f64);
+}
+
 /// `__bodyId() -> id | -1`
 fn prim_body_id(
     scope: &mut v8::PinScope,
@@ -2693,6 +2704,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__getElementsByTagNameWithin", prim_get_elements_by_tag_name_within);
     set_fn(scope, global, "__getElementsByClassName", prim_get_elements_by_class_name);
     set_fn(scope, global, "__documentElementId", prim_document_element_id);
+    set_fn(scope, global, "__documentRootId", prim_document_root_id);
     set_fn(scope, global, "__bodyId", prim_body_id);
     set_fn(scope, global, "__headId", prim_head_id);
     set_fn(scope, global, "__rootId", prim_root_id);
@@ -6589,6 +6601,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return el;
   }
   def(globalThis, "__canonNode", canon);
+  // Look up the canonical wrapper for a node id, if one was already created (createElement / a prior
+  // lookup). Returns null if the node was never wrapped. Lets out-of-scope code resolve a node id.
+  def(globalThis, "__nodeById", function (id) { return __nodeCache[id] || null; });
 
   // Map a tag name to the most specific DOM interface prototype we have, so element wrappers
   // satisfy `el instanceof HTMLElement/Element/Node` (and SVG/MathML where appropriate). The
@@ -7880,6 +7895,29 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // implementation lives in globalThis.__createEvent (defined alongside the Event constructors).
   def(document, "createEvent", function (name) { return globalThis.__createEvent(name); });
   if (typeof document.elementFromPoint !== "function") { def(document, "elementFromPoint", function () { return null; }); }
+  // caretRangeFromPoint(x, y): a collapsed Range at the caret nearest (x, y). We don't hit-test
+  // glyph offsets, so return a Range collapsed at offset 0 inside the element at the point (the
+  // document's root element as a fallback). Enough for callers that just need a Range back.
+  if (typeof document.caretRangeFromPoint !== "function") {
+    def(document, "caretRangeFromPoint", function (x, y) {
+      var el = null;
+      try { el = document.elementFromPoint(x, y); } catch (e) {}
+      if (!el) { el = document.documentElement || document.body || null; }
+      if (!el) {
+        // Fall back to the document's first element child (handles a replaced/removed root element).
+        try {
+          var kids = __children(__documentRootId());
+          for (var i = 0; i < kids.length; i++) { if (__nodeType(kids[i]) === 1) { el = __nodeById(kids[i]); break; } }
+        } catch (e) {}
+      }
+      if (!el) { return null; }
+      var R = globalThis.Range;
+      var r = (R && R.prototype) ? Object.create(R.prototype) : {};
+      r.startContainer = el; r.endContainer = el; r.commonAncestorContainer = el;
+      r.startOffset = 0; r.endOffset = 0; r.collapsed = true;
+      return r;
+    });
+  }
   if (typeof document.hasFocus !== "function") { def(document, "hasFocus", function () { return true; }); }
   if (!("activeElement" in document)) { Object.defineProperty(document, "activeElement", { get: function () { try { return document.body; } catch (e) { return null; } }, enumerable: true, configurable: true }); }
   if (!("visibilityState" in document)) { document.visibilityState = "visible"; }
