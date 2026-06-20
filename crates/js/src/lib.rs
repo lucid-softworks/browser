@@ -7774,6 +7774,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
 
   // --- CSSStyleSheet --------------------------------------------------------------------------
+  // CSSOM origin-clean flag: a stylesheet fetched from another origin is not origin-clean, so its
+  // rules (cssRules/insertRule/deleteRule) throw SecurityError. `href` is the link's URL attribute.
+  function __computeOriginClean(href) {
+    // No href (inline <style>, constructed sheet) is same-origin; data:/about: inherit the doc origin.
+    if (!href) { return true; }
+    if (href.slice(0, 5) === "data:" || href.slice(0, 6) === "about:") { return true; }
+    try {
+      return new URL(href, document.baseURI).origin === location.origin;
+    } catch (e) {
+      // Unparseable/opaque URL (e.g. a cross-origin authority we can't resolve) → not origin-clean.
+      return false;
+    }
+  }
   function makeStyleSheetCore(structs, ownerNode) {
     var ss = {};
     var mediaHolder = { text: "" };
@@ -7801,15 +7814,23 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(ss, "href", { get: function () { return ss.__href != null ? ss.__href : null; }, enumerable: true, configurable: true });
     Object.defineProperty(ss, "title", { get: function () { return (ownerNode && ownerNode.getAttribute && ownerNode.getAttribute("title")) || null; }, enumerable: true, configurable: true });
     Object.defineProperty(ss, "media", { get: function () { return ss.__media || mediaList; }, set: function (v) { (ss.__media || mediaList).mediaText = v; }, enumerable: true, configurable: true });
-    Object.defineProperty(ss, "cssRules", { get: function () { ss.__sync(); return ruleList; }, enumerable: true, configurable: true });
-    Object.defineProperty(ss, "rules", { get: function () { ss.__sync(); return ruleList; }, enumerable: false, configurable: true });
+    // A non-origin-clean (cross-origin) sheet throws SecurityError on any rule access (CSSOM).
+    ss.__checkOriginClean = function () {
+      if (ss.__originClean === false) {
+        throw new globalThis.DOMException("Cannot access rules of a cross-origin stylesheet", "SecurityError");
+      }
+    };
+    Object.defineProperty(ss, "cssRules", { get: function () { ss.__checkOriginClean(); ss.__sync(); return ruleList; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "rules", { get: function () { ss.__checkOriginClean(); ss.__sync(); return ruleList; }, enumerable: false, configurable: true });
     ss.insertRule = function (text, index) {
       if (arguments.length < 1) { throw new TypeError("insertRule requires at least 1 argument"); }
+      ss.__checkOriginClean();
       ss.__sync();
       return ruleList.__insert(String(text), index);
     };
     ss.deleteRule = function (index) {
       if (arguments.length < 1) { throw new TypeError("deleteRule requires 1 argument"); }
+      ss.__checkOriginClean();
       return ruleList.__delete(index);
     };
     // Legacy CSSOM members.
@@ -7867,11 +7888,26 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (!initial && styleEl.tagName === "LINK") {
       try {
         var __h = styleEl.getAttribute && styleEl.getAttribute("href");
-        if (__h && typeof __fetch === "function") { initial = __fetch(__h) || ""; }
+        if (__h && __h.slice(0, 5) === "data:") {
+          // A `data:` stylesheet carries its CSS inline (decode it here; the host fetcher is HTTP).
+          var __c = __h.indexOf(",");
+          if (__c >= 0) {
+            var __meta = __h.slice(5, __c), __body = __h.slice(__c + 1);
+            initial = (__meta.indexOf(";base64") >= 0)
+              ? (typeof atob === "function" ? atob(__body) : "")
+              : decodeURIComponent(__body);
+          }
+        } else if (__h && typeof __fetch === "function") {
+          initial = __fetch(__h) || "";
+        }
       } catch (e) {}
     }
     var ss = makeStyleSheetCore(parseRuleStructs(initial), styleEl);
     ss.__lastText = initial;
+    // A <link>'s sheet is origin-clean only if fetched from the document's origin (CSSOM).
+    if (styleEl.tagName === "LINK") {
+      ss.__originClean = __computeOriginClean(styleEl.getAttribute && styleEl.getAttribute("href"));
+    }
     // The sheet's `media` reflects the owner <style>/<link> element's `media` content attribute.
     // The MediaList writes back to that attribute, so `sheet.media.appendMedium(...)` updates it.
     var mediaHolder = { get text() { var m = styleEl.getAttribute && styleEl.getAttribute("media"); return m == null ? "" : m; }, set text(v) { if (styleEl.setAttribute) { styleEl.setAttribute("media", v); } } };
