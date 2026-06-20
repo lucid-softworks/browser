@@ -10,3 +10,6 @@
 # macOS
 .DS_Store
 .claude/worktrees/
+
+# Generated WPT results report (the default homepage)
+/wpt-report.html
