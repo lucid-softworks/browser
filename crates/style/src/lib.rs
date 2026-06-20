@@ -799,6 +799,10 @@ impl ComputedStyle {
             "font-size" => px(self.font_size),
             "font-weight" => if self.bold { "700" } else { "400" }.to_string(),
             "font-style" => if self.italic { "italic" } else { "normal" }.to_string(),
+            // `direction` / `unicode-bidi` are not modeled beyond their initial values (they don't
+            // affect our layout); report the initial computed keyword so getComputedStyle reads work.
+            "direction" => "ltr".to_string(),
+            "unicode-bidi" => "normal".to_string(),
             "text-align" => match self.text_align {
                 TextAlign::Left => "left",
                 TextAlign::Center => "center",
@@ -1160,6 +1164,11 @@ impl ComputedStyle {
             "gap",
             "grid-template-columns",
             "grid-template-rows",
+            // `direction` and `unicode-bidi` are the two properties NOT reset by the `all` shorthand;
+            // getComputedStyle enumerates them (with their inherited/initial keyword) so author code
+            // iterating computed longhands sees them. Their values come from `get_property` below.
+            "direction",
+            "unicode-bidi",
         ];
         // Every name here maps to a tracked field, so all are non-empty.
         NAMES.to_vec()
@@ -1379,6 +1388,34 @@ fn cascade_locked(
     let _cascade_guard = CASCADE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dark) = os_dark {
         set_color_scheme_dark(dark);
+    }
+    // Collect `@property` registrations from all author sheets (later sheets / later rules win on
+    // duplicate names, matching the cascade-order "last registration wins" behaviour).
+    {
+        let mut reg: Vec<css::PropertyRule> = Vec::new();
+        for sheet in sheets {
+            for pr in &sheet.property_rules {
+                reg.retain(|r| r.name != pr.name);
+                reg.push(pr.clone());
+            }
+        }
+        REGISTERED_PROPERTIES.with(|c| *c.borrow_mut() = reg);
+    }
+    // Collect `@namespace` bindings from all author sheets (later declarations win on duplicate
+    // prefix / default).
+    {
+        let mut env = NamespaceEnv::default();
+        for sheet in sheets {
+            for ns in &sheet.namespace_rules {
+                if ns.prefix.is_empty() {
+                    env.default_ns = Some(ns.uri.clone());
+                } else {
+                    env.prefixes.retain(|(p, _)| p != &ns.prefix);
+                    env.prefixes.push((ns.prefix.clone(), ns.uri.clone()));
+                }
+            }
+        }
+        NAMESPACE_BINDINGS.with(|c| *c.borrow_mut() = env);
     }
     let mut out = HashMap::new();
     // Pre-pass: resolve the root's *used* color scheme (light vs dark) BEFORE the real UA sheet and
@@ -1632,6 +1669,39 @@ static ROOT_USED_SCHEME_DARK: std::sync::atomic::AtomicBool =
 /// cheap and held only for the (fast) cascade body. Poisoning is irrelevant — we only need mutual
 /// exclusion — so the guard ignores it.
 static CASCADE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// Registered custom properties (`@property`) in effect for the current cascade. Set at the
+    /// start of [`cascade_locked`] from the author sheets; read by `compute_element_style` to seed
+    /// each element's registered-property initial values into its `custom_props` environment. Only
+    /// populated for the duration of one cascade (which holds [`CASCADE_LOCK`], so this is
+    /// effectively single-threaded). Keyed by property name (`--x`).
+    static REGISTERED_PROPERTIES: std::cell::RefCell<Vec<css::PropertyRule>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// `@namespace` prefix bindings in effect for the current cascade: `(prefix -> uri)` plus an
+    /// optional default namespace (empty prefix). Set at the start of [`cascade_locked`]; read by
+    /// `compound_matches` to resolve a selector's namespace component against the element's
+    /// namespace. Empty when no `@namespace` rule is present (the common case), in which case
+    /// namespace constraints are ignored and matching behaves exactly as before.
+    static NAMESPACE_BINDINGS: std::cell::RefCell<NamespaceEnv> =
+        const { std::cell::RefCell::new(NamespaceEnv { default_ns: None, prefixes: Vec::new() }) };
+}
+
+/// The resolved `@namespace` environment for one cascade.
+#[derive(Default, Clone)]
+struct NamespaceEnv {
+    /// The default namespace URI (`@namespace url(...)` with no prefix), if any.
+    default_ns: Option<String>,
+    /// `(prefix, uri)` bindings from `@namespace prefix url(...)`.
+    prefixes: Vec<(String, String)>,
+}
+
+impl NamespaceEnv {
+    fn lookup(&self, prefix: &str) -> Option<&str> {
+        self.prefixes.iter().find(|(p, _)| p == prefix).map(|(_, u)| u.as_str())
+    }
+}
 
 /// Whether the root opted into a dark color scheme for this cascade (UA dark canvas + light text).
 pub fn root_used_scheme_dark() -> bool {
@@ -1968,13 +2038,37 @@ fn compute_element_style<'a>(
     // override with any `--name: value` declared on this element (in cascade order, so the
     // winning declaration applies last).
     let mut vars = parent_vars.clone();
+    let mut declared_here: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in &matches {
         for (prop, val) in m.decls {
             if let Some(name) = prop.strip_prefix("--") {
-                vars.insert(format!("--{name}"), val.clone());
+                let key = format!("--{name}");
+                declared_here.insert(key.clone());
+                vars.insert(key, val.clone());
             }
         }
     }
+    // Apply `@property` registrations to the custom-property environment. A registered
+    // non-inherited property that this element did NOT declare resets to its initial value
+    // (it does not inherit). Any registered property with an initial value that is still absent
+    // is seeded with that initial value (so it appears in the computed-style enumeration on every
+    // element). `*`-syntax registrations without an initial value are not seeded.
+    REGISTERED_PROPERTIES.with(|c| {
+        for pr in c.borrow().iter() {
+            if !pr.inherits && !declared_here.contains(&pr.name) {
+                if let Some(iv) = &pr.initial_value {
+                    vars.insert(pr.name.clone(), iv.clone());
+                } else {
+                    // Non-inherited, no initial value: it must not carry an inherited value.
+                    vars.remove(&pr.name);
+                }
+            } else if !vars.contains_key(&pr.name) {
+                if let Some(iv) = &pr.initial_value {
+                    vars.insert(pr.name.clone(), iv.clone());
+                }
+            }
+        }
+    });
 
     // Now apply the regular declarations, resolving any `var(...)` references against `vars`
     // and supplying the current/inherited color for `currentColor`/`inherit`.
@@ -5295,11 +5389,28 @@ impl NthArg {
     }
 }
 
+/// The namespace component of a type/universal selector (`svg|`, `*|`, `|`, or none).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum NsConstraint {
+    /// No namespace prefix written. With a declared default `@namespace`, the type is constrained to
+    /// it; otherwise (no default) it matches any namespace.
+    #[default]
+    Unspecified,
+    /// `*|` — explicitly any namespace.
+    Any,
+    /// `|` — explicitly the null namespace (no namespace).
+    None,
+    /// `prefix|` — the namespace bound to `prefix` by an `@namespace` rule.
+    Prefixed(String),
+}
+
 /// A compound selector: an optional type plus any number of class/id/attr/pseudo simples.
 #[derive(Debug, Clone, Default)]
 struct Compound {
     /// Leading type, lowercased. `None` = universal (`*`) or no explicit type.
     type_part: Option<String>,
+    /// The namespace component of the (possibly implied universal) type selector.
+    type_ns: NsConstraint,
     classes: Vec<String>,
     ids: Vec<String>,
     attrs: Vec<AttrSel>,
@@ -5551,8 +5662,59 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)>
     // must be the LAST token in the compound, so once seen, nothing else may follow.
     let mut pseudo_element: Option<PseudoElement> = None;
 
-    // Optional leading type / universal.
-    if i < n && chars[i] != '.' && chars[i] != '#' && chars[i] != '[' && chars[i] != ':' && chars[i] != '*' {
+    // Optional leading namespace prefix + type / universal. A `|` may appear after an ident, a `*`,
+    // or at the very start (`|tag` = null namespace). Recognize: `prefix|tag`, `prefix|*`, `*|tag`,
+    // `*|*`, `|tag`, `|*`, plain `tag`, plain `*`.
+    // First, read an optional prefix token (`ident`, `*`, or empty) that is immediately followed by
+    // a `|` (but not `||`, the column combinator).
+    let has_ns_pipe = {
+        // Scan a tentative prefix: empty, `*`, or an ident, then require a single `|` not followed
+        // by another `|`.
+        let mut k = i;
+        if k < n && chars[k] == '*' {
+            k += 1;
+        } else {
+            while k < n && (chars[k].is_alphanumeric() || chars[k] == '-' || chars[k] == '_') {
+                k += 1;
+            }
+        }
+        k < n && chars[k] == '|' && !(k + 1 < n && chars[k + 1] == '|')
+    };
+    if has_ns_pipe {
+        let pstart = i;
+        if i < n && chars[i] == '*' {
+            i += 1;
+            compound.type_ns = NsConstraint::Any;
+        } else {
+            while i < n && (chars[i].is_alphanumeric() || chars[i] == '-' || chars[i] == '_') {
+                i += 1;
+            }
+            let prefix: String = chars[pstart..i].iter().collect();
+            compound.type_ns = if prefix.is_empty() {
+                NsConstraint::None
+            } else {
+                NsConstraint::Prefixed(prefix)
+            };
+        }
+        i += 1; // consume the `|`
+        // Now read the type / universal that follows the namespace prefix.
+        if i < n && chars[i] == '*' {
+            i += 1; // universal within this namespace
+        } else if i < n && !matches!(chars[i], '.' | '#' | '[' | ':') {
+            let start = i;
+            while i < n && !matches!(chars[i], '.' | '#' | '[' | ':' | '*') {
+                i += 1;
+            }
+            let t: String = chars[start..i].iter().collect();
+            if !is_ident(&t) {
+                return None;
+            }
+            compound.type_part = Some(t.to_lowercase());
+            spec.c += 1;
+        } else {
+            return None; // `ns|` with no type/universal is invalid
+        }
+    } else if i < n && chars[i] != '.' && chars[i] != '#' && chars[i] != '[' && chars[i] != ':' && chars[i] != '*' {
         let start = i;
         while i < n && !matches!(chars[i], '.' | '#' | '[' | ':' | '*') {
             i += 1;
@@ -6294,6 +6456,12 @@ fn compound_matches(doc: &dom::Document, id: dom::NodeId, c: &Compound) -> bool 
             return false;
         }
     }
+    // Namespace constraint on the (possibly implied universal) type selector. Only enforced when an
+    // `@namespace` rule is in scope; otherwise every constraint matches (so non-namespaced pages are
+    // unaffected). `el.namespace == None` means the HTML namespace.
+    if !namespace_matches(&c.type_ns, el.namespace.as_deref()) {
+        return false;
+    }
     for want in &c.ids {
         match el.id() {
             Some(eid) if eid == want => {}
@@ -6316,6 +6484,51 @@ fn compound_matches(doc: &dom::Document, id: dom::NodeId, c: &Compound) -> bool 
         }
     }
     true
+}
+
+/// The XHTML namespace URI. An element with `namespace == None` (a normal HTML element) is treated
+/// as being in this namespace for `@namespace` matching.
+const XHTML_NS: &str = "http://www.w3.org/1999/xhtml";
+
+/// Does a selector's namespace constraint match an element's namespace? `el_ns` is the element's
+/// namespace URI (`None` = HTML, treated as the XHTML namespace). Only enforced when an
+/// `@namespace` environment is in scope; with no `@namespace` rules every constraint passes, so
+/// ordinary (non-namespaced) pages match exactly as they did before this feature.
+fn namespace_matches(constraint: &NsConstraint, el_ns: Option<&str>) -> bool {
+    // The common case: no namespace component on the selector and no `@namespace` rule in scope.
+    // Resolve without touching the bindings (and never constrain) so non-namespaced pages are fast
+    // and unaffected.
+    if *constraint == NsConstraint::Unspecified {
+        return NAMESPACE_BINDINGS.with(|c| {
+            let env = c.borrow();
+            match &env.default_ns {
+                // With a declared default namespace, an unspecified type is constrained to it.
+                Some(def) => el_ns.unwrap_or(XHTML_NS) == def,
+                None => true, // no default → matches any namespace
+            }
+        });
+    }
+    NAMESPACE_BINDINGS.with(|c| {
+        let env = c.borrow();
+        // The element's effective namespace URI (HTML elements default to XHTML).
+        let el_uri = el_ns.unwrap_or(XHTML_NS);
+        match constraint {
+            NsConstraint::Any => true,
+            // `|tag` = the null namespace: matches only elements explicitly in no namespace.
+            NsConstraint::None => el_uri.is_empty(),
+            NsConstraint::Unspecified => match &env.default_ns {
+                // With a default namespace, an unspecified type is constrained to it.
+                Some(def) => el_uri == def,
+                // No default namespace → matches any namespace.
+                None => true,
+            },
+            NsConstraint::Prefixed(prefix) => match env.lookup(prefix) {
+                Some(uri) => el_uri == uri,
+                // Unknown prefix → matches nothing (invalid selector, treated as non-matching).
+                None => false,
+            },
+        }
+    })
 }
 
 /// Match one attribute selector against an element. Attribute *names* are matched
@@ -6766,6 +6979,42 @@ mod tests {
         let doc = dom::Document::new();
         let map = cascade(&doc, &[]);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn namespace_type_selector_matches_only_svg() {
+        // With a default (xhtml) @namespace and a `svg` prefix, `svg|*` matches the SVG element but
+        // not the HTML one; an unprefixed selector is constrained to the default (xhtml) namespace.
+        let doc = html::parse("<html><body><div class=x></div><svg class=x></svg></body></html>");
+        let sheet = css::parse(
+            "@namespace url(http://www.w3.org/1999/xhtml); \
+             @namespace svg url(http://www.w3.org/2000/svg); \
+             svg|*.x { color: rgb(1, 2, 3); } \
+             .x { background-color: rgb(4, 5, 6); }",
+        );
+        let map = cascade(&doc, std::slice::from_ref(&sheet));
+        let svg = elem(&doc, |e| e.tag == "svg");
+        let div = elem(&doc, |e| e.tag == "div");
+        // svg|*.x matched the SVG element (color set), not the HTML div.
+        assert_eq!(map[&svg].color, (1, 2, 3));
+        assert_ne!(map[&div].color, (1, 2, 3));
+        // The unprefixed `.x` is constrained to the default xhtml namespace -> matches the HTML div,
+        // not the SVG element.
+        assert_eq!(map[&div].background_color, Some((4, 5, 6)));
+        assert_eq!(map[&svg].background_color, None);
+    }
+
+    #[test]
+    fn registered_property_seeds_initial_value() {
+        let doc = html::parse("<html><body><div id=t></div></body></html>");
+        let sheet = css::parse(
+            "@property --reg { syntax: \"<length>\"; inherits: false; initial-value: 7px; }",
+        );
+        let map = cascade(&doc, std::slice::from_ref(&sheet));
+        let div = elem(&doc, |e| e.attrs.get("id").map(|s| s == "t").unwrap_or(false));
+        // The registered property's initial value is present in the element's custom-prop env even
+        // though it was never explicitly set.
+        assert_eq!(map[&div].custom_props.get("--reg").map(String::as_str), Some("7px"));
     }
 
     #[test]

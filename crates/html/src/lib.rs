@@ -24,6 +24,11 @@
 
 use dom::{Document, ElementData, NodeData, NodeId};
 
+/// The SVG namespace URI (foreign content entered via an `<svg>` start tag).
+const SVG_NS: &str = "http://www.w3.org/2000/svg";
+/// The MathML namespace URI (foreign content entered via a `<math>` start tag).
+const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
+
 /// Elements that never have children and need no end tag.
 const VOID_ELEMENTS: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
@@ -207,7 +212,7 @@ impl<'a> Parser<'a> {
         let root = self.doc.root();
         let html = self.doc.append_child(
             root,
-            NodeData::Element(ElementData { tag: "html".into(), attrs: Default::default() }),
+            NodeData::Element(ElementData { tag: "html".into(), attrs: Default::default(), namespace: None }),
         );
         self.html = Some(html);
         self.open.push(html);
@@ -225,7 +230,7 @@ impl<'a> Parser<'a> {
         let html = self.ensure_html();
         let head = self.doc.append_child(
             html,
-            NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default() }),
+            NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default(), namespace: None }),
         );
         self.head = Some(head);
         self.open.push(head);
@@ -253,14 +258,14 @@ impl<'a> Parser<'a> {
         if self.head.is_none() {
             let head = self.doc.append_child(
                 html,
-                NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default() }),
+                NodeData::Element(ElementData { tag: "head".into(), attrs: Default::default(), namespace: None }),
             );
             self.head = Some(head);
         }
         self.pop_head();
         let body = self.doc.append_child(
             html,
-            NodeData::Element(ElementData { tag: "body".into(), attrs: Default::default() }),
+            NodeData::Element(ElementData { tag: "body".into(), attrs: Default::default(), namespace: None }),
         );
         self.body = Some(body);
         self.open.push(body);
@@ -628,9 +633,26 @@ impl<'a> Parser<'a> {
         }
 
         let parent = self.current_parent();
+        // Foreign content: an `<svg>` (or `<math>`) start tag enters the SVG (or MathML) namespace,
+        // and descendants inherit it until the foreign root closes. We don't implement the full
+        // foreign-content algorithm, but tracking the namespace this way is enough for namespaced
+        // selector matching (`@namespace svg url(...)` + `svg|rect`).
+        let namespace = {
+            let parent_ns = match &self.doc.get(parent).data {
+                NodeData::Element(e) => e.namespace.clone(),
+                _ => None,
+            };
+            if tag.eq_ignore_ascii_case("svg") {
+                Some(SVG_NS.to_string())
+            } else if tag.eq_ignore_ascii_case("math") {
+                Some(MATHML_NS.to_string())
+            } else {
+                parent_ns
+            }
+        };
         let node = self.doc.append_child(
             parent,
-            NodeData::Element(ElementData { tag: tag.clone(), attrs }),
+            NodeData::Element(ElementData { tag: tag.clone(), attrs, namespace }),
         );
 
         if is_void(&tag) || self_closing {

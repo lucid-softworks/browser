@@ -898,7 +898,7 @@ fn prim_create_element(
     let tag = arg_str(scope, &args, 0);
     let state = host_state(scope);
     let id = state.doc.borrow_mut().alloc(
-        dom::NodeData::Element(dom::ElementData { tag, attrs: Default::default() }),
+        dom::NodeData::Element(dom::ElementData { tag, attrs: Default::default(), namespace: None }),
         None,
     );
     rv.set_double(id.0 as f64);
@@ -1547,6 +1547,17 @@ fn prim_computed_style_prop(
     rv.set(s);
 }
 
+/// The computed-style property names for one element: the standard tracked longhands plus this
+/// element's resolved custom properties (`--name`), which `getComputedStyle(el)` enumerates per
+/// CSSOM. Custom props are appended (sorted) after the standard names so iteration order is stable.
+fn computed_names_with_custom(cs: &style::ComputedStyle) -> Vec<String> {
+    let mut names: Vec<String> = cs.property_names().iter().map(|s| s.to_string()).collect();
+    let mut custom: Vec<String> = cs.custom_props.keys().cloned().collect();
+    custom.sort();
+    names.extend(custom);
+    names
+}
+
 /// `__computedStyleNames(id) -> [name...]` — the property names with non-empty computed values for
 /// node `id` (backs `length`/`item(i)`/index access/iteration). Empty array for non-elements.
 fn prim_computed_style_names(
@@ -1560,12 +1571,10 @@ fn prim_computed_style_names(
     let names: Vec<String> = match (node, &pseudo) {
         (None, _) | (_, style::GcsPseudo::Invalid) => Vec::new(),
         (Some(n), style::GcsPseudo::Pseudo(key)) => with_pseudo_style(&state, n, key, |cs| {
-            cs.map(|cs| cs.property_names().iter().map(|s| s.to_string()).collect())
-                .unwrap_or_default()
+            cs.map(computed_names_with_custom).unwrap_or_default()
         }),
         (Some(n), style::GcsPseudo::Element) => with_computed_style(&state, n, |cs| {
-            cs.map(|cs| cs.property_names().iter().map(|s| s.to_string()).collect())
-                .unwrap_or_default()
+            cs.map(computed_names_with_custom).unwrap_or_default()
         }),
     };
     let arr = js_str_array(scope, &names);
@@ -5158,7 +5167,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "overflow-x", "overflow-y", "z-index", "cursor", "box-sizing",
     "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
     "align-items", "align-content", "align-self", "justify-items", "justify-content", "justify-self",
-    "row-gap", "column-gap", "outline-width", "outline-style", "outline-color"
+    "row-gap", "column-gap", "outline-width", "outline-style", "outline-color",
+    // Reset by `all` too (every property except direction / unicode-bidi / custom props).
+    "border-collapse", "border-spacing", "order", "grid-template-columns", "grid-template-rows"
   ];
   // A custom property is `--*`; case-sensitive, value kept raw (whitespace-trimmed).
   function isCustomProp(name) { return name.length >= 2 && name[0] === "-" && name[1] === "-"; }
@@ -5258,10 +5269,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "border-image-outset": "0", "border-image-repeat": "stretch"
   };
   // overflow / overscroll-behavior / gap: 1-2 value shorthand of x/y (or row/column).
+  // The flow-relative box shorthands (`margin-inline` etc.) are 2-value start/end shorthands too.
   var XY_SHORTHANDS = {
     "overflow": ["overflow-x", "overflow-y"],
     "overscroll-behavior": ["overscroll-behavior-x", "overscroll-behavior-y"],
-    "gap": ["row-gap", "column-gap"]
+    "gap": ["row-gap", "column-gap"],
+    "margin-inline": ["margin-inline-start", "margin-inline-end"],
+    "margin-block": ["margin-block-start", "margin-block-end"],
+    "padding-inline": ["padding-inline-start", "padding-inline-end"],
+    "padding-block": ["padding-block-start", "padding-block-end"],
+    "inset-inline": ["inset-inline-start", "inset-inline-end"],
+    "inset-block": ["inset-block-start", "inset-block-end"]
   };
   // list-style: type/position/image.
   function parseListStyle(v) {
@@ -5301,8 +5319,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   // Shorthands we don't value-serialize but whose longhand set we know, so the CSS-wide-keyword
   // case (e.g. reading `font` after `all: revert`) can be serialized. Used by getVal only.
+  // The `font` longhands listed here use the *granular* font-variant longhands (the actual stored
+  // properties), not the `font-variant` sub-shorthand, so that after `all: <css-wide-keyword>` — which
+  // expands to those granular longhands — `getPropertyValue("font")` can detect that every font
+  // longhand carries the same CSS-wide keyword and return it.
   var KEYWORD_ONLY_SHORTHANDS = {
-    "font": ["font-style", "font-variant", "font-weight", "font-stretch", "font-size", "line-height", "font-family"],
+    "font": ["font-style", "font-variant-ligatures", "font-variant-caps", "font-variant-alternates",
+      "font-variant-numeric", "font-variant-east-asian", "font-variant-position", "font-variant-emoji",
+      "font-weight", "font-stretch", "font-size", "line-height", "font-family"],
     "background": ["background-image", "background-position-x", "background-position-y", "background-size", "background-repeat", "background-origin", "background-clip", "background-attachment", "background-color"]
   };
   // font-variant shorthand longhands, in canonical serialization order.
@@ -5627,21 +5651,26 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var out = [];
     text = String(text || "");
     var parts = splitTopLevelSemis(text);
-    for (var i = 0; i < parts.length; i++) {
-      var seg = parts[i];
-      var c = indexOfTopLevelColon(seg);
-      if (c < 0) { continue; }
-      var rawName = seg.slice(0, c).trim();
-      // Custom property names are case-sensitive; decode CSS escapes (`--a\;b` -> `--a;b`). Standard
-      // property names are ASCII-lowercased.
-      var name;
-      if (isCustomProp(rawName)) { name = unescapeCssIdent(rawName); }
-      else { name = unescapeCssIdent(rawName).toLowerCase(); }
-      if (!name) continue;
-      var rawVal = seg.slice(c + 1).trim();
-      var imp = splitImportant(rawVal);
-      pushDecl(out, name, imp[0], imp[1]);
-    }
+    // Parsing a whole block: importance, not source order, decides ties between same-property decls.
+    var prev = __blockImportanceCascade;
+    __blockImportanceCascade = true;
+    try {
+      for (var i = 0; i < parts.length; i++) {
+        var seg = parts[i];
+        var c = indexOfTopLevelColon(seg);
+        if (c < 0) { continue; }
+        var rawName = seg.slice(0, c).trim();
+        // Custom property names are case-sensitive; decode CSS escapes (`--a\;b` -> `--a;b`). Standard
+        // property names are ASCII-lowercased.
+        var name;
+        if (isCustomProp(rawName)) { name = unescapeCssIdent(rawName); }
+        else { name = unescapeCssIdent(rawName).toLowerCase(); }
+        if (!name) continue;
+        var rawVal = seg.slice(c + 1).trim();
+        var imp = splitImportant(rawVal);
+        pushDecl(out, name, imp[0], imp[1]);
+      }
+    } finally { __blockImportanceCascade = prev; }
     return out;
   }
   // Index of the first top-level `:` (not inside parens/strings, not backslash-escaped). Used to
@@ -5884,14 +5913,25 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     setDecl(out, name, nv, important);
   }
   function findDecl(out, name) { for (var i = 0; i < out.length; i++) { if (out[i][0] === name) return i; } return -1; }
+  // When true (set only while parsing a whole declaration block, e.g. the `cssText` setter), a later
+  // NON-important declaration must not override an earlier `!important` one of the same property —
+  // the cascade within a declaration block resolves on importance, not source order. The CSSOM
+  // `setProperty` path leaves this false so an explicit set always replaces.
+  var __blockImportanceCascade = false;
   function setDecl(out, name, val, important) {
     important = !!important;
     var i = findDecl(out, name);
     if (val == null || val === "") { if (i >= 0) out.splice(i, 1); return; }
     if (i >= 0) {
-      // Re-declaring with a different importance moves the declaration to the end (so an important
-      // override of a shorthand's longhand serializes after the non-important remainder).
-      if (out[i][2] !== important) { out.splice(i, 1); out.push([name, val, important]); }
+      if (__blockImportanceCascade && out[i][2] && !important) { return; }
+      // When parsing a whole declaration block, a re-declared property keeps the LATER source
+      // position (the cascade keeps the last occurrence, in its place) — so move it to the end. We
+      // limit this to box-edge longhands (the logical property groups), whose relative ordering is
+      // what the logical-group shorthand-serialization adjacency rule depends on; other properties
+      // update in place to avoid disturbing the serialization of unexpanded shorthands.
+      // Outside block parsing (a single `setProperty`), a different importance also moves it to the
+      // end so an important override serializes after the non-important remainder.
+      if ((__blockImportanceCascade && LOGICAL_GROUP[name]) || out[i][2] !== important) { out.splice(i, 1); out.push([name, val, important]); }
       else { out[i][1] = val; out[i][2] = important; }
     } else out.push([name, val, important]);
   }
@@ -5901,9 +5941,24 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "border", "border-width", "border-style", "border-color",
     "border-top", "border-right", "border-bottom", "border-left", "border-image",
     "margin", "padding", "inset", "border-radius",
+    "margin-inline", "margin-block", "padding-inline", "padding-block", "inset-inline", "inset-block",
     "overflow", "overscroll-behavior", "gap", "outline", "list-style", "text-decoration",
     "flex", "flex-flow", "place-content", "place-items", "place-self", "columns", "font-variant"
   ];
+  // Logical property groups for box edges: physical + flow-relative longhands share a group, and
+  // mixing them prevents shorthand serialization unless the interleaving longhands belong to the
+  // shorthand being formed (CSSOM "serialize a CSS declaration block" — logical-group adjacency).
+  // Maps a longhand property name to its group id; properties not present here have no group.
+  var LOGICAL_GROUP = (function () {
+    var g = Object.create(null);
+    ["margin-top","margin-right","margin-bottom","margin-left",
+     "margin-block-start","margin-block-end","margin-inline-start","margin-inline-end"].forEach(function (p) { g[p] = "margin"; });
+    ["padding-top","padding-right","padding-bottom","padding-left",
+     "padding-block-start","padding-block-end","padding-inline-start","padding-inline-end"].forEach(function (p) { g[p] = "padding"; });
+    ["top","right","bottom","left",
+     "inset-block-start","inset-block-end","inset-inline-start","inset-inline-end"].forEach(function (p) { g[p] = "inset"; });
+    return g;
+  })();
   // Serialize expanded longhand triples WITHOUT shorthand grouping — the engine-readable form
   // stored in the `style` attribute (the Rust cascade understands longhands, not every shorthand).
   function serializeStyleDeclsFlat(decls) {
@@ -5918,7 +5973,29 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // longhands into shorthands where possible (CSSOM §serialize-a-css-declaration-block).
   function serializeStyleDecls(decls) {
     var byName = Object.create(null);
-    for (var i = 0; i < decls.length; i++) { byName[decls[i][0]] = { v: decls[i][1], imp: decls[i][2] }; }
+    var indexOfName = Object.create(null);
+    for (var i = 0; i < decls.length; i++) { byName[decls[i][0]] = { v: decls[i][1], imp: decls[i][2] }; indexOfName[decls[i][0]] = i; }
+    // The logical-group adjacency test (CSSOM): a shorthand whose longhands span declaration indices
+    // [lo, hi] may only serialize if every OTHER declaration of a property in the same logical group
+    // that falls within (lo, hi) is itself one of the shorthand's longhands. Returns true if `lhs`
+    // (the shorthand's longhands) is serializable under this rule for group `group`.
+    function logicalGroupContiguous(lhs, group) {
+      if (!group) { return true; }
+      var lo = Infinity, hi = -Infinity, set = Object.create(null);
+      for (var a = 0; a < lhs.length; a++) {
+        set[lhs[a]] = 1;
+        var idx = indexOfName[lhs[a]];
+        if (idx === undefined) { continue; }
+        if (idx < lo) { lo = idx; }
+        if (idx > hi) { hi = idx; }
+      }
+      if (lo === Infinity) { return true; }
+      for (var d2 = lo; d2 <= hi; d2++) {
+        var nm = decls[d2][0];
+        if (LOGICAL_GROUP[nm] === group && !set[nm]) { return false; }
+      }
+      return true;
+    }
     var serialized = Object.create(null);
     var pieces = [];
     function emit(prop, value, important) { pieces.push(prop + ": " + value + (important ? " !important" : "") + ";"); }
@@ -5952,6 +6029,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           if (!rec || serialized[lhs[k]] || rec.imp !== imp) { ok = false; break; }
         }
         if (!ok) continue;
+        // Logical-group adjacency: don't form this shorthand if a different-mapping-logic property of
+        // the same logical group is declared between its longhands.
+        if (!logicalGroupContiguous(lhs, LOGICAL_GROUP[name])) { continue; }
         var ser = serializeShorthand(sh, function (n) { var r = byName[n]; return r ? r.v : ""; });
         if (ser === "") continue;
         emit(sh, ser, imp);
@@ -7099,6 +7179,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var rule = newRule("CSSFontFaceRule", 5, sheet, parentRule);
     var decls = struct.decls || (struct.decls = parseDeclList(struct.body));
     var styleObj = makeRuleStyle(decls, function () { struct.body = serializeDeclList(decls); markDirty(sheet); });
+    // The descriptor block of a `@font-face` rule is a `CSSFontFaceDescriptors`, not a plain
+    // CSSStyleDeclaration, so `rule.style.toString()` reports `[object CSSFontFaceDescriptors]`.
+    try {
+      Object.defineProperty(styleObj, Symbol.toStringTag,
+        { value: "CSSFontFaceDescriptors", writable: false, enumerable: false, configurable: true });
+    } catch (e) {}
     defOn(rule, "style", { get: function () { return styleObj; }, enumerable: true });
     defOn(rule, "cssText", { get: function () {
       var body = serializeDeclList(decls);
@@ -9149,6 +9235,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (parentCtor && parentCtor.prototype) {
       try { Object.setPrototypeOf(ctor.prototype, parentCtor.prototype); } catch (e) {}
     }
+    // Per WebIDL, an interface prototype object carries `@@toStringTag` = the interface name, so
+    // `Object.prototype.toString.call(instance)` reports `[object <Interface>]`. Defined here on the
+    // own prototype (configurable, non-enumerable) so e.g. a `CSSFontFaceRule` stringifies correctly.
+    try {
+      Object.defineProperty(ctor.prototype, Symbol.toStringTag,
+        { value: name, writable: false, enumerable: false, configurable: true });
+    } catch (e) {}
     def(globalThis, name, ctor);
     return ctor;
   }

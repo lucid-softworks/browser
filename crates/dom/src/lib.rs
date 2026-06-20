@@ -47,10 +47,15 @@ pub struct ProcessingInstructionData {
     pub data: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ElementData {
     pub tag: String,
     pub attrs: AttrMap,
+    /// The element's namespace URI. `None` = the HTML namespace (the common case; kept `None` so
+    /// existing code and constructors need no change). `Some(uri)` for foreign content (SVG / MathML
+    /// elements, or elements created via `createElementNS`), used by namespaced selector matching
+    /// (`@namespace` + `ns|tag` / `*|tag` / `|tag`).
+    pub namespace: Option<String>,
 }
 
 impl ElementData {
@@ -142,7 +147,7 @@ impl Document {
     pub fn append_element(&mut self, parent: NodeId, tag: &str) -> NodeId {
         self.append_child(
             parent,
-            NodeData::Element(ElementData { tag: tag.to_string(), attrs: Default::default() }),
+            NodeData::Element(ElementData { tag: tag.to_string(), attrs: Default::default(), namespace: None }),
         )
     }
 }

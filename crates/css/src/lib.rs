@@ -6,10 +6,39 @@
 //! gracefully (including any balanced `{ … }` block) without emitting bogus rules, and
 //! malformed input never panics.
 
-/// A parsed CSS stylesheet: an ordered list of rules.
+/// A parsed CSS stylesheet: an ordered list of rules, plus the structured at-rules the cascade
+/// needs (registered custom properties from `@property`, and namespace prefix bindings from
+/// `@namespace`).
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     pub rules: Vec<Rule>,
+    /// `@property --name { … }` registrations, in source order.
+    pub property_rules: Vec<PropertyRule>,
+    /// `@namespace [prefix] url(...)` bindings, in source order. An empty `prefix` is the default
+    /// namespace.
+    pub namespace_rules: Vec<NamespaceRule>,
+}
+
+/// A registered custom property from an `@property` rule.
+#[derive(Debug, Clone, Default)]
+pub struct PropertyRule {
+    /// The property name including the leading `--`.
+    pub name: String,
+    /// The declared `syntax` string with surrounding quotes stripped (e.g. `<length>`, `*`).
+    pub syntax: String,
+    /// The `inherits` flag (defaults to false if absent / unparseable).
+    pub inherits: bool,
+    /// The `initial-value`, if declared. `None` when omitted (only valid for the `*` syntax).
+    pub initial_value: Option<String>,
+}
+
+/// An `@namespace [prefix] <url>` binding.
+#[derive(Debug, Clone, Default)]
+pub struct NamespaceRule {
+    /// The prefix (empty string = default namespace).
+    pub prefix: String,
+    /// The namespace URI.
+    pub uri: String,
 }
 
 /// A single rule: a group of selectors and the declarations they apply.
@@ -56,7 +85,124 @@ fn parse_inner(css: &str, base_url: Option<&str>) -> Stylesheet {
             rule.base_url = Some(base.to_string());
         }
     }
-    Stylesheet { rules }
+    let (property_rules, namespace_rules) = extract_top_level_at_rules(&bytes);
+    Stylesheet { rules, property_rules, namespace_rules }
+}
+
+/// Scan the (comment-stripped) source for the `@property` and `@namespace` at-rules the cascade
+/// needs. These are top-level (not nested in `@media`/etc.) in practice; a flat scan is sufficient
+/// for the CSSOM tests. Returns `(property_rules, namespace_rules)` in source order.
+fn extract_top_level_at_rules(bytes: &[char]) -> (Vec<PropertyRule>, Vec<NamespaceRule>) {
+    let end = bytes.len();
+    let mut props = Vec::new();
+    let mut namespaces = Vec::new();
+    let mut pos = 0usize;
+    while pos < end {
+        match bytes[pos] {
+            '@' => {
+                let name_start = pos + 1;
+                let mut i = name_start;
+                while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == '-' || bytes[i] == '_') {
+                    i += 1;
+                }
+                let name: String = bytes[name_start..i].iter().collect();
+                let name = name.to_ascii_lowercase();
+                let prelude_end = scan_to_block_or_semi(bytes, i, end);
+                if prelude_end >= end {
+                    break;
+                }
+                if name == "namespace" && bytes[prelude_end] == ';' {
+                    let prelude: String = bytes[i..prelude_end].iter().collect();
+                    if let Some(ns) = parse_namespace_prelude(prelude.trim()) {
+                        namespaces.push(ns);
+                    }
+                    pos = prelude_end + 1;
+                    continue;
+                }
+                if bytes[prelude_end] == ';' {
+                    pos = prelude_end + 1;
+                    continue;
+                }
+                // Block at-rule.
+                let body_start = prelude_end + 1;
+                let body_end = scan_balanced_block_end(bytes, body_start, end);
+                if name == "property" {
+                    let prelude: String = bytes[i..prelude_end].iter().collect();
+                    let pname = prelude.trim().to_string();
+                    if pname.starts_with("--") {
+                        let body: String = bytes[body_start..body_end].iter().collect();
+                        props.push(parse_property_body(&pname, &body));
+                    }
+                }
+                pos = if body_end < end { body_end + 1 } else { body_end };
+            }
+            '"' => pos = skip_string(bytes, pos, end, '"'),
+            '\'' => pos = skip_string(bytes, pos, end, '\''),
+            '{' => pos = scan_balanced_block_end(bytes, pos + 1, end).saturating_add(1),
+            _ => pos += 1,
+        }
+    }
+    (props, namespaces)
+}
+
+/// Parse a `@namespace` prelude: an optional prefix followed by a `url(...)` or string URI.
+fn parse_namespace_prelude(prelude: &str) -> Option<NamespaceRule> {
+    let p = prelude.trim();
+    // Split into an optional prefix token and the URI part.
+    let (prefix, uri_part) = match p.find(|c: char| c.is_whitespace()) {
+        Some(idx) => {
+            let first = p[..idx].trim();
+            let rest = p[idx..].trim();
+            // If the first token looks like a url()/string, there's no prefix.
+            if first.starts_with("url(") || first.starts_with('"') || first.starts_with('\'') {
+                ("", p)
+            } else {
+                (first, rest)
+            }
+        }
+        None => ("", p),
+    };
+    let uri = strip_url_or_string(uri_part)?;
+    Some(NamespaceRule { prefix: prefix.to_string(), uri })
+}
+
+/// Strip a `url(...)` wrapper or string quotes to get the raw URI.
+fn strip_url_or_string(s: &str) -> Option<String> {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix("url(").and_then(|r| r.strip_suffix(')')) {
+        let inner = inner.trim();
+        let inner = inner.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+            .or_else(|| inner.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+            .unwrap_or(inner);
+        return Some(inner.trim().to_string());
+    }
+    if let Some(inner) = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        return Some(inner.to_string());
+    }
+    if let Some(inner) = s.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return Some(inner.to_string());
+    }
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
+/// Parse the descriptor body of an `@property --x { … }` rule.
+fn parse_property_body(name: &str, body: &str) -> PropertyRule {
+    let mut rule = PropertyRule { name: name.to_string(), ..Default::default() };
+    for (k, v) in parse_declarations(body) {
+        match k.as_str() {
+            "syntax" => {
+                let v = v.trim();
+                let v = v.strip_prefix('"').and_then(|r| r.strip_suffix('"'))
+                    .or_else(|| v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+                    .unwrap_or(v);
+                rule.syntax = v.trim().to_string();
+            }
+            "inherits" => rule.inherits = v.trim().eq_ignore_ascii_case("true"),
+            "initial-value" => rule.initial_value = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+    rule
 }
 
 /// Combine an existing at-rule context (`media` or `container`) with a newly entered query,
@@ -785,6 +931,42 @@ mod tests {
     fn empty_parse_has_no_rules() {
         let sheet = parse("");
         assert_eq!(sheet.rules.len(), 0);
+    }
+
+    #[test]
+    fn extracts_property_rules() {
+        let sheet = parse(
+            "@property --x { syntax: \"<length>\"; inherits: true; initial-value: 0px; } \
+             @property --y { syntax: '*'; inherits: false; } \
+             div { color: red }",
+        );
+        assert_eq!(sheet.property_rules.len(), 2);
+        let x = &sheet.property_rules[0];
+        assert_eq!(x.name, "--x");
+        assert_eq!(x.syntax, "<length>");
+        assert!(x.inherits);
+        assert_eq!(x.initial_value.as_deref(), Some("0px"));
+        let y = &sheet.property_rules[1];
+        assert_eq!(y.name, "--y");
+        assert_eq!(y.syntax, "*");
+        assert!(!y.inherits);
+        assert_eq!(y.initial_value, None);
+        // The non-at-rule still parses.
+        assert_eq!(sheet.rules.len(), 1);
+    }
+
+    #[test]
+    fn extracts_namespace_rules() {
+        let sheet = parse(
+            "@namespace url(http://www.w3.org/1999/xhtml); \
+             @namespace svg url(http://www.w3.org/2000/svg); \
+             svg|rect { fill: red }",
+        );
+        assert_eq!(sheet.namespace_rules.len(), 2);
+        assert_eq!(sheet.namespace_rules[0].prefix, "");
+        assert_eq!(sheet.namespace_rules[0].uri, "http://www.w3.org/1999/xhtml");
+        assert_eq!(sheet.namespace_rules[1].prefix, "svg");
+        assert_eq!(sheet.namespace_rules[1].uri, "http://www.w3.org/2000/svg");
     }
 
     #[test]
