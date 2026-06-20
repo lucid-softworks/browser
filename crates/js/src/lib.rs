@@ -3106,43 +3106,142 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   })();
 
   // --- event model (no-op but present) + a simple listener registry ------------------------
+  // Normalize an addEventListener/removeEventListener `options` arg to a capture boolean (the 3rd
+  // arg may be a boolean or an options dict `{capture}`); per spec, "capture" identity is what
+  // distinguishes two registrations of the same callback for the same type.
+  function __captureFlag(options) {
+    if (options && typeof options === "object") { return !!options.capture; }
+    return !!options;
+  }
   function installEvents(target) {
     if (!target || typeof target !== "object") { return; }
     if (target.__listeners) { return; } // already installed
-    var registry = Object.create(null);
+    var registry = Object.create(null); // type -> [ {cb, capture, once} ]
     def(target, "__listeners", registry);
     def(target, "addEventListener", function (type, cb, options) {
       if (typeof cb !== "function") { return; }
       type = String(type);
-      (registry[type] || (registry[type] = [])).push(cb);
+      var capture = __captureFlag(options);
+      var once = !!(options && typeof options === "object" && options.once);
+      var list = registry[type] || (registry[type] = []);
+      // Duplicate (same callback + same capture) registrations are ignored.
+      for (var i = 0; i < list.length; i++) { if (list[i].cb === cb && list[i].capture === capture) { return; } }
+      var entry = { cb: cb, capture: capture, once: once };
+      list.push(entry);
       // `{ signal }` option: auto-remove this listener when the AbortSignal aborts.
       var sig = options && typeof options === "object" ? options.signal : null;
       if (sig && typeof sig.addEventListener === "function") {
-        if (sig.aborted) { var l0 = registry[type]; var j0 = l0 ? l0.indexOf(cb) : -1; if (j0 >= 0) { l0.splice(j0, 1); } return; }
+        if (sig.aborted) { var j0 = list.indexOf(entry); if (j0 >= 0) { list.splice(j0, 1); } return; }
         sig.addEventListener("abort", function () {
           var l = registry[type]; if (!l) { return; }
-          var j = l.indexOf(cb); if (j >= 0) { l.splice(j, 1); }
+          var j = l.indexOf(entry); if (j >= 0) { l.splice(j, 1); }
         });
       }
     });
-    def(target, "removeEventListener", function (type, cb) {
+    def(target, "removeEventListener", function (type, cb, options) {
       type = String(type);
+      var capture = __captureFlag(options);
       var list = registry[type];
       if (!list) { return; }
-      for (var i = 0; i < list.length; i++) { if (list[i] === cb) { list.splice(i, 1); return; } }
+      for (var i = 0; i < list.length; i++) { if (list[i].cb === cb && list[i].capture === capture) { list.splice(i, 1); return; } }
     });
     def(target, "dispatchEvent", function (ev) {
-      var type = ev && ev.type ? String(ev.type) : "";
-      var list = registry[type];
-      if (list) {
-        var copy = list.slice();
-        for (var i = 0; i < copy.length; i++) {
-          try { copy[i].call(target, ev); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); }
-        }
-      }
-      return true;
+      return globalThis.__dispatchEventObject(target, ev);
     });
   }
+  // Invoke the listeners registered on `target` for `type` whose capture flag matches `wantCapture`,
+  // plus (when invoking the bubble/target set) the legacy `on<type>` handler. Honours `once` and
+  // the event's stop-immediate flag. `ev` may be a constructed Event (with __ev) or a plain object.
+  def(globalThis, "__runListeners", function (target, type, ev, wantCapture, includeOn) {
+    if (!target) { return; }
+    var s = ev && ev.__ev ? ev.__ev : null;
+    var reg = target.__listeners;
+    var list = reg ? reg[type] : null;
+    if (list) {
+      var copy = list.slice();
+      for (var i = 0; i < copy.length; i++) {
+        var entry = copy[i];
+        if (entry.capture !== wantCapture) { continue; }
+        if (entry.once) { var j = list.indexOf(entry); if (j >= 0) { list.splice(j, 1); } }
+        try { entry.cb.call(target, ev); } catch (e) { (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); }
+        if (s && s.stopImmediate) { return; }
+      }
+    }
+    if (includeOn) {
+      var on = target["on" + type];
+      if (typeof on === "function") {
+        try { on.call(target, ev); } catch (e2) { (globalThis.__timerErrors || []).push((e2 && e2.stack) || String(e2)); }
+      }
+    }
+  });
+  // Build an event's propagation path: [target, ancestors..., document, window]. The target is
+  // always included; ancestors/document/window are the bubbling targets walked via parentNode.
+  def(globalThis, "__eventPath", function (target) {
+    var path = [target];
+    // Only DOM nodes propagate to ancestors / document / window. Non-node EventTargets
+    // (AbortSignal, XMLHttpRequest, WebSocket, …) dispatch to themselves only.
+    var isNode = target === globalThis || target === document ||
+                 (target && typeof target.__node === "number");
+    if (!isNode) { return path; }
+    var cur = target, guard = 0;
+    while (cur && guard < 4096) {
+      var parent = null;
+      try { parent = cur.parentNode; } catch (e0) { parent = null; }
+      if (!parent || parent === cur) { break; }
+      path.push(parent); cur = parent; guard++;
+    }
+    if (path.indexOf(document) < 0) { path.push(document); }
+    if (path.indexOf(globalThis) < 0) { path.push(globalThis); }
+    return path;
+  });
+  // Shared dispatch for `target.dispatchEvent(ev)`. Drives constructed Event objects (which carry
+  // internal __ev state + read-only getters) through the full DOM dispatch algorithm: builds the
+  // propagation path, runs the capture phase (root -> target), the target phase, then the bubble
+  // phase (target -> root) when ev.bubbles, setting target/currentTarget/eventPhase and honouring
+  // stopPropagation/stopImmediatePropagation. Falls back gracefully for plain {type} objects.
+  def(globalThis, "__dispatchEventObject", function (target, ev) {
+    var type = ev && ev.type != null ? String(ev.type) : "";
+    var s = ev && ev.__ev ? ev.__ev : null; // internal state for constructed events
+    var bubbles = s ? s.bubbles : !!(ev && ev.bubbles);
+
+    var path = globalThis.__eventPath(target); // [target, ...ancestors, document, window]
+
+    if (s) {
+      s.dispatched = true; s.target = target; s.stopPropagation = false;
+      s.stopImmediate = false; s.path = path.slice();
+    } else { try { ev.target = target; } catch (e1) {} }
+
+    function setCT(ct, phase) {
+      if (s) { s.currentTarget = ct; s.eventPhase = phase; }
+      else { try { ev.currentTarget = ct; } catch (e2) {} }
+    }
+    var run = globalThis.__runListeners;
+
+    // Capture phase: ancestors from outermost (window) down to (but not including) the target.
+    for (var i = path.length - 1; i >= 1; i--) {
+      if (s && s.stopPropagation) { break; }
+      setCT(path[i], 1 /*CAPTURING_PHASE*/);
+      run(path[i], type, ev, true, false);
+    }
+    // Target phase: both capture- and bubble-registered listeners fire here, plus on<type>.
+    if (!(s && s.stopPropagation)) {
+      setCT(target, 2 /*AT_TARGET*/);
+      run(target, type, ev, true, false);
+      if (!(s && s.stopImmediate)) { run(target, type, ev, false, true); }
+    }
+    // Bubble phase: ancestors from target's parent up to window (only when the event bubbles).
+    if (bubbles) {
+      for (var h = 1; h < path.length; h++) {
+        if (s && s.stopPropagation) { break; }
+        setCT(path[h], 3 /*BUBBLING_PHASE*/);
+        run(path[h], type, ev, false, true);
+      }
+    }
+
+    if (s) { s.eventPhase = 0; s.currentTarget = null; s.stopPropagation = false; s.stopImmediate = false; }
+    else { try { ev.currentTarget = null; } catch (e3) {} }
+    return s ? !s.defaultPrevented : !(ev && ev.defaultPrevented);
+  });
   installEvents(globalThis);
   installEvents(document);
 
@@ -4147,9 +4246,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   if (typeof document.contains !== "function") {
     def(document, "contains", function (node) { try { return document.documentElement ? (document.documentElement === node || document.documentElement.contains(node)) : false; } catch (e) { return false; } });
   }
-  if (typeof document.createEvent !== "function") {
-    def(document, "createEvent", function () { var e = { type: "", bubbles: false, cancelable: false, defaultPrevented: false, preventDefault: fn, stopPropagation: fn, initEvent: function (t, b, c) { this.type = String(t); this.bubbles = !!b; this.cancelable = !!c; }, initCustomEvent: function (t, b, c, d) { this.type = String(t); this.bubbles = !!b; this.cancelable = !!c; this.detail = d; } }; return e; });
-  }
+  // Legacy event factory. Maps a (case-insensitive) interface name to an uninitialized event of
+  // the right interface (prototype chain intact); unknown names throw NotSupportedError. The real
+  // implementation lives in globalThis.__createEvent (defined alongside the Event constructors).
+  def(document, "createEvent", function (name) { return globalThis.__createEvent(name); });
   if (typeof document.elementFromPoint !== "function") { def(document, "elementFromPoint", function () { return null; }); }
   if (typeof document.hasFocus !== "function") { def(document, "hasFocus", function () { return true; }); }
   if (!("activeElement" in document)) { Object.defineProperty(document, "activeElement", { get: function () { try { return document.body; } catch (e) { return null; } }, enumerable: true, configurable: true }); }
@@ -5277,54 +5377,232 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     this.addEventListener = fn; this.removeEventListener = fn;
   });
 
-  // Constructors some pages feature-detect / construct.
-  if (typeof globalThis.Event !== "function") {
-    def(globalThis, "Event", function (type, init) { this.type = String(type); this.bubbles = !!(init && init.bubbles); this.cancelable = !!(init && init.cancelable); this.defaultPrevented = false; this.preventDefault = fn; this.stopPropagation = fn; });
-  }
-  if (typeof globalThis.CustomEvent !== "function") {
-    def(globalThis, "CustomEvent", function (type, init) { this.type = String(type); this.detail = init ? init.detail : null; this.bubbles = !!(init && init.bubbles); this.preventDefault = fn; this.stopPropagation = fn; });
-  }
-  // Event subclasses (UIEvent/MouseEvent/KeyboardEvent/etc.). Each extends Event with its init
-  // fields copied through, so `new MouseEvent('click', {...})` and friends construct without error.
+  // --- DOM Event constructors + class hierarchy (per the DOM / UI Events standards) ---------
+  // Each Event/subclass stores its standard members in a non-enumerable internal bag (__ev) and
+  // exposes them as read-only getters on the prototype, so the prototype chain gives correct
+  // `instanceof` and `Object.getPrototypeOf(ev) === Iface.prototype` (which document.createEvent
+  // relies on). Subclasses inherit Event via real prototype chains (MouseEvent -> UIEvent -> Event).
   (function () {
-    function makeEventClass(extraDefaults) {
-      return function (type, init) {
-        init = init || {};
-        globalThis.Event.call(this, type, init);
-        for (var k in extraDefaults) { this[k] = (k in init) ? init[k] : extraDefaults[k]; }
-        this.detail = init.detail || 0;
-        this.view = init.view || globalThis.window || null;
-      };
+    // Monotonic high-resolution timestamp source for Event.timeStamp. The event-loop clock does
+    // not advance between two synchronous constructions, but spec tests create events in tight
+    // loops and rely on consecutive timestamps eventually differing (and not having sub-5µs
+    // resolution). Base off performance.now() (shared time origin) and add a 5-microsecond
+    // (0.005 ms) monotonic quantum per call so the value strictly increases yet stays coarse.
+    var __tsCounter = 0;
+    function __eventTimeStamp() {
+      var base = 0;
+      try { base = (globalThis.performance && typeof globalThis.performance.now === "function")
+        ? globalThis.performance.now()
+        : (globalThis.__eventLoop ? globalThis.__eventLoop.now : 0); } catch (e) { base = 0; }
+      __tsCounter += 1;
+      return base + __tsCounter * 0.005;
     }
-    var classes = {
-      UIEvent: {},
-      FocusEvent: { relatedTarget: null },
-      MouseEvent: { screenX: 0, screenY: 0, clientX: 0, clientY: 0, pageX: 0, pageY: 0, button: 0, buttons: 0, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, relatedTarget: null, movementX: 0, movementY: 0, getModifierState: undefined },
-      PointerEvent: { pointerId: 0, width: 1, height: 1, pressure: 0, pointerType: "", isPrimary: false, clientX: 0, clientY: 0, button: 0, buttons: 0 },
-      KeyboardEvent: { key: "", code: "", keyCode: 0, which: 0, charCode: 0, location: 0, repeat: false, isComposing: false, ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, getModifierState: undefined },
-      WheelEvent: { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0, clientX: 0, clientY: 0 },
-      InputEvent: { data: null, inputType: "", isComposing: false },
-      TouchEvent: { touches: [], targetTouches: [], changedTouches: [], ctrlKey: false, shiftKey: false, altKey: false, metaKey: false },
-      PopStateEvent: { state: null },
-      HashChangeEvent: { oldURL: "", newURL: "" },
-      MessageEvent: { data: null, origin: "", lastEventId: "", source: null, ports: [] },
-      ProgressEvent: { lengthComputable: false, loaded: 0, total: 0 },
-      ErrorEvent: { message: "", filename: "", lineno: 0, colno: 0, error: null },
-      AnimationEvent: { animationName: "", elapsedTime: 0, pseudoElement: "" },
-      TransitionEvent: { propertyName: "", elapsedTime: 0, pseudoElement: "" },
-      CloseEvent: { code: 0, reason: "", wasClean: false },
-    };
-    for (var name in classes) {
-      if (typeof globalThis[name] !== "function") {
-        var ctor = makeEventClass(classes[name]);
-        ctor.prototype = Object.create(globalThis.Event.prototype || Object.prototype);
-        def(globalThis, name, ctor);
+    // Per-event internal state. `flags` holds dispatch bookkeeping shared with dispatchEvent().
+    function initEventState(ev) {
+      var s = {
+        type: "", bubbles: false, cancelable: false, composed: false,
+        defaultPrevented: false, isTrusted: false,
+        eventPhase: 0, target: null, currentTarget: null,
+        timeStamp: __eventTimeStamp(),
+        stopPropagation: false, stopImmediate: false, dispatched: false, inPassive: false,
+        path: []
+      };
+      def(ev, "__ev", s);
+      return s;
+    }
+    function st(ev) { return ev.__ev || initEventState(ev); }
+
+    // Define a read-only getter `name` on `proto` returning the matching internal-state field.
+    function roGet(proto, name, field) {
+      Object.defineProperty(proto, name, {
+        get: function () { return st(this)[field]; }, enumerable: true, configurable: true
+      });
+    }
+
+    function Event(type, init) {
+      var s = initEventState(this);
+      if (arguments.length > 0) { s.type = String(type); }
+      if (init !== undefined && init !== null) {
+        s.bubbles = !!init.bubbles;
+        s.cancelable = !!init.cancelable;
+        s.composed = !!init.composed;
       }
     }
-    if (typeof globalThis.getModifierState === "undefined") {
-      try { globalThis.MouseEvent.prototype.getModifierState = function () { return false; };
-            globalThis.KeyboardEvent.prototype.getModifierState = function () { return false; }; } catch (e) {}
+    var EP = Event.prototype;
+    roGet(EP, "type", "type");
+    roGet(EP, "bubbles", "bubbles");
+    roGet(EP, "cancelable", "cancelable");
+    roGet(EP, "composed", "composed");
+    roGet(EP, "defaultPrevented", "defaultPrevented");
+    roGet(EP, "isTrusted", "isTrusted");
+    roGet(EP, "eventPhase", "eventPhase");
+    roGet(EP, "target", "target");
+    roGet(EP, "currentTarget", "currentTarget");
+    roGet(EP, "timeStamp", "timeStamp");
+    Object.defineProperty(EP, "srcElement", { get: function () { return st(this).target; }, enumerable: true, configurable: true });
+    // returnValue: legacy alias of !defaultPrevented (settable to false => preventDefault()).
+    Object.defineProperty(EP, "returnValue", {
+      get: function () { return !st(this).defaultPrevented; },
+      set: function (v) { if (v === false) { var s = st(this); if (s.cancelable && !s.inPassive) { s.defaultPrevented = true; } } },
+      enumerable: true, configurable: true
+    });
+    // cancelBubble: legacy alias of the stop-propagation flag. Getter returns it; setting to true
+    // sets the flag (like stopPropagation()), setting to false is a no-op.
+    Object.defineProperty(EP, "cancelBubble", {
+      get: function () { return st(this).stopPropagation; },
+      set: function (v) { if (v) { st(this).stopPropagation = true; } },
+      enumerable: true, configurable: true
+    });
+    EP.preventDefault = function () { var s = st(this); if (s.cancelable && !s.inPassive) { s.defaultPrevented = true; } };
+    EP.stopPropagation = function () { st(this).stopPropagation = true; };
+    EP.stopImmediatePropagation = function () { var s = st(this); s.stopPropagation = true; s.stopImmediate = true; };
+    EP.composedPath = function () { var s = st(this); return s.path ? s.path.slice() : []; };
+    EP.initEvent = function (type, bubbles, cancelable) {
+      var s = st(this);
+      if (s.dispatched) { return; }
+      s.type = String(type);
+      s.bubbles = !!bubbles;
+      s.cancelable = !!cancelable;
+      s.defaultPrevented = false; s.isTrusted = false;
+      s.target = null; s.stopPropagation = false; s.stopImmediate = false;
+    };
+    // Phase constants on both the constructor and the prototype.
+    var phases = { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 };
+    for (var pk in phases) {
+      Object.defineProperty(Event, pk, { value: phases[pk], enumerable: true });
+      Object.defineProperty(EP, pk, { value: phases[pk], enumerable: true });
     }
+    def(globalThis, "Event", Event);
+    // Expose the internal-state helpers so dispatchEvent / createEvent can drive events.
+    def(globalThis, "__eventState", st);
+    def(globalThis, "__initEventState", initEventState);
+
+    // Build a subclass: ctor copies its own init members (from `members`) on top of the parent.
+    // `members` maps property -> default value. `coerce` optionally transforms an init value.
+    function defSubclass(name, ParentCtor, members, validate) {
+      function Ctor(type, init) {
+        ParentCtor.call(this, type, init);
+        if (init === undefined || init === null) { init = {}; }
+        if (validate) { validate(init); }
+        for (var k in members) {
+          var v = (k in init) ? init[k] : members[k];
+          def(this, k, v);
+        }
+      }
+      Ctor.prototype = Object.create(ParentCtor.prototype);
+      Object.defineProperty(Ctor.prototype, "constructor", { value: Ctor, enumerable: false, configurable: true, writable: true });
+      def(globalThis, name, Ctor);
+      Ctor.__members = members;
+      Ctor.__parent = ParentCtor;
+      return Ctor;
+    }
+
+    // CustomEvent: read-only `detail` + legacy initCustomEvent.
+    var CustomEvent = defSubclass("CustomEvent", Event, { detail: null });
+    CustomEvent.prototype.initCustomEvent = function (type, bubbles, cancelable, detail) {
+      var s = st(this);
+      if (s.dispatched) { return; }
+      this.initEvent(type, bubbles, cancelable);
+      def(this, "detail", detail === undefined ? null : detail);
+    };
+
+    function requireObjOrNull(v, what) {
+      if (v !== undefined && v !== null && typeof v !== "object" && typeof v !== "function") {
+        throw new TypeError(what + " is not an object");
+      }
+    }
+
+    var UIEvent = defSubclass("UIEvent", Event, { view: null, detail: 0 }, function (init) {
+      if ("view" in init) { requireObjOrNull(init.view, "view"); }
+    });
+    var modInit = function (init) {
+      if ("relatedTarget" in init) { requireObjOrNull(init.relatedTarget, "relatedTarget"); }
+    };
+    var FocusEvent = defSubclass("FocusEvent", UIEvent, { relatedTarget: null }, modInit);
+    var MouseEvent = defSubclass("MouseEvent", UIEvent, {
+      screenX: 0, screenY: 0, clientX: 0, clientY: 0, button: 0, buttons: 0,
+      ctrlKey: false, shiftKey: false, altKey: false, metaKey: false,
+      relatedTarget: null, movementX: 0, movementY: 0
+    }, modInit);
+    MouseEvent.prototype.getModifierState = function (k) {
+      switch (k) { case "Control": return !!this.ctrlKey; case "Shift": return !!this.shiftKey;
+        case "Alt": return !!this.altKey; case "Meta": return !!this.metaKey; default: return false; }
+    };
+    var WheelEvent = defSubclass("WheelEvent", MouseEvent, { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }, modInit);
+    var DragEvent = defSubclass("DragEvent", MouseEvent, { dataTransfer: null }, modInit);
+    var PointerEvent = defSubclass("PointerEvent", MouseEvent, {
+      pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0,
+      tiltX: 0, tiltY: 0, twist: 0, altitudeAngle: 0, azimuthAngle: 0,
+      pointerType: "", isPrimary: false
+    }, modInit);
+    var KeyboardEvent = defSubclass("KeyboardEvent", UIEvent, {
+      key: "", code: "", location: 0, repeat: false, isComposing: false,
+      ctrlKey: false, shiftKey: false, altKey: false, metaKey: false,
+      charCode: 0, keyCode: 0, which: 0
+    });
+    KeyboardEvent.prototype.getModifierState = MouseEvent.prototype.getModifierState;
+    var CompositionEvent = defSubclass("CompositionEvent", UIEvent, { data: "" });
+    var InputEvent = defSubclass("InputEvent", UIEvent, { data: null, inputType: "", isComposing: false });
+    var TouchEvent = defSubclass("TouchEvent", UIEvent, {
+      touches: [], targetTouches: [], changedTouches: [],
+      ctrlKey: false, shiftKey: false, altKey: false, metaKey: false
+    });
+    // Plain-Event subclasses (extend Event directly).
+    defSubclass("PopStateEvent", Event, { state: null });
+    defSubclass("HashChangeEvent", Event, { oldURL: "", newURL: "" });
+    defSubclass("PageTransitionEvent", Event, { persisted: false });
+    defSubclass("BeforeUnloadEvent", Event, { returnValue: "" });
+    defSubclass("MessageEvent", Event, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
+    defSubclass("ProgressEvent", Event, { lengthComputable: false, loaded: 0, total: 0 });
+    defSubclass("ErrorEvent", Event, { message: "", filename: "", lineno: 0, colno: 0, error: null });
+    defSubclass("PromiseRejectionEvent", Event, { promise: null, reason: undefined });
+    defSubclass("StorageEvent", Event, { key: null, oldValue: null, newValue: null, url: "", storageArea: null });
+    defSubclass("AnimationEvent", Event, { animationName: "", elapsedTime: 0, pseudoElement: "" });
+    defSubclass("TransitionEvent", Event, { propertyName: "", elapsedTime: 0, pseudoElement: "" });
+    defSubclass("CloseEvent", Event, { code: 0, reason: "", wasClean: false });
+    defSubclass("DeviceMotionEvent", Event, { acceleration: null, accelerationIncludingGravity: null, rotationRate: null, interval: 0 });
+    defSubclass("DeviceOrientationEvent", Event, { alpha: null, beta: null, gamma: null, absolute: false });
+    defSubclass("TextEvent", UIEvent, { data: "" });
+
+    // document.createEvent legacy factory: case-insensitive name -> interface, per the DOM spec
+    // table. Returns an UNINITIALIZED event (type==="") whose prototype is the interface's
+    // prototype; the caller must initEvent()/initCustomEvent()/... before dispatching.
+    var createEventTable = {
+      "event": Event, "events": Event, "htmlevents": Event, "svgevents": Event,
+      "customevent": CustomEvent,
+      "uievent": UIEvent, "uievents": UIEvent,
+      "mouseevent": MouseEvent, "mouseevents": MouseEvent,
+      "keyboardevent": KeyboardEvent,
+      "compositionevent": CompositionEvent,
+      "focusevent": FocusEvent,
+      "messageevent": MessageEvent,
+      "hashchangeevent": globalThis.HashChangeEvent,
+      "beforeunloadevent": globalThis.BeforeUnloadEvent,
+      "dragevent": DragEvent,
+      "storageevent": globalThis.StorageEvent,
+      "textevent": TextEvent,
+      "devicemotionevent": globalThis.DeviceMotionEvent,
+      "deviceorientationevent": globalThis.DeviceOrientationEvent
+    };
+    def(globalThis, "__createEvent", function (name) {
+      var key = String(name).toLowerCase();
+      var Ctor = createEventTable.hasOwnProperty(key) ? createEventTable[key] : null;
+      if (!Ctor) {
+        throw new globalThis.DOMException(
+          "The event \"" + name + "\" is not supported.", "NotSupportedError");
+      }
+      var ev = Object.create(Ctor.prototype);
+      initEventState(ev);
+      // Materialise this interface's own (and inherited) members as data properties with defaults
+      // so they exist before init*() is called, matching a freshly-constructed event.
+      var chain = [];
+      for (var C = Ctor; C && C.__members; C = C.__parent) { chain.unshift(C); }
+      for (var i = 0; i < chain.length; i++) {
+        var m = chain[i].__members;
+        for (var k in m) { def(ev, k, m[k]); }
+      }
+      return ev;
+    });
   })();
 
   // --- synthetic event dispatch (driven from Rust on user interaction) ----------------------
@@ -5346,50 +5624,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     catch (e) { ev = { type: type, bubbles: true, cancelable: true, defaultPrevented: false }; }
     // Copy caller-supplied props (clientX/clientY/button/...) onto the event.
     if (props) { for (var k in props) { try { ev[k] = props[k]; } catch (e2) {} } }
-
-    var stopped = false, stoppedImmediate = false;
-    ev.defaultPrevented = !!ev.defaultPrevented;
-    ev.preventDefault = function () { this.defaultPrevented = true; };
-    ev.stopPropagation = function () { stopped = true; };
-    ev.stopImmediatePropagation = function () { stopped = true; stoppedImmediate = true; };
-
-    // Build the propagation path: node, its ancestors, document, then window (globalThis).
-    var path = [node];
-    var cur = node;
-    var guard = 0;
-    while (cur && guard < 4096) {
-      var parent = null;
-      try { parent = cur.parentNode; } catch (e3) { parent = null; }
-      if (!parent || parent === cur) { break; }
-      path.push(parent);
-      cur = parent;
-      guard++;
-    }
-    path.push(document);
-    path.push(globalThis);
-
-    try { ev.target = node; } catch (e4) {}
-
-    for (var h = 0; h < path.length; h++) {
-      if (stopped) { break; }
-      var target = path[h];
-      if (!target) { continue; }
-      try { ev.currentTarget = target; } catch (e5) {}
-      var reg = target.__listeners;
-      var list = reg ? reg[type] : null;
-      if (list) {
-        var copy = list.slice();
-        for (var i = 0; i < copy.length; i++) {
-          try { copy[i].call(target, ev); } catch (e6) { (globalThis.__timerErrors || []).push((e6&&e6.stack||String(e6))); }
-          if (stoppedImmediate) { break; }
-        }
-      }
-      var on = target["on" + type];
-      if (typeof on === "function") {
-        try { on.call(target, ev); } catch (e7) { (globalThis.__timerErrors || []).push((e7&&e7.stack||String(e7))); }
-      }
-    }
-    return !ev.defaultPrevented;
+    // Run it through the shared capture/target/bubble dispatch (which honours stopPropagation,
+    // capture listeners, and returns !defaultPrevented).
+    return globalThis.__dispatchEventObject(node, ev);
   });
 
   // --- non-bubbling synthetic event dispatch ------------------------------------------------
@@ -5406,26 +5643,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     try { ev = new Ctor(type, { bubbles: false, cancelable: true }); }
     catch (e) { ev = { type: type, bubbles: false, cancelable: true, defaultPrevented: false }; }
     if (props) { for (var k in props) { try { ev[k] = props[k]; } catch (e2) {} } }
-
-    ev.defaultPrevented = !!ev.defaultPrevented;
-    ev.preventDefault = function () { this.defaultPrevented = true; };
-    ev.stopPropagation = function () {};
-    ev.stopImmediatePropagation = function () {};
-    try { ev.target = node; ev.currentTarget = node; } catch (e4) {}
-
-    var reg = node.__listeners;
-    var list = reg ? reg[type] : null;
-    if (list) {
-      var copy = list.slice();
-      for (var i = 0; i < copy.length; i++) {
-        try { copy[i].call(node, ev); } catch (e6) { (globalThis.__timerErrors || []).push((e6&&e6.stack||String(e6))); }
-      }
-    }
-    var on = node["on" + type];
-    if (typeof on === "function") {
-      try { on.call(node, ev); } catch (e7) { (globalThis.__timerErrors || []).push((e7&&e7.stack||String(e7))); }
-    }
-    return !ev.defaultPrevented;
+    // Non-bubbling: __dispatchEventObject skips the bubble phase (capture + target still run).
+    return globalThis.__dispatchEventObject(node, ev);
   });
 
   // mouseover/mouseout bubble; mouseenter/mouseleave do not — register the latter as non-bubbling.
@@ -7785,6 +8004,213 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("true"));
         // Setting a property on `window` creates a global.
         assert_eq!(out[1].value.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn event_constructor_props_and_prevent_default() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var e = new Event("x", { bubbles: true, cancelable: true });
+                var ok = e.type === "x" && e.bubbles === true && e.cancelable === true &&
+                         e.composed === false && e.defaultPrevented === false &&
+                         e.eventPhase === 0 && e.target === null && e.isTrusted === false &&
+                         e.returnValue === true && typeof e.timeStamp === "number" &&
+                         Event.NONE === 0 && Event.CAPTURING_PHASE === 1 &&
+                         Event.AT_TARGET === 2 && Event.BUBBLING_PHASE === 3;
+                e.preventDefault();
+                [ok, e.defaultPrevented, e.returnValue].join(",")
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,true,false"));
+    }
+
+    #[test]
+    fn custom_event_detail() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var e = new CustomEvent("y", { detail: 42 });
+                [e.detail === 42, e instanceof Event, e instanceof CustomEvent].join(",")
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,true,true"));
+    }
+
+    #[test]
+    fn mouse_event_init_and_instanceof_chain() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var e = new MouseEvent("click", { clientX: 5 });
+                [e.clientX === 5, e instanceof MouseEvent, e instanceof UIEvent,
+                 e instanceof Event].join(",")
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,true,true,true"));
+    }
+
+    #[test]
+    fn ui_event_view_wrong_type_throws() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var threw = false;
+                try { new UIEvent("x", { view: 7 }); } catch (e) { threw = (e instanceof TypeError); }
+                threw
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn create_event_init_and_dispatch_fires_listener() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var ev = document.createEvent("Event");
+                var preType = ev.type;
+                ev.initEvent("ping", true, true);
+                var fired = 0;
+                document.addEventListener("ping", function () { fired++; });
+                var ret = document.dispatchEvent(ev);
+                [preType === "", ev.type === "ping", fired, ret,
+                 ev instanceof Event].join(",")
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,true,1,true,true"));
+    }
+
+    #[test]
+    fn create_event_unknown_throws_not_supported() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var name = "";
+                try { document.createEvent("nope"); }
+                catch (e) { name = e.name; }
+                name
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("NotSupportedError"));
+    }
+
+    #[test]
+    fn create_event_prototype_matches_interface() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                [Object.getPrototypeOf(document.createEvent("Event")) === Event.prototype,
+                 Object.getPrototypeOf(document.createEvent("mouseevent")) === MouseEvent.prototype,
+                 Object.getPrototypeOf(document.createEvent("HTMLEvents")) === Event.prototype,
+                 Object.getPrototypeOf(document.createEvent("CustomEvent")) === CustomEvent.prototype].join(",")
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,true,true,true"));
+    }
+
+    #[test]
+    fn bubbling_event_reaches_ancestor_listener() {
+        // A bubbling event dispatched on a child element must reach a listener on an ancestor.
+        let (mut doc, body) = doc_with_body("");
+        let parent = doc.append_element(body, "div");
+        let child = doc.append_element(parent, "span");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(parent).data {
+            e.attrs.insert("id".to_string(), "par".to_string());
+        }
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(child).data {
+            e.attrs.insert("id".to_string(), "kid".to_string());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var par = document.getElementById("par");
+                var kid = document.getElementById("kid");
+                var hits = [];
+                par.addEventListener("boom", function (e) {
+                    hits.push("par:" + e.eventPhase + ":" + (e.currentTarget === par) + ":" + (e.target === kid));
+                });
+                var ev = new Event("boom", { bubbles: true });
+                kid.dispatchEvent(ev);
+                hits.join("|")
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // ancestor handler ran in bubble phase (3), currentTarget=parent, target=child.
+        assert_eq!(out[0].value.as_deref(), Some("par:3:true:true"));
+    }
+
+    #[test]
+    fn capture_listener_runs_in_capture_phase() {
+        let (mut doc, body) = doc_with_body("");
+        let child = doc.append_element(body, "div");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(child).data {
+            e.attrs.insert("id".to_string(), "c".to_string());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var c = document.getElementById("c");
+                var phase = -1;
+                document.addEventListener("zap", function (e) { phase = e.eventPhase; }, true);
+                c.dispatchEvent(new Event("zap", { bubbles: true }));
+                phase
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // document's capture listener fires during the capture phase (1).
+        assert_eq!(out[0].value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn stop_propagation_blocks_ancestors() {
+        let (mut doc, body) = doc_with_body("");
+        let parent = doc.append_element(body, "div");
+        let child = doc.append_element(parent, "span");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(parent).data {
+            e.attrs.insert("id".to_string(), "p".to_string());
+        }
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(child).data {
+            e.attrs.insert("id".to_string(), "k".to_string());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var p = document.getElementById("p");
+                var k = document.getElementById("k");
+                var reached = 0;
+                k.addEventListener("t", function (e) { e.stopPropagation(); });
+                p.addEventListener("t", function () { reached++; });
+                k.dispatchEvent(new Event("t", { bubbles: true }));
+                reached
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("0"));
     }
 
     #[test]
