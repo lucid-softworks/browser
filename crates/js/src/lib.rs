@@ -5100,6 +5100,78 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   function urlPathSet(cp) { return urlQuerySet(cp) || cp === 0x3f || cp === 0x60 || cp === 0x7b || cp === 0x7d; }
   function urlUserSet(cp) { return urlPathSet(cp) || cp === 0x2f || cp === 0x3a || cp === 0x3b || cp === 0x3d || cp === 0x40 || cp === 0x5b || cp === 0x5c || cp === 0x5d || cp === 0x5e || cp === 0x7c; }
 
+  // WHATWG IPv6 parser: an address (inside [...]) -> 8 16-bit pieces, or null on failure.
+  function parseIPv6(input) {
+    var address = [0, 0, 0, 0, 0, 0, 0, 0];
+    var pieceIndex = 0, compress = null, p = 0, n = input.length;
+    function c() { return p < n ? input[p] : null; }
+    function isHex(ch) { return ch != null && /[0-9a-fA-F]/.test(ch); }
+    if (c() === ":") {
+      if (input[p + 1] !== ":") { return null; }
+      p += 2; pieceIndex++; compress = pieceIndex;
+    }
+    while (c() !== null) {
+      if (pieceIndex === 8) { return null; }
+      if (c() === ":") {
+        if (compress !== null) { return null; }
+        p++; pieceIndex++; compress = pieceIndex; continue;
+      }
+      var value = 0, length = 0;
+      while (length < 4 && isHex(c())) { value = value * 16 + parseInt(c(), 16); p++; length++; }
+      if (c() === ".") {
+        if (length === 0) { return null; }
+        p -= length;
+        if (pieceIndex > 6) { return null; }
+        var numbersSeen = 0;
+        while (c() !== null) {
+          var ipv4Piece = null;
+          if (numbersSeen > 0) { if (c() === "." && numbersSeen < 4) { p++; } else { return null; } }
+          if (!/[0-9]/.test(c() || "")) { return null; }
+          while (/[0-9]/.test(c() || "")) {
+            var d = parseInt(c(), 10);
+            if (ipv4Piece === null) { ipv4Piece = d; }
+            else if (ipv4Piece === 0) { return null; }
+            else { ipv4Piece = ipv4Piece * 10 + d; }
+            if (ipv4Piece > 255) { return null; }
+            p++;
+          }
+          address[pieceIndex] = address[pieceIndex] * 0x100 + ipv4Piece;
+          numbersSeen++;
+          if (numbersSeen === 2 || numbersSeen === 4) { pieceIndex++; }
+        }
+        if (numbersSeen !== 4) { return null; }
+        break;
+      } else if (c() === ":") { p++; if (c() === null) { return null; } }
+      else if (c() !== null) { return null; }
+      address[pieceIndex] = value; pieceIndex++;
+    }
+    if (compress !== null) {
+      var swaps = pieceIndex - compress; pieceIndex = 7;
+      while (pieceIndex !== 0 && swaps > 0) {
+        var tmp = address[pieceIndex]; address[pieceIndex] = address[compress + swaps - 1]; address[compress + swaps - 1] = tmp;
+        pieceIndex--; swaps--;
+      }
+    } else if (pieceIndex !== 8) { return null; }
+    return address;
+  }
+  // Serialize 8 pieces with the canonical longest-zero-run compression.
+  function serializeIPv6(address) {
+    var out = "", compress = null, curBase = null, curLen = 0, maxLen = 0;
+    for (var i = 0; i < 8; i++) {
+      if (address[i] === 0) { if (curBase === null) { curBase = i; curLen = 1; } else { curLen++; } if (curLen > maxLen) { maxLen = curLen; compress = curBase; } }
+      else { curBase = null; curLen = 0; }
+    }
+    if (maxLen < 2) { compress = null; }
+    var ignore0 = false;
+    for (var j = 0; j < 8; j++) {
+      if (ignore0) { if (address[j] === 0) { continue; } ignore0 = false; }
+      if (compress === j) { out += (j === 0 ? "::" : ":"); ignore0 = true; continue; }
+      out += address[j].toString(16);
+      if (j !== 7) { out += ":"; }
+    }
+    return out;
+  }
+
   function parseURL(input, base) {
     if (base != null && typeof base === "string") { base = parseURLRecord(base, null); }
     var r = parseURLRecord(input, base || null);
@@ -5189,7 +5261,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var host = authority, port = "";
     if (host.charAt(0) === "[") {
       var rb = host.indexOf("]");
-      if (rb >= 0) { var ip = host.slice(0, rb + 1); var tail = host.slice(rb + 1); if (tail.charAt(0) === ":") { port = tail.slice(1); } host = ip; }
+      if (rb >= 0) {
+        var addr = parseIPv6(host.slice(1, rb));
+        var ip = addr ? "[" + serializeIPv6(addr) + "]" : host.slice(0, rb + 1);
+        var tail = host.slice(rb + 1);
+        if (tail.charAt(0) === ":") { port = tail.slice(1); }
+        host = ip;
+      }
     } else {
       var cidx = host.lastIndexOf(":");
       if (cidx >= 0) { port = host.slice(cidx + 1); host = host.slice(0, cidx); }
