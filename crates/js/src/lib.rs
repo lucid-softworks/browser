@@ -4941,6 +4941,7 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     Object.defineProperty(el, "lastChild", { get: function () { var k = __children(id); return k.length ? nf(k[k.length - 1]) : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "firstElementChild", { get: function () { var c = childList(true); return c.length ? c[0] : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "lastElementChild", { get: function () { var c = childList(true); return c.length ? c[c.length - 1] : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "childElementCount", { get: function () { var k = __children(id), n = 0; for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { n++; } } return n; }, enumerable: true, configurable: true });
 
     function sibling(next, elementOnly) {
       var p = __parent(id); if (p < 0) { return null; }
@@ -11212,6 +11213,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(XElement.prototype, "attributes", { get: function () { var a = this._attrs.slice(); a.item = function (i) { return this[i] || null; }; return a; } });
     Object.defineProperty(XElement.prototype, "children", { get: function () { return this.childNodes.filter(function (c) { return c.nodeType === 1; }); } });
     Object.defineProperty(XElement.prototype, "firstElementChild", { get: function () { return this.children[0] || null; } });
+    Object.defineProperty(XElement.prototype, "childElementCount", { get: function () { return this.children.length; } });
     XElement.prototype._findByName = function (name) { for (var i = 0; i < this._attrs.length; i++) { if (this._attrs[i].name === name) { return i; } } return -1; };
     XElement.prototype._findNS = function (ns, local) { for (var i = 0; i < this._attrs.length; i++) { var a = this._attrs[i]; if ((a.namespaceURI || null) === (ns || null) && a.localName === local) { return i; } } return -1; };
     XElement.prototype.getAttribute = function (name) { var i = this._findByName(name); return i >= 0 ? this._attrs[i].value : null; };
@@ -12371,6 +12373,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             get children() { var k = __children(tplNode), a = []; for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { a.push(nodeAt(k[i])); } } return a; },
             get firstChild() { var k = __children(tplNode); return k.length ? nodeAt(k[0]) : null; },
             get firstElementChild() { var k = __children(tplNode); for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { return nodeAt(k[i]); } } return null; },
+            get childElementCount() { var k = __children(tplNode), n = 0; for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { n++; } } return n; },
             querySelector: function (s) { try { return tpl.querySelector(s); } catch (e) { return null; } },
             querySelectorAll: function (s) { try { return tpl.querySelectorAll(s); } catch (e) { return []; } },
             getElementById: function (gid) { try { return tpl.querySelector('#' + gid); } catch (e) { return null; } },
@@ -18470,6 +18473,25 @@ mod tests {
             style.contains("display: block"),
             "child style attr was {style:?}"
         );
+    }
+
+    #[test]
+    fn child_element_count_counts_only_element_children() {
+        // ParentNode.childElementCount must count element children only, ignoring text/comment nodes.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var d = document.createElement("div");
+                    d.appendChild(document.createElement("span"));
+                    d.appendChild(document.createTextNode("text"));
+                    d.appendChild(document.createElement("b"));
+                    d.appendChild(document.createComment("c"));
+                    String(d.childElementCount) + "/" + d.childNodes.length"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("2/4"));
     }
 
     #[test]
