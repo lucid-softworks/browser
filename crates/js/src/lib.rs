@@ -4415,6 +4415,52 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     for (var i = 0; i < n; i++) { copyNsMetaDeep(sk[i], dk[i]); }
   }
 
+  // ---- Tree-position primitives (shared by compareDocumentPosition + Range boundary points) ----
+  // The root (furthest ancestor) of a node id.
+  function __rootId(id) { var c = id; while (true) { var p = __parent(c); if (p < 0) { return c; } c = p; } }
+  // A boundary point (node, offset) as a root-relative key: the indices of each ancestor within its
+  // parent (root downward), then the offset. Lexicographic comparison of two such keys (shorter key
+  // is "before" when it is a prefix) reproduces the DOM "position of boundary point relative to
+  // boundary point" algorithm exactly — and, with offset omitted, plain node tree order.
+  function __pathKey(id, offset) {
+    var path = []; var c = id;
+    while (true) { var p = __parent(c); if (p < 0) { break; } path.push(__children(p).indexOf(c)); c = p; }
+    path.reverse();
+    if (offset !== undefined) { path.push(offset); }
+    return path;
+  }
+  function __cmpKey(a, b) {
+    var n = a.length < b.length ? a.length : b.length;
+    for (var i = 0; i < n; i++) { if (a[i] < b[i]) { return -1; } if (a[i] > b[i]) { return 1; } }
+    if (a.length < b.length) { return -1; }
+    if (a.length > b.length) { return 1; }
+    return 0;
+  }
+  def(globalThis, "__rootId", __rootId);
+  def(globalThis, "__pathKey", __pathKey);
+  def(globalThis, "__cmpKey", __cmpKey);
+  // compareDocumentPosition bitmask for otherId relative to thisId (node1 = other, node2 = this).
+  var DOCPOS = { DISCONNECTED: 1, PRECEDING: 2, FOLLOWING: 4, CONTAINS: 8, CONTAINED_BY: 16, IMPLEMENTATION_SPECIFIC: 32 };
+  function __cmpDocPos(thisId, otherId) {
+    if (otherId === thisId) { return 0; }
+    if (otherId < 0 || thisId < 0) {
+      return DOCPOS.DISCONNECTED | DOCPOS.IMPLEMENTATION_SPECIFIC | (otherId < thisId ? DOCPOS.PRECEDING : DOCPOS.FOLLOWING);
+    }
+    if (__rootId(otherId) !== __rootId(thisId)) {
+      // Disconnected: pick a consistent (implementation-specific) ordering by id.
+      return DOCPOS.DISCONNECTED | DOCPOS.IMPLEMENTATION_SPECIFIC | (otherId < thisId ? DOCPOS.PRECEDING : DOCPOS.FOLLOWING);
+    }
+    var ko = __pathKey(otherId), kt = __pathKey(thisId);
+    var n = ko.length < kt.length ? ko.length : kt.length;
+    for (var i = 0; i < n; i++) {
+      if (ko[i] !== kt[i]) { return ko[i] < kt[i] ? DOCPOS.PRECEDING : DOCPOS.FOLLOWING; }
+    }
+    // One path is a prefix of the other → ancestor/descendant.
+    if (ko.length < kt.length) { return DOCPOS.CONTAINS | DOCPOS.PRECEDING; }   // other is ancestor of this
+    return DOCPOS.CONTAINED_BY | DOCPOS.FOLLOWING;                              // other is descendant of this
+  }
+  def(globalThis, "__cmpDocPos", __cmpDocPos);
+
   // Build a fresh element wrapper object for a node id. Carries `__node` plus accessors/methods
   // that delegate to the native primitives. Returns null for id === -1.
   function wrap(id) {
@@ -4966,6 +5012,13 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       return false;
     });
 
+    def(el, "compareDocumentPosition", function (other) {
+      if (!other || typeof other.__node !== "number") {
+        throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
+      }
+      return __cmpDocPos(id, other.__node);
+    });
+
     def(el, "querySelector", function (sel) { var r = __querySelectorAllWithin(id, String(sel)); return r.length ? wrap(r[0]) : null; });
     def(el, "querySelectorAll", function (sel) { return __querySelectorAllWithin(id, String(sel)).map(wrap); });
     def(el, "getElementsByTagName", function (tag) {
@@ -5278,6 +5331,19 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   Object.defineProperty(document, "body", { get: function () { var n = __bodyId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
   Object.defineProperty(document, "documentElement", { get: function () { var n = __documentElementId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
   Object.defineProperty(document, "head", { get: function () { var n = __headId(); return n >= 0 ? wrap(n) : null; }, enumerable: true, configurable: true });
+  // Live child accessors over the arena document node (id 0). Canonicalize via __nodeFor so identity
+  // checks (e.g. WPT common.js `indexOf`: `while (node != node.parentNode.childNodes[i]) i++`) hold.
+  function __docKidFor(cid) { return (typeof globalThis.__nodeFor === "function") ? globalThis.__nodeFor(cid) : wrap(cid); }
+  Object.defineProperty(document, "childNodes", { get: function () { var ids = __children(0), a = []; for (var i = 0; i < ids.length; i++) { a.push(__docKidFor(ids[i])); } return a; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "firstChild", { get: function () { var ids = __children(0); return ids.length ? __docKidFor(ids[0]) : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "lastChild", { get: function () { var ids = __children(0); return ids.length ? __docKidFor(ids[ids.length - 1]) : null; }, enumerable: true, configurable: true });
+  // A Document has no parent, siblings, or owner document (all null, never undefined — WPT helpers
+  // compare strictly against null, e.g. `if (node.parentNode === null)`).
+  Object.defineProperty(document, "parentNode", { get: function () { return null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "parentElement", { get: function () { return null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "previousSibling", { get: function () { return null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "nextSibling", { get: function () { return null; }, enumerable: true, configurable: true });
+  Object.defineProperty(document, "ownerDocument", { get: function () { return null; }, enumerable: true, configurable: true });
   def(document, "nodeType", 9);
   // A Document's textContent / nodeValue are null (it's not CharacterData or an Element).
   Object.defineProperty(document, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
@@ -10673,7 +10739,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       Object.defineProperty(doc, "childNodes", { get: function () { var ids = kids(), a = []; for (var i = 0; i < ids.length; i++) { a.push(globalThis.__nodeFor(ids[i])); } return a; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "firstChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[0]) : null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "lastChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[ids.length - 1]) : null; }, configurable: true, enumerable: true });
+      // A Document has no parent/siblings/owner (all null, never undefined).
+      Object.defineProperty(doc, "parentNode", { get: function () { return null; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "parentElement", { get: function () { return null; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "previousSibling", { get: function () { return null; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "nextSibling", { get: function () { return null; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "ownerDocument", { get: function () { return null; }, configurable: true, enumerable: true });
       def(doc, "contains", function (other) { return nodeContains(doc, other); });
+      def(doc, "compareDocumentPosition", function (other) {
+        if (!other || typeof other.__node !== "number") {
+          throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
+        }
+        return __cmpDocPos(docId, other.__node);
+      });
       def(doc, "createRange", function () { return createRangeForDocument(doc); });
       return doc;
     }
@@ -10770,6 +10848,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   if (typeof document.contains !== "function") {
     def(document, "contains", function (node) { return nodeContains(document, node); });
+  }
+  if (typeof document.compareDocumentPosition !== "function") {
+    def(document, "compareDocumentPosition", function (other) {
+      if (!other || typeof other.__node !== "number") {
+        throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
+      }
+      var self = (typeof document.__node === "number") ? document.__node : 0;
+      return __cmpDocPos(self, other.__node);
+    });
   }
 
   // Document is a Node: its children are the doctype + the root element. Wire the Node mutation
@@ -11609,7 +11696,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var consts = {
       ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
       ENTITY_REFERENCE_NODE: 5, ENTITY_NODE: 6, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8,
-      DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, NOTATION_NODE: 12
+      DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, NOTATION_NODE: 12,
+      DOCUMENT_POSITION_DISCONNECTED: 0x01, DOCUMENT_POSITION_PRECEDING: 0x02,
+      DOCUMENT_POSITION_FOLLOWING: 0x04, DOCUMENT_POSITION_CONTAINS: 0x08,
+      DOCUMENT_POSITION_CONTAINED_BY: 0x10, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 0x20
     };
     for (var k in consts) {
       NodeCtor[k] = consts[k];
@@ -11845,11 +11935,68 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // boundary points within a single text container), getBoundingClientRect/getClientRects (caret or
   // text-span geometry), and cloneRange. Enough for the CSSOM caret tests and common callers.
   var AbstractRangeProto = (globalThis.AbstractRange && globalThis.AbstractRange.prototype) || Object.prototype;
+  // A range is created with its boundary points at (current global document, 0).
   function Range() {
-    this._sc = null; this._so = 0; this._ec = null; this._eo = 0;
+    var d = globalThis.document || null;
+    this._sc = d; this._so = 0; this._ec = d; this._eo = 0;
   }
   Range.prototype = Object.create(AbstractRangeProto);
   Range.prototype.constructor = Range;
+  // ---- Range boundary-point helpers (per DOM spec) ----
+  // node length: doctype 0; CharacterData -> data length; otherwise child count.
+  function __rangeLength(node) {
+    var id = __idOf(node); if (id < 0) { return 0; }
+    var t = __nodeType(id);
+    if (t === 10) { return 0; }
+    if (t === 3 || t === 8 || t === 7 || t === 4) { var s = __textContent(id); return s ? s.length : 0; }
+    return __children(id).length;
+  }
+  // Position of boundary point (nodeA, offA) relative to (nodeB, offB): -1 before, 0 equal, 1 after.
+  // Only meaningful when the two nodes share a root (callers check first).
+  function __cmpBP(nodeA, offA, nodeB, offB) {
+    return globalThis.__cmpKey(globalThis.__pathKey(__idOf(nodeA), offA), globalThis.__pathKey(__idOf(nodeB), offB));
+  }
+  function __rootOf(node) { return globalThis.__rootId(__idOf(node)); }
+  // WebIDL unsigned short conversion (for compareBoundaryPoints' `how`).
+  function __toUint16(v) {
+    var n = Number(v);
+    if (isNaN(n) || n === 0 || n === Infinity || n === -Infinity) { return 0; }
+    var posInt = (n < 0 ? -1 : 1) * Math.floor(Math.abs(n));
+    var k = posInt % 65536; if (k < 0) { k += 65536; } return k;
+  }
+  function __idxErr(m) { throw new globalThis.DOMException(m || "The index is not in the allowed range.", "IndexSizeError"); }
+  function __invNodeType(m) { throw new globalThis.DOMException(m || "The node is of a type that does not support this operation.", "InvalidNodeTypeError"); }
+  function __wrongDoc() { throw new globalThis.DOMException("The object is in the wrong document.", "WrongDocumentError"); }
+  function __isNodeLike(node) {
+    if (node == null) { return false; }
+    if (typeof node.__node === "number") { return true; }
+    // Arena-less engine Documents (bare `new Document()`, createDocument) carry no `__node` but are
+    // still Nodes for boundary-point purposes.
+    return !!(globalThis.Node && (node instanceof globalThis.Node));
+  }
+  function __reqNode(node, method, idx) {
+    if (!__isNodeLike(node)) {
+      throw new TypeError("Failed to execute '" + method + "' on 'Range': parameter " + (idx || 1) + " is not of type 'Node'.");
+    }
+  }
+  // Validate (node, offset) as a settable boundary point, returning the WebIDL-coerced offset.
+  function __validBP(node, offset, method) {
+    __reqNode(node, method);
+    if (__nodeType(__idOf(node)) === 10) { __invNodeType("Cannot set a Range boundary to a doctype node."); }
+    var off = offset >>> 0;
+    if (off > __rangeLength(node)) { __idxErr("The offset " + off + " is larger than the node's length."); }
+    return off;
+  }
+  // "Set the start of a range" — sets start, dragging end along when the new start is past it or in a
+  // different tree. "Set the end" is the mirror.
+  function __setRangeStart(r, node, off) {
+    if (__rootOf(node) !== __rootOf(r._sc) || __cmpBP(node, off, r._ec, r._eo) > 0) { r._ec = node; r._eo = off; }
+    r._sc = node; r._so = off;
+  }
+  function __setRangeEnd(r, node, off) {
+    if (__rootOf(node) !== __rootOf(r._sc) || __cmpBP(node, off, r._sc, r._so) < 0) { r._sc = node; r._so = off; }
+    r._ec = node; r._eo = off;
+  }
   Object.defineProperty(Range.prototype, "startContainer", { get: function () { return this._sc; }, enumerable: true, configurable: true });
   Object.defineProperty(Range.prototype, "endContainer", { get: function () { return this._ec; }, enumerable: true, configurable: true });
   Object.defineProperty(Range.prototype, "startOffset", { get: function () { return this._so; }, enumerable: true, configurable: true });
@@ -11868,24 +12015,104 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return this._sc;
   }, enumerable: true, configurable: true });
   Range.prototype.setStart = function (node, offset) {
-    this._sc = node; this._so = offset | 0;
-    // If start is now after end (or end unset), collapse end onto start.
-    if (this._ec == null || (this._sc === this._ec && this._so > this._eo)) { this._ec = node; this._eo = this._so; }
+    var off = __validBP(node, offset, "setStart");
+    __setRangeStart(this, node, off);
   };
   Range.prototype.setEnd = function (node, offset) {
-    this._ec = node; this._eo = offset | 0;
-    if (this._sc == null || (this._sc === this._ec && this._eo < this._so)) { this._sc = node; this._so = this._eo; }
+    var off = __validBP(node, offset, "setEnd");
+    __setRangeEnd(this, node, off);
   };
-  Range.prototype.setStartBefore = function (node) { var id = __idOf(node); var p = __parent(id); this.setStart(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) : 0); };
-  Range.prototype.setStartAfter = function (node) { var id = __idOf(node); var p = __parent(id); this.setStart(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) + 1 : 0); };
-  Range.prototype.setEndBefore = function (node) { var id = __idOf(node); var p = __parent(id); this.setEnd(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) : 0); };
-  Range.prototype.setEndAfter = function (node) { var id = __idOf(node); var p = __parent(id); this.setEnd(p >= 0 ? __nodeFor(p) : node, p >= 0 ? __children(p).indexOf(id) + 1 : 0); };
+  // setStartBefore/After & setEndBefore/After: throw InvalidNodeTypeError when node has no parent.
+  Range.prototype.setStartBefore = function (node) {
+    __reqNode(node, "setStartBefore"); var id = __idOf(node); var p = __parent(id);
+    if (p < 0) { __invNodeType("The node has no parent."); }
+    __setRangeStart(this, __nodeFor(p), __children(p).indexOf(id));
+  };
+  Range.prototype.setStartAfter = function (node) {
+    __reqNode(node, "setStartAfter"); var id = __idOf(node); var p = __parent(id);
+    if (p < 0) { __invNodeType("The node has no parent."); }
+    __setRangeStart(this, __nodeFor(p), __children(p).indexOf(id) + 1);
+  };
+  Range.prototype.setEndBefore = function (node) {
+    __reqNode(node, "setEndBefore"); var id = __idOf(node); var p = __parent(id);
+    if (p < 0) { __invNodeType("The node has no parent."); }
+    __setRangeEnd(this, __nodeFor(p), __children(p).indexOf(id));
+  };
+  Range.prototype.setEndAfter = function (node) {
+    __reqNode(node, "setEndAfter"); var id = __idOf(node); var p = __parent(id);
+    if (p < 0) { __invNodeType("The node has no parent."); }
+    __setRangeEnd(this, __nodeFor(p), __children(p).indexOf(id) + 1);
+  };
   Range.prototype.collapse = function (toStart) {
     if (toStart) { this._ec = this._sc; this._eo = this._so; }
     else { this._sc = this._ec; this._so = this._eo; }
   };
-  Range.prototype.selectNode = function (node) { this.setStartBefore(node); this.setEndAfter(node); };
-  Range.prototype.selectNodeContents = function (node) { this.setStart(node, 0); this.setEnd(node, __nodeLength(__idOf(node))); };
+  // selectNode: parent-less node throws InvalidNodeTypeError; otherwise select the node within parent.
+  Range.prototype.selectNode = function (node) {
+    __reqNode(node, "selectNode"); var id = __idOf(node); var p = __parent(id);
+    if (p < 0) { __invNodeType("The node has no parent."); }
+    var parent = __nodeFor(p); var idx = __children(p).indexOf(id);
+    __setRangeStart(this, parent, idx);
+    __setRangeEnd(this, parent, idx + 1);
+  };
+  // selectNodeContents: a doctype throws InvalidNodeTypeError; otherwise span the whole node.
+  Range.prototype.selectNodeContents = function (node) {
+    __reqNode(node, "selectNodeContents");
+    if (__nodeType(__idOf(node)) === 10) { __invNodeType("Cannot select the contents of a doctype node."); }
+    var len = __rangeLength(node);
+    __setRangeStart(this, node, 0);
+    __setRangeEnd(this, node, len);
+  };
+  // compareBoundaryPoints(how, sourceRange): NotSupportedError for how outside 0-3 (after WebIDL
+  // unsigned-short coercion); WrongDocumentError when the ranges live in different trees.
+  Range.prototype.compareBoundaryPoints = function (how, sourceRange) {
+    var h = __toUint16(how);
+    if (h !== 0 && h !== 1 && h !== 2 && h !== 3) {
+      throw new globalThis.DOMException("The comparison method is not one of START_TO_START, START_TO_END, END_TO_END, or END_TO_START.", "NotSupportedError");
+    }
+    if (sourceRange == null || sourceRange._sc === undefined) {
+      throw new TypeError("Failed to execute 'compareBoundaryPoints' on 'Range': parameter 2 is not of type 'Range'.");
+    }
+    if (__rootOf(this._sc) !== __rootOf(sourceRange._sc)) { __wrongDoc(); }
+    var thisStart = (h === 0 || h === 3);                       // START_TO_START | END_TO_START
+    var otherStart = (h === 0 || h === 1);                      // START_TO_START | START_TO_END
+    var tn = thisStart ? this._sc : this._ec, to = thisStart ? this._so : this._eo;
+    var on = otherStart ? sourceRange._sc : sourceRange._ec, oo = otherStart ? sourceRange._so : sourceRange._eo;
+    return __cmpBP(tn, to, on, oo);
+  };
+  // comparePoint(node, offset): -1 / 0 / 1 for before / within / after; throws WrongDocumentError,
+  // InvalidNodeTypeError, IndexSizeError per spec (in that order).
+  Range.prototype.comparePoint = function (node, offset) {
+    __reqNode(node, "comparePoint");
+    if (__rootOf(node) !== __rootOf(this._sc)) { __wrongDoc(); }
+    if (__nodeType(__idOf(node)) === 10) { __invNodeType("The node is a doctype."); }
+    var off = offset >>> 0;
+    if (off > __rangeLength(node)) { __idxErr("The offset is larger than the node's length."); }
+    if (__cmpBP(node, off, this._sc, this._so) < 0) { return -1; }
+    if (__cmpBP(node, off, this._ec, this._eo) > 0) { return 1; }
+    return 0;
+  };
+  // isPointInRange(node, offset): false for a different root (no throw); doctype/oversized offset throw.
+  Range.prototype.isPointInRange = function (node, offset) {
+    __reqNode(node, "isPointInRange");
+    if (__rootOf(node) !== __rootOf(this._sc)) { return false; }
+    if (__nodeType(__idOf(node)) === 10) { __invNodeType("The node is a doctype."); }
+    var off = offset >>> 0;
+    if (off > __rangeLength(node)) { __idxErr("The offset is larger than the node's length."); }
+    if (__cmpBP(node, off, this._sc, this._so) < 0 || __cmpBP(node, off, this._ec, this._eo) > 0) { return false; }
+    return true;
+  };
+  // intersectsNode(node): does this range overlap node? false (no throw) when roots differ.
+  Range.prototype.intersectsNode = function (node) {
+    __reqNode(node, "intersectsNode");
+    var id = __idOf(node);
+    if (globalThis.__rootId(id) !== __rootOf(this._sc)) { return false; }
+    var p = __parent(id);
+    if (p < 0) { return true; }
+    var parent = __nodeFor(p); var offset = __children(p).indexOf(id);
+    if (__cmpBP(parent, offset, this._ec, this._eo) < 0 && __cmpBP(parent, offset + 1, this._sc, this._so) > 0) { return true; }
+    return false;
+  };
   Range.prototype.cloneRange = function () { var r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; };
   Range.prototype.detach = function () {};
   Range.prototype.createContextualFragment = function (html) {
@@ -11939,6 +12166,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // Install as the global Range, keeping `range instanceof Range` working. defClass already made an
   // empty Range earlier; overwrite it with this functional constructor (its prototype still chains to
   // AbstractRange).
+  // compareBoundaryPoints `how` constants live on both the constructor and the prototype.
+  (function () {
+    var rconsts = { START_TO_START: 0, START_TO_END: 1, END_TO_END: 2, END_TO_START: 3 };
+    for (var k in rconsts) {
+      try { def(Range, k, rconsts[k]); } catch (e) {}
+      try { def(Range.prototype, k, rconsts[k]); } catch (e) {}
+    }
+  })();
   try { def(globalThis, "Range", Range); } catch (e) {}
 
   // CaretPosition: { offsetNode, offset, getClientRect() }. getClientRect() returns a FRESH DOMRect
@@ -13014,10 +13249,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   if (typeof globalThis.document !== "undefined" && globalThis.document) {
     if (typeof globalThis.document.createTreeWalker !== "function") {
-      def(globalThis.document, "createTreeWalker", function (root, whatToShow, filter) { return __makeTreeWalker(root, whatToShow, filter); });
+      def(globalThis.document, "createTreeWalker", function (root, whatToShow, filter) {
+        if (arguments.length < 1 || root == null || typeof root.__node !== "number") {
+          throw new TypeError("Failed to execute 'createTreeWalker' on 'Document': parameter 1 is not of type 'Node'.");
+        }
+        return __makeTreeWalker(root, whatToShow, filter);
+      });
     }
     if (typeof globalThis.document.createNodeIterator !== "function") {
-      def(globalThis.document, "createNodeIterator", function (root, whatToShow, filter) { return __makeNodeIterator(root, whatToShow, filter); });
+      def(globalThis.document, "createNodeIterator", function (root, whatToShow, filter) {
+        if (arguments.length < 1 || root == null || typeof root.__node !== "number") {
+          throw new TypeError("Failed to execute 'createNodeIterator' on 'Document': parameter 1 is not of type 'Node'.");
+        }
+        return __makeNodeIterator(root, whatToShow, filter);
+      });
     }
   }
 
