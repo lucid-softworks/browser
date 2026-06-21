@@ -9050,6 +9050,27 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return el;
   }
   def(globalThis, "__canonNode", canon);
+
+  // The live document is the facade for arena node 0. Register it in the canonical wrapper cache
+  // so walking parentNode from the document element reaches the actual global document object.
+  try {
+    Object.defineProperty(document, "__node", { value: 0, configurable: true });
+    def(document, "__enriched", true);
+    canon(document);
+  } catch (e) {}
+
+  function nodeContains(root, other) {
+    if (other == null) { return false; }
+    if (other === root) { return true; }
+    var rootId = root && root.__node;
+    var cur = other && other.__node;
+    if (typeof rootId !== "number" || typeof cur !== "number") { return false; }
+    while (cur >= 0) {
+      if (cur === rootId) { return true; }
+      cur = __parent(cur);
+    }
+    return false;
+  }
   // Look up the canonical wrapper for a node id, if one was already created (createElement / a prior
   // lookup). Returns null if the node was never wrapped. Lets out-of-scope code resolve a node id.
   def(globalThis, "__nodeById", function (id) { return __nodeCache[id] || null; });
@@ -10565,6 +10586,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       Object.defineProperty(doc, "childNodes", { get: function () { var ids = kids(), a = []; for (var i = 0; i < ids.length; i++) { a.push(globalThis.__nodeFor(ids[i])); } return a; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "firstChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[0]) : null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "lastChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[ids.length - 1]) : null; }, configurable: true, enumerable: true });
+      def(doc, "contains", function (other) { return nodeContains(doc, other); });
       return doc;
     }
     def(document, "implementation", {
@@ -10627,9 +10649,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         // A Document's textContent / nodeValue are null; setting them is a no-op.
         Object.defineProperty(doc, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
         Object.defineProperty(doc, "nodeValue", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
-        // Back the facade with a real arena Document node holding <html> as its element child, so
+        // createHTMLDocument() creates an HTML doctype before the document element.
+        var doctype = makeDoctypeFor(doc, "html", "", "");
+        doc.doctype = doctype;
+        // Back the facade with a real arena Document node holding the doctype and <html>, so
         // appendChild / childNodes / traversal work on the off-document tree.
-        backDocWithArena(doc, [htmlEl && typeof htmlEl.__node === "number" ? htmlEl.__node : -1]);
+        backDocWithArena(doc, [doctype && typeof doctype.__node === "number" ? doctype.__node : -1,
+                               htmlEl && typeof htmlEl.__node === "number" ? htmlEl.__node : -1]);
         return doc;
       },
       createDocument: function (namespace) {
@@ -10655,7 +10681,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     def(document, "getElementsByName", function (n) { try { return document.querySelectorAll('[name="' + String(n) + '"]'); } catch (e) { return []; } });
   }
   if (typeof document.contains !== "function") {
-    def(document, "contains", function (node) { try { return document.documentElement ? (document.documentElement === node || document.documentElement.contains(node)) : false; } catch (e) { return false; } });
+    def(document, "contains", function (node) { return nodeContains(document, node); });
   }
 
   // Document is a Node: its children are the doctype + the root element. Wire the Node mutation
@@ -18583,6 +18609,67 @@ mod tests {
         assert!(
             style.contains("display: block"),
             "child style attr was {style:?}"
+        );
+    }
+
+    #[test]
+    fn node_contains_handles_live_and_disconnected_trees() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var parent = document.createElement("div");
+                var child = document.createElement("span");
+                parent.appendChild(child);
+                document.body.appendChild(parent);
+                var attached = [document.contains(document),
+                                document.contains(document.documentElement),
+                                document.contains(child), parent.contains(parent),
+                                parent.contains(child),
+                                document.documentElement.parentNode === document];
+                parent.remove();
+                var detached = [document.contains(parent), document.contains(child),
+                                parent.contains(child), child.contains(parent),
+                                parent.contains(null)];
+                attached.concat(detached).join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true,true,true,true,true,true,false,false,true,false,false")
+        );
+    }
+
+    #[test]
+    fn document_contains_is_scoped_to_each_document_tree() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var foreign = document.implementation.createHTMLDocument("");
+                var foreignChild = foreign.createElement("p");
+                foreign.body.appendChild(foreignChild);
+                var xml = document.implementation.createDocument(null, null, null);
+                var xmlChild = xml.createElement("item");
+                xml.appendChild(xmlChild);
+                var detached = foreign.createElement("aside");
+                [foreign.contains(foreign), foreign.contains(foreignChild),
+                 foreign.contains(document.body), foreign.contains(detached),
+                 foreign.contains(foreign.doctype), foreign.doctype.parentNode === foreign,
+                 document.contains(foreignChild),
+                 xml.contains(xml), xml.contains(xmlChild),
+                 xml.contains(foreignChild)].join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true,true,false,false,true,true,false,true,true,false")
         );
     }
 
