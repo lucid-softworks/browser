@@ -31,6 +31,10 @@ jobs:
   wpt:
     name: wpt (${{ matrix.dir }})
     runs-on: ubuntu-latest
+    # A buggy engine can drive a WPT test into an infinite loop inside a single tick() — the
+    # runner's per-file 5s wall guard only fires between tick() calls, so an in-tick loop hangs
+    # the leg forever (default 6h before GitHub kills it). Cap each leg instead.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
