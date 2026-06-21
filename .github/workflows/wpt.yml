@@ -3,9 +3,13 @@ name: WPT
 # Every PR runs the web-platform-tests conformance suite and posts a report comment — except PRs
 # that can't affect engine conformance (docs, CI config, the macOS shell, packaging, build scripts).
 # Anything under crates/ or the workspace manifests still triggers it.
+#
+# Pushes to main run the same suite to refresh the baseline the PR comment diffs against: each main
+# run caches its per-area TSVs under `wpt-baseline-<sha>`, and PR runs restore the most recent one
+# (caches created on the default branch are visible to PR runs) to compute the Δ-vs-main column.
 on:
   pull_request:
-    paths-ignore:
+    paths-ignore: &paths-ignore
       - '**.md'
       - '.github/**'
       - 'swift/**'
@@ -14,6 +18,9 @@ on:
       - 'include/**'
       - 'LICENSE'
       - '.gitignore'
+  push:
+    branches: [main]
+    paths-ignore: *paths-ignore
 
 concurrency:
   group: wpt-${{ github.ref }}
@@ -110,26 +117,51 @@ jobs:
           pattern: wpt-result-*
           merge-multiple: true
 
+      # Restore the latest main baseline (per-area TSVs). On a PR the exact key never matches, so the
+      # `wpt-baseline-` prefix falls through to the newest cache — which only main writes. Absent on
+      # the very first run before main has ever cached; the report degrades to "—" deltas then.
+      - name: Restore main baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: baseline
+          key: wpt-baseline-${{ github.sha }}
+          restore-keys: |
+            wpt-baseline-
+
       - name: Build report
         id: wpt
         run: |
-          rows=""; tp=0; tt=0
+          rows=""; tp=0; tt=0; tdelta=0; have_base=0
+          # Render the signed change in passing subtests vs the baseline; ±0 for no change, — if the
+          # area has no baseline yet.
+          fmt() { if [ "$1" -gt 0 ]; then echo "+$1"; elif [ "$1" -lt 0 ]; then echo "$1"; else echo "±0"; fi; }
           # Canonical display order, independent of which legs finished.
           for dir in css/cssom dom domparsing html/dom url fetch; do
             slug="${dir//\//-}"
             f="artifacts/${slug}.tsv"
             [ -f "$f" ] || continue
             IFS=$'\t' read -r d p t pct < "$f"
-            rows="${rows}| \`${d}\` | ${p} / ${t} | ${pct} |\n"
+            delta="—"
+            bf="baseline/${slug}.tsv"
+            if [ -f "$bf" ]; then
+              have_base=1
+              IFS=$'\t' read -r bd bp bt bpct < "$bf"
+              dp=$((p - bp))
+              delta=$(fmt "$dp")
+              tdelta=$((tdelta + dp))
+            fi
+            rows="${rows}| \`${d}\` | ${p} / ${t} | ${pct} | ${delta} |\n"
             tp=$((tp + p)); tt=$((tt + t))
           done
           total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
+          # Total Δ sums only areas that had a baseline, so it stays honest if a new area lacks one.
+          total_delta="—"; [ "$have_base" -eq 1 ] && total_delta=$(fmt "$tdelta")
           {
             echo "report<<REPORT_EOF"
-            echo "| Area | Subtests | Pass rate |"
-            echo "|------|----------|-----------|"
+            echo "| Area | Subtests | Pass rate | Δ vs \`main\` |"
+            echo "|------|----------|-----------|------------|"
             printf "%b" "$rows"
-            echo "| **Total** | **${tp} / ${tt}** | **${total_pct}** |"
+            echo "| **Total** | **${tp} / ${tt}** | **${total_pct}** | **${total_delta}** |"
             echo "REPORT_EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -141,7 +173,23 @@ jobs:
             artifacts/*.html
             artifacts/*.log
 
+      # On main, publish this run's per-area TSVs as the new baseline. The key is per-commit so the
+      # save always succeeds (cache keys are immutable); PR runs pick it up via the restore-keys
+      # prefix above. Old baselines age out under GitHub's cache eviction.
+      - name: Save main baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          rm -rf baseline && mkdir -p baseline
+          cp artifacts/*.tsv baseline/ 2>/dev/null || true
+      - name: Cache main baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: baseline
+          key: wpt-baseline-${{ github.sha }}
+
       - name: Comment report on PR
+        if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: wpt-report
@@ -150,4 +198,4 @@ jobs:
 
             ${{ steps.wpt.outputs.report }}
 
-            <sub>web-platform-tests via `crates/wpt-runner`. Full HTML reports are attached as the `wpt-reports` artifact on this run.</sub>
+            <sub>Δ vs `main` is the change in passing subtests against the latest `main` baseline (`—` when no baseline exists yet). web-platform-tests via `crates/wpt-runner`. Full HTML reports are attached as the `wpt-reports` artifact on this run.</sub>
