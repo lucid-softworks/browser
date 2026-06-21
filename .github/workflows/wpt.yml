@@ -24,8 +24,26 @@ permissions:
   pull-requests: write   # to post/update the report comment
 
 jobs:
+  # Each WPT area runs on its own runner in parallel. html/dom dominates wall-clock; fanning the
+  # areas out means the suite finishes in ~max(area) instead of ~sum(area). Each leg emits a
+  # one-line TSV (dir, pass, total, pct) + its HTML report + a live-streamed .log; the `report`
+  # job stitches them together.
   wpt:
+    name: wpt (${{ matrix.dir }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # slug mirrors dir with `/` → `-`; used for unique artifact names (artifact names can't
+        # contain `/`). css/cssom, dom, domparsing, url are quick; html/dom is large; fetch is
+        # mostly network-dependent. All exclude tentative tests (skipped by the runner).
+        include:
+          - { dir: css/cssom, slug: css-cssom }
+          - { dir: dom,       slug: dom }
+          - { dir: domparsing, slug: domparsing }
+          - { dir: html/dom,  slug: html-dom }
+          - { dir: url,       slug: url }
+          - { dir: fetch,     slug: fetch }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,38 +55,66 @@ jobs:
       - name: Install fonts
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
 
-      # Sparse, blobless checkout of just the directories we run (the full repo is ~160k files).
+      # Sparse, blobless checkout of just this leg's directory (+ shared resources). The full repo
+      # is ~160k files.
       - name: Checkout web-platform-tests
         run: |
           git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git "$RUNNER_TEMP/wpt"
           cd "$RUNNER_TEMP/wpt"
-          git sparse-checkout set css/cssom dom domparsing html/dom url fetch resources
+          git sparse-checkout set "${{ matrix.dir }}" resources
 
       - name: Build runner
         run: cargo build --release -p wpt-runner
 
-      - name: Run WPT + build report
-        id: wpt
+      - name: Run WPT
         run: |
           WPT="$RUNNER_TEMP/wpt"
+          dir="${{ matrix.dir }}"
+          slug="${{ matrix.slug }}"
           mkdir -p reports
+          # `-q` silences cargo's own Finished/Running chatter; 2>&1 keeps the runner's per-file
+          # PASS/FAIL/TIMEOUT lines. tee streams them into this leg's live log and saves a .log
+          # (uploaded alongside the HTML report), then we read the summary line back out.
+          log="reports/${slug}.log"
+          WPT_REPORT="reports/${slug}.html" \
+            cargo run --release -q -p wpt-runner -- "$WPT" "$dir" 200000 2>&1 | tee "$log"
+          line=$(grep -E "^subtests:" "$log" | tail -1)
+          p=$(echo "$line" | sed -E 's#subtests: ([0-9]+)/.*#\1#')
+          t=$(echo "$line" | sed -E 's#subtests: [0-9]+/([0-9]+).*#\1#')
+          pct=$(echo "$line" | sed -E 's#.*\(([0-9.]+%)\).*#\1#')
+          printf '%s\t%s\t%s\t%s\n' "$dir" "$p" "$t" "$pct" > "reports/${slug}.tsv"
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-result-${{ matrix.slug }}
+          path: reports/
+
+  # Collect every leg's TSV + HTML + log, build the combined table, and post the single sticky
+  # comment. Runs even if some legs fail (fail-fast is off) so partial results still surface.
+  report:
+    needs: wpt
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: wpt-result-*
+          merge-multiple: true
+
+      - name: Build report
+        id: wpt
+        run: |
           rows=""; tp=0; tt=0
-          # css/cssom, dom, domparsing, url are quick; html/dom is large; fetch is mostly network-
-          # dependent (low but non-zero). All exclude tentative tests (skipped by the runner).
+          # Canonical display order, independent of which legs finished.
           for dir in css/cssom dom domparsing html/dom url fetch; do
-            echo "::group::WPT $dir"
-            # `-q` silences cargo's own Finished/Running chatter; 2>&1 keeps the runner's "running N
-            # tests" header. tee streams every per-file PASS/FAIL/TIMEOUT line into the live log and
-            # saves a per-area .log (uploaded alongside the HTML report), then we read the summary back.
-            log="reports/${dir//\//-}.log"
-            WPT_REPORT="reports/${dir//\//-}.html" \
-              cargo run --release -q -p wpt-runner -- "$WPT" "$dir" 200000 2>&1 | tee "$log"
-            echo "::endgroup::"
-            line=$(grep -E "^subtests:" "$log" | tail -1)
-            p=$(echo "$line" | sed -E 's#subtests: ([0-9]+)/.*#\1#')
-            t=$(echo "$line" | sed -E 's#subtests: [0-9]+/([0-9]+).*#\1#')
-            pct=$(echo "$line" | sed -E 's#.*\(([0-9.]+%)\).*#\1#')
-            rows="${rows}| \`${dir}\` | ${p} / ${t} | ${pct} |\n"
+            slug="${dir//\//-}"
+            f="artifacts/${slug}.tsv"
+            [ -f "$f" ] || continue
+            IFS=$'\t' read -r d p t pct < "$f"
+            rows="${rows}| \`${d}\` | ${p} / ${t} | ${pct} |\n"
             tp=$((tp + p)); tt=$((tt + t))
           done
           total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
@@ -85,7 +131,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: wpt-reports
-          path: reports/
+          path: |
+            artifacts/*.html
+            artifacts/*.log
 
       - name: Comment report on PR
         uses: marocchino/sticky-pull-request-comment@v2
