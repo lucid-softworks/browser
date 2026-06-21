@@ -88,6 +88,22 @@ jobs:
               return;
             }
 
+            // One claim at a time: refuse if the commenter already has another open issue assigned.
+            // Keeps issues from being hoarded and going stale. Maintainers can still assign via the
+            // GitHub UI, which bypasses this check entirely.
+            const MAX_OPEN_CLAIMS = 1;
+            const mine = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', assignee: commenter, per_page: 100,
+            });
+            // listForRepo returns PRs too; only count real issues, and exclude this one.
+            const openClaims = mine.filter(i => !i.pull_request && i.number !== issue_number);
+            if (openClaims.length >= MAX_OPEN_CLAIMS) {
+              await react('confused');
+              const list = openClaims.map(i => `#${i.number}`).join(', ');
+              await comment(`@${commenter} you already have an open claim (${list}). Please finish it or comment \`/unclaim\` there before claiming another — one issue at a time keeps things from going stale.`);
+              return;
+            }
+
             await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: [commenter] });
 
             // Assignment silently no-ops if the user can't be assigned (e.g. private repo + not a
