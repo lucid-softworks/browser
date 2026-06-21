@@ -375,8 +375,23 @@ fn content_type_from_url(url: &str) -> String {
     .to_string()
 }
 
+/// Convert the portion of a `file://` URL after the scheme into a filesystem path. On Windows a
+/// `file:///C:/dir/x` URL leaves `/C:/dir/x` here; the leading slash before the drive letter must be
+/// removed (`C:/dir/x`) or the OS rejects it (error 123, invalid name). A no-op on Unix.
+fn file_url_to_path(path: &str) -> &str {
+    #[cfg(windows)]
+    {
+        let b = path.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            return &path[1..];
+        }
+    }
+    path
+}
+
 /// Read a `file://` URL from local disk. `path` is the part after `file://`.
 fn fetch_file(path: &str, original: &str) -> Result<Response, String> {
+    let path = file_url_to_path(path);
     let body = std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))?;
     let content_type = match path.rsplit('.').next() {
         Some("html") | Some("htm") => "text/html",

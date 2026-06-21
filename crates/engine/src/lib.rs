@@ -8368,8 +8368,10 @@ mod tests {
         assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
         let _ = e.render();
 
+        // Poll generously (up to ~5s): the connect-failure → close-event → drain → dispatch chain
+        // can take longer than a second on a heavily loaded CI runner. Breaks out as soon as it fires.
         let mut closed = false;
-        for _ in 0..40 {
+        for _ in 0..200 {
             if e.console_eval("String(window.__wsClosed)") == "3" {
                 closed = true;
                 break;
