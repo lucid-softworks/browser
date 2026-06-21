@@ -2823,6 +2823,30 @@ fn prim_tag(
     rv.set(s);
 }
 
+/// `__namespaceUri(id) -> string | null`
+fn prim_namespace_uri(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let namespace = node.and_then(|n| match &state.doc.borrow().get(n).data {
+        dom::NodeData::Element(element) => Some(
+            element
+                .namespace
+                .as_deref()
+                .unwrap_or("http://www.w3.org/1999/xhtml")
+                .to_string(),
+        ),
+        _ => None,
+    });
+    match namespace {
+        Some(namespace) => rv.set(js_str(scope, &namespace)),
+        None => rv.set_null(),
+    }
+}
+
 /// `__nodeType(id) -> 1 | 3 | 8 | 9`
 fn prim_node_type(
     scope: &mut v8::PinScope,
@@ -3812,6 +3836,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__children", prim_children);
     set_fn(scope, global, "__parent", prim_parent);
     set_fn(scope, global, "__tag", prim_tag);
+    set_fn(scope, global, "__namespaceUri", prim_namespace_uri);
     set_fn(scope, global, "__nodeType", prim_node_type);
     set_fn(scope, global, "__rect", prim_rect);
     set_fn(scope, global, "__naturalSize", prim_natural_size);
@@ -4013,6 +4038,145 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     Object.defineProperty(obj, name, { value: value, enumerable: false, configurable: true, writable: true });
   }
 
+  // Web IDL collection objects. A resolver either recomputes the current nodes (live collection)
+  // or closes over a snapshot (static NodeList). Proxy traps provide indexed and named properties
+  // without making the platform object inherit from Array.
+  var __collectionState = new WeakMap();
+  function NodeList() { throw new TypeError("Illegal constructor"); }
+  function HTMLCollection() { throw new TypeError("Illegal constructor"); }
+  function collectionItems(value) {
+    var resolver = __collectionState.get(value);
+    if (!resolver) { throw new TypeError("Illegal invocation"); }
+    return resolver();
+  }
+  function arrayIndex(prop) {
+    if (typeof prop !== "string" || !/^(0|[1-9][0-9]*)$/.test(prop)) { return -1; }
+    var n = Number(prop);
+    return n >= 0 && n < 4294967295 ? n : -1;
+  }
+  function collectionNamedItems(items) {
+    var names = Object.create(null);
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item) { continue; }
+      var id = item.id == null ? "" : String(item.id);
+      if (id && !(id in names)) { names[id] = item; }
+      var name = item.getAttribute && item.namespaceURI === "http://www.w3.org/1999/xhtml"
+        ? item.getAttribute("name") : null;
+      if (name && !(name in names)) { names[String(name)] = item; }
+    }
+    return names;
+  }
+  function makeCollection(Ctor, resolver, live) {
+    var snapshot = live ? null : resolver().slice();
+    var resolve = live ? resolver : function () { return snapshot; };
+    var target = Object.create(Ctor.prototype);
+    var proxy = new Proxy(target, {
+      get: function (obj, prop, receiver) {
+        var index = arrayIndex(prop);
+        if (index >= 0) { return resolve()[index]; }
+        if (Ctor === HTMLCollection && typeof prop === "string" && !(prop in obj)) {
+          var named = collectionNamedItems(resolve());
+          if (prop in named) { return named[prop]; }
+        }
+        return Reflect.get(obj, prop, receiver);
+      },
+      set: function (obj, prop, value, receiver) {
+        if (arrayIndex(prop) >= 0) { return false; }
+        if (Ctor === HTMLCollection && typeof prop === "string" && prop in collectionNamedItems(resolve())) { return false; }
+        return Reflect.set(obj, prop, value, receiver);
+      },
+      has: function (obj, prop) {
+        var index = arrayIndex(prop);
+        if (index >= 0) { return index < resolve().length; }
+        if (Ctor === HTMLCollection && typeof prop === "string" && prop in collectionNamedItems(resolve())) { return true; }
+        return Reflect.has(obj, prop);
+      },
+      ownKeys: function (obj) {
+        var items = resolve(), keys = [];
+        for (var i = 0; i < items.length; i++) { keys.push(String(i)); }
+        if (Ctor === HTMLCollection) {
+          var named = collectionNamedItems(items);
+          for (var name in named) { if (keys.indexOf(name) < 0) { keys.push(name); } }
+        }
+        var own = Reflect.ownKeys(obj);
+        for (var j = 0; j < own.length; j++) { if (keys.indexOf(own[j]) < 0) { keys.push(own[j]); } }
+        return keys;
+      },
+      getOwnPropertyDescriptor: function (obj, prop) {
+        var index = arrayIndex(prop), items = resolve();
+        if (index >= 0 && index < items.length) {
+          return { value: items[index], writable: false, enumerable: true, configurable: true };
+        }
+        if (Ctor === HTMLCollection && typeof prop === "string") {
+          var named = collectionNamedItems(items);
+          if (prop in named) {
+            return { value: named[prop], writable: false, enumerable: false, configurable: true };
+          }
+        }
+        return Reflect.getOwnPropertyDescriptor(obj, prop);
+      },
+      defineProperty: function (obj, prop, descriptor) {
+        if (arrayIndex(prop) >= 0) { return false; }
+        return Reflect.defineProperty(obj, prop, descriptor);
+      }
+    });
+    __collectionState.set(proxy, resolve);
+    return proxy;
+  }
+  Object.defineProperty(NodeList.prototype, Symbol.toStringTag,
+    { value: "NodeList", configurable: true });
+  Object.defineProperty(HTMLCollection.prototype, Symbol.toStringTag,
+    { value: "HTMLCollection", configurable: true });
+  Object.defineProperty(NodeList.prototype, "length", {
+    get: function () { return collectionItems(this).length; }, enumerable: true, configurable: true
+  });
+  Object.defineProperty(HTMLCollection.prototype, "length", {
+    get: function () { return collectionItems(this).length; }, enumerable: true, configurable: true
+  });
+  def(NodeList.prototype, "item", function (index) {
+    var item = collectionItems(this)[Number(index) >>> 0];
+    return item === undefined ? null : item;
+  });
+  def(HTMLCollection.prototype, "item", NodeList.prototype.item);
+  def(HTMLCollection.prototype, "namedItem", function (name) {
+    var key = String(name);
+    if (!key) { return null; }
+    var item = collectionNamedItems(collectionItems(this))[key];
+    return item === undefined ? null : item;
+  });
+  def(NodeList.prototype, "forEach", function (callback, thisArg) {
+    var items = collectionItems(this);
+    for (var i = 0; i < items.length; i++) { callback.call(thisArg, items[i], i, this); }
+  });
+  function collectionIterator(kind) {
+    return function () {
+      var collection = this, index = 0;
+      var iterator = { next: function () {
+        var items = collectionItems(collection);
+        if (index >= items.length) { return { value: undefined, done: true }; }
+        var value = kind === "keys" ? index : (kind === "entries" ? [index, items[index]] : items[index]);
+        index++;
+        return { value: value, done: false };
+      } };
+      iterator[Symbol.iterator] = function () { return this; };
+      return iterator;
+    };
+  }
+  def(NodeList.prototype, "entries", collectionIterator("entries"));
+  def(NodeList.prototype, "keys", collectionIterator("keys"));
+  def(NodeList.prototype, "values", collectionIterator("values"));
+  def(NodeList.prototype, Symbol.iterator, NodeList.prototype.values);
+  def(HTMLCollection.prototype, Symbol.iterator, collectionIterator("values"));
+  def(globalThis, "NodeList", NodeList);
+  def(globalThis, "HTMLCollection", HTMLCollection);
+  def(globalThis, "__makeNodeList", function (resolver, live) {
+    return makeCollection(NodeList, resolver, !!live);
+  });
+  def(globalThis, "__makeHTMLCollection", function (resolver) {
+    return makeCollection(HTMLCollection, resolver, true);
+  });
+
   // window / self aliases (globalThis already exists).
   globalThis.window = globalThis;
   globalThis.self = globalThis;
@@ -4118,7 +4282,7 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   function elNamespace(eid) {
     var m = __nsMeta[eid];
     if (m) { return m.namespaceURI; }
-    return __nodeType(eid) === 1 ? HTML_NS : null;
+    return __nodeType(eid) === 1 ? __namespaceUri(eid) : null;
   }
   function elLocalName(eid) {
     var m = __nsMeta[eid];
@@ -4458,7 +4622,7 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     Object.defineProperty(el, "namespaceURI", { get: function () {
       var m = __nsMeta[id];
       if (m) { return m.namespaceURI; }
-      return __nodeType(id) === 1 ? HTML_NS : null;
+      return __nodeType(id) === 1 ? __namespaceUri(id) : null;
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "prefix", { get: function () {
       var m = __nsMeta[id];
@@ -4967,27 +5131,36 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     });
 
     def(el, "querySelector", function (sel) { var r = __querySelectorAllWithin(id, String(sel)); return r.length ? wrap(r[0]) : null; });
-    def(el, "querySelectorAll", function (sel) { return __querySelectorAllWithin(id, String(sel)).map(wrap); });
+    def(el, "querySelectorAll", function (sel) {
+      var ids = __querySelectorAllWithin(id, String(sel));
+      return globalThis.__makeNodeList(function () { return ids.map(wrap); }, false);
+    });
     def(el, "getElementsByTagName", function (tag) {
       var qn = String(tag);
-      return collectDescendants(id, function (eid) { return matchesTagName(eid, qn); });
+      return globalThis.__makeHTMLCollection(function () {
+        return collectDescendants(id, function (eid) { return matchesTagName(eid, qn); });
+      });
     });
     def(el, "getElementsByTagNameNS", function (ns, localName) {
-      var n = (ns === "*" || ns == null) ? "*" : String(ns);
+      var n = ns === "*" ? "*" : (ns == null || ns === "" ? null : String(ns));
       var ln = (localName === "*" || localName == null) ? "*" : String(localName);
-      return collectDescendants(id, function (eid) { return matchesTagNameNS(eid, n, ln); });
+      return globalThis.__makeHTMLCollection(function () {
+        return collectDescendants(id, function (eid) { return matchesTagNameNS(eid, n, ln); });
+      });
     });
     def(el, "getElementsByClassName", function (cls) {
       // Scope getElementsByClassName by filtering the global result to descendants of `id`.
-      var wanted = String(cls).split(/\s+/).filter(Boolean);
-      var all = __getElementsByClassName(String(cls));
-      var out = [];
-      for (var i = 0; i < all.length; i++) {
-        var cur = __parent(all[i]); var isDesc = false;
-        while (cur >= 0) { if (cur === id) { isDesc = true; break; } cur = __parent(cur); }
-        if (isDesc) { out.push(wrap(all[i])); }
-      }
-      return out;
+      var classNames = String(cls);
+      return globalThis.__makeHTMLCollection(function () {
+        var all = __getElementsByClassName(classNames);
+        var out = [];
+        for (var i = 0; i < all.length; i++) {
+          var cur = __parent(all[i]); var isDesc = false;
+          while (cur >= 0) { if (cur === id) { isDesc = true; break; } cur = __parent(cur); }
+          if (isDesc) { out.push(wrap(all[i])); }
+        }
+        return out;
+      });
     });
 
     def(el, "matches", function (sel) {
@@ -5019,8 +5192,15 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       }
       return out;
     }
-    Object.defineProperty(el, "children", { get: function () { return childList(true); }, enumerable: true, configurable: true });
-    Object.defineProperty(el, "childNodes", { get: function () { return childList(false); }, enumerable: true, configurable: true });
+    var childrenCollection = null, childNodesList = null;
+    Object.defineProperty(el, "children", { get: function () {
+      if (!childrenCollection) { childrenCollection = globalThis.__makeHTMLCollection(function () { return childList(true); }); }
+      return childrenCollection;
+    }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "childNodes", { get: function () {
+      if (!childNodesList) { childNodesList = globalThis.__makeNodeList(function () { return childList(false); }, true); }
+      return childNodesList;
+    }, enumerable: true, configurable: true });
     Object.defineProperty(el, "parentNode", { get: function () { return nf(__parent(id)); }, enumerable: true, configurable: true });
     Object.defineProperty(el, "parentElement", { get: function () { var p = __parent(id); return p >= 0 ? nf(p) : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "firstChild", { get: function () { var k = __children(id); return k.length ? nf(k[0]) : null; }, enumerable: true, configurable: true });
@@ -5065,11 +5245,41 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   def(document, "getElementById", function (idStr) { var n = __getElementById(String(idStr)); return n >= 0 ? wrap(n) : null; });
   def(document, "getElementsByTagName", function (tag) {
     var qn = String(tag);
-    return collectDescendants(0, function (eid) { return matchesTagName(eid, qn); });
+    return globalThis.__makeHTMLCollection(function () {
+      return collectDescendants(0, function (eid) { return matchesTagName(eid, qn); });
+    });
   });
-  def(document, "getElementsByClassName", function (cls) { return __getElementsByClassName(String(cls)).map(wrap); });
+  def(document, "getElementsByClassName", function (cls) {
+    var classNames = String(cls);
+    return globalThis.__makeHTMLCollection(function () { return __getElementsByClassName(classNames).map(wrap); });
+  });
   def(document, "querySelector", function (sel) { var r = __querySelectorAll(String(sel)); return r.length ? wrap(r[0]) : null; });
-  def(document, "querySelectorAll", function (sel) { return __querySelectorAll(String(sel)).map(wrap); });
+  def(document, "querySelectorAll", function (sel) {
+    var ids = __querySelectorAll(String(sel));
+    return globalThis.__makeNodeList(function () { return ids.map(wrap); }, false);
+  });
+  function documentCollection(predicate) {
+    return globalThis.__makeHTMLCollection(function () { return collectDescendants(0, predicate); });
+  }
+  function collectionProperty(name, collection) {
+    Object.defineProperty(document, name, {
+      get: function () { return collection; }, enumerable: true, configurable: true
+    });
+  }
+  collectionProperty("images", documentCollection(function (id) { return __tag(id) === "img"; }));
+  var embedsCollection = documentCollection(function (id) { return __tag(id) === "embed"; });
+  collectionProperty("embeds", embedsCollection);
+  collectionProperty("plugins", embedsCollection);
+  collectionProperty("links", documentCollection(function (id) {
+    var tag = __tag(id);
+    return (tag === "a" || tag === "area") && __getAttr(id, "href") !== null;
+  }));
+  collectionProperty("forms", documentCollection(function (id) { return __tag(id) === "form"; }));
+  collectionProperty("scripts", documentCollection(function (id) { return __tag(id) === "script"; }));
+  collectionProperty("anchors", documentCollection(function (id) {
+    return __tag(id) === "a" && __getAttr(id, "name") !== null;
+  }));
+  collectionProperty("applets", documentCollection(function (id) { return __tag(id) === "applet"; }));
   // document.write / writeln. We run scripts after the full parse (there is no live insertion point),
   // so the written markup is parsed and appended to <body> (or the documentElement) — enough for the
   // common case of a script writing extra elements (e.g. a <link>/<script>) into the page.
@@ -5208,12 +5418,14 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     };
     return wrap(id);
   });
-  // getElementsByTagNameNS(namespace, localName): all descendant elements matching namespace
-  // (or "*") and localName (or "*"). Returned as a plain array snapshot.
+  // getElementsByTagNameNS(namespace, localName): live descendant collection matching namespace
+  // (or "*") and localName (or "*").
   def(document, "getElementsByTagNameNS", function (namespace, localName) {
-    var ns = (namespace === "*" || namespace == null) ? "*" : String(namespace);
+    var ns = namespace === "*" ? "*" : (namespace == null || namespace === "" ? null : String(namespace));
     var ln = (localName === "*" || localName == null) ? "*" : String(localName);
-    return collectDescendants(0, function (eid) { return matchesTagNameNS(eid, ns, ln); });
+    return globalThis.__makeHTMLCollection(function () {
+      return collectDescendants(0, function (eid) { return matchesTagNameNS(eid, ns, ln); });
+    });
   });
   // Node-id-keyed attribute helpers the browser-env bootstrap uses for style/classList/dataset.
   def(document, "__getAttr", function (node, name) { return __getAttr(node, String(name)); });
@@ -9192,6 +9404,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (typeof ctor === "function" && ctor.prototype) { return ctor.prototype; }
     return (globalThis.HTMLElement && globalThis.HTMLElement.prototype) || null;
   }
+  function applyNodePrototype(wrapper, node) {
+    if (!wrapper || typeof node !== "number") { return; }
+    var type = __nodeType(node);
+    var proto = null;
+    if (type === 1) { proto = ifaceProtoForTag(wrapper.tagName); }
+    else if (type === 3) { proto = globalThis.Text && globalThis.Text.prototype; }
+    else if (type === 4) { proto = globalThis.CDATASection && globalThis.CDATASection.prototype; }
+    else if (type === 7) { proto = globalThis.ProcessingInstruction && globalThis.ProcessingInstruction.prototype; }
+    else if (type === 8) { proto = globalThis.Comment && globalThis.Comment.prototype; }
+    else if (type === 10) { proto = globalThis.DocumentType && globalThis.DocumentType.prototype; }
+    else if (type === 11) { proto = globalThis.DocumentFragment && globalThis.DocumentFragment.prototype; }
+    if (proto && Object.getPrototypeOf(wrapper) !== proto) { Object.setPrototypeOf(wrapper, proto); }
+  }
 
   // ============================================================================================
   // Generic HTML IDL attribute reflection.
@@ -10017,18 +10242,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       }
     } catch (e) {}
     // Graft the matching DOM interface prototype onto the wrapper's chain (own props survive).
-    // Non-element nodes (Text=3, Comment=8, DocumentFragment=11) use their CharacterData/Node
-    // interface prototype so `instanceof Text/Comment/DocumentFragment` holds; elements map by tag.
     if (typeof node === "number") {
-      try {
-        var nt = __nodeType(node);
-        var proto = null;
-        if (nt === 3) { proto = globalThis.Text && globalThis.Text.prototype; }
-        else if (nt === 8) { proto = globalThis.Comment && globalThis.Comment.prototype; }
-        else if (nt === 11) { proto = globalThis.DocumentFragment && globalThis.DocumentFragment.prototype; }
-        else { proto = ifaceProtoForTag(el.tagName); }
-        if (proto && Object.getPrototypeOf(el) !== proto) { Object.setPrototypeOf(el, proto); }
-      } catch (e) {}
+      try { applyNodePrototype(el, node); } catch (e) {}
     }
     if (typeof node === "number") {
       // `style` lives on the prototype chain (ElementCSSInlineStyle mixin) so it passes
@@ -10325,12 +10540,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         if (typeof orig === "function") { def(el, mn, function () { return canon(orig.apply(this, arguments)); }); }
       })(elemMethods[mi]);
     }
-    var listMethods = ["querySelectorAll", "getElementsByTagName", "getElementsByClassName"];
+    var listMethods = ["querySelectorAll", "getElementsByTagName", "getElementsByTagNameNS", "getElementsByClassName"];
     for (var li = 0; li < listMethods.length; li++) {
       (function (mn) {
         var orig = el[mn];
         if (typeof orig === "function") { def(el, mn, function () { var r = orig.apply(this, arguments); if (r && typeof r.length === "number") { for (var i = 0; i < r.length; i++) { r[i] = canon(r[i]); } } return r; }); }
-      })(listMethods[mi]);
+      })(listMethods[li]);
     }
     // Navigation accessors return fresh wrappers each time; re-wrap to canonicalize on read.
     var navAccessors = ["parentNode", "parentElement", "firstChild", "lastChild", "firstElementChild",
@@ -10519,6 +10734,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     def(obj, name, function () {
       var r = orig.apply(this, arguments);
       if (r && typeof r === "object") {
+        if (r instanceof globalThis.NodeList || r instanceof globalThis.HTMLCollection) { return r; }
         if (typeof r.length === "number" && typeof r.splice === "function") {
           for (var i = 0; i < r.length; i++) { r[i] = canon(r[i]); }
         } else {
@@ -10670,7 +10886,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         globalThis.__removeChild(docId, o); globalThis.__insertNode(docId, n, ref); return oldNode;
       });
       function kids() { return globalThis.__children(docId); }
-      Object.defineProperty(doc, "childNodes", { get: function () { var ids = kids(), a = []; for (var i = 0; i < ids.length; i++) { a.push(globalThis.__nodeFor(ids[i])); } return a; }, configurable: true, enumerable: true });
+      var childNodesList = globalThis.__makeNodeList(function () {
+        var ids = kids(), out = [];
+        for (var i = 0; i < ids.length; i++) { out.push(globalThis.__nodeFor(ids[i])); }
+        return out;
+      }, true);
+      Object.defineProperty(doc, "childNodes", { get: function () { return childNodesList; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "firstChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[0]) : null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "lastChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[ids.length - 1]) : null; }, configurable: true, enumerable: true });
       def(doc, "contains", function (other) { return nodeContains(doc, other); });
@@ -10766,7 +10987,18 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     });
   }
   if (typeof document.getElementsByName !== "function") {
-    def(document, "getElementsByName", function (n) { try { return document.querySelectorAll('[name="' + String(n) + '"]'); } catch (e) { return []; } });
+    def(document, "getElementsByName", function (n) {
+      var name = String(n);
+      return globalThis.__makeNodeList(function () {
+        var ids = __querySelectorAll("[name]"), out = [];
+        for (var i = 0; i < ids.length; i++) {
+          var node = globalThis.__nodeFor(ids[i]);
+          if (node && node.namespaceURI === "http://www.w3.org/1999/xhtml" &&
+              __getAttr(ids[i], "name") === name) { out.push(node); }
+        }
+        return out;
+      }, true);
+    });
   }
   if (typeof document.contains !== "function") {
     def(document, "contains", function (node) { return nodeContains(document, node); });
@@ -10784,6 +11016,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     function notFound(msg) { throw new (globalThis.DOMException)(msg, "NotFoundError"); }
     function docNode() { var de = __documentElementId(); return de >= 0 ? __parent(de) : -1; }
+    var childNodesList = globalThis.__makeNodeList(function () {
+      var ids = __children(docNode()), out = [];
+      for (var i = 0; i < ids.length; i++) { out.push(globalThis.__nodeFor(ids[i])); }
+      return out;
+    }, true);
+    Object.defineProperty(document, "childNodes", {
+      get: function () { return childNodesList; }, enumerable: true, configurable: true
+    });
     def(document, "appendChild", function (child) {
       var id = docNode(); var c = reqNode(child, "appendChild"); __insertNode(id, c, -1); return child;
     });
@@ -11587,8 +11827,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // `instanceof` checks behave. The element wrappers' prototype is set to HTMLElement.prototype
   // (see __wrapNode below) so `el instanceof HTMLElement/Element/Node` returns true.
   function defClass(name, parentCtor) {
-    if (typeof globalThis[name] === "function") { return globalThis[name]; }
-    var ctor = function () {};
+    var ctor = typeof globalThis[name] === "function" ? globalThis[name] : function () {};
     if (parentCtor && parentCtor.prototype) {
       try { Object.setPrototypeOf(ctor.prototype, parentCtor.prototype); } catch (e) {}
     }
@@ -11599,7 +11838,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       Object.defineProperty(ctor.prototype, Symbol.toStringTag,
         { value: name, writable: false, enumerable: false, configurable: true });
     } catch (e) {}
-    def(globalThis, name, ctor);
+    if (globalThis[name] !== ctor) { def(globalThis, name, ctor); }
     return ctor;
   }
   var NodeCtor = defClass("Node");
@@ -11656,6 +11895,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // HTMLMediaElement should sit under HTMLElement; audio/video under it. Keep flat-under-HTMLElement
   // for simplicity except a couple that pages explicitly chain.
   for (var hi = 0; hi < htmlSubclasses.length; hi++) { defClass(htmlSubclasses[hi], HTMLElementCtor); }
+
+  // Parsing can populate the wrapper cache before the interface constructors above are installed.
+  for (var cachedNode in __nodeCache) {
+    if (Object.prototype.hasOwnProperty.call(__nodeCache, cachedNode)) {
+      try { applyNodePrototype(__nodeCache[cachedNode], Number(cachedNode)); } catch (e) {}
+    }
+  }
 
   // ElementCSSInlineStyle: `style` on the prototype chain (so assert_idl_attribute passes — it must
   // NOT be an own property). Returns the per-element cached CSSStyleDeclaration stashed by
@@ -12534,6 +12780,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 
   // --- Image / Audio / media element constructors ------------------------------------------
   if (typeof globalThis.Image !== "function") {
+    var imageElementProto = globalThis.HTMLImageElement && globalThis.HTMLImageElement.prototype;
     def(globalThis, "Image", function (w, h) {
       this.width = w || 0; this.height = h || 0; this.naturalWidth = 0; this.naturalHeight = 0;
       this.complete = false; this.src = ""; this.alt = ""; this.crossOrigin = null; this.decoding = "auto";
@@ -12543,6 +12790,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       this.decode = function () { return Promise.resolve(); };
       try { def(this, "style", { setProperty: fn, getPropertyValue: function () { return ""; }, removeProperty: function () { return ""; }, cssText: "" }); } catch (e) {}
     });
+    if (imageElementProto) {
+      try { Object.setPrototypeOf(globalThis.Image.prototype, imageElementProto); } catch (e) {}
+    }
     def(globalThis, "HTMLImageElement", globalThis.Image);
   }
   if (typeof globalThis.Audio !== "function") {
@@ -18829,6 +19079,113 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("2/4"));
+    }
+
+    #[test]
+    fn node_list_and_html_collection_have_correct_brand_and_liveness() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+                var host = document.createElement("div");
+                var first = document.createElement("span");
+                host.appendChild(first);
+                var children = host.children;
+                var childNodes = host.childNodes;
+                var tags = host.getElementsByTagName("span");
+                var snapshot = host.querySelectorAll("span");
+                host.appendChild(document.createTextNode("x"));
+                host.appendChild(document.createElement("span"));
+                [Object.prototype.toString.call(children),
+                 Object.prototype.toString.call(childNodes),
+                 children instanceof HTMLCollection, childNodes instanceof NodeList,
+                 host.children === children, host.childNodes === childNodes,
+                 children.length, childNodes.length, tags.length, snapshot.length,
+                 snapshot.item(0) === first].join("|")
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("[object HTMLCollection]|[object NodeList]|true|true|true|true|2|3|2|1|true")
+        );
+    }
+
+    #[test]
+    fn dom_collections_support_iteration_named_access_and_expandos() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+                var host = document.createElement("div");
+                var first = document.createElement("span"); first.id = "first";
+                var second = document.createElement("span"); second.setAttribute("name", "second");
+                host.append(first, second);
+                var collection = host.getElementsByTagName("span");
+                var list = host.querySelectorAll("span");
+                var iterated = []; for (var node of list) { iterated.push(node.id || node.getAttribute("name")); }
+                var strictIndexWriteThrows = false;
+                try { (function () { "use strict"; collection[5] = first; })(); }
+                catch (e) { strictIndexWriteThrows = e instanceof TypeError; }
+                var stringItemIsFirst = collection.item("not-a-number") === first;
+                collection.item = "expando";
+                Object.defineProperty(list, "length", { get: function () { return 1; } });
+                [collection.namedItem("first") === first, collection.first === first,
+                 collection.second === second, collection[0] === first,
+                 stringItemIsFirst, first instanceof Element,
+                 collection.item, strictIndexWriteThrows,
+                 iterated.join(","), list.length, list[1] === second].join("|")
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("true|true|true|true|true|true|expando|true|first,second|1|true")
+        );
+    }
+
+    #[test]
+    fn html_collection_item_converts_nonnumeric_index_for_parsed_elements() {
+        let doc = html::parse(
+            r#"<!doctype html><html><head></head><body><div id="host"><img><img id="foo"></div></body></html>"#,
+        );
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var collection = document.getElementById("host").children;
+                var item = collection.item("foo");
+                [item === collection[0], item instanceof Element, item && item.tagName].join("|")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|true|IMG"));
+    }
+
+    #[test]
+    fn document_named_and_legacy_collections_are_live() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+                var named = document.getElementsByName("target");
+                var scripts = document.scripts;
+                var links = document.links;
+                var input = document.createElement("input"); input.setAttribute("name", "target");
+                var script = document.createElement("script");
+                var link = document.createElement("a"); link.href = "/x";
+                document.body.append(input, script, link);
+                var afterAppend = [named.length, scripts.length, links.length];
+                input.remove(); script.remove(); link.remove();
+                [Object.prototype.toString.call(named),
+                 Object.prototype.toString.call(scripts),
+                 named instanceof NodeList, scripts instanceof HTMLCollection,
+                 afterAppend.join(","), named.length, scripts.length, links.length].join("|")
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("[object NodeList]|[object HTMLCollection]|true|true|1,1,1|0|0|0")
+        );
     }
 
     #[test]
