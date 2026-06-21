@@ -5146,7 +5146,17 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   Object.defineProperty(document, "doctype", {
     get: function () {
       var kids = __children(0);
-      for (var i = 0; i < kids.length; i++) { if (__nodeType(kids[i]) === 10) { return wrap(kids[i]); } }
+      // Return the CANONICAL wrapper, not a fresh wrap(): otherwise document.doctype mints a new
+      // object on every access, so it never === the doctype in document.childNodes and its
+      // .parentNode is unstable. Identity-sensitive callers then loop forever (e.g. WPT common.js
+      // `indexOf`: `while (node != node.parentNode.childNodes[i]) i++`).
+      for (var i = 0; i < kids.length; i++) {
+        if (__nodeType(kids[i]) === 10) {
+          var dt = wrap(kids[i]);
+          try { dt = globalThis.__canonNode(dt); } catch (e) {}
+          return dt;
+        }
+      }
       return null;
     },
     enumerable: true, configurable: true
@@ -10494,6 +10504,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     function backDocWithArena(doc, initialChildIds) {
       var docId = globalThis.__createDocumentNode();
       try { Object.defineProperty(doc, "__node", { value: docId, configurable: true }); } catch (e) {}
+      // Register THIS facade as the canonical wrapper for its arena node, so that __nodeFor(docId)
+      // — and therefore every `.parentNode` / `.childNodes` that resolves a child back to its
+      // document — returns this same object rather than a fresh, separate wrapper. Without this the
+      // facade and the canonical wrapper are two different objects for one node; identity checks
+      // (e.g. WPT common.js `indexOf`: `while (node != node.parentNode.childNodes[i]) i++`) then
+      // never match and spin forever. Mark `__enriched` first so __canonNode skips the element-only
+      // enrichment that doesn't apply to a Document facade.
+      try { def(doc, "__enriched", true); } catch (e) {}
+      try { globalThis.__canonNode(doc); } catch (e) {}
       for (var i = 0; i < initialChildIds.length; i++) {
         var cid = initialChildIds[i];
         if (typeof cid === "number" && cid >= 0) { globalThis.__insertNode(docId, cid, -1); }
