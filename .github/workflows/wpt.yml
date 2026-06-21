@@ -29,7 +29,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Shares the --release dependency cache seeded by CI's `test` job on main, so a fresh PR
+      # doesn't recompile V8 + every dependency from cold. Only the workspace crates rebuild.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-deps
       - name: Install fonts
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
 
