@@ -6061,12 +6061,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       for (var i = 0; i < list.length; i++) { if (list[i].cb === cb && list[i].capture === capture) { list.splice(i, 1); return; } }
     });
     def(target, "dispatchEvent", function (ev) {
+      if (!(ev instanceof globalThis.Event) || !ev.__ev) {
+        throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
+      }
       return globalThis.__dispatchEventObject(target, ev);
     });
   }
   // Invoke the listeners registered on `target` for `type` whose capture flag matches `wantCapture`,
   // plus (when invoking the bubble/target set) the legacy `on<type>` handler. Honours `once` and
-  // the event's stop-immediate flag. `ev` may be a constructed Event (with __ev) or a plain object.
+  // the event's stop-immediate flag.
   def(globalThis, "__runListeners", function (target, type, ev, wantCapture, includeOn) {
     if (!target) { return; }
     var s = ev && ev.__ev ? ev.__ev : null;
@@ -6113,49 +6116,51 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // internal __ev state + read-only getters) through the full DOM dispatch algorithm: builds the
   // propagation path, runs the capture phase (root -> target), the target phase, then the bubble
   // phase (target -> root) when ev.bubbles, setting target/currentTarget/eventPhase and honouring
-  // stopPropagation/stopImmediatePropagation. Falls back gracefully for plain {type} objects.
+  // stopPropagation/stopImmediatePropagation.
   def(globalThis, "__dispatchEventObject", function (target, ev) {
-    var type = ev && ev.type != null ? String(ev.type) : "";
-    var s = ev && ev.__ev ? ev.__ev : null; // internal state for constructed events
-    var bubbles = s ? s.bubbles : !!(ev && ev.bubbles);
+    var s = ev.__ev;
+    if (!s.initialized || s.dispatching) {
+      throw new globalThis.DOMException(
+        "Failed to execute 'dispatchEvent': The event is uninitialized or is already being dispatched.",
+        "InvalidStateError");
+    }
+    var type = String(ev.type);
+    var bubbles = s.bubbles;
 
     var path = globalThis.__eventPath(target); // [target, ...ancestors, document, window]
 
-    if (s) {
-      s.dispatched = true; s.target = target; s.stopPropagation = false;
-      s.stopImmediate = false; s.path = path.slice();
-    } else { try { ev.target = target; } catch (e1) {} }
+    s.dispatching = true; s.target = target; s.stopPropagation = false;
+    s.stopImmediate = false; s.path = path.slice();
 
     function setCT(ct, phase) {
-      if (s) { s.currentTarget = ct; s.eventPhase = phase; }
-      else { try { ev.currentTarget = ct; } catch (e2) {} }
+      s.currentTarget = ct; s.eventPhase = phase;
     }
     var run = globalThis.__runListeners;
 
     // Capture phase: ancestors from outermost (window) down to (but not including) the target.
     for (var i = path.length - 1; i >= 1; i--) {
-      if (s && s.stopPropagation) { break; }
+      if (s.stopPropagation) { break; }
       setCT(path[i], 1 /*CAPTURING_PHASE*/);
       run(path[i], type, ev, true, false);
     }
     // Target phase: both capture- and bubble-registered listeners fire here, plus on<type>.
-    if (!(s && s.stopPropagation)) {
+    if (!s.stopPropagation) {
       setCT(target, 2 /*AT_TARGET*/);
       run(target, type, ev, true, false);
-      if (!(s && s.stopImmediate)) { run(target, type, ev, false, true); }
+      if (!s.stopImmediate) { run(target, type, ev, false, true); }
     }
     // Bubble phase: ancestors from target's parent up to window (only when the event bubbles).
     if (bubbles) {
       for (var h = 1; h < path.length; h++) {
-        if (s && s.stopPropagation) { break; }
+        if (s.stopPropagation) { break; }
         setCT(path[h], 3 /*BUBBLING_PHASE*/);
         run(path[h], type, ev, false, true);
       }
     }
 
-    if (s) { s.eventPhase = 0; s.currentTarget = null; s.stopPropagation = false; s.stopImmediate = false; }
-    else { try { ev.currentTarget = null; } catch (e3) {} }
-    return s ? !s.defaultPrevented : !(ev && ev.defaultPrevented);
+    s.eventPhase = 0; s.currentTarget = null; s.stopPropagation = false;
+    s.stopImmediate = false; s.dispatching = false;
+    return !s.defaultPrevented;
   });
   installEvents(globalThis);
   installEvents(document);
@@ -6196,9 +6201,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (!signal || signal.aborted) { return; }
     signal.aborted = true;
     signal.reason = __makeAbortReason(reason);
-    var ev = { type: "abort", target: signal, currentTarget: signal, bubbles: false };
-    if (typeof signal.onabort === "function") { try { signal.onabort.call(signal, ev); } catch (e) { (globalThis.__timerErrors || []).push((e&&e.stack||String(e))); } }
-    if (typeof signal.dispatchEvent === "function") { try { signal.dispatchEvent(ev); } catch (e) {} }
+    var ev = new globalThis.Event("abort");
+    if (typeof signal.dispatchEvent === "function") {
+      try { signal.dispatchEvent(ev); } catch (e) {}
+    } else if (typeof signal.onabort === "function") {
+      try { signal.onabort.call(signal, ev); } catch (e2) { (globalThis.__timerErrors || []).push((e2&&e2.stack||String(e2))); }
+    }
   }
   function AbortSignal() {
     this.aborted = false;
@@ -6254,9 +6262,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   };
 
   function makeEvent(type) {
-    return { type: type, target: document, currentTarget: document, bubbles: false, cancelable: false,
-             defaultPrevented: false, timeStamp: 0,
-             preventDefault: fn, stopPropagation: fn, stopImmediatePropagation: fn };
+    return new globalThis.Event(type);
   }
   function fireOn(target, type) {
     if (target && typeof target.dispatchEvent === "function") {
@@ -12565,11 +12571,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     def(globalThis, "WebSocket", WebSocketCtor);
 
     // Fire a handler (onX + any addEventListener listeners) with an event object on a WebSocket.
-    function __wsFire(ws, type, ev) {
-      ev.type = type; ev.target = ws; ev.currentTarget = ws;
-      var on = ws["on" + type];
-      if (typeof on === "function") { try { on.call(ws, ev); } catch (e) { (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); } }
-      if (typeof ws.dispatchEvent === "function") { try { ws.dispatchEvent(ev); } catch (e) { (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); } }
+    function __wsFire(ws, type, init) {
+      var ev = new globalThis.Event(type);
+      for (var key in init) { try { def(ev, key, init[key]); } catch (e0) {} }
+      if (typeof ws.dispatchEvent === "function") {
+        try { ws.dispatchEvent(ev); } catch (e) { (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); }
+      }
     }
     // Called from Rust's drain phase for each pending socket event.
     def(globalThis, "__wsDeliver", function (id, kind, payload) {
@@ -13230,7 +13237,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         defaultPrevented: false, isTrusted: false,
         eventPhase: 0, target: null, currentTarget: null,
         timeStamp: __eventTimeStamp(),
-        stopPropagation: false, stopImmediate: false, dispatched: false, inPassive: false,
+        stopPropagation: false, stopImmediate: false, initialized: false, dispatching: false,
+        inPassive: false,
         path: []
       };
       def(ev, "__ev", s);
@@ -13248,6 +13256,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     function Event(type, init) {
       var s = initEventState(this);
       if (arguments.length > 0) { s.type = String(type); }
+      s.initialized = true;
       if (init !== undefined && init !== null) {
         s.bubbles = !!init.bubbles;
         s.cancelable = !!init.cancelable;
@@ -13285,10 +13294,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     EP.composedPath = function () { var s = st(this); return s.path ? s.path.slice() : []; };
     EP.initEvent = function (type, bubbles, cancelable) {
       var s = st(this);
-      if (s.dispatched) { return; }
+      if (s.dispatching) { return; }
       s.type = String(type);
       s.bubbles = !!bubbles;
       s.cancelable = !!cancelable;
+      s.initialized = true;
       s.defaultPrevented = false; s.isTrusted = false;
       s.target = null; s.stopPropagation = false; s.stopImmediate = false;
     };
@@ -13327,7 +13337,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var CustomEvent = defSubclass("CustomEvent", Event, { detail: null });
     CustomEvent.prototype.initCustomEvent = function (type, bubbles, cancelable, detail) {
       var s = st(this);
-      if (s.dispatched) { return; }
+      if (s.dispatching) { return; }
       this.initEvent(type, bubbles, cancelable);
       def(this, "detail", detail === undefined ? null : detail);
     };
@@ -16469,6 +16479,65 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_event_rejects_invalid_and_active_events() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var invalidType = false;
+                try { document.dispatchEvent(null); }
+                catch (e) { invalidType = e instanceof TypeError; }
+                var plainObjectType = false;
+                try { document.dispatchEvent({ type: "ping" }); }
+                catch (e) { plainObjectType = e instanceof TypeError; }
+
+                var uninitialized = document.createEvent("Event");
+                var invalidState = false;
+                try { document.dispatchEvent(uninitialized); }
+                catch (e) { invalidState = e.name === "InvalidStateError"; }
+
+                var target = document.createElement("div");
+                var event = new Event("ping");
+                var nestedInvalidState = false;
+                target.addEventListener("ping", function () {
+                    try { target.dispatchEvent(event); }
+                    catch (e) { nestedInvalidState = e.name === "InvalidStateError"; }
+                });
+                var first = target.dispatchEvent(event);
+                var second = target.dispatchEvent(event);
+                [invalidType, plainObjectType, invalidState, nestedInvalidState,
+                 first, second].join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true,true,true,true,true,true")
+        );
+    }
+
+    #[test]
+    fn dispatch_event_returns_false_only_when_canceled() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var target = document.createElement("div");
+                target.addEventListener("cancel", function (event) { event.preventDefault(); });
+                var uncancelable = target.dispatchEvent(new Event("cancel"));
+                var canceled = target.dispatchEvent(new Event("cancel", { cancelable: true }));
+                [uncancelable, canceled].join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,false"));
+    }
+
+    #[test]
     fn create_event_unknown_throws_not_supported() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
@@ -17821,12 +17890,54 @@ mod tests {
     }
 
     #[test]
+    fn abort_signal_dispatches_real_event_once() {
+        let out = env_eval(
+            "https://example.com/",
+            "var c = new AbortController(); var onCount = 0; var listenerCount = 0; \
+             var validEvent = true; \
+             c.signal.onabort = function (event) { \
+               onCount++; validEvent = validEvent && event instanceof Event && \
+                 event.target === c.signal && event.currentTarget === c.signal; \
+             }; \
+             c.signal.addEventListener('abort', function (event) { \
+               listenerCount++; validEvent = validEvent && event instanceof Event && \
+                 event.target === c.signal && event.currentTarget === c.signal; \
+             }); \
+             c.abort(); c.abort(); \
+             [onCount, listenerCount, validEvent].join(',')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("1,1,true"));
+    }
+
+    #[test]
+    fn websocket_delivery_dispatches_real_event_once() {
+        let out = env_eval(
+            "https://example.com/",
+            "var ws = new WebSocket('ws://example.com/socket'); \
+             var onCount = 0; var listenerCount = 0; var validEvent = true; \
+             ws.onmessage = function (event) { \
+               onCount++; validEvent = validEvent && event instanceof Event && \
+                 event.target === ws && event.currentTarget === ws && event.data === 'hello'; \
+             }; \
+             ws.addEventListener('message', function (event) { \
+               listenerCount++; validEvent = validEvent && event instanceof Event && \
+                 event.target === ws && event.currentTarget === ws && event.data === 'hello'; \
+             }); \
+             __wsDeliver(ws.__wsid, 1, 'hello'); \
+             [onCount, listenerCount, validEvent].join(',')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("1,1,true"));
+    }
+
+    #[test]
     fn add_event_listener_signal_option_removes_on_abort() {
         let out = env_eval(
             "https://example.com/",
             "var c = new AbortController(); var n = 0; \
              document.addEventListener('ping', function () { n++; }, { signal: c.signal }); \
-             document.dispatchEvent({ type: 'ping' }); c.abort(); document.dispatchEvent({ type: 'ping' }); \
+             document.dispatchEvent(new Event('ping')); c.abort(); document.dispatchEvent(new Event('ping')); \
              String(n)",
         );
         assert_eq!(out.error, None, "{out:?}");
