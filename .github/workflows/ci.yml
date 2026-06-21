@@ -45,8 +45,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       # Caches ~/.cargo and target/, including the prebuilt V8 static lib — without this every
-      # run re-downloads/links ~hundreds of MB of V8.
+      # run re-downloads/links ~hundreds of MB of V8. The shared-key lets the WPT workflow restore
+      # the same --release dependency cache (its Linux leg builds the identical dep set).
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-deps
       # Engine font tests need a system TTF; Linux runners ship none by default.
       - name: Install fonts (Linux)
         if: runner.os == 'Linux'
