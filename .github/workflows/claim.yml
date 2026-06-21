@@ -1,0 +1,110 @@
+name: Claim issue
+
+# Lets contributors self-assign an open issue by commenting a command, with no maintainer in the
+# loop. Comment `/claim` (or `.take`) to be assigned; `/unclaim` to release it. Implemented with
+# the built-in GITHUB_TOKEN via actions/github-script — no third-party action, no extra secrets.
+#
+# NOTE: `issue_comment` workflows only take effect once this file is on the default branch.
+on:
+  issue_comment:
+    types: [created]
+
+# Least privilege: the job only needs to (re)assign issues and manage the `claimed` label/comments.
+permissions:
+  issues: write
+
+jobs:
+  claim:
+    # Skip PR comments (the issue_comment event fires for both) and skip comments that don't carry a
+    # command, so the runner only spins up when there's work to do. Precise parsing happens in-script.
+    if: >
+      github.event.issue.pull_request == null &&
+      (contains(github.event.comment.body, '/claim') ||
+       contains(github.event.comment.body, '.take') ||
+       contains(github.event.comment.body, '/unclaim') ||
+       contains(github.event.comment.body, '/release') ||
+       contains(github.event.comment.body, '/drop') ||
+       contains(github.event.comment.body, '/unassign'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+            const commenter = context.payload.comment.user.login;
+            const isBot = context.payload.comment.user.type === 'Bot';
+            const body = context.payload.comment.body || '';
+
+            // A command must sit at the start of a line (optionally after a quote/space) so it isn't
+            // matched inside prose. `/claim`, `/take`, `.take` claim; the rest release.
+            const claimRe = /^[>\s]*[\/.](claim|take)\b/im;
+            const releaseRe = /^[>\s]*[\/.](unclaim|release|drop|unassign)\b/im;
+            const wantsClaim = claimRe.test(body);
+            const wantsRelease = !wantsClaim && releaseRe.test(body);
+            if (isBot || (!wantsClaim && !wantsRelease)) return;
+
+            const react = (content) => github.rest.reactions.createForIssueComment({
+              owner, repo, comment_id: context.payload.comment.id, content,
+            }).catch(() => {});
+            const comment = (msgBody) => github.rest.issues.createComment({
+              owner, repo, issue_number, body: msgBody,
+            });
+
+            const issue = (await github.rest.issues.get({ owner, repo, issue_number })).data;
+            const assignees = (issue.assignees || []).map(a => a.login);
+            const isAssignee = assignees.includes(commenter);
+
+            if (wantsRelease) {
+              if (!isAssignee) {
+                await react('confused');
+                await comment(`@${commenter} you're not currently assigned to this issue, so there's nothing to release.`);
+                return;
+              }
+              await github.rest.issues.removeAssignees({ owner, repo, issue_number, assignees: [commenter] });
+              const remaining = assignees.filter(a => a !== commenter);
+              if (remaining.length === 0) {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: 'claimed' }).catch(() => {});
+              }
+              await react('+1');
+              await comment(`@${commenter} you've been unassigned — thanks for the update. This issue is open again for anyone to \`/claim\`.`);
+              return;
+            }
+
+            // --- claim ---
+            if (issue.state !== 'open') {
+              await react('confused');
+              await comment(`@${commenter} this issue is closed, so it can't be claimed.`);
+              return;
+            }
+            if (isAssignee) {
+              await react('+1'); // already theirs — no-op, just acknowledge
+              return;
+            }
+            const others = assignees.filter(a => a !== commenter);
+            if (others.length > 0) {
+              await react('confused');
+              await comment(`@${commenter} this issue is already claimed by ${others.map(a => '@' + a).join(', ')}. If it looks stale, ping them or a maintainer, or pick another from the [WPT tracker](https://github.com/${owner}/${repo}/issues/40).`);
+              return;
+            }
+
+            await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: [commenter] });
+
+            // Assignment silently no-ops if the user can't be assigned (e.g. private repo + not a
+            // collaborator). Re-read to confirm before claiming success.
+            const after = (await github.rest.issues.get({ owner, repo, issue_number })).data;
+            if (!(after.assignees || []).some(a => a.login === commenter)) {
+              await react('confused');
+              await comment(`@${commenter} I couldn't assign you automatically (GitHub only allows assigning users with repo access). A maintainer can assign you, or you can still just open a PR that says \`Closes #${issue_number}\`.`);
+              return;
+            }
+
+            await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['claimed'] }).catch(() => {});
+            await react('rocket');
+            await comment([
+              `@${commenter} this issue is yours — assigned and labelled \`claimed\`. 🚀`,
+              ``,
+              `- Open a PR that says \`Closes #${issue_number}\` so it auto-closes on merge.`,
+              `- Changed your mind? Comment \`/unclaim\` to release it.`,
+              `- See [\`crates/wpt-runner/README.md\`](https://github.com/${owner}/${repo}/blob/main/crates/wpt-runner/README.md) for running the test locally.`,
+            ].join('\n'));

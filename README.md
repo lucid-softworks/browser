@@ -106,6 +106,10 @@ from 🟢 *good first issue* (small, self-contained, with a dedicated test to ve
 failing test, exact subtest counts, the relevant spec section, and a one-line repro. Running the
 suite locally is documented in [`crates/wpt-runner/README.md`](crates/wpt-runner/README.md).
 
+**Claiming an issue:** comment `/claim` (or `.take`) on any open issue to have it assigned to you —
+a bot assigns you and labels it `claimed`, no maintainer needed. Comment `/unclaim` to release it.
+Then open a PR that says `Closes #<n>` so it auto-closes on merge.
+
 [wpt-tracker]: https://github.com/lucid-softworks/browser/issues/40
 
 ## Status
