@@ -4371,10 +4371,51 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     // element nodes `data` is a reflected content attribute (e.g. <object>.data is a URL), so leave
     // it free for the reflection layer.
     if (__nodeType(id) !== 1) {
+      // `data` is a [LegacyNullToEmptyString] DOMString: only `null` becomes "" (undefined -> the
+      // string "undefined", 0 -> "0", etc.).
       Object.defineProperty(el, "data", {
         get: function () { return __textContent(id); },
-        set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
+        set: function (v) { __setTextContent(id, v === null ? "" : String(v)); },
         enumerable: true, configurable: true
+      });
+      // CharacterData.length: the number of UTF-16 code units in `data`.
+      Object.defineProperty(el, "length", {
+        get: function () { return __textContent(id).length; },
+        enumerable: true, configurable: true
+      });
+      // The CharacterData mutation methods all reduce to "replace data": offset/count are WebIDL
+      // `unsigned long` (ToUint32, i.e. `>>> 0`), an out-of-range offset throws IndexSizeError, and a
+      // count running past the end is clamped. Operations are in UTF-16 code units (JS string units).
+      var __cdReplace = function (offset, count, insert) {
+        var d = __textContent(id);
+        var len = d.length;
+        if (offset > len) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
+        if (offset + count > len) { count = len - offset; }
+        __setTextContent(id, d.slice(0, offset) + insert + d.slice(offset + count));
+      };
+      def(el, "substringData", function (offset, count) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'substringData': 2 arguments required."); }
+        var d = __textContent(id), len = d.length;
+        offset = offset >>> 0; count = count >>> 0;
+        if (offset > len) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
+        var end = offset + count; if (end > len) { end = len; }
+        return d.slice(offset, end);
+      });
+      def(el, "appendData", function (data) {
+        if (arguments.length < 1) { throw new TypeError("Failed to execute 'appendData': 1 argument required."); }
+        __setTextContent(id, __textContent(id) + String(data));
+      });
+      def(el, "insertData", function (offset, data) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertData': 2 arguments required."); }
+        __cdReplace(offset >>> 0, 0, String(data));
+      });
+      def(el, "deleteData", function (offset, count) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'deleteData': 2 arguments required."); }
+        __cdReplace(offset >>> 0, count >>> 0, "");
+      });
+      def(el, "replaceData", function (offset, count, data) {
+        if (arguments.length < 3) { throw new TypeError("Failed to execute 'replaceData': 3 arguments required."); }
+        __cdReplace(offset >>> 0, count >>> 0, String(data));
       });
     }
     Object.defineProperty(el, "nodeValue", {
