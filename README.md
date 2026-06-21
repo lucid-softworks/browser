@@ -97,6 +97,17 @@ Note the model/tooling on your PR.
 - **Releases:** merging the release-plz version PR tags `vX.Y.Z`, which builds + signs + notarizes
   the macOS app and publishes it as a GitHub release.
 
+### Where to start
+
+Looking for something to work on? The pinned [**WPT conformance tracker** (#40)][wpt-tracker] lists
+open [web-platform-tests](https://github.com/web-platform-tests/wpt) failures sorted by difficulty —
+from 🟢 *good first issue* (small, self-contained, with a dedicated test to verify) through
+🔴 *high-impact* fixes that unblock thousands of subtests. Each issue has a verified root cause, the
+failing test, exact subtest counts, the relevant spec section, and a one-line repro. Running the
+suite locally is documented in [`crates/wpt-runner/README.md`](crates/wpt-runner/README.md).
+
+[wpt-tracker]: https://github.com/lucid-softworks/browser/issues/40
+
 ## Status
 
 The app fetches a URL (`http(s)://` or `file://`) through the Rust engine, parses the HTML
