@@ -5860,7 +5860,7 @@ pub fn collect_module_graph(
                     next.push(resolved);
                 }
             }
-            replacements.sort_by(|a, b| b.0.cmp(&a.0));
+            replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
             let mut rewritten = body;
             for (start, end, rep) in replacements {
                 rewritten.replace_range(start..end, &rep);
