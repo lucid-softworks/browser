@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- V8 JITs JavaScript. The hardened runtime (required for notarization) blocks executable
+	     memory by default, so these are mandatory or the app crashes on first script execution.
+	     allow-jit covers V8's MAP_JIT path on Apple Silicon; the second is a fallback for the
+	     writable-executable path. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+</dict>
+</plist>
