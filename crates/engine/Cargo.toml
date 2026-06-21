@@ -16,6 +16,7 @@ layout = { path = "../layout" }
 js = { path = "../js" }
 url = "2.5"
 image = "0.25"
+jxl-oxide = "0.12.6"
 
 [lints]
 workspace = true

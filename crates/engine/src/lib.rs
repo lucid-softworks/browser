@@ -5233,6 +5233,10 @@ fn collect_images(
 /// Decode raster image bytes into straight-alpha RGBA8. Returns `None` on decode failure or if
 /// the decoded image would exceed [`MAX_IMAGE_PIXELS`]. Never panics.
 fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
+    // The `image` crate has no JPEG XL decoder, so route `.jxl` bytes to `jxl-oxide` (pure Rust).
+    if is_jxl(bytes) {
+        return decode_jxl(bytes);
+    }
     let dynimg = image::load_from_memory(bytes).ok()?;
     let w = dynimg.width();
     let h = dynimg.height();
@@ -5245,6 +5249,67 @@ fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
         w,
         h,
     })
+}
+
+/// Whether `bytes` look like a JPEG XL stream: either the raw codestream marker (`FF 0A`) or the
+/// ISOBMFF container's signature box (`00000000C 'JXL ' 0D 0A 87 0A`).
+fn is_jxl(bytes: &[u8]) -> bool {
+    const CONTAINER: [u8; 12] = [
+        0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A,
+    ];
+    bytes.starts_with(&[0xFF, 0x0A]) || bytes.starts_with(&CONTAINER)
+}
+
+/// Decode a JPEG XL image to straight-alpha RGBA8 via `jxl-oxide`. The decoder yields interleaved
+/// `f32` samples in `[0, 1]` with 1 (gray), 2 (gray+alpha), 3 (RGB) or 4 (RGBA) channels; we expand
+/// each to RGBA8. Returns `None` on a decode failure or if the image exceeds [`MAX_IMAGE_PIXELS`].
+fn decode_jxl(bytes: &[u8]) -> Option<DecodedImage> {
+    let image = jxl_oxide::JxlImage::builder().read(bytes).ok()?;
+    let w = image.width();
+    let h = image.height();
+    if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+        return None;
+    }
+    let render = image.render_frame(0).ok()?;
+    let fb = render.image_all_channels();
+    let channels = fb.channels();
+    if channels == 0 {
+        return None;
+    }
+    let buf = fb.buf();
+    let px = (w as usize).checked_mul(h as usize)?;
+    if buf.len() < px * channels {
+        return None;
+    }
+    let to_u8 = |f: f32| (f.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let mut rgba = Vec::with_capacity(px * 4);
+    for i in 0..px {
+        let base = i * channels;
+        let (r, g, b, a) = match channels {
+            1 => {
+                let v = to_u8(buf[base]);
+                (v, v, v, 255)
+            }
+            2 => {
+                let v = to_u8(buf[base]);
+                (v, v, v, to_u8(buf[base + 1]))
+            }
+            3 => (
+                to_u8(buf[base]),
+                to_u8(buf[base + 1]),
+                to_u8(buf[base + 2]),
+                255,
+            ),
+            _ => (
+                to_u8(buf[base]),
+                to_u8(buf[base + 1]),
+                to_u8(buf[base + 2]),
+                to_u8(buf[base + 3]),
+            ),
+        };
+        rgba.extend_from_slice(&[r, g, b, a]);
+    }
+    Some(DecodedImage { rgba, w, h })
 }
 
 /// Decode a `data:[<mediatype>][;base64],<data>` URL into its raw bytes. Returns `None` if it
@@ -8184,6 +8249,50 @@ mod tests {
         // Render must not panic and produces a framebuffer.
         let fb = e.render();
         assert_eq!(fb.width, 400);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 2x2 solid opaque-red JPEG XL (raw codestream, lossless), produced by `cjxl`. The `image`
+    /// crate cannot decode this; it exercises the `jxl-oxide` path in `decode_image`.
+    const RED_2X2_JXL: &[u8] = &[
+        0xff, 0x0a, 0x08, 0x10, 0xb0, 0x12, 0x08, 0x10, 0x10, 0x00, 0x38, 0x00, 0x4b, 0x18, 0x8b,
+        0x15, 0xc2, 0x49, 0x41, 0x1e, 0x40, 0x04, 0xe8, 0x8f, 0xfe, 0x00,
+    ];
+
+    #[test]
+    fn jpeg_xl_bytes_decode_to_rgba8() {
+        assert!(is_jxl(RED_2X2_JXL), "raw codestream should sniff as JXL");
+        let img = decode_image(RED_2X2_JXL).expect("jxl-oxide should decode the codestream");
+        assert_eq!((img.w, img.h), (2, 2));
+        assert_eq!(img.rgba.len(), 2 * 2 * 4);
+        for px in img.rgba.chunks_exact(4) {
+            // Lossless red: ~(255, 0, 0, 255). Allow a tiny slack for color conversion rounding.
+            assert!(px[0] > 247, "R≈255, got {}", px[0]);
+            assert!(px[1] < 8, "G≈0, got {}", px[1]);
+            assert!(px[2] < 8, "B≈0, got {}", px[2]);
+            assert_eq!(px[3], 255, "opaque");
+        }
+    }
+
+    #[test]
+    fn local_jpeg_xl_image_is_decoded_via_engine() {
+        // The full <img> pipeline (fetch + decode) must handle a `.jxl` source over file://.
+        let dir = std::env::temp_dir().join(format!("engine_jxl_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jxl_path = dir.join("red.jxl");
+        std::fs::write(&jxl_path, RED_2X2_JXL).unwrap();
+
+        let img_url = format!("file://{}", jxl_path.display());
+        let html = format!(r#"<html><body><img src="{img_url}"></body></html>"#);
+        let html_path = dir.join("page.html");
+        std::fs::write(&html_path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(400, 300, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", html_path.display())), 0);
+        assert_eq!(e.decoded_image_count(), 1, "expected the JXL to decode");
+        assert_eq!(e.first_decoded_image_size(), Some((2, 2)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
