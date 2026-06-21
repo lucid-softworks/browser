@@ -10263,21 +10263,274 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 
   // --- IdleDeadline-style object is already provided via requestIdleCallback above. ---------
 
+  // ===== XML documents: an independent pure-JS DOM + parser + serializer ======================
+  // The arena-backed DOM is HTML-only. XML documents (DOMParser `text/xml`, XMLSerializer) need
+  // element/attribute namespaces to round-trip per the DOM Parsing & Serialization spec, so they
+  // use this self-contained node model instead of the arena.
+  var __xml = (function () {
+    var XML_NS = "http://www.w3.org/XML/1998/namespace";
+    var XMLNS_NS = "http://www.w3.org/2000/xmlns/";
+
+    function XNode(type, doc) { this.nodeType = type; this.ownerDocument = doc; this.childNodes = []; this.parentNode = null; }
+    XNode.prototype.appendChild = function (c) { if (c.parentNode) { c.parentNode.removeChild(c); } c.parentNode = this; this.childNodes.push(c); return c; };
+    XNode.prototype.insertBefore = function (c, ref) { if (ref == null) { return this.appendChild(c); } if (c.parentNode) { c.parentNode.removeChild(c); } var i = this.childNodes.indexOf(ref); if (i < 0) { return this.appendChild(c); } c.parentNode = this; this.childNodes.splice(i, 0, c); return c; };
+    XNode.prototype.removeChild = function (c) { var i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); c.parentNode = null; } return c; };
+    XNode.prototype.replaceChild = function (nw, old) { var i = this.childNodes.indexOf(old); if (i < 0) { return old; } if (nw.parentNode) { nw.parentNode.removeChild(nw); } nw.parentNode = this; this.childNodes[i] = nw; old.parentNode = null; return old; };
+    XNode.prototype.hasChildNodes = function () { return this.childNodes.length > 0; };
+    XNode.prototype.isEqualNode = function (o) { return globalThis.__nodesEqual(this, o); };
+    XNode.prototype.cloneNode = function () { return this; };
+    Object.defineProperty(XNode.prototype, "firstChild", { get: function () { return this.childNodes[0] || null; } });
+    Object.defineProperty(XNode.prototype, "lastChild", { get: function () { return this.childNodes[this.childNodes.length - 1] || null; } });
+    Object.defineProperty(XNode.prototype, "nextSibling", { get: function () { var p = this.parentNode; if (!p) { return null; } return p.childNodes[p.childNodes.indexOf(this) + 1] || null; } });
+    Object.defineProperty(XNode.prototype, "previousSibling", { get: function () { var p = this.parentNode; if (!p) { return null; } var i = p.childNodes.indexOf(this); return i > 0 ? p.childNodes[i - 1] : null; } });
+    Object.defineProperty(XNode.prototype, "parentElement", { get: function () { var p = this.parentNode; return p && p.nodeType === 1 ? p : null; } });
+    Object.defineProperty(XNode.prototype, "textContent", {
+      get: function () { var s = ""; for (var i = 0; i < this.childNodes.length; i++) { var c = this.childNodes[i]; if (c.nodeType === 3 || c.nodeType === 4) { s += c.data; } else if (c.nodeType === 1) { s += c.textContent; } } return s; },
+      set: function (v) { while (this.childNodes.length) { this.removeChild(this.childNodes[0]); } if (v !== "" && v != null) { this.appendChild(this.ownerDocument.createTextNode(String(v))); } }
+    });
+
+    function XAttr(ns, prefix, local, value) { this.namespaceURI = ns || null; this.prefix = prefix || null; this.localName = local; this.value = value; this.name = prefix ? prefix + ":" + local : local; this.nodeType = 2; }
+
+    function splitQ(qname) { var c = qname.indexOf(":"); return c > 0 ? [qname.slice(0, c), qname.slice(c + 1)] : [null, qname]; }
+
+    function XElement(doc, ns, prefix, local) { XNode.call(this, 1, doc); this.namespaceURI = ns || null; this.prefix = prefix || null; this.localName = local; this._attrs = []; }
+    XElement.prototype = Object.create(XNode.prototype);
+    XElement.prototype.constructor = XElement;
+    Object.defineProperty(XElement.prototype, "tagName", { get: function () { return this.prefix ? this.prefix + ":" + this.localName : this.localName; } });
+    Object.defineProperty(XElement.prototype, "nodeName", { get: function () { return this.tagName; } });
+    Object.defineProperty(XElement.prototype, "attributes", { get: function () { var a = this._attrs.slice(); a.item = function (i) { return this[i] || null; }; return a; } });
+    Object.defineProperty(XElement.prototype, "children", { get: function () { return this.childNodes.filter(function (c) { return c.nodeType === 1; }); } });
+    Object.defineProperty(XElement.prototype, "firstElementChild", { get: function () { return this.children[0] || null; } });
+    XElement.prototype._findByName = function (name) { for (var i = 0; i < this._attrs.length; i++) { if (this._attrs[i].name === name) { return i; } } return -1; };
+    XElement.prototype._findNS = function (ns, local) { for (var i = 0; i < this._attrs.length; i++) { var a = this._attrs[i]; if ((a.namespaceURI || null) === (ns || null) && a.localName === local) { return i; } } return -1; };
+    XElement.prototype.getAttribute = function (name) { var i = this._findByName(name); return i >= 0 ? this._attrs[i].value : null; };
+    XElement.prototype.hasAttribute = function (name) { return this._findByName(name) >= 0; };
+    XElement.prototype.removeAttribute = function (name) { var i = this._findByName(name); if (i >= 0) { this._attrs.splice(i, 1); } };
+    XElement.prototype.setAttribute = function (name, value) { var i = this._findByName(name); if (i >= 0) { this._attrs[i].value = String(value); } else { this._attrs.push(new XAttr(null, null, name, String(value))); } };
+    XElement.prototype.getAttributeNS = function (ns, local) { var i = this._findNS(ns, local); return i >= 0 ? this._attrs[i].value : null; };
+    XElement.prototype.setAttributeNS = function (ns, qname, value) { ns = ns || null; var s = splitQ(qname); var i = this._findNS(ns, s[1]); if (i >= 0) { this._attrs[i].value = String(value); this._attrs[i].prefix = s[0]; this._attrs[i].name = qname; } else { this._attrs.push(new XAttr(ns, s[0], s[1], String(value))); } };
+
+    function XText(doc, data) { XNode.call(this, 3, doc); this.data = data; }
+    XText.prototype = Object.create(XNode.prototype); XText.prototype.constructor = XText;
+    Object.defineProperty(XText.prototype, "nodeValue", { get: function () { return this.data; }, set: function (v) { this.data = String(v); } });
+    Object.defineProperty(XText.prototype, "textContent", { get: function () { return this.data; }, set: function (v) { this.data = String(v); } });
+    function XComment(doc, data) { XNode.call(this, 8, doc); this.data = data; }
+    XComment.prototype = Object.create(XText.prototype); XComment.prototype.constructor = XComment;
+    function XCData(doc, data) { XNode.call(this, 4, doc); this.data = data; }
+    XCData.prototype = Object.create(XText.prototype); XCData.prototype.constructor = XCData;
+    function XPI(doc, target, data) { XNode.call(this, 7, doc); this.target = target; this.data = data; }
+    XPI.prototype = Object.create(XNode.prototype); XPI.prototype.constructor = XPI;
+    function XDoctype(doc, name, pub, sys) { XNode.call(this, 10, doc); this.name = name; this.publicId = pub || ""; this.systemId = sys || ""; }
+    XDoctype.prototype = Object.create(XNode.prototype); XDoctype.prototype.constructor = XDoctype;
+
+    function XDocument() { XNode.call(this, 9, null); }
+    XDocument.prototype = Object.create(XNode.prototype); XDocument.prototype.constructor = XDocument;
+    XDocument.prototype.createElement = function (name) { var s = splitQ(name); return new XElement(this, null, null, s[1]); };
+    XDocument.prototype.createElementNS = function (ns, qname) { var s = splitQ(qname); return new XElement(this, ns || null, s[0], s[1]); };
+    XDocument.prototype.createTextNode = function (d) { return new XText(this, String(d)); };
+    XDocument.prototype.createComment = function (d) { return new XComment(this, String(d)); };
+    XDocument.prototype.createCDATASection = function (d) { return new XCData(this, String(d)); };
+    XDocument.prototype.createProcessingInstruction = function (t, d) { return new XPI(this, t, d); };
+    Object.defineProperty(XDocument.prototype, "documentElement", { get: function () { for (var i = 0; i < this.childNodes.length; i++) { if (this.childNodes[i].nodeType === 1) { return this.childNodes[i]; } } return null; } });
+
+    // --- Parser: a small namespace-aware XML reader ----------------------------------------------
+    function parse(str) {
+      var doc = new XDocument();
+      var i = 0, n = str.length;
+      var open = [];
+      function cur() { return open.length ? open[open.length - 1] : doc; }
+      function lookup(prefix, local) {
+        if (local && Object.prototype.hasOwnProperty.call(local, prefix)) { return local[prefix]; }
+        for (var k = open.length - 1; k >= 0; k--) { var d = open[k].__ns; if (d && Object.prototype.hasOwnProperty.call(d, prefix)) { return d[prefix]; } }
+        if (prefix === "xml") { return XML_NS; }
+        if (prefix === "xmlns") { return XMLNS_NS; }
+        return prefix === "" ? null : undefined;
+      }
+      function decodeEnt(s) {
+        return s.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, function (m, e) {
+          if (e[0] === '#') { var cp = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10); return isNaN(cp) ? m : String.fromCodePoint(cp); }
+          var map = { lt: "<", gt: ">", amp: "&", quot: "\"", apos: "'" };
+          return Object.prototype.hasOwnProperty.call(map, e) ? map[e] : m;
+        });
+      }
+      while (i < n) {
+        if (str[i] === "<") {
+          if (str.substr(i, 4) === "<!--") { var e = str.indexOf("-->", i + 4); if (e < 0) { e = n - 3; } cur().appendChild(doc.createComment(str.slice(i + 4, e))); i = e + 3; continue; }
+          if (str.substr(i, 9) === "<![CDATA[") { var e2 = str.indexOf("]]>", i + 9); if (e2 < 0) { e2 = n - 3; } cur().appendChild(doc.createCDATASection(str.slice(i + 9, e2))); i = e2 + 3; continue; }
+          if (str.substr(i, 2) === "<?") { var e3 = str.indexOf("?>", i + 2); if (e3 < 0) { e3 = n - 2; } var body = str.slice(i + 2, e3); var sp = body.search(/\s/); var tgt = sp < 0 ? body : body.slice(0, sp); var dat = sp < 0 ? "" : body.slice(sp + 1); if (tgt.toLowerCase() !== "xml") { cur().appendChild(doc.createProcessingInstruction(tgt, dat)); } i = e3 + 2; continue; }
+          if (str.substr(i, 2) === "<!") { var e4 = str.indexOf(">", i); if (e4 < 0) { e4 = n - 1; } i = e4 + 1; continue; }
+          if (str[i + 1] === "/") { var e5 = str.indexOf(">", i); if (e5 < 0) { e5 = n - 1; } if (open.length) { open.pop(); } i = e5 + 1; continue; }
+          // start tag
+          i++;
+          var nameM = /^[^\s/>]+/.exec(str.slice(i));
+          if (!nameM) { return { error: true }; }
+          var rawName = nameM[0]; i += rawName.length;
+          var rawAttrs = [];
+          while (i < n && str[i] !== ">" && str[i] !== "/") {
+            var am = /^\s*([^\s=/>]+)\s*(=\s*("([^"]*)"|'([^']*)'))?/.exec(str.slice(i));
+            if (!am || am[0].length === 0) { i++; continue; }
+            i += am[0].length;
+            var av = am[4] != null ? am[4] : (am[5] != null ? am[5] : "");
+            rawAttrs.push([am[1], decodeEnt(av)]);
+          }
+          var selfClose = str[i] === "/";
+          var gt = str.indexOf(">", i); i = (gt < 0 ? n : gt + 1);
+          // collect this element's namespace declarations
+          var nsdecl = {};
+          for (var ai = 0; ai < rawAttrs.length; ai++) {
+            var an = rawAttrs[ai][0];
+            if (an === "xmlns") { nsdecl[""] = rawAttrs[ai][1]; }
+            else if (an.slice(0, 6) === "xmlns:") { nsdecl[an.slice(6)] = rawAttrs[ai][1]; }
+          }
+          var es = splitQ(rawName);
+          var elNs = lookup(es[0] || "", nsdecl);
+          if (elNs === undefined) { elNs = null; }
+          var el = new XElement(doc, elNs, es[0], es[1]);
+          el.__ns = nsdecl;
+          for (var aj = 0; aj < rawAttrs.length; aj++) {
+            var qn = rawAttrs[aj][0], val = rawAttrs[aj][1];
+            if (qn === "xmlns") { el.setAttributeNS(XMLNS_NS, "xmlns", val); }
+            else if (qn.slice(0, 6) === "xmlns:") { el.setAttributeNS(XMLNS_NS, qn, val); }
+            else { var qs = splitQ(qn); var ans = qs[0] ? lookup(qs[0], nsdecl) : null; if (ans === undefined) { ans = null; } el.setAttributeNS(ans, qn, val); }
+          }
+          cur().appendChild(el);
+          if (!selfClose) { open.push(el); }
+          continue;
+        }
+        var lt = str.indexOf("<", i); var end = lt < 0 ? n : lt;
+        var text = str.slice(i, end);
+        if (text.length) { cur().appendChild(doc.createTextNode(decodeEnt(text))); }
+        i = end;
+      }
+      return { doc: doc };
+    }
+
+    // --- Serializer: the DOM Parsing & Serialization "XML serialization" algorithm ----------------
+    function escText(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+    function escAttr(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;").replace(/\t/g, "&#9;").replace(/\n/g, "&#10;").replace(/\r/g, "&#13;"); }
+    function mapClone(m) { var o = {}; for (var k in m) { o[k] = m[k].slice(); } return o; }
+    function mapAdd(m, prefix, ns) { if (!m[prefix]) { m[prefix] = []; } if (m[prefix].indexOf(ns) < 0) { m[prefix].push(ns); } }
+    function mapHas(m, prefix, ns) { return m[prefix] && m[prefix].indexOf(ns) >= 0; }
+    function genPrefix(map, ns, idx) { var p = "ns" + idx.v; idx.v++; mapAdd(map, p, ns); return p; }
+    function preferredPrefix(map, ns, prefer) {
+      var cand = null;
+      for (var p in map) { if (map[p].indexOf(ns) >= 0) { if (p === prefer) { return p; } if (p !== "") { cand = p; } } }
+      return cand;
+    }
+    function recordNs(node, map, localPrefixes) {
+      var localDefault = null;
+      for (var i = 0; i < node._attrs.length; i++) {
+        var a = node._attrs[i];
+        if ((a.namespaceURI || null) !== XMLNS_NS) { continue; }
+        if (a.prefix === null) { localDefault = a.value; }
+        else { var pfx = a.localName; if (!mapHas(map, pfx, a.value)) { mapAdd(map, pfx, a.value); } localPrefixes[pfx] = a.value; }
+      }
+      return localDefault;
+    }
+    function serAttrs(node, map, idx, localPrefixes, ignoreDefault) {
+      var out = "";
+      for (var i = 0; i < node._attrs.length; i++) {
+        var a = node._attrs[i];
+        var ans = a.namespaceURI || null;
+        // A no-namespace attribute literally named "xmlns" (e.g. via setAttribute) is not a real
+        // namespace declaration; emitting it would forge one, so it's dropped.
+        if (ans === null && a.localName === "xmlns") { continue; }
+        if (ans === XMLNS_NS) {
+          // a namespace-definition attribute
+          if (a.prefix === null) { if (ignoreDefault) { continue; } out += " xmlns=\"" + escAttr(a.value) + "\""; continue; }
+          // xmlns:prefix — drop if it just re-declares what the map already has for that prefix
+          if (mapHas(map, a.localName, a.value) && a.value !== "") { /* still emit declared xmlns:* from source */ }
+          out += " xmlns:" + a.localName + "=\"" + escAttr(a.value) + "\"";
+          continue;
+        }
+        var pfx = "";
+        if (ans !== null) {
+          var cand = preferredPrefix(map, ans, a.prefix);
+          if (cand !== null && cand !== "xmlns") {
+            pfx = cand + ":";
+          } else {
+            // The namespace isn't already bound to a usable prefix: bind a freshly generated one.
+            var p = genPrefix(map, ans, idx);
+            out += " xmlns:" + p + "=\"" + escAttr(ans) + "\"";
+            pfx = p + ":";
+          }
+        }
+        out += " " + pfx + a.localName + "=\"" + escAttr(a.value) + "\"";
+      }
+      return out;
+    }
+    function serNode(node, ns, map, idx) {
+      switch (node.nodeType) {
+        case 1: return serElem(node, ns, map, idx);
+        case 3: return escText(node.data);
+        case 4: return "<![CDATA[" + node.data + "]]>";
+        case 8: return "<!--" + node.data + "-->";
+        case 7: return "<?" + node.target + " " + node.data + "?>";
+        case 10: return "<!DOCTYPE " + node.name + (node.publicId ? " PUBLIC \"" + node.publicId + "\"" : "") + (node.systemId ? (node.publicId ? "" : " SYSTEM") + " \"" + node.systemId + "\"" : "") + ">";
+        case 9: case 11: { var s = ""; for (var i = 0; i < node.childNodes.length; i++) { s += serNode(node.childNodes[i], ns, map, idx); } return s; }
+        default: return "";
+      }
+    }
+    function serElem(node, ns, map, idx) {
+      map = mapClone(map);
+      var localPrefixes = {};
+      var localDefault = recordNs(node, map, localPrefixes);
+      var inherited = ns;
+      var nodeNs = node.namespaceURI || null;
+      var qname, markup = "<", ignoreDefault = false;
+      if ((inherited || null) === nodeNs) {
+        if (localDefault !== null) { ignoreDefault = true; }
+        qname = (nodeNs === XML_NS) ? "xml:" + node.localName : node.localName;
+        markup += qname;
+      } else {
+        var prefix = node.prefix;
+        if (prefix === "xmlns") { prefix = null; }
+        var cand = preferredPrefix(map, nodeNs, prefix);
+        if (cand !== null && cand !== "xmlns") {
+          qname = cand + ":" + node.localName;
+          if (localDefault !== null && localDefault !== "") { inherited = localDefault; }
+          markup += qname;
+        } else if (prefix !== null) {
+          if (Object.prototype.hasOwnProperty.call(localPrefixes, prefix)) { prefix = genPrefix(map, nodeNs, idx); }
+          else { mapAdd(map, prefix, nodeNs); }
+          qname = prefix + ":" + node.localName;
+          markup += qname + " xmlns:" + prefix + "=\"" + escAttr(nodeNs) + "\"";
+        } else {
+          qname = node.localName;
+          inherited = nodeNs;
+          // The element declares its own default namespace here, so the source `xmlns` attribute
+          // (the same declaration, possibly stale/inconsistent) must not be repeated.
+          ignoreDefault = true;
+          markup += qname + " xmlns=\"" + escAttr(nodeNs || "") + "\"";
+        }
+      }
+      markup += serAttrs(node, map, idx, localPrefixes, ignoreDefault);
+      if (node.childNodes.length === 0) { return markup + "/>"; }
+      markup += ">";
+      for (var i = 0; i < node.childNodes.length; i++) { markup += serNode(node.childNodes[i], inherited, map, idx); }
+      return markup + "</" + qname + ">";
+    }
+    function serialize(node) { return serNode(node, null, { "xml": [XML_NS] }, { v: 1 }); }
+
+    return { parse: parse, serialize: serialize, XDocument: XDocument };
+  })();
+
   // --- a few more constructors pages feature-detect ----------------------------------------
   if (typeof globalThis.DOMParser !== "function") {
     def(globalThis, "DOMParser", function () {
       this.parseFromString = function (str, type) {
         var t = String(type || "").toLowerCase();
-        // text/html parses as an HTML document (HTML namespace); XML flavours produce an XML
-        // document whose createElement assigns the null namespace.
+        // text/html parses as an HTML document (HTML namespace).
         if (t === "text/html") { return document; }
-        if (document.implementation && typeof document.implementation.createDocument === "function") {
-          // XHTML documents are in the HTML namespace; other XML flavours use the null namespace.
-          var ns = (t === "application/xhtml+xml") ? "http://www.w3.org/1999/xhtml" : null;
-          return document.implementation.createDocument(ns, "", null);
-        }
+        // XML flavours: parse into an independent namespace-aware XML document.
+        if (t.indexOf("xml") >= 0) { return __xml.parse(String(str)).doc; }
         return document;
       };
+    });
+  }
+  if (typeof globalThis.XMLSerializer !== "function") {
+    def(globalThis, "XMLSerializer", function () {
+      this.serializeToString = function (node) { return __xml.serialize(node); };
     });
   }
   if (typeof globalThis.IntersectionObserverEntry !== "function") { def(globalThis, "IntersectionObserverEntry", function () {}); }
