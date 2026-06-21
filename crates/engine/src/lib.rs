@@ -6091,6 +6091,7 @@ fn start_session(
 fn collect_text(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
     match &doc.get(id).data {
         dom::NodeData::Text(t) => out.push_str(t),
+        dom::NodeData::Cdata(t) => out.push_str(t),
         dom::NodeData::Element(e) => {
             if SKIP_SUBTREE.contains(&e.tag.as_str()) {
                 return;

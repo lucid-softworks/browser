@@ -24,6 +24,10 @@ pub enum NodeData {
     Text(String),
     /// A comment `<!-- ... -->`.
     Comment(String),
+    /// A CDATA section `<![CDATA[ ... ]]>` (nodeType 4). Like `Text`, it is `CharacterData`; only
+    /// produced via `document.createCDATASection` on an XML document (the HTML parser never emits
+    /// one). Its data renders/serializes as text.
+    Cdata(String),
     /// A `DocumentFragment` — a parentless container whose children move on insertion.
     DocumentFragment,
     /// A `<!DOCTYPE ...>` node (nodeType 10). Carries the name and the (usually empty) public/system
