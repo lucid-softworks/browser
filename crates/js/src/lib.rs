@@ -25,6 +25,8 @@
 //! `dataset` write-through, the DOM interface class hierarchy + `instanceof`, navigator/location/
 //! storage/observers, the timer/event loop) lives in that reused, engine-agnostic JavaScript.
 
+mod inner_text;
+
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -3192,6 +3194,67 @@ fn prim_set_inner_html(
     }
 }
 
+/// `__innerText(id) -> string` — the `innerText`/`outerText` getter (rendered-text algorithm).
+fn prim_inner_text(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    // innerText/outerText are HTMLElement-only; leave the return value `undefined` for SVG/MathML.
+    let s = node.and_then(|n| {
+        with_cascade_map(&state, |doc, map| {
+            inner_text::is_html_element(doc, n).then(|| inner_text::inner_text(doc, map, n))
+        })
+    });
+    if let Some(s) = s {
+        let v = js_str(scope, &s);
+        rv.set(v);
+    }
+}
+
+/// `__setInnerText(id, text)` — the `innerText` setter (replace children with a rendered fragment).
+fn prim_set_inner_text(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let text = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    if let Some(n) = node {
+        // No-op on SVG/MathML elements (innerText is HTMLElement-only).
+        if !inner_text::is_html_element(&state.doc.borrow(), n) {
+            return;
+        }
+        state.bump_dom_version(); // invalidate getComputedStyle cache (subtree replaced)
+        inner_text::set_inner_text(&mut state.doc.borrow_mut(), n, &text);
+    }
+}
+
+/// `__setOuterText(id, text) -> bool` — the `outerText` setter. Returns `false` when the element has
+/// no parent (the JS wrapper then throws `NoModificationAllowedError`).
+fn prim_set_outer_text(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let text = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    let ok = match node {
+        // No-op (but no error) on SVG/MathML elements (outerText is HTMLElement-only).
+        Some(n) if !inner_text::is_html_element(&state.doc.borrow(), n) => true,
+        Some(n) => {
+            state.bump_dom_version();
+            inner_text::set_outer_text(&mut state.doc.borrow_mut(), n, &text)
+        }
+        None => false,
+    };
+    rv.set_bool(ok);
+}
+
 /// `__getElementById(idStr) -> id | -1`
 fn prim_get_element_by_id(
     scope: &mut v8::PinScope,
@@ -3758,6 +3821,9 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__setTextContent", prim_set_text_content);
     set_fn(scope, global, "__innerHTML", prim_inner_html);
     set_fn(scope, global, "__setInnerHTML", prim_set_inner_html);
+    set_fn(scope, global, "__innerText", prim_inner_text);
+    set_fn(scope, global, "__setInnerText", prim_set_inner_text);
+    set_fn(scope, global, "__setOuterText", prim_set_outer_text);
     set_fn(scope, global, "__getElementById", prim_get_element_by_id);
     set_fn(scope, global, "__querySelectorAll", prim_query_selector_all);
     set_fn(
@@ -4479,6 +4545,26 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     });
     Object.defineProperty(el, "outerHTML", {
       get: function () { try { return __innerHTML(__parent(id) >= 0 ? id : id); } catch (e) { return ""; } },
+      enumerable: true, configurable: true
+    });
+    // innerText / outerText are HTMLElement-only (not on SVG/MathML elements). The getter is the
+    // rendered-text algorithm; the setters build a fragment (text runs + <br>s). innerText replaces
+    // children; outerText replaces the element and throws NoModificationAllowedError when detached.
+    // Both attributes are [LegacyNullToEmptyString]: null -> "", undefined -> the string "undefined".
+    // The HTMLElement-only gate lives in the native primitives (which see the parsed namespace):
+    // on SVG/MathML the getter yields `undefined` and the setters are no-ops.
+    Object.defineProperty(el, "innerText", {
+      get: function () { return __innerText(id); },
+      set: function (v) { __setInnerText(id, v === null ? "" : String(v)); },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(el, "outerText", {
+      get: function () { return __innerText(id); },
+      set: function (v) {
+        if (!__setOuterText(id, v === null ? "" : String(v))) {
+          throw new globalThis.DOMException("The object can not be modified.", "NoModificationAllowedError");
+        }
+      },
       enumerable: true, configurable: true
     });
     // setHTMLUnsafe(html): parse `html` and replace this element's children, like innerHTML but
@@ -17037,13 +17123,13 @@ mod tests {
             doc,
             vec![
                 "var s = getComputedStyle(document.querySelectorAll('div')[0]); \
-                 [s.cursor, s.getPropertyValue('transition'), s.visibility].join(',')"
+                 [s.cursor, s.getPropertyValue('transition')].join(',')"
                     .to_string(),
             ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some(",,"));
+        assert_eq!(out[0].value.as_deref(), Some(","));
     }
 
     #[test]

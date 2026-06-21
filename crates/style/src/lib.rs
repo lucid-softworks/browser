@@ -64,6 +64,16 @@ pub enum Display {
     TableColumnGroup,
 }
 
+/// CSS `visibility`. Inherits. `hidden`/`collapse` keep the box in layout but hide its own content
+/// (a descendant can opt back in with `visibility: visible`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Visibility {
+    #[default]
+    Visible,
+    Hidden,
+    Collapse,
+}
+
 /// CSS `position`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Position {
@@ -271,6 +281,8 @@ pub struct ComputedStyle {
     pub display_block: bool,
     /// The full display mode. Drives layout dispatch.
     pub display: Display,
+    /// CSS `visibility`. Inherited.
+    pub visibility: Visibility,
     /// CSS `position`. Not inherited.
     pub position: Position,
     /// Inset `top` in px (`None` = auto). Percentages unsupported (stored as None).
@@ -616,6 +628,8 @@ pub enum WhiteSpace {
     Pre,
     /// Preserve spaces and newlines; DO wrap long lines too.
     PreWrap,
+    /// Collapse runs of spaces/tabs (like `normal`) but preserve newlines as forced breaks.
+    PreLine,
 }
 
 impl WhiteSpace {
@@ -625,7 +639,10 @@ impl WhiteSpace {
     }
     /// Whether `\n` in the source is a forced line break under this mode.
     pub fn preserves_newlines(self) -> bool {
-        matches!(self, WhiteSpace::Pre | WhiteSpace::PreWrap)
+        matches!(
+            self,
+            WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
+        )
     }
 }
 
@@ -730,6 +747,7 @@ impl Default for ComputedStyle {
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
             white_space: WhiteSpace::Normal,
+            visibility: Visibility::Visible,
             list_style_type: ListStyleType::Disc,
             underline: false,
             line_through: false,
@@ -992,6 +1010,13 @@ impl ComputedStyle {
                 WhiteSpace::Nowrap => "nowrap",
                 WhiteSpace::Pre => "pre",
                 WhiteSpace::PreWrap => "pre-wrap",
+                WhiteSpace::PreLine => "pre-line",
+            }
+            .to_string(),
+            "visibility" => match self.visibility {
+                Visibility::Visible => "visible",
+                Visibility::Hidden => "hidden",
+                Visibility::Collapse => "collapse",
             }
             .to_string(),
             "list-style-type" => match self.list_style_type {
@@ -2244,6 +2269,7 @@ fn compute_element_style<'a>(
         text_transform: parent.text_transform,
         letter_spacing: parent.letter_spacing,
         white_space: parent.white_space,
+        visibility: parent.visibility,
         list_style_type: parent.list_style_type,
         underline: parent.underline,
         line_through: parent.line_through,
@@ -4109,7 +4135,14 @@ fn apply_declaration(
             "nowrap" => style.white_space = WhiteSpace::Nowrap,
             "pre" => style.white_space = WhiteSpace::Pre,
             "pre-wrap" => style.white_space = WhiteSpace::PreWrap,
-            // `pre-line` collapses spaces but keeps newlines; approximate as Normal for now.
+            // `pre-line` collapses runs of spaces/tabs but preserves newlines as forced breaks.
+            "pre-line" => style.white_space = WhiteSpace::PreLine,
+            _ => {}
+        },
+        "visibility" => match val.trim().to_ascii_lowercase().as_str() {
+            "visible" => style.visibility = Visibility::Visible,
+            "hidden" => style.visibility = Visibility::Hidden,
+            "collapse" => style.visibility = Visibility::Collapse,
             _ => {}
         },
         // `list-style-type` (and the `list-style` shorthand, from which we pull the type token).
@@ -9864,7 +9897,7 @@ mod tests {
         let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
             e.tag == "div"
         });
-        assert_eq!(cs.get_property("visibility"), "");
+        assert_eq!(cs.get_property("caret-color"), "");
         assert_eq!(cs.get_property("cursor"), "");
         assert_eq!(cs.get_property("--custom-var"), "");
         assert_eq!(cs.get_property("transition"), "");

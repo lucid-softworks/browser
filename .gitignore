@@ -13,4 +13,6 @@
 
 # Generated WPT results report (the default homepage)
 /wpt-report.html
+# Local checkout of the web-platform-tests suite (cloned for conformance runs)
+/wpt/
 dist/
