@@ -1,0 +1,105 @@
+name: WPT issue update
+
+# Refreshes the "Current pass rates" table on the WPT conformance tracker (issue #40) whenever a push
+# to main finishes a full WPT run.
+#
+# Like wpt-comment.yml, this is a separate workflow_run handler rather than a job inside wpt.yml: it
+# keeps wpt.yml itself read-only (it runs on `pull_request`, where fork PRs get a read-only token) and
+# isolates the write permission to a workflow that never checks out PR code. It only downloads the
+# prebuilt per-area TSVs produced by wpt.yml and edits the issue body, so granting `issues: write` here
+# is safe.
+on:
+  workflow_run:
+    workflows: [WPT]
+    types: [completed]
+
+permissions:
+  actions: read   # to download the result artifacts from the triggering run
+  issues: write   # to edit the tracker issue body
+
+# Serialize edits so two back-to-back main pushes can't race on the issue body.
+concurrency:
+  group: wpt-issue-update
+
+jobs:
+  update:
+    # Only push-to-main runs refresh the baseline numbers, and only a fully green run has a TSV for
+    # every area — a failed leg produces no TSV, which would silently drop that row from the table.
+    if: >
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE: 40
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+      # The per-leg artifacts uploaded by wpt.yml's matrix; each holds a one-line TSV (dir, pass,
+      # total, pct). merge-multiple flattens all six into one directory.
+      - name: Download WPT results
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: wpt-result-*
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - name: Build pass-rates table
+        run: |
+          rows=""; tp=0; tt=0; missing=0
+          # Canonical display order, matching the issue's existing table.
+          for dir in css/cssom dom domparsing html/dom url fetch; do
+            slug="${dir//\//-}"
+            f="artifacts/${slug}.tsv"
+            if [ ! -f "$f" ]; then missing=1; continue; fi
+            IFS=$'\t' read -r d p t pct < "$f"
+            rows="${rows}| \`${d}\` | ${p} / ${t} | ${pct} |\n"
+            tp=$((tp + p)); tt=$((tt + t))
+          done
+          # Defensive: if any area's TSV is absent the table would be incomplete, so bail rather than
+          # overwrite the issue with partial numbers. (The job's `if` already requires a green run.)
+          if [ "$missing" -eq 1 ]; then
+            echo "::error::Missing one or more area TSVs; refusing to write a partial table."
+            exit 1
+          fi
+          total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
+          {
+            echo "<!-- WPT-PASS-RATES:START -->"
+            echo "| Area | Subtests | Pass rate |"
+            echo "|------|----------|-----------|"
+            printf "%b" "$rows"
+            echo "| **Total** | **${tp} / ${tt}** | **${total_pct}** |"
+            echo
+            echo "<sub>Auto-updated from [\`${GITHUB_SHA:0:7}\`](${RUN_URL}) on push to \`main\`.</sub>"
+            echo "<!-- WPT-PASS-RATES:END -->"
+          } > table.md
+
+      - name: Update issue body
+        run: |
+          gh issue view "$ISSUE" --json body -q .body > body.md
+          python3 - <<'PY'
+          import re, sys
+          body = open("body.md").read()
+          table = open("table.md").read().rstrip("\n")
+          start, end = "<!-- WPT-PASS-RATES:START -->", "<!-- WPT-PASS-RATES:END -->"
+          if start not in body or end not in body:
+              sys.exit("pass-rates markers not found in issue body; aborting")
+          new = re.sub(
+              re.escape(start) + r".*?" + re.escape(end),
+              lambda _: table,
+              body,
+              count=1,
+              flags=re.DOTALL,
+          )
+          if new == body:
+              print("No change to issue body.")
+          open("new-body.md", "w").write(new)
+          PY
+          if [ -f new-body.md ] && ! cmp -s body.md new-body.md; then
+            gh issue edit "$ISSUE" --body-file new-body.md
+            echo "Updated issue #$ISSUE pass-rates table."
+          else
+            echo "Pass rates unchanged; nothing to update."
+          fi
