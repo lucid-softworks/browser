@@ -10518,13 +10518,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     });
   }
 
+  function createRangeForDocument(doc) {
+    var r = new globalThis.Range();
+    r.setStart(doc, 0);
+    r.setEnd(doc, 0);
+    return r;
+  }
   if (typeof document.createRange !== "function") {
-    def(document, "createRange", function () {
-      var r = new globalThis.Range();
-      r.setStart(this, 0);
-      r.setEnd(this, 0);
-      return r;
-    });
+    def(document, "createRange", function () { return createRangeForDocument(this); });
   }
   // document.implementation.createHTMLDocument — used to build/parse HTML off to the side (e.g.
   // sanitizers, template parsing). We back it with real (detached) arena nodes so innerHTML /
@@ -10587,6 +10588,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       Object.defineProperty(doc, "firstChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[0]) : null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "lastChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[ids.length - 1]) : null; }, configurable: true, enumerable: true });
       def(doc, "contains", function (other) { return nodeContains(doc, other); });
+      def(doc, "createRange", function () { return createRangeForDocument(doc); });
       return doc;
     }
     def(document, "implementation", {
@@ -11654,6 +11656,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       def(DocumentCtor.prototype, "lookupNamespaceURI", function () { return null; });
       def(DocumentCtor.prototype, "lookupPrefix", function () { return null; });
       def(DocumentCtor.prototype, "isDefaultNamespace", function (ns) { return ns == null || ns === ""; });
+      def(DocumentCtor.prototype, "createRange", function () { return createRangeForDocument(this); });
       // A bare `new Document()` is an XML document, so it supports the CharacterData factories
       // (including createCDATASection, which an HTML document refuses). Nodes are real arena nodes so
       // they can be inserted into a live tree and traversed.
@@ -12376,6 +12379,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             if (w.__frameDoc) { return w.__frameDoc; }
             // A <template> ANCESTOR (not the node itself) puts the node in its contents document.
             if (cur !== id && w.tagName === "TEMPLATE") { return __templateDocFor(w); }
+            // Arena-backed foreign documents are canonicalized to their Document facade.
+            if (w.nodeType === 9) { return w; }
           }
           cur = __parent(cur);
         }
@@ -17598,6 +17603,54 @@ mod tests {
             out[0].value.as_deref(),
             Some("html|html|pub|sys|10|null|null")
         );
+    }
+
+    #[test]
+    fn create_range_is_available_on_every_document() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var foreign = document.implementation.createHTMLDocument("");
+                var xml = document.implementation.createDocument(null, null, null);
+                var bare = new Document();
+                var docs = [document, foreign, xml, bare];
+                docs.map(function (doc) {
+                    var range = doc.createRange();
+                    return typeof doc.createRange === "function" &&
+                           range instanceof Range && range instanceof AbstractRange &&
+                           range.startContainer === doc && range.startOffset === 0 &&
+                           range.endContainer === doc && range.endOffset === 0 &&
+                           range.collapsed;
+                }).join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,true,true,true"));
+    }
+
+    #[test]
+    fn foreign_node_owner_document_creates_range_in_that_document() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var foreign = document.implementation.createHTMLDocument("");
+                var child = foreign.createElement("p");
+                foreign.body.appendChild(child);
+                var owner = child.ownerDocument;
+                var first = owner.createRange();
+                var second = owner.createRange();
+                [owner === foreign, first.startContainer === foreign,
+                 first.endContainer === foreign, first !== second].join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true,true,true,true"));
     }
 
     #[test]
