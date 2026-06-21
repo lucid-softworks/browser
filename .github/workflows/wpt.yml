@@ -52,9 +52,15 @@ jobs:
           # css/cssom, dom, domparsing, url are quick; html/dom is large; fetch is mostly network-
           # dependent (low but non-zero). All exclude tentative tests (skipped by the runner).
           for dir in css/cssom dom domparsing html/dom url fetch; do
-            line=$(WPT_REPORT="reports/${dir//\//-}.html" \
-              cargo run --release -p wpt-runner -- "$WPT" "$dir" 200000 2>/dev/null \
-              | grep -E "^subtests:" | tail -1)
+            echo "::group::WPT $dir"
+            # `-q` silences cargo's own Finished/Running chatter; 2>&1 keeps the runner's "running N
+            # tests" header. tee streams every per-file PASS/FAIL/TIMEOUT line into the live log and
+            # saves a per-area .log (uploaded alongside the HTML report), then we read the summary back.
+            log="reports/${dir//\//-}.log"
+            WPT_REPORT="reports/${dir//\//-}.html" \
+              cargo run --release -q -p wpt-runner -- "$WPT" "$dir" 200000 2>&1 | tee "$log"
+            echo "::endgroup::"
+            line=$(grep -E "^subtests:" "$log" | tail -1)
             p=$(echo "$line" | sed -E 's#subtests: ([0-9]+)/.*#\1#')
             t=$(echo "$line" | sed -E 's#subtests: [0-9]+/([0-9]+).*#\1#')
             pct=$(echo "$line" | sed -E 's#.*\(([0-9.]+%)\).*#\1#')
