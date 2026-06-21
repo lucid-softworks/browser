@@ -17832,10 +17832,14 @@ mod tests {
 
     #[test]
     fn crypto_get_random_values_fills_nonzero() {
+        // Assert the buffer was filled with randomness, not left zeroed. We check that *some* byte
+        // is nonzero rather than *every* byte: with a correct RNG any single byte is zero ~1/256 of
+        // the time, so `every` over 4 bytes flakes ~1.5% of runs. `some` over 64 bytes only fails
+        // if the fill never happened (P(all zero) ≈ (1/256)^64), so it still catches a regression.
         let out = env_eval(
             "https://example.com/",
-            "var a = new Uint8Array(4); crypto.getRandomValues(a); \
-             a.every(function (x) { return x !== 0; })",
+            "var a = new Uint8Array(64); crypto.getRandomValues(a); \
+             a.some(function (x) { return x !== 0; })",
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("true"));
