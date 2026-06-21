@@ -8,9 +8,10 @@ harness completes, and we tally subtest pass/fail.
 
 ## Usage
 ```
-# get a WPT subset
+# get a WPT subset — `common` holds shared helpers many tests load via `/common/...`
+# (subset-tests*.js, get-host-info, utils.js, …); omit it and those tests fail spuriously.
 git clone --depth 1 --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git
-cd wpt && git sparse-checkout set resources dom/nodes
+cd wpt && git sparse-checkout set resources common dom/nodes
 
 # run
 cargo run --release -p wpt-runner -- <wpt-root> <subpath> [max-tests]
