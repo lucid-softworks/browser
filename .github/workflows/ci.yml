@@ -4,6 +4,8 @@ on:
   pull_request:
   push:
     branches: [main]
+    # Release tags (release-plz pushes these) run the cross-platform `test` matrix — see its `if`.
+    tags: ['v*']
 
 # A new push to a PR cancels the previous run.
 concurrency:
@@ -20,8 +22,10 @@ jobs:
   # (opened/synchronize/reopened) does not cover — without re-running the build/test matrix on
   # every title or description edit.
 
-  # Fast lint pass (one OS): formatting + clippy. Fails the PR on warnings.
+  # Fast lint pass (one OS): formatting + clippy. Fails the PR on warnings. PRs + main only — the
+  # tag trigger above is just for `test`, so skip lint on tags.
   lint:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +38,11 @@ jobs:
 
   # The whole point of cross-platform dev: the Rust engine + all unit tests build and pass on
   # macOS, Linux, and Windows. (The Swift/AppKit shell is macOS-only and built separately.)
+  # Runs only on release tags (v*) — not on PRs or main — so it's a release-time check, not a
+  # per-push gate. It does NOT block release.yml's publish job.
   test:
     name: test (${{ matrix.os }})
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     strategy:
       fail-fast: false
       matrix:
