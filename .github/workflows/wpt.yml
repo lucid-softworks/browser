@@ -26,9 +26,11 @@ concurrency:
   group: wpt-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only: a fork PR's GITHUB_TOKEN is read-only regardless, so this workflow never comments.
+# The report is posted by wpt-comment.yml, which runs via workflow_run in the base repo's context
+# with a write token. See that file for the rationale.
 permissions:
   contents: read
-  pull-requests: write   # to post/update the report comment
 
 jobs:
   # Each WPT area runs on its own runner in parallel. html/dom dominates wall-clock; fanning the
@@ -129,7 +131,6 @@ jobs:
             wpt-baseline-
 
       - name: Build report
-        id: wpt
         run: |
           rows=""; tp=0; tt=0; tdelta=0; have_base=0
           # Render the signed change in passing subtests vs the baseline; ±0 for no change, — if the
@@ -156,14 +157,19 @@ jobs:
           total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
           # Total Δ sums only areas that had a baseline, so it stays honest if a new area lacks one.
           total_delta="—"; [ "$have_base" -eq 1 ] && total_delta=$(fmt "$tdelta")
+          # Write the full comment body to a file. wpt-comment.yml posts this verbatim — keeping all
+          # report formatting here means that workflow stays a dumb "download + post" step.
+          mkdir -p comment
           {
-            echo "report<<REPORT_EOF"
+            echo "## 🧪 WPT conformance"
+            echo
             echo "| Area | Subtests | Pass rate | Δ vs \`main\` |"
             echo "|------|----------|-----------|------------|"
             printf "%b" "$rows"
             echo "| **Total** | **${tp} / ${tt}** | **${total_pct}** | **${total_delta}** |"
-            echo "REPORT_EOF"
-          } >> "$GITHUB_OUTPUT"
+            echo
+            echo "<sub>Δ vs \`main\` is the change in passing subtests against the latest \`main\` baseline (\`—\` when no baseline exists yet). web-platform-tests via \`crates/wpt-runner\`. Full HTML reports are attached as the \`wpt-reports\` artifact on this run.</sub>"
+          } > comment/report.md
 
       - name: Upload HTML reports
         uses: actions/upload-artifact@v4
@@ -188,14 +194,16 @@ jobs:
           path: baseline
           key: wpt-baseline-${{ github.sha }}
 
-      - name: Comment report on PR
+      # Hand the comment off to wpt-comment.yml. We can't post here: a fork PR's GITHUB_TOKEN is
+      # read-only. Stash the rendered body + the PR number so the workflow_run handler — which does
+      # have a write token — can post it. Only PR runs need this; pushes to main have nothing to
+      # comment on.
+      - name: Stage PR comment
         if: github.event_name == 'pull_request'
-        uses: marocchino/sticky-pull-request-comment@v2
+        run: echo "${{ github.event.pull_request.number }}" > comment/pr-number.txt
+      - name: Upload PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
         with:
-          header: wpt-report
-          message: |
-            ## 🧪 WPT conformance
-
-            ${{ steps.wpt.outputs.report }}
-
-            <sub>Δ vs `main` is the change in passing subtests against the latest `main` baseline (`—` when no baseline exists yet). web-platform-tests via `crates/wpt-runner`. Full HTML reports are attached as the `wpt-reports` artifact on this run.</sub>
+          name: wpt-comment
+          path: comment/
