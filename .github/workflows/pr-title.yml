@@ -1,0 +1,43 @@
+name: PR Title
+
+# Enforce Conventional Commits on the PR title. PRs are squash-merged, so the title becomes the
+# commit message (feat/fix/docs/…) and drives automatic versioning via release-plz.
+#
+# This is a dedicated workflow — separate from ci.yml — purely so it re-runs on `edited`. The
+# default `pull_request` trigger fires on opened/synchronize/reopened only, so editing JUST the PR
+# title (no new commit) would never re-validate it. Keeping it out of ci.yml means a title or
+# description edit re-checks the title WITHOUT re-running the full build/test matrix.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+# A newer event for the same PR supersedes an in-flight check.
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: read
+
+jobs:
+  # Keep this job name (`conventional-commit`) identical to its former home in ci.yml so any
+  # required-status-check / branch-protection rule referencing it keeps resolving.
+  conventional-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert

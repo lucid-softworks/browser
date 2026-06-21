@@ -15,28 +15,10 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Enforce Conventional Commits. PRs are squash-merged, so the PR title becomes the commit —
-  # lint it (feat/fix/docs/…). This also drives automatic versioning via release-plz.
-  conventional-commit:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: amannn/action-semantic-pull-request@v5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          types: |
-            feat
-            fix
-            docs
-            style
-            refactor
-            perf
-            test
-            build
-            ci
-            chore
-            revert
+  # NOTE: the Conventional-Commit PR-title check lives in its own workflow (pr-title.yml) so it
+  # re-runs when the title is EDITED — which this workflow's default pull_request trigger
+  # (opened/synchronize/reopened) does not cover — without re-running the build/test matrix on
+  # every title or description edit.
 
   # Fast lint pass (one OS): formatting + clippy. Fails the PR on warnings.
   lint:
