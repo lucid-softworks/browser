@@ -854,12 +854,16 @@
       if (elIsHtml()) { nm = asciiLower(nm); }
       // `value` is a non-nullable DOMString in WebIDL: undefined -> "undefined", null -> "null".
       __setAttr(id, nm, String(value));
+      // Mutating an aria element-reflection content attribute directly clears any explicitly set
+      // attr-element slot, so the IDL getter falls back to ID lookup (see __aomNoteAttrChange).
+      if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
     });
     def(el, "removeAttribute", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
       __detachCachedAttr(nm);
       __removeAttr(id, nm); delete __attrNs[nm]; delete __attrNodeCache[nm];
+      if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
     });
     def(el, "hasAttribute", function (name) {
       var nm = String(name);
@@ -1531,6 +1535,24 @@
     return globalThis.__makeHTMLCollection(function () {
       return collectDescendants(0, function (eid) { return matchesTagNameNS(eid, ns, ln); });
     });
+  });
+  // adoptNode(node): change `node`'s owner document to this document, first removing it from its
+  // current parent. This engine keeps every node in one arena with no per-document ownership, so the
+  // observable effect is the detach; the node (with its subtree and references) is returned as-is.
+  def(document, "adoptNode", function (node) {
+    if (node == null) { return node; }
+    if (node.nodeType === 9) {
+      throw new globalThis.DOMException("Cannot adopt a document node.", "NotSupportedError");
+    }
+    var nid = (typeof node.__node === "number") ? node.__node : -1;
+    if (nid >= 0) { var p = __parent(nid); if (p >= 0) { __removeChild(p, nid); } }
+    return node;
+  });
+  // importNode(node, deep): return a clone of `node` belonging to this document. Cross-document
+  // ownership isn't tracked, so this is a plain clone (the original stays put).
+  def(document, "importNode", function (node, deep) {
+    if (node == null || typeof node.cloneNode !== "function") { return node; }
+    return node.cloneNode(!!deep);
   });
   // Node-id-keyed attribute helpers the browser-env bootstrap uses for style/classList/dataset.
   def(document, "__getAttr", function (node, name) { return __getAttr(node, String(name)); });

@@ -563,6 +563,57 @@ mod tests {
     }
 
     #[test]
+    fn aria_element_reflection_single_and_array() {
+        // ARIA element reflection: ariaActiveDescendantElement (single Element) and the
+        // FrozenArray<Element> family. Covers content-attribute fallback, IDL set emptying the
+        // content attribute + storing the reference, null clearing it, and a setAttribute reset.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var p = document.createElement("div");
+                var a = document.createElement("div"); a.id = "a";
+                var b = document.createElement("div"); b.id = "b";
+                document.body.appendChild(p);
+                document.body.appendChild(a);
+                document.body.appendChild(b);
+                var r = [];
+                // Content-attribute fallback resolves the IDREF to the element.
+                p.setAttribute("aria-activedescendant", "a");
+                r.push(p.ariaActiveDescendantElement === a);     // true
+                // IDL set stores the reference and empties the content attribute.
+                p.ariaActiveDescendantElement = b;
+                r.push(p.getAttribute("aria-activedescendant")); // ""
+                r.push(p.ariaActiveDescendantElement === b);     // true
+                // setAttribute clears the explicit reference (falls back to IDREF lookup).
+                p.setAttribute("aria-activedescendant", "a");
+                r.push(p.ariaActiveDescendantElement === a);     // true
+                // null removes the content attribute.
+                p.ariaActiveDescendantElement = null;
+                r.push(p.hasAttribute("aria-activedescendant")); // false
+                // FrozenArray family: parsed IDREF list, caching invariant, and type checking.
+                p.setAttribute("aria-describedby", "a b");
+                r.push(p.ariaDescribedByElements.length);        // 2
+                r.push(p.ariaDescribedByElements === p.ariaDescribedByElements); // true (cached)
+                p.ariaDescribedByElements = [b];
+                r.push(p.getAttribute("aria-describedby"));      // ""
+                r.push(p.ariaDescribedByElements[0] === b);      // true
+                var threw = false;
+                try { p.ariaControlsElements = [1]; } catch (e) { threw = e instanceof TypeError; }
+                r.push(threw);                                   // true
+                r.join("|");
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true||true|true|false|2|true||true|true")
+        );
+    }
+
+    #[test]
     fn create_element_ns_records_namespace_prefix_localname_and_preserves_case() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(

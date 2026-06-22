@@ -4335,6 +4335,8 @@
       var nm = __reflAria[ai];
       defineReflected(el, node, "aria" + nm, { type: "nullable string", domAttrName: "aria-" + __asciiLower(nm) });
     }
+    // ARIA element reflection (aria*Element / aria*Elements) — Element / FrozenArray<Element>.
+    applyAomElementReflection(el, node);
     // Per-element attributes.
     var tbl = __reflTables[tag];
     if (tbl) {
@@ -4344,6 +4346,209 @@
     }
   }
   def(globalThis, "__applyReflection", applyReflection);
+
+  // ============================================================================================
+  // ARIA element reflection (aria*Element / aria*Elements).
+  //
+  // A handful of ARIAMixin IDL attributes reflect an aria-* ID-reference content attribute as actual
+  // Element references rather than strings: the single `ariaActiveDescendantElement`
+  // (<-> aria-activedescendant) and the FrozenArray<Element> family `ariaControlsElements`,
+  // `ariaDescribedByElements`, `ariaDetailsElements`, `ariaErrorMessageElements`, `ariaFlowToElements`,
+  // `ariaLabelledByElements`, `ariaOwnsElements`. Each has an "explicitly set attr-element(s)" internal
+  // slot (stashed on the wrapper). Setting via the IDL attribute stores the element reference(s) and
+  // writes the empty string to the content attribute; mutating the content attribute directly
+  // (setAttribute/removeAttribute) clears the slot so the getter falls back to ID lookup. A referenced
+  // element is only exposed when it is in a "valid scope" — its tree is the reflecting element's tree
+  // or a shadow-including ancestor (a "lighter") tree; references into a "darker" (descendant) shadow
+  // tree, a detached subtree, or another document are kept intact but hidden until back in scope.
+  var __aomElemAttrs = [
+    { idl: "ariaActiveDescendantElement", attr: "aria-activedescendant", multi: false },
+    { idl: "ariaControlsElements",        attr: "aria-controls",         multi: true },
+    { idl: "ariaDescribedByElements",     attr: "aria-describedby",      multi: true },
+    { idl: "ariaDetailsElements",         attr: "aria-details",          multi: true },
+    { idl: "ariaErrorMessageElements",    attr: "aria-errormessage",     multi: true },
+    { idl: "ariaFlowToElements",          attr: "aria-flowto",           multi: true },
+    { idl: "ariaLabelledByElements",      attr: "aria-labelledby",       multi: true },
+    { idl: "ariaOwnsElements",            attr: "aria-owns",             multi: true }
+  ];
+  var __aomAttrToIdl = Object.create(null);
+  for (var __aomI = 0; __aomI < __aomElemAttrs.length; __aomI++) {
+    __aomAttrToIdl[__aomElemAttrs[__aomI].attr] = __aomElemAttrs[__aomI];
+  }
+
+  // The shadow root in this engine is a real <div> child of the host carrying `.host`. An element's
+  // "tree root" is the nearest such shadow-root ancestor (inclusive), else the topmost ancestor
+  // (document node, or a detached subtree's root). Returns a node id.
+  function __aomTreeRoot(id) {
+    var cur = id;
+    while (true) {
+      var w = globalThis.__nodeById ? globalThis.__nodeById(cur) : null;
+      if (w && w.host) { return cur; }            // cur is itself a shadow root
+      var p = __parent(cur);
+      if (typeof p !== "number" || p < 0) { return cur; }
+      cur = p;
+    }
+  }
+  // The chain of tree roots from `id`'s own tree outward through host boundaries (lighter trees).
+  function __aomRootChain(id) {
+    var chain = [];
+    var r = __aomTreeRoot(id);
+    while (true) {
+      chain.push(r);
+      var w = globalThis.__nodeById ? globalThis.__nodeById(r) : null;
+      if (w && w.host && typeof w.host.__node === "number") { r = __aomTreeRoot(w.host.__node); }
+      else { break; }
+    }
+    return chain;
+  }
+  // Is `candId` in a valid scope to be referenced by reflecting element `hostId`? Valid iff the
+  // candidate's tree root is the reflecting element's tree root or a shadow-including ancestor.
+  function __aomValidScope(hostId, candId) {
+    if (typeof candId !== "number" || candId < 0) { return false; }
+    var cr = __aomTreeRoot(candId);
+    var chain = __aomRootChain(hostId);
+    for (var i = 0; i < chain.length; i++) { if (chain[i] === cr) { return true; } }
+    return false;
+  }
+  // First element (tree order) with id `wantId` within the tree rooted at `rootId`, without crossing
+  // into nested shadow roots (a different tree). Returns a node id, or -1.
+  function __aomGetById(rootId, wantId) {
+    var found = -1;
+    function visit(pid) {
+      var kids;
+      try { kids = __children(pid); } catch (e) { return; }
+      for (var i = 0; i < kids.length; i++) {
+        var c = kids[i];
+        if (found >= 0) { return; }
+        if (__nodeType(c) !== 1) { continue; }
+        if (__getAttr(c, "id") === wantId) { found = c; return; }
+        var w = globalThis.__nodeById ? globalThis.__nodeById(c) : null;
+        if (w && w.host) { continue; }            // don't descend into a nested shadow tree
+        visit(c);
+        if (found >= 0) { return; }
+      }
+    }
+    visit(rootId);
+    return found;
+  }
+  function __aomIsElement(v) {
+    return !!v && typeof v === "object" && typeof v.__node === "number" && __nodeType(v.__node) === 1;
+  }
+  // Convert a sequence<Element> argument (per WebIDL) to a JS array, throwing TypeError for a
+  // non-iterable value or any member that is not an Element.
+  function __aomToElementSeq(value) {
+    var iterFn = (value != null) ? value[Symbol.iterator] : undefined;
+    if (typeof iterFn !== "function") { throw new TypeError("Value is not a sequence"); }
+    var out = [];
+    var iter = iterFn.call(value);
+    while (true) {
+      var step = iter.next();
+      if (step.done) { break; }
+      if (!__aomIsElement(step.value)) { throw new TypeError("Value is not an Element"); }
+      out.push(step.value);
+    }
+    return out;
+  }
+
+  // Clear the explicitly set attr-element slot (+ cached FrozenArray) for a content attribute that
+  // changed via setAttribute/removeAttribute. Called from the document-layer attribute mutators.
+  def(globalThis, "__aomNoteAttrChange", function (el, attrLower) {
+    var info = __aomAttrToIdl[attrLower];
+    if (!info || !el) { return; }
+    if (el.__aomRefs) { delete el.__aomRefs[info.idl]; }
+    if (el.__aomCache) { delete el.__aomCache[info.idl]; }
+  });
+
+  function applyAomElementReflection(el, node) {
+    if (typeof node !== "number") { return; }
+    if (!el.__aomRefs) { def(el, "__aomRefs", Object.create(null)); }
+    if (!el.__aomCache) { def(el, "__aomCache", Object.create(null)); }
+    for (var ei = 0; ei < __aomElemAttrs.length; ei++) {
+      (function (info) {
+        var idl = info.idl, attr = info.attr, refs = el.__aomRefs, cache = el.__aomCache;
+        if (info.multi) {
+          Object.defineProperty(el, idl, {
+            get: function () {
+              var ids;
+              if (Object.prototype.hasOwnProperty.call(refs, idl)) {
+                // Explicitly set: expose only the members that are currently in a valid scope.
+                var arr = refs[idl];
+                ids = [];
+                for (var i = 0; i < arr.length; i++) {
+                  var cid = arr[i] && arr[i].__node;
+                  if (typeof cid === "number" && __aomValidScope(node, cid)) { ids.push(cid); }
+                }
+              } else {
+                // Reflect the content attribute: absent -> null; else resolve each ID token in tree
+                // order within this element's tree.
+                var v = __getAttr(node, attr);
+                if (v == null) { delete cache[idl]; return null; }
+                var toks = v.split(/[ \t\n\f\r]+/);
+                var rootId = __aomTreeRoot(node);
+                ids = [];
+                for (var j = 0; j < toks.length; j++) {
+                  if (!toks[j]) { continue; }
+                  var fid = __aomGetById(rootId, toks[j]);
+                  if (fid >= 0) { ids.push(fid); }
+                }
+              }
+              // Caching invariant: return the same FrozenArray object while the resolved list of
+              // elements is unchanged.
+              var prev = cache[idl];
+              if (prev && prev.ids.length === ids.length) {
+                var same = true;
+                for (var k = 0; k < ids.length; k++) { if (prev.ids[k] !== ids[k]) { same = false; break; } }
+                if (same) { return prev.frozen; }
+              }
+              var frozen = [];
+              for (var m = 0; m < ids.length; m++) { frozen.push(globalThis.__nodeFor(ids[m])); }
+              Object.freeze(frozen);
+              cache[idl] = { ids: ids.slice(), frozen: frozen };
+              return frozen;
+            },
+            set: function (value) {
+              if (value === null || value === undefined) {
+                delete refs[idl]; delete cache[idl];
+                __removeAttr(node, attr);
+                return;
+              }
+              var items = __aomToElementSeq(value);   // validates (throws before mutating)
+              refs[idl] = items.slice();
+              delete cache[idl];
+              __setAttr(node, attr, "");
+            },
+            enumerable: true, configurable: true
+          });
+        } else {
+          Object.defineProperty(el, idl, {
+            get: function () {
+              if (Object.prototype.hasOwnProperty.call(refs, idl)) {
+                var cand = refs[idl];
+                var cid = cand && cand.__node;
+                if (typeof cid === "number" && __aomValidScope(node, cid)) { return cand; }
+                return null;
+              }
+              var v = __getAttr(node, attr);
+              if (v == null) { return null; }
+              var fid = __aomGetById(__aomTreeRoot(node), v);
+              return fid >= 0 ? globalThis.__nodeFor(fid) : null;
+            },
+            set: function (value) {
+              if (value === null || value === undefined) {
+                delete refs[idl]; delete cache[idl];
+                __removeAttr(node, attr);
+                return;
+              }
+              if (!__aomIsElement(value)) { throw new TypeError("Value is not an Element"); }
+              refs[idl] = value;
+              __setAttr(node, attr, "");
+            },
+            enumerable: true, configurable: true
+          });
+        }
+      })(__aomElemAttrs[ei]);
+    }
+  }
 
   // Minimal Streams (WritableStream / ReadableStream / TransformStream / TextDecoderStream) — enough
   // for the streaming partial-update methods (streamHTML etc.) and piping a Response body through.
