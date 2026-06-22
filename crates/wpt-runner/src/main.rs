@@ -238,7 +238,13 @@ fn main() {
     }
 
     let mut all = Vec::new();
-    collect_tests(&root.join(subpath), &mut all);
+    let target = root.join(subpath);
+    if target.is_file() {
+        // Allow pointing the runner at a single test file, not just a directory.
+        all.push(target);
+    } else {
+        collect_tests(&target, &mut all);
+    }
     all.sort();
     // Keep only testharness.js tests (skip reftests / visual tests, which have no JS result).
     let mut tests: Vec<PathBuf> = all
