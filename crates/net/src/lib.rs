@@ -20,34 +20,104 @@ fn agent() -> &'static ureq::Agent {
             .max_idle_connections_per_host(16)
             // Persist cookies across requests AND redirects so logins/sessions survive.
             .cookie_store(cookie_store::CookieStore::new(None));
-        // wpt-runner sets `WPT_CA_FILE` to the WPT test CA (`tools/certs/cacert.pem`) so `.https`
-        // conformance tests load over TLS against `wpt serve`. No effect on normal browsing.
-        if let Ok(ca) = std::env::var("WPT_CA_FILE") {
-            if let Some(cfg) = wpt_tls_config(&ca) {
-                builder = builder.tls_config(std::sync::Arc::new(cfg));
-            }
+        // Test-driving env knobs (no effect on normal browsing):
+        //  - `WPT_INSECURE_TLS`: accept any server certificate. The WebDriver server sets this so
+        //    `.https` WPT tests load over TLS against `wpt serve`'s self-signed cert without needing
+        //    the checkout's CA path (matches the `acceptInsecureCerts` capability it advertises).
+        //  - `WPT_CA_FILE`: trust a specific extra CA (the WPT `tools/certs/cacert.pem`).
+        if let Some(cfg) = wpt_tls_config() {
+            builder = builder.tls_config(std::sync::Arc::new(cfg));
         }
         builder.build()
     })
 }
 
-/// Build a rustls client config that trusts the usual webpki roots *plus* the WPT test CA at
-/// `ca_path`. Returns `None` (and leaves the agent on its default trust store) if the file is
-/// missing or unparseable, so a stale `WPT_CA_FILE` degrades gracefully instead of breaking fetches.
-fn wpt_tls_config(ca_path: &str) -> Option<rustls::ClientConfig> {
+/// A test-only rustls client config, or `None` to leave the agent on its default trust store.
+/// `WPT_INSECURE_TLS` disables certificate verification entirely; otherwise `WPT_CA_FILE` adds an
+/// extra trusted CA on top of the usual webpki roots. A missing/unparseable `WPT_CA_FILE` degrades
+/// gracefully to `None`.
+fn wpt_tls_config() -> Option<rustls::ClientConfig> {
+    // `ring` is a hard dependency, so the provider is always present — no default-provider panic.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+    if std::env::var_os("WPT_INSECURE_TLS").is_some() {
+        return rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .ok()?
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(insecure::NoVerify(provider)))
+            .with_no_client_auth()
+            .into();
+    }
+
+    let ca_path = std::env::var("WPT_CA_FILE").ok()?;
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let pem = std::fs::read(ca_path).ok()?;
     for cert in rustls_pemfile::certs(&mut &pem[..]).flatten() {
         let _ = roots.add(cert);
     }
-    // `ring` is a hard dependency above, so the provider is always present — no default-provider panic.
-    rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+    rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .ok()?
         .with_root_certificates(roots)
         .with_no_client_auth()
         .into()
+}
+
+/// A rustls verifier that accepts any server certificate — for driving WPT (`wpt serve` uses a
+/// self-signed cert) under `WPT_INSECURE_TLS` only. Signature checks still run against the provider.
+mod insecure {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    pub struct NoVerify(pub Arc<CryptoProvider>);
+
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
 }
 
 /// A mainstream desktop-Safari User-Agent so sites serve us their normal content.

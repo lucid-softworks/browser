@@ -8,6 +8,12 @@ fn main() {
     if std::env::var_os("NET_CACHE_DIR").is_none() {
         std::env::set_var("NET_CACHE_DIR", "off");
     }
+    // `.https` WPT tests are served by `wpt serve` with a self-signed cert. As a test driver we
+    // accept it (matching the `acceptInsecureCerts` capability we advertise) so secure-context tests
+    // load over TLS without threading the WPT CA path through.
+    if std::env::var_os("WPT_INSECURE_TLS").is_none() {
+        std::env::set_var("WPT_INSECURE_TLS", "1");
+    }
 
     let mut port: u16 = 4444;
     let args: Vec<String> = std::env::args().collect();
