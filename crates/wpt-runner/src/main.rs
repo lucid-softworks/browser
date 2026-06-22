@@ -270,6 +270,9 @@ fn start_wptserve(root: &Path) -> Backend {
     std::fs::write(&report_path, REPORT_JS).expect("override testharnessreport.js");
     let log = std::fs::File::create("/tmp/wptserve.log").expect("create wptserve log");
 
+    // The child is owned by the returned `Backend`, whose `Drop` kills and `wait()`s it; clippy
+    // can't see that through the enum, so silence the zombie-process lint here.
+    #[allow(clippy::zombie_processes)]
     let child = Command::new("python3")
         .current_dir(root)
         .arg("./wpt")
@@ -433,7 +436,9 @@ fn main() {
     tests.truncate(max);
     let backend_name = match backend {
         Backend::Static(port) => format!("static :{port}"),
-        Backend::WptServe { .. } => format!("wpt serve {WPT_HOST}:{WPT_HTTP_PORT}/{WPT_HTTPS_PORT}"),
+        Backend::WptServe { .. } => {
+            format!("wpt serve {WPT_HOST}:{WPT_HTTP_PORT}/{WPT_HTTPS_PORT}")
+        }
     };
     eprintln!(
         "running {} testharness tests from {} ({backend_name})",
