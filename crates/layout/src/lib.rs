@@ -1178,9 +1178,19 @@ mod tests {
         let c = ibox.dimensions.content;
 
         // top: 20% of 200 = 40px below the padding-box top.
-        assert!((c.y - (pad.y + 40.0)).abs() < 0.01, "c.y={} pad.y={}", c.y, pad.y);
+        assert!(
+            (c.y - (pad.y + 40.0)).abs() < 0.01,
+            "c.y={} pad.y={}",
+            c.y,
+            pad.y
+        );
         // left: 75% of 400 = 300px right of the padding-box left.
-        assert!((c.x - (pad.x + 300.0)).abs() < 0.01, "c.x={} pad.x={}", c.x, pad.x);
+        assert!(
+            (c.x - (pad.x + 300.0)).abs() < 0.01,
+            "c.x={} pad.x={}",
+            c.x,
+            pad.x
+        );
     }
 
     #[test]
@@ -1220,7 +1230,11 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let ibox = find_box(&root_box, &|x| x.node == Some(inner)).unwrap();
         // left: 10% of the 200px-wide containing block = 20px to the right of the normal-flow x.
-        assert!((ibox.dimensions.content.x - 20.0).abs() < 0.01, "x={}", ibox.dimensions.content.x);
+        assert!(
+            (ibox.dimensions.content.x - 20.0).abs() < 0.01,
+            "x={}",
+            ibox.dimensions.content.x
+        );
     }
 
     #[test]
@@ -1480,6 +1494,69 @@ mod tests {
         assert_eq!(ibox.dimensions.content.width, 100.0);
         assert_eq!(ibox.dimensions.content.height, 50.0);
         assert_eq!(ibox.node, Some(img));
+    }
+
+    #[test]
+    fn absolutely_positioned_image_keeps_intrinsic_size() {
+        // Regression (wikipedia.org globe logo): an `position: absolute` <img> must keep its
+        // build-time intrinsic size. The out-of-flow path used to size it like a container —
+        // width from `intrinsic_width` (0, no children) and height from children (0) — so the
+        // logo collapsed to 0×0 and never painted.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let cb = doc.append_element(body, "div");
+        let img = doc.append_element(cb, "img");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            cb,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Relative,
+                width: Some(400.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            img,
+            style::ComputedStyle {
+                position: style::Position::Absolute,
+                top: Some(10.0),
+                left: Some(20.0),
+                ..Default::default()
+            },
+        );
+
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(img, (200.0, 183.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(cb)).unwrap();
+        let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
+        let pad = pbox.dimensions.padding_box();
+        let c = ibox.dimensions.content;
+        assert_eq!(
+            (c.width, c.height),
+            (200.0, 183.0),
+            "image must keep intrinsic size"
+        );
+        // Anchored at top:10 / left:20 from the positioned ancestor's padding box.
+        assert!(
+            (c.x - (pad.x + 20.0)).abs() < 0.01,
+            "c.x={} pad.x={}",
+            c.x,
+            pad.x
+        );
+        assert!(
+            (c.y - (pad.y + 10.0)).abs() < 0.01,
+            "c.y={} pad.y={}",
+            c.y,
+            pad.y
+        );
     }
 
     #[test]

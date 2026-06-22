@@ -338,6 +338,17 @@ pub(crate) fn layout_out_of_flow(
     let horizontal =
         margin.left + margin.right + border.left + border.right + padding.left + padding.right;
 
+    // Replaced content (<img>/<canvas>/<svg>/form widget) has an intrinsic size already resolved
+    // at build time (CSS width/height + intrinsic dims + aspect ratio, via `image_content_size`).
+    // Out-of-flow layout must preserve those dimensions: treating the box as a container would
+    // size width from `intrinsic_width` (0 for a childless box) and height from children (also 0),
+    // leaving the element invisible — this is why absolutely-positioned images didn't render.
+    let replaced = matches!(boxx.content, BoxContent::Image(_) | BoxContent::Widget(_));
+    let (replaced_w, replaced_h) = (
+        boxx.dimensions.content.width,
+        boxx.dimensions.content.height,
+    );
+
     // Resolve insets against the containing block. Percentage (and percentage-bearing `calc()`)
     // insets can't be resolved at cascade time because their basis — the containing block's
     // extent on the relevant axis — isn't known until now, so they're carried symbolically in
@@ -355,7 +366,9 @@ pub(crate) fn layout_out_of_flow(
     //   * otherwise shrink-to-fit to the box's intrinsic (max-content) width, exactly like the
     //     inline-block path. `intrinsic_width` returns the border-box width (content + padding +
     //     border), so we strip the box's own horizontal padding/border back off to get content.
-    let content_width = if let Some(w) = cs.width {
+    let content_width = if replaced {
+        replaced_w
+    } else if let Some(w) = cs.width {
         w
     } else if let (Some(l), Some(r)) = (inset_left, inset_right) {
         (cb.width - l - r - horizontal).max(0.0)
@@ -421,30 +434,41 @@ pub(crate) fn layout_out_of_flow(
     };
 
     let display = display_of(boxx, styles);
-    let content_height = match display {
-        style::Display::Flex | style::Display::InlineFlex => {
-            layout_flex(boxx, child_ctx, styles, measurer)
-        }
-        style::Display::Grid | style::Display::InlineGrid => {
-            layout_grid(boxx, child_ctx, styles, measurer)
-        }
-        _ => {
-            let any_block = boxx.children.iter().any(|c| {
-                matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
-                    || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
-                        && image_is_block(c, styles))
-            });
-            if any_block {
-                layout_block_children(boxx, child_ctx, styles, measurer)
-            } else if !boxx.children.is_empty() {
-                let align = text_align_of(boxx.node, styles);
-                layout_inline_children(boxx, align, child_ctx, styles, measurer)
-            } else {
-                0.0
+    let content_height = if replaced {
+        // Replaced box: its height is the build-time intrinsic height, not derived from children.
+        replaced_h
+    } else {
+        match display {
+            style::Display::Flex | style::Display::InlineFlex => {
+                layout_flex(boxx, child_ctx, styles, measurer)
+            }
+            style::Display::Grid | style::Display::InlineGrid => {
+                layout_grid(boxx, child_ctx, styles, measurer)
+            }
+            _ => {
+                let any_block = boxx.children.iter().any(|c| {
+                    matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+                        || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
+                            && image_is_block(c, styles))
+                });
+                if any_block {
+                    layout_block_children(boxx, child_ctx, styles, measurer)
+                } else if !boxx.children.is_empty() {
+                    let align = text_align_of(boxx.node, styles);
+                    layout_inline_children(boxx, align, child_ctx, styles, measurer)
+                } else {
+                    0.0
+                }
             }
         }
     };
-    let final_height = cs.height.unwrap_or(content_height);
+    // For replaced content the build-time height already honors CSS `height`; otherwise CSS
+    // `height` overrides the content-derived height.
+    let final_height = if replaced {
+        content_height
+    } else {
+        cs.height.unwrap_or(content_height)
+    };
     let final_height = clamp_height(boxx, final_height, cb.height, styles);
     boxx.dimensions.content.height = final_height;
 
