@@ -5027,12 +5027,26 @@
               configurable: true, enumerable: true
             });
           };
+          var __defUserInfoPart = function (prop) {
+            var d = null;
+            try { d = Object.getOwnPropertyDescriptor(el, prop); } catch (eU3) {}
+            if (d && (d.get || d.set)) { return; }
+            Object.defineProperty(el, prop, {
+              get: function () { return __hrefParts()[prop]; },
+              set: function (v) {
+                var rec = __hrefParts().__rec;
+                if (!rec || rec.host == null || rec.host === "" || rec.scheme === "file") { return; }
+                rec[prop] = urlPctEncode(String(v), urlUserSet);
+                __setAttr(node, "href", serializeURLRecord(rec).href);
+              },
+              configurable: true, enumerable: true
+            });
+          };
           __defUrlPart("protocol", "protocol"); __defUrlPart("host", "host");
           __defUrlPart("hostname", "hostname"); __defUrlPart("port", "port");
           __defUrlPart("pathname", "pathname"); __defUrlPart("search", "search");
           __defUrlPart("hash", "hash"); __defUrlPart("origin", "origin");
-          if (!("username" in el)) { def(el, "username", ""); }
-          if (!("password" in el)) { def(el, "password", ""); }
+          __defUserInfoPart("username"); __defUserInfoPart("password");
         }
         // <img>.naturalWidth / naturalHeight: the decoded intrinsic size from the engine
         // (0 when the image is missing/broken/not yet decoded). `width`/`height` reflect the
