@@ -13325,7 +13325,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var caches = (typeof globalThis.caches === "object" && globalThis.caches) ? globalThis.caches : undefined;
       Object.defineProperty(scope, "caches", { value: caches, enumerable: true, configurable: true });
       def(scope, "skipWaiting", function () { sw.__skipWaiting = true; return Promise.resolve(); });
-      def(scope, "fetch", function () { return globalThis.fetch.apply(globalThis, arguments); });
+      // The worker's own fetches bypass interception (a worker doesn't intercept its own requests).
+      def(scope, "fetch", function () {
+        var prev = __swBypassFetch; __swBypassFetch = true;
+        try { return globalThis.fetch.apply(globalThis, arguments); }
+        finally { __swBypassFetch = prev; }
+      });
       var runInScope = function (src, url) {
         var fn = (globalThis.Function)(
           "self", "registration", "clients", "location", "caches", "skipWaiting",
@@ -13348,6 +13353,50 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       sw.__scope = scope;
       runInScope(source || "", scriptHref);
       return scope;
+    }
+
+    // --- Fetch interception (stage 3) -----------------------------------------------------
+    // A request from a controlled client (the page once a worker has clients.claim()ed it) is
+    // dispatched to the controller as a FetchEvent; if the handler calls respondWith(), that response
+    // is used instead of the network. __swBypassFetch suppresses interception for the worker's own
+    // fetches (so respondWith(fetch(event.request)) doesn't re-enter), and __swInFetchDispatch guards
+    // against synchronous re-entry during dispatch.
+    var __swBypassFetch = false;
+    var __swInFetchDispatch = false;
+    // Returns a Promise<Response> if the controller handled the request, or null to fall through to
+    // the network. `method`/`url` describe the request; `reqInit` carries headers/body for the event.
+    def(globalThis, "__swInterceptFetch", function (method, url, reqInit) {
+      if (__swBypassFetch || __swInFetchDispatch) { return null; }
+      var controller = __swContainer.controller;
+      if (!controller || !controller.__scope) { return null; }
+      var abs; try { abs = (new globalThis.URL(url, __swBase())).href; } catch (e) { return null; }
+      if (!__swMatchesClient2(controller, abs)) { return null; }
+      var req;
+      try { req = new globalThis.Request(abs, reqInit || { method: method }); } catch (e) { req = { url: abs, method: method, headers: {} }; }
+      var ev = new globalThis.FetchEvent("fetch", { request: req, clientId: __swPageClient().id });
+      var s = globalThis.__eventState(ev);
+      s.__active = true;
+      __swInFetchDispatch = true;
+      try { controller.__scope.dispatchEvent(ev); }
+      finally { __swInFetchDispatch = false; s.__active = false; }
+      if (!s.__responded) { return null; } // handler didn't respondWith -> network fallthrough
+      // respondWith(r): r may be a Response or a promise for one. A rejection or non-Response is a
+      // network error (the fetch rejects with TypeError), matching the spec.
+      return Promise.resolve(s.__response).then(function (r) {
+        if (r && (typeof globalThis.Response !== "function" || r instanceof globalThis.Response || r.__isResponse || typeof r.text === "function")) { return r; }
+        throw new TypeError("Failed to fetch: the FetchEvent respondWith() value was not a Response.");
+      }, function () { throw new TypeError("Failed to fetch: the FetchEvent respondWith() promise rejected."); });
+    });
+    // The controller controls a client whose URL is within the registration scope. We approximate the
+    // controller's scope from its script directory's parent walk via the registration that owns it.
+    function __swMatchesClient2(controller, absUrl) {
+      for (var i = 0; i < __swRegs.length; i++) {
+        var sl = __swRegs[i].__slots();
+        if (sl.active === controller || sl.waiting === controller || sl.installing === controller) {
+          return absUrl.indexOf(__swRegs[i].scope) === 0;
+        }
+      }
+      return false;
     }
 
     // Dispatch a lifecycle ExtendableEvent into the worker scope and await its waitUntil() promises.
@@ -14219,6 +14268,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         return Promise.reject(new TypeError("Failed to fetch"));
       }
       var method = String(init.method || "GET").toUpperCase();
+
+      // Service worker fetch interception: a controlled client's request is offered to the
+      // controller's FetchEvent handler, which may respondWith() a synthetic/passed-through response.
+      if (typeof globalThis.__swInterceptFetch === "function") {
+        var intercepted = globalThis.__swInterceptFetch(method, url, init);
+        if (intercepted) { return intercepted; }
+      }
 
       // Honor an AbortSignal: a fetch on an already-aborted signal rejects with AbortError. (Our
       // fetch is synchronous, so only pre-abort is observable.)
@@ -20471,6 +20527,56 @@ mod tests {
             _ => None,
         };
         assert_eq!(reply.as_deref(), Some("pong:ping"));
+    }
+
+    #[test]
+    fn service_worker_intercepts_controlled_fetch() {
+        // After the worker activates and clients.claim()s the page, a fetch() from the page is
+        // dispatched to the worker's `fetch` handler, which respondWith()s a synthetic Response.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                navigator.serviceWorker.addEventListener('controllerchange', function () {
+                  fetch('https://x/magic').then(function (r) { return r.text(); })
+                    .then(function (t) { document.body.setAttribute('data-fetch', t); });
+                });
+                navigator.serviceWorker.register('sw.js', { scope: '/' });
+            "#
+            .to_string(),
+        );
+        let worker_body = "self.addEventListener('install', function (e) { self.skipWaiting(); });\\nself.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });\\nself.addEventListener('fetch', function (e) { if (e.request.url.indexOf('magic') >= 0) { e.respondWith(new Response('intercepted')); } });";
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(move |_m, u, _b, _h| {
+                // Serve the worker script as JS; anything else (shouldn't be hit) as a marker.
+                let body = if u.ends_with("sw.js") {
+                    worker_body
+                } else {
+                    "NETWORK"
+                };
+                Some(format!(
+                    r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/javascript","body":"{body}"}}"#
+                ))
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let got = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-fetch").cloned(),
+            _ => None,
+        };
+        assert_eq!(got.as_deref(), Some("intercepted"));
     }
 
     #[test]
