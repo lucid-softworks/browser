@@ -568,7 +568,7 @@ mod tests {
         let mut styles = HashMap::new();
         styles.insert(body, block_style(true));
         styles.insert(wrap, block_style(true));
-        let mut fl = |w: f32| style::ComputedStyle {
+        let fl = |w: f32| style::ComputedStyle {
             display: style::Display::Block,
             display_block: true,
             float: style::Float::Left,
