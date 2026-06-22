@@ -1,15 +1,16 @@
 name: WPT
 
 # Runs the Web Platform Tests the way other browsers are tested: the real `wpt run` harness driving
-# our engine over WebDriver (crates/webdriver) via the `lucid` wptrunner product. Each area runs on
-# its own runner in parallel; each leg writes a wptreport, which the `report` job stitches into a
-# pass-rate summary.
+# our engine over WebDriver (crates/webdriver) via the `lucid` wptrunner product.
 #
-# Scope note: `wpt run` launches a full session per test and the engine has no worker support yet
-# (worker variants time out), so large areas may not finish within a leg's budget. Legs are
-# time-bounded and never fail the build on that — they report whatever completed ("incomplete" if a
-# leg was cut off). This is the standard-conformance path; it does not gate on test failures (the
-# engine has known, tracked failures).
+# `wpt run` launches a session per test, so a whole area (dom ≈ 600 files, fetch ≈ 540) is far too
+# slow to run as a single leg. Instead each area is split into balanced CHUNKS (`wpt run
+# --total-chunks/--this-chunk`) that run as parallel matrix legs, so wall-clock is roughly the
+# slowest single chunk + per-leg setup. The `report` job sums an area's chunks back into one row.
+# Same areas we've always tracked — just parallelized.
+#
+# It does not gate on test failures (the engine has known, tracked failures); legs are also
+# wall-bounded so a pathological hang can't stall the build.
 
 on:
   pull_request:
@@ -32,23 +33,35 @@ permissions:
   contents: read
 
 jobs:
+  # Build the chunked run matrix. Each `area:chunks` becomes `chunks` legs; chunk counts are sized so
+  # every leg is ~150 test files (≈ the slowest tolerable leg). Edit AREAS to change coverage.
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    env:
+      AREAS: "css/cssom:2 dom:4 domparsing:1 html/dom:3 url:1 fetch:4 service-workers:3"
+    steps:
+      - id: gen
+        run: |
+          entries=""
+          for ac in $AREAS; do
+            dir="${ac%:*}"; chunks="${ac#*:}"; slug="${dir//\//-}"
+            for c in $(seq 1 "$chunks"); do
+              entries="${entries}{\"dir\":\"$dir\",\"slug\":\"$slug\",\"chunks\":$chunks,\"chunk\":$c}\n"
+            done
+          done
+          matrix=$(printf "$entries" | jq -s -c '{include: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   wpt:
-    name: wpt (${{ matrix.dir }})
+    needs: scope
+    name: wpt (${{ matrix.dir }} ${{ matrix.chunk }}/${{ matrix.chunks }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
       fail-fast: false
-      matrix:
-        # The WPT areas to drive via `wpt run`. `slug` mirrors `dir` with `/` -> `-` (artifact names
-        # can't contain `/`).
-        include:
-          - { dir: "css/cssom", slug: "css-cssom" }
-          - { dir: "dom", slug: "dom" }
-          - { dir: "domparsing", slug: "domparsing" }
-          - { dir: "html/dom", slug: "html-dom" }
-          - { dir: "url", slug: "url" }
-          - { dir: "fetch", slug: "fetch" }
-          - { dir: "service-workers", slug: "service-workers" }
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -65,7 +78,6 @@ jobs:
           cd wpt
           git sparse-checkout set tools third_party docs resources common "${{ matrix.dir }}"
 
-      # `wpt serve` (started by `wpt run`) binds the WPT subdomains, so they must resolve to loopback.
       - name: Map WPT hosts
         run: |
           cd wpt
@@ -74,43 +86,44 @@ jobs:
       - name: Build WebDriver server
         run: cargo build --release -p webdriver
 
-      # Drive the area via `wpt run`. `--test-types testharness` avoids the aamtest accessibility
-      # requirements (PyGObject/cairo, absent on the runner). A short timeout multiplier keeps
-      # worker-variant timeouts cheap. The whole run is wall-bounded so a huge area can't hang the
-      # leg; `|| true` so a non-zero exit (test failures, or being cut off) never fails the build.
+      # Drive this chunk via `wpt run`. `--test-types testharness` avoids the aamtest accessibility
+      # requirements (PyGObject/cairo, absent on the runner). `--chunk-type hash` balances tests
+      # evenly across chunks. A short timeout multiplier keeps worker-variant timeouts cheap. The run
+      # is wall-bounded; `|| true` so failures / a cut-off never fail the build.
       - name: Run WPT via wpt run
         run: |
           mkdir -p reports
           timeout 1500 scripts/run-wpt.sh "${{ matrix.dir }}" -- \
             --test-types testharness \
             --timeout-multiplier=0.25 \
-            --log-wptreport="$PWD/reports/${{ matrix.slug }}.json" \
+            --total-chunks ${{ matrix.chunks }} \
+            --this-chunk ${{ matrix.chunk }} \
+            --chunk-type hash \
+            --log-wptreport="$PWD/reports/${{ matrix.slug }}-${{ matrix.chunk }}.json" \
           || true
 
-      - name: Summarize area
+      - name: Summarize chunk
         run: |
-          python3 - "${{ matrix.dir }}" "reports/${{ matrix.slug }}.json" "reports/${{ matrix.slug }}.tsv" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          python3 - "${{ matrix.dir }}" "reports/${{ matrix.slug }}-${{ matrix.chunk }}.json" "reports/${{ matrix.slug }}-${{ matrix.chunk }}.tsv" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, os, sys
           area, report, tsv = sys.argv[1], sys.argv[2], sys.argv[3]
           if not os.path.exists(report) or os.path.getsize(report) == 0:
-              # Leg was cut off before wpt run wrote a report (area too large for the budget).
               open(tsv, "w").write(f"{area}\t0\t0\tincomplete\n")
-              print(f"### `{area}`\n\n⏳ incomplete — did not finish within the time budget.\n")
+              print(f"`{area}` chunk — ⏳ incomplete (cut off before writing a report)")
               sys.exit(0)
           data = json.load(open(report))
           results = data.get("results", [])
           sp = sum(1 for t in results for s in t.get("subtests", []) if s["status"] == "PASS")
           st = sum(len(t.get("subtests", [])) for t in results)
-          pct = (100 * sp / st) if st else 0
-          open(tsv, "w").write(f"{area}\t{sp}\t{st}\t{pct:.1f}%\n")
-          print(f"### `{area}`\n\nTests: {len(results)} — Subtests: **{sp} / {st}** ({pct:.1f}%)\n")
+          open(tsv, "w").write(f"{area}\t{sp}\t{st}\tok\n")
+          print(f"`{area}` chunk — {len(results)} tests, {sp}/{st} subtests")
           PY
 
-      - name: Upload area results
+      - name: Upload chunk results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wpt-result-${{ matrix.slug }}
+          name: wpt-result-${{ matrix.slug }}-${{ matrix.chunk }}
           path: reports/
 
   report:
@@ -126,24 +139,31 @@ jobs:
           merge-multiple: true
       - name: Build combined summary
         run: |
-          {
-            echo "## 🧪 WPT conformance (via \`wpt run\` over WebDriver)"
-            echo
-            echo "| Area | Subtests | Pass rate |"
-            echo "|------|----------|-----------|"
-            tp=0; tt=0
-            for f in artifacts/*.tsv; do
-              [ -f "$f" ] || continue
-              IFS=$'\t' read -r area p t pct < "$f"
-              if [ "$pct" = "incomplete" ]; then
-                echo "| \`$area\` | — | ⏳ incomplete |"
-              else
-                echo "| \`$area\` | $p / $t | $pct |"
-                tp=$((tp + p)); tt=$((tt + t))
-              fi
-            done
-            total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
-            echo "| **Total (completed areas)** | **$tp / $tt** | **$total_pct** |"
-            echo
-            echo "<sub>web-platform-tests via the real \`wpt run\` harness driving the engine over WebDriver (\`lucid\` product). Worker-dependent variants time out (no worker support yet); large areas may be \`incomplete\` within the per-leg budget.</sub>"
-          } >> "$GITHUB_STEP_SUMMARY"
+          python3 - artifacts <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, os, sys
+          from collections import defaultdict
+          areas = {}  # area -> [pass, total, any_incomplete]
+          order = []
+          for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.tsv"))):
+              for line in open(f):
+                  area, p, t, st = line.rstrip("\n").split("\t")
+                  if area not in areas:
+                      areas[area] = [0, 0, False]; order.append(area)
+                  rec = areas[area]
+                  rec[0] += int(p); rec[1] += int(t)
+                  if st == "incomplete":
+                      rec[2] = True
+          print("## 🧪 WPT conformance (via `wpt run` over WebDriver)\n")
+          print("| Area | Subtests | Pass rate |")
+          print("|------|----------|-----------|")
+          tp = tt = 0
+          for area in order:
+              p, t, inc = areas[area]
+              tp += p; tt += t
+              pct = f"{100*p/t:.1f}%" if t else "—"
+              note = " ⚠️ partial" if inc else ""
+              print(f"| `{area}` | {p} / {t} | {pct}{note} |")
+          total_pct = f"{100*tp/tt:.1f}%" if tt else "—"
+          print(f"| **Total** | **{tp} / {tt}** | **{total_pct}** |")
+          print("\n<sub>web-platform-tests via the real `wpt run` harness driving the engine over WebDriver (`lucid` product). Each area is sharded into parallel chunks. Worker-dependent variants time out (no worker support yet); ⚠️ partial means a chunk was cut off.</sub>")
+          PY
