@@ -11,7 +11,6 @@ members = [
     "crates/paint",
     "crates/engine",
     "crates/ffi",
-    "crates/wpt-runner",
     "crates/webdriver",
 ]
 

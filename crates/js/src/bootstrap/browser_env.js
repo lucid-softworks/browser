@@ -44,6 +44,8 @@
     mimeTypes: [],
     userActivation: { hasBeenActive: false, isActive: false },
     sendBeacon: function () { return false; },
+    registerProtocolHandler: function () {},
+    unregisterProtocolHandler: function () {},
     clipboard: {},
     geolocation: {
       getCurrentPosition: function () {},
@@ -58,6 +60,25 @@
   // dot-segment normalization, percent-encoding per destination set, relative resolution, and
   // canonical serialization. `base` (a parsed record or string) resolves a relative reference.
   var URL_SPECIAL = { ftp: "21", file: "", http: "80", https: "443", ws: "80", wss: "443" };
+  function toUSVString(v) {
+    var s = String(v);
+    var out = "";
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff) {
+        if (i + 1 < s.length) {
+          var n = s.charCodeAt(i + 1);
+          if (n >= 0xdc00 && n <= 0xdfff) { out += s.charAt(i) + s.charAt(i + 1); i++; continue; }
+        }
+        out += "\uFFFD";
+      } else if (c >= 0xdc00 && c <= 0xdfff) {
+        out += "\uFFFD";
+      } else {
+        out += s.charAt(i);
+      }
+    }
+    return out;
+  }
   function urlPctEncode(s, isInSet) {
     var out = "";
     for (var i = 0; i < s.length; i++) {
@@ -335,24 +356,92 @@
   }
 
   var parts = parseURL(globalThis.__pageURL);
+  var locationState = {};
+  function __syncLocation(p) {
+    if (!p || p.__invalid) { return; }
+    locationState.href = p.href; locationState.protocol = p.protocol; locationState.host = p.host;
+    locationState.hostname = p.hostname; locationState.port = p.port; locationState.pathname = p.pathname;
+    locationState.search = p.search; locationState.hash = p.hash; locationState.origin = p.origin;
+  }
+  function __setLocationHref(v) {
+    var p = parseURL(String(v), locationState.href || parts.href);
+    __syncLocation(p);
+  }
+  function __setLocationUrlPart(prop, v) {
+    var p = parseURL(locationState.href || parts.href);
+    var rec = p && p.__rec;
+    if (!rec) { return; }
+    v = String(v);
+    if (prop === "hash") {
+      if (v.charAt(0) === "#") { v = v.slice(1); }
+      rec.fragment = urlPctEncode(v, urlFragSet);
+    } else if (prop === "search") {
+      if (v.charAt(0) === "?") { v = v.slice(1); }
+      rec.query = urlPctEncode(v, urlQuerySet);
+    }
+    __syncLocation(serializeURLRecord(rec));
+  }
   var location = {
-    href: parts.href, protocol: parts.protocol, host: parts.host, hostname: parts.hostname,
-    port: parts.port, pathname: parts.pathname, search: parts.search, hash: parts.hash,
-    origin: parts.origin,
-    assign: fn, replace: fn, reload: fn,
-    toString: function () { return this.href; }
+    assign: function (url) { __setLocationHref(url); },
+    replace: function (url) { __setLocationHref(url); },
+    reload: fn,
+    toString: function () { return locationState.href; }
   };
+  __syncLocation(parts);
+  Object.defineProperty(location, "href", { get: function () { return locationState.href; }, set: __setLocationHref, enumerable: true, configurable: true });
+  Object.defineProperty(location, "hash", { get: function () { return locationState.hash; }, set: function (v) { __setLocationUrlPart("hash", v); }, enumerable: true, configurable: true });
+  Object.defineProperty(location, "search", { get: function () { return locationState.search; }, set: function (v) { __setLocationUrlPart("search", v); }, enumerable: true, configurable: true });
+  ["protocol", "host", "hostname", "port", "pathname", "origin"].forEach(function (name) {
+    Object.defineProperty(location, name, { get: function () { return locationState[name]; }, enumerable: true, configurable: true });
+  });
   // `location` already exists (a minimal stub from install_globals); overwrite it.
   globalThis.location = location;
+  function __makeDetachedWindow(url) {
+    var childState = {};
+    function childSync(p) {
+      if (!p || p.__invalid) { return; }
+      childState.href = p.href; childState.protocol = p.protocol; childState.host = p.host;
+      childState.hostname = p.hostname; childState.port = p.port; childState.pathname = p.pathname;
+      childState.search = p.search; childState.hash = p.hash; childState.origin = p.origin;
+      if (childDoc) { childDoc.URL = p.href; childDoc.documentURI = p.href; }
+    }
+    function childSetHref(v) { childSync(parseURL(String(v), location.href)); }
+    var childLoc = { assign: function (v) { childSetHref(v); }, replace: function (v) { childSetHref(v); }, reload: fn, toString: function () { return childState.href; } };
+    var childDoc = { URL: "", documentURI: "", location: childLoc };
+    Object.defineProperty(childLoc, "href", { get: function () { return childState.href; }, set: childSetHref, enumerable: true, configurable: true });
+    Object.defineProperty(childLoc, "hash", {
+      get: function () { return childState.hash; },
+      set: function (v) {
+        var p = parseURL(childState.href || "about:blank");
+        var rec = p && p.__rec;
+        if (!rec) { return; }
+        v = String(v);
+        if (v.charAt(0) === "#") { v = v.slice(1); }
+        rec.fragment = urlPctEncode(v, urlFragSet);
+        childSync(serializeURLRecord(rec));
+      },
+      enumerable: true, configurable: true
+    });
+    ["protocol", "host", "hostname", "port", "pathname", "search", "origin"].forEach(function (name) {
+      Object.defineProperty(childLoc, name, { get: function () { return childState[name]; }, enumerable: true, configurable: true });
+    });
+    childSync(parseURL(url == null ? "about:blank" : String(url), location.href));
+    return { location: childLoc, document: childDoc, close: fn, closed: false };
+  }
+  globalThis.open = function (url) { return __makeDetachedWindow(url); };
+  if (typeof document !== "undefined") {
+    document.open = function (url) {
+      if (arguments.length) { return __makeDetachedWindow(url); }
+      return document;
+    };
+  }
 
   // --- history (pushState/replaceState update location so SPA routers see the new URL) -------
   function __applyURLToLocation(url) {
     var resolved;
     try { resolved = new URL(String(url), location.href).href; } catch (e) { resolved = String(url); }
     var p = parseURL(resolved);
-    location.href = p.href; location.protocol = p.protocol; location.host = p.host;
-    location.hostname = p.hostname; location.port = p.port; location.pathname = p.pathname;
-    location.search = p.search; location.hash = p.hash; location.origin = p.origin;
+    __syncLocation(p);
   }
   globalThis.history = {
     length: 1, scrollRestoration: "auto", state: null,
@@ -444,7 +533,8 @@
   };
   globalThis.moveTo = fn; globalThis.moveBy = fn; globalThis.resizeTo = fn; globalThis.resizeBy = fn;
   globalThis.focus = fn; globalThis.blur = fn; globalThis.print = fn;
-  globalThis.open = function () { return null; }; globalThis.close = fn; globalThis.stop = fn;
+  if (typeof globalThis.open !== "function") { globalThis.open = function () { return null; }; }
+  globalThis.close = fn; globalThis.stop = fn;
   // getSelection is installed later (alongside Range/Selection) with a real Selection implementation.
   globalThis.alert = fn; globalThis.confirm = function () { return false; }; globalThis.prompt = function () { return null; };
 
@@ -5027,12 +5117,26 @@
               configurable: true, enumerable: true
             });
           };
+          var __defUserInfoPart = function (prop) {
+            var d = null;
+            try { d = Object.getOwnPropertyDescriptor(el, prop); } catch (eU3) {}
+            if (d && (d.get || d.set)) { return; }
+            Object.defineProperty(el, prop, {
+              get: function () { return __hrefParts()[prop]; },
+              set: function (v) {
+                var rec = __hrefParts().__rec;
+                if (!rec || rec.host == null || rec.host === "" || rec.scheme === "file") { return; }
+                rec[prop] = urlPctEncode(String(v), urlUserSet);
+                __setAttr(node, "href", serializeURLRecord(rec).href);
+              },
+              configurable: true, enumerable: true
+            });
+          };
           __defUrlPart("protocol", "protocol"); __defUrlPart("host", "host");
           __defUrlPart("hostname", "hostname"); __defUrlPart("port", "port");
           __defUrlPart("pathname", "pathname"); __defUrlPart("search", "search");
           __defUrlPart("hash", "hash"); __defUrlPart("origin", "origin");
-          if (!("username" in el)) { def(el, "username", ""); }
-          if (!("password" in el)) { def(el, "password", ""); }
+          __defUserInfoPart("username"); __defUserInfoPart("password");
         }
         // <img>.naturalWidth / naturalHeight: the decoded intrinsic size from the engine
         // (0 when the image is missing/broken/not yet decoded). `width`/`height` reflect the
@@ -8989,6 +9093,19 @@
     def(globalThis, "Response", ResponseCtor);
   }
 
+  if (typeof globalThis.EventSource !== "function") {
+    var EventSourceCtor = function (url) {
+      var p = parseURL(String(url), location.href);
+      this.url = p && !p.__invalid ? p.href : "";
+      this.readyState = 0;
+      this.withCredentials = false;
+    };
+    EventSourceCtor.CONNECTING = 0; EventSourceCtor.OPEN = 1; EventSourceCtor.CLOSED = 2;
+    EventSourceCtor.prototype.CONNECTING = 0; EventSourceCtor.prototype.OPEN = 1; EventSourceCtor.prototype.CLOSED = 2;
+    EventSourceCtor.prototype.close = function () { this.readyState = 2; };
+    def(globalThis, "EventSource", EventSourceCtor);
+  }
+
   // --- Cache / CacheStorage (issue #56 stage 4) --------------------------------------------
   // An in-memory CacheStorage exposed as `caches` on the window and (via the worker scope) the
   // ServiceWorkerGlobalScope. Each Cache stores GET request/response pairs keyed by URL; add()/
@@ -10003,13 +10120,14 @@
 
     // Build a subclass: ctor copies its own init members (from `members`) on top of the parent.
     // `members` maps property -> default value. `coerce` optionally transforms an init value.
-    function defSubclass(name, ParentCtor, members, validate) {
+    function defSubclass(name, ParentCtor, members, validate, coerce) {
       function Ctor(type, init) {
         ParentCtor.call(this, type, init);
         if (init === undefined || init === null) { init = {}; }
         if (validate) { validate(init); }
         for (var k in members) {
           var v = (k in init) ? init[k] : members[k];
+          if (coerce && coerce[k]) { v = coerce[k](v); }
           def(this, k, v);
         }
       }
@@ -10080,7 +10198,7 @@
     defSubclass("ProgressEvent", Event, { lengthComputable: false, loaded: 0, total: 0 });
     defSubclass("ErrorEvent", Event, { message: "", filename: "", lineno: 0, colno: 0, error: null });
     defSubclass("PromiseRejectionEvent", Event, { promise: null, reason: undefined });
-    defSubclass("StorageEvent", Event, { key: null, oldValue: null, newValue: null, url: "", storageArea: null });
+    defSubclass("StorageEvent", Event, { key: null, oldValue: null, newValue: null, url: "", storageArea: null }, null, { url: toUSVString });
     defSubclass("AnimationEvent", Event, { animationName: "", elapsedTime: 0, pseudoElement: "" });
     defSubclass("TransitionEvent", Event, { propertyName: "", elapsedTime: 0, pseudoElement: "" });
     defSubclass("CloseEvent", Event, { code: 0, reason: "", wasClean: false });

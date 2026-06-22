@@ -38,15 +38,16 @@ adding a dependency, keep it behind such a boundary and prefer pure-Rust crates.
 
 - **Never edit WPT tests to make them pass — fix the engine.** The vendored tests are the spec
   oracle; changing them defeats the purpose. (Engine *unit* tests may change freely.)
-- Run the suite locally with the in-process runner:
+- Run the suite locally the way other browsers are tested — the real `wpt run` harness driving the
+  engine over WebDriver:
   ```sh
-  cargo run --release -p wpt-runner -- <wpt-checkout> <subpath> [max-tests]
-  # e.g. cargo run --release -p wpt-runner -- ./wpt dom/nodes
+  scripts/run-wpt.sh dom/nodes        # an area, dir, or single test file
   ```
-- CI posts a WPT conformance report on PRs that can affect it; don't regress it.
+  See [`docs/running-wpt.md`](docs/running-wpt.md) for one-time setup (WPT checkout + hosts).
+- CI runs the WPT conformance suite on PRs that can affect it; don't regress it.
 
 ## Layout
 
 Engine crates live under `crates/` (`net`, `html`, `css`, `dom`, `js`, `style`, `layout`, `paint`,
-`engine`, `ffi`, `wpt-runner`, `webdriver`). The native app shell is under `swift/`. Keep
-platform-agnostic engine code free of OS/shell concerns.
+`engine`, `ffi`, `webdriver`). The native app shell is under `swift/`. Keep platform-agnostic engine
+code free of OS/shell concerns.
