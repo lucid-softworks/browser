@@ -18,13 +18,95 @@ use crate::json::{obj, parse, Json};
 /// The W3C web element identifier key. Every element reference is a single-key object using it.
 const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 
-/// A driven browser session: one engine plus the viewport metrics and current URL we last loaded.
+/// A parked (non-current) window: its engine and last-loaded URL, set aside while another window is
+/// current. Switching windows swaps one of these into the [`Session`]'s current `engine`/`url`.
+struct ParkedWindow {
+    engine: engine::Engine,
+    url: String,
+}
+
+/// A driven browser session. The engine has one V8 isolate per *window*, and WebDriver is
+/// inherently multi-window (wptrunner opens a separate window per test), so a session holds the
+/// current window inline (`engine`/`url` — kept as fields so every command operates on the current
+/// window unchanged) plus any number of `parked` background windows. `order` tracks all live window
+/// handles in creation order, for `Get Window Handles` and for promoting a survivor on close.
 struct Session {
     engine: engine::Engine,
+    url: String,
     width: u32,
     height: u32,
     scale: f32,
-    url: String,
+    /// Handle of the current window (the one `engine`/`url` belong to).
+    handle: String,
+    /// Background windows, keyed by handle.
+    parked: HashMap<String, ParkedWindow>,
+    /// All live window handles (current + parked) in creation order.
+    order: Vec<String>,
+    /// Next window-handle ordinal.
+    next_window: u64,
+    /// Script timeout in ms, from `Set Timeouts` (default 30s, per the WebDriver default).
+    script_timeout_ms: u64,
+}
+
+impl Session {
+    /// Create a fresh background window at `about:blank` and return its handle. Does not switch to
+    /// it (the W3C `New Window` command leaves the current window unchanged).
+    fn new_window(&mut self) -> String {
+        let handle = format!("window-{}", self.next_window);
+        self.next_window += 1;
+        let mut engine = engine::Engine::new();
+        engine.set_viewport(self.width, self.height, self.scale);
+        if let Some(url) = blank_page_url() {
+            engine.load_url(&url);
+            for _ in 0..5 {
+                engine.tick();
+            }
+        }
+        self.parked.insert(
+            handle.clone(),
+            ParkedWindow {
+                engine,
+                url: String::new(),
+            },
+        );
+        self.order.push(handle.clone());
+        handle
+    }
+
+    /// Make `target` the current window, parking the previously-current one. `Err` if no such window.
+    fn switch_to(&mut self, target: &str) -> Result<(), WdError> {
+        if self.handle == target {
+            return Ok(());
+        }
+        let park = self
+            .parked
+            .remove(target)
+            .ok_or_else(WdError::no_such_window)?;
+        let prev_engine = std::mem::replace(&mut self.engine, park.engine);
+        let prev_url = std::mem::replace(&mut self.url, park.url);
+        self.parked.insert(
+            std::mem::replace(&mut self.handle, target.to_string()),
+            ParkedWindow {
+                engine: prev_engine,
+                url: prev_url,
+            },
+        );
+        Ok(())
+    }
+
+    /// Close the current window and switch to a surviving window (the most recently created).
+    /// Returns the remaining handles. If it was the last window, the session is left empty.
+    fn close_current(&mut self) -> Vec<String> {
+        self.order.retain(|h| h != &self.handle);
+        if let Some(next) = self.order.last().cloned() {
+            if let Some(park) = self.parked.remove(&next) {
+                self.engine = park.engine; // drops the closed window's engine
+                self.url = park.url;
+                self.handle = next;
+            }
+        }
+        self.order.clone()
+    }
 }
 
 /// All live sessions, keyed by session id. Guarded by a mutex so the (single-threaded) engines are
@@ -60,6 +142,9 @@ impl WdError {
     }
     fn no_such_element() -> Self {
         WdError::new(404, "no such element", "Element not found")
+    }
+    fn no_such_window() -> Self {
+        WdError::new(404, "no such window", "No window with that handle")
     }
     fn invalid_argument(msg: impl Into<String>) -> Self {
         WdError::new(400, "invalid argument", msg)
@@ -262,6 +347,27 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &Mutex<Sessions>) ->
 
         ("GET", ["session", id, "window", "rect"]) => window_rect(id, sessions),
         ("POST", ["session", id, "window", "rect"]) => set_window_rect(id, body, sessions),
+        ("GET", ["session", id, "window", "handles"]) => window_handles(id, sessions),
+        ("POST", ["session", id, "window", "new"]) => new_window_cmd(id, body, sessions),
+        ("GET", ["session", id, "window"]) => get_window_handle(id, sessions),
+        ("POST", ["session", id, "window"]) => switch_window(id, body, sessions),
+        ("DELETE", ["session", id, "window"]) => close_window(id, sessions),
+
+        ("POST", ["session", id, "timeouts"]) => set_timeouts(id, body, sessions),
+        ("GET", ["session", id, "timeouts"]) => get_timeouts(id, sessions),
+
+        // Actions: `release` (DELETE) runs before every test even when it uses no testdriver input,
+        // so it must succeed. `perform` (POST) is a no-op until the Actions API is implemented;
+        // tests that depend on real input will fail rather than 404.
+        ("POST", ["session", id, "actions"]) => with_session(id, sessions, |_| Ok(Json::Null)),
+        ("DELETE", ["session", id, "actions"]) => with_session(id, sessions, |_| Ok(Json::Null)),
+
+        // Frame switching is not modeled yet; accept and stay on the top-level context so tests that
+        // only touch the top document keep working (frame-targeted ones will misbehave, not 404).
+        ("POST", ["session", id, "frame"]) => with_session(id, sessions, |_| Ok(Json::Null)),
+        ("POST", ["session", id, "frame", "parent"]) => {
+            with_session(id, sessions, |_| Ok(Json::Null))
+        }
 
         _ => Err(WdError::unknown_command()),
     }
@@ -321,12 +427,18 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
         "browser-wd-{:08}",
         SESSION_COUNTER.fetch_add(1, Ordering::SeqCst)
     );
+    let handle = "window-0".to_string();
     let session = Session {
         engine,
+        url: String::new(),
         width,
         height,
         scale,
-        url: String::new(),
+        handle: handle.clone(),
+        parked: HashMap::new(),
+        order: vec![handle],
+        next_window: 1,
+        script_timeout_ms: 30_000,
     };
     sessions.lock().unwrap().map.insert(id.clone(), session);
 
@@ -605,13 +717,14 @@ window.__wd_async_done = 0; window.__wd_async_result = null; window.__wd_async_e
         );
         let _ = s.engine.console_eval(&setup);
 
-        // Tick the event loop until the callback fires or we hit the script timeout.
+        // Tick the event loop until the callback fires or we hit the session's script timeout.
+        let timeout = Duration::from_millis(s.script_timeout_ms);
         let start = Instant::now();
         loop {
             if s.engine.console_eval("window.__wd_async_done || 0") == "1" {
                 break;
             }
-            if start.elapsed() > Duration::from_secs(20) {
+            if start.elapsed() > timeout {
                 return Err(WdError::script_timeout());
             }
             for _ in 0..5 {
@@ -1005,6 +1118,82 @@ fn set_window_rect(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult
             ("y", Json::Num(0.0)),
             ("width", Json::Num(s.width as f64)),
             ("height", Json::Num(s.height as f64)),
+        ]))
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Windows
+// ---------------------------------------------------------------------------------------------
+
+fn get_window_handle(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |s| Ok(Json::Str(s.handle.clone())))
+}
+
+fn window_handles(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |s| {
+        Ok(Json::Arr(s.order.iter().cloned().map(Json::Str).collect()))
+    })
+}
+
+fn switch_window(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    let parsed = parse(body).unwrap_or(Json::Null);
+    let handle = parsed
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| WdError::invalid_argument("missing handle"))?
+        .to_string();
+    with_session(id, sessions, |s| {
+        s.switch_to(&handle)?;
+        Ok(Json::Null)
+    })
+}
+
+fn new_window_cmd(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    let parsed = parse(body).unwrap_or(Json::Null);
+    // We have no real tabs-vs-windows distinction; echo back whatever was asked for (default "tab").
+    let type_hint = parsed
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("tab")
+        .to_string();
+    with_session(id, sessions, |s| {
+        let handle = s.new_window();
+        Ok(obj(vec![
+            ("handle", Json::Str(handle)),
+            ("type", Json::Str(type_hint)),
+        ]))
+    })
+}
+
+fn close_window(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |s| {
+        let remaining = s.close_current();
+        Ok(Json::Arr(remaining.into_iter().map(Json::Str).collect()))
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Timeouts
+// ---------------------------------------------------------------------------------------------
+
+fn set_timeouts(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    let parsed = parse(body).unwrap_or(Json::Null);
+    with_session(id, sessions, |s| {
+        // `null` script timeout means "no timeout"; represent that as a large value.
+        if let Some(script) = parsed.get("script") {
+            s.script_timeout_ms = script.as_f64().map(|v| v as u64).unwrap_or(u64::MAX);
+        }
+        Ok(Json::Null)
+    })
+}
+
+fn get_timeouts(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |s| {
+        Ok(obj(vec![
+            ("script", Json::Num(s.script_timeout_ms as f64)),
+            ("pageLoad", Json::Num(300_000.0)),
+            ("implicit", Json::Num(0.0)),
         ]))
     })
 }

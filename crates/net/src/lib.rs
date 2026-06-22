@@ -377,8 +377,14 @@ fn cache_dir() -> Option<std::path::PathBuf> {
 /// cache is disabled or the URL shouldn't be cached.
 fn cache_path(url: &str) -> Option<std::path::PathBuf> {
     // Never disk-cache local dev servers (e.g. the WPT runner): they serve mutable content at stable
-    // URLs, so a cache hit would mask edits.
-    if url.contains("://localhost") || url.contains("://127.0.0.1") || url.contains("://[::1]") {
+    // URLs, so a cache hit would mask edits. This includes the WPT hostnames (`web-platform.test` &
+    // friends), which resolve to loopback and serve per-run-regenerated tests/endpoints — caching
+    // them replays a previous run's body and silently corrupts conformance results.
+    if url.contains("://localhost")
+        || url.contains("://127.0.0.1")
+        || url.contains("://[::1]")
+        || url.contains("web-platform.test")
+    {
         return None;
     }
     let dir = cache_dir()?;
