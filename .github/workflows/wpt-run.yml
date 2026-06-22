@@ -142,40 +142,77 @@ jobs:
           path: artifacts
           pattern: wpt-result-*
           merge-multiple: true
+
+      # Restore the latest main baseline (per-area pass/total). On a PR the exact key never matches,
+      # so the `wpt-baseline-run-` prefix falls through to the newest cache — which only main writes
+      # (caches created on the default branch are visible to PR runs). Absent before main has ever
+      # cached; the report then shows "—" deltas.
+      - name: Restore main baseline
+        uses: actions/cache/restore@v4
+        with:
+          path: baseline
+          key: wpt-baseline-run-${{ github.sha }}
+          restore-keys: |
+            wpt-baseline-run-
+
       - name: Build combined report
         run: |
-          mkdir -p comment
-          python3 - artifacts comment/report.md <<'PY'
+          mkdir -p comment baseline
+          python3 - artifacts comment/report.md baseline <<'PY'
           import glob, os, sys
-          areas = {}  # area -> [pass, total, any_incomplete]
-          order = []
-          for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.tsv"))):
+          artifacts, out_md, basedir = sys.argv[1], sys.argv[2], sys.argv[3]
+          # Sum each area's chunk results into one (pass, total, any-chunk-incomplete).
+          areas, order = {}, []
+          for f in sorted(glob.glob(os.path.join(artifacts, "*.tsv"))):
               for line in open(f):
                   area, p, t, st = line.rstrip("\n").split("\t")
                   if area not in areas:
                       areas[area] = [0, 0, False]; order.append(area)
                   rec = areas[area]
                   rec[0] += int(p); rec[1] += int(t)
-                  if st == "incomplete":
-                      rec[2] = True
-          out = []
-          out.append("## 🧪 WPT conformance (via `wpt run` over WebDriver)\n")
-          out.append("| Area | Subtests | Pass rate |")
-          out.append("|------|----------|-----------|")
-          tp = tt = 0
+                  rec[2] |= (st == "incomplete")
+          slug = lambda a: a.replace("/", "-")
+          def fmt(d):
+              return f"+{d:,}" if d > 0 else (f"{d:,}" if d < 0 else "±0")
+          # Read the restored baseline BEFORE we overwrite it with this run's numbers.
+          base = {}
+          for area in order:
+              bf = os.path.join(basedir, slug(area) + ".tsv")
+              if os.path.exists(bf):
+                  base[area] = int(open(bf).read().split("\t")[1])
+          out = ["## 🧪 WPT conformance (via `wpt run` over WebDriver)\n",
+                 "| Area | Subtests | Pass rate | Δ vs `main` |",
+                 "|------|----------|-----------|------------|"]
+          tp = tt = tdelta = 0; have_base = False
           for area in order:
               p, t, inc = areas[area]
               tp += p; tt += t
               pct = f"{100*p/t:.1f}%" if t else "—"
               note = " ⚠️ partial" if inc else ""
-              out.append(f"| `{area}` | {p:,} / {t:,} | {pct}{note} |")
+              delta = "—"
+              if area in base:
+                  d = p - base[area]; delta = fmt(d); tdelta += d; have_base = True
+              out.append(f"| `{area}` | {p:,} / {t:,} | {pct}{note} | {delta} |")
           total_pct = f"{100*tp/tt:.1f}%" if tt else "—"
-          out.append(f"| **Total** | **{tp:,} / {tt:,}** | **{total_pct}** |")
-          out.append("\n<sub>web-platform-tests via the real `wpt run` harness driving the engine over WebDriver (`lucid` product). Each area is sharded into parallel chunks. Worker-dependent variants time out (no worker support yet); ⚠️ partial means a chunk was cut off.</sub>")
-          md = "\n".join(out) + "\n"
-          open(sys.argv[2], "w").write(md)
+          total_delta = fmt(tdelta) if have_base else "—"
+          out.append(f"| **Total** | **{tp:,} / {tt:,}** | **{total_pct}** | **{total_delta}** |")
+          out.append("\n<sub>Δ vs `main` is the change in passing subtests against the latest `main` baseline (`—` when none exists yet). web-platform-tests via the real `wpt run` harness driving the engine over WebDriver (`lucid` product); each area is sharded into parallel chunks. Worker-dependent variants time out (no worker support yet); ⚠️ partial means a chunk was cut off.</sub>")
+          open(out_md, "w").write("\n".join(out) + "\n")
+          # Publish this run's per-area numbers as the (new) baseline contents to be cached.
+          for area in order:
+              p, t, _ = areas[area]
+              open(os.path.join(basedir, slug(area) + ".tsv"), "w").write(f"{area}\t{p}\t{t}\n")
           PY
           cat comment/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # On main, publish this run's per-area numbers as the new baseline. The key is per-commit so the
+      # save always succeeds (cache keys are immutable); PR runs pick it up via the restore-keys prefix.
+      - name: Save main baseline
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: baseline
+          key: wpt-baseline-run-${{ github.sha }}
 
       # On PRs, stage the comment + PR number for wpt-comment.yml to post (a workflow_run handler, so
       # it works for fork PRs whose `pull_request` token is read-only). Pushes to main don't comment.
