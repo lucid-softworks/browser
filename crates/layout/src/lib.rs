@@ -98,10 +98,10 @@ mod tests {
     /// A stub measurer: each char is `0.6 * px` wide; line height is `1.3 * px`.
     struct Stub;
     impl TextMeasurer for Stub {
-        fn text_width(&self, text: &str, px: f32, _bold: bool) -> f32 {
+        fn text_width(&self, text: &str, px: f32, _bold: bool, _family: Option<&str>) -> f32 {
             text.chars().count() as f32 * px * 0.6
         }
-        fn line_height(&self, px: f32) -> f32 {
+        fn line_height(&self, px: f32, _family: Option<&str>) -> f32 {
             px * 1.3
         }
     }
@@ -226,7 +226,7 @@ mod tests {
             "newline should drop 'c' to a new line"
         );
         // The first run's width reflects the preserved spaces: "a   b" = 5 chars at 0.6*16.
-        let expected = Stub.text_width("a   b", 16.0, false);
+        let expected = Stub.text_width("a   b", 16.0, false, None);
         assert!(
             (l1.dimensions.content.width - expected).abs() < 0.01,
             "width {} != {}",

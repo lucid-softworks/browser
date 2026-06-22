@@ -90,6 +90,9 @@ pub struct PaintStyle {
     pub letter_spacing: f32,
     /// Resolved `line-height` in px (`None` = use the font metric). Drives inline line advance.
     pub line_height: Option<f32>,
+    /// The computed `font-family` list (CSSOM-serialized), used to pick a loaded `@font-face` web
+    /// font when measuring/painting this run's text. `None` = the system/default font.
+    pub font_family: Option<Box<str>>,
     /// Rarely-used paint features (gradients / shadows / transforms / border-radius), boxed so the
     /// common box stays small (one pointer) and allocates nothing — `None` = none of them set.
     pub extras: Option<Box<PaintExtras>>,
@@ -135,6 +138,7 @@ impl Default for PaintStyle {
             visible: true,
             letter_spacing: 0.0,
             line_height: None,
+            font_family: None,
             extras: None,
         }
     }
@@ -242,8 +246,10 @@ impl LayoutBox {
 /// How the layout engine measures text. Implemented by the engine over its font so layout
 /// stays decoupled from font rasterization.
 pub trait TextMeasurer {
-    /// Advance width (px) of `text` rendered at `px` size (with optional faux-bold).
-    fn text_width(&self, text: &str, px: f32, bold: bool) -> f32;
-    /// The line height (px) for text rendered at `px` size.
-    fn line_height(&self, px: f32) -> f32;
+    /// Advance width (px) of `text` rendered at `px` size (with optional faux-bold). `family` is the
+    /// computed `font-family` list (e.g. `"Ahem"`, `"Arial, sans-serif"`); the measurer selects the
+    /// first matching loaded face, falling back to the system font when `None` / unmatched.
+    fn text_width(&self, text: &str, px: f32, bold: bool, family: Option<&str>) -> f32;
+    /// The line height (px) for text rendered at `px` size in `family` (see [`Self::text_width`]).
+    fn line_height(&self, px: f32, family: Option<&str>) -> f32;
 }

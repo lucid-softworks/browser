@@ -428,7 +428,7 @@ pub(crate) fn intrinsic_cross_height(
     let fs = boxx.style.font_size;
     let has_text = has_any_text(boxx);
     if has_text {
-        measurer.line_height(if fs > 0.0 { fs } else { 16.0 })
+        measurer.line_height(if fs > 0.0 { fs } else { 16.0 }, boxx.style.font_family.as_deref())
     } else {
         0.0
     }

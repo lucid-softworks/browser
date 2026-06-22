@@ -219,6 +219,7 @@ pub(crate) fn cell_min_content_width(boxx: &LayoutBox, measurer: &dyn TextMeasur
                 w.style.font_size,
                 w.style.bold,
                 w.style.letter_spacing,
+                w.style.font_family.as_deref(),
             );
             max_word = max_word.max(ww);
         }

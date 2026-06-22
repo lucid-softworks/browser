@@ -67,6 +67,15 @@ impl SystemFont {
         }
         None
     }
+
+    /// Load a font from in-memory TrueType/OpenType bytes (a fetched `@font-face` `src`). Returns
+    /// `None` if the bytes aren't a font fontdue can parse (e.g. `woff`/`woff2`, which are
+    /// compressed wrappers we don't decode).
+    pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
+        fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
+            .ok()
+            .map(|font| Self { font })
+    }
 }
 
 impl GlyphRasterizer for SystemFont {

@@ -39,12 +39,13 @@ pub(crate) fn place_marker(
         } else {
             16.0
         };
-        let mw = measurer.text_width(text, fs, mb.style.bold);
+        let fam = mb.style.font_family.as_deref();
+        let mw = measurer.text_width(text, fs, mb.style.bold, fam);
         let gap = (fs * 0.5).max(4.0);
         let lh = mb
             .style
             .line_height
-            .unwrap_or_else(|| measurer.line_height(fs));
+            .unwrap_or_else(|| measurer.line_height(fs, fam));
         mb.dimensions.content = Rect {
             x: (x - mw - gap).max(0.0),
             y,

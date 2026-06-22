@@ -5,6 +5,14 @@ use std::collections::HashMap;
 // Inline layout (line boxes + text wrapping)
 // ---------------------------------------------------------------------------------------------
 
+/// Whether `c` is a whitespace character at which a line may break (so word-splitting separates on
+/// it). Unicode whitespace qualifies EXCEPT the non-breaking spaces — `&nbsp;` (U+00A0), narrow
+/// NBSP (U+202F), figure space (U+2007), and ZWNBSP/BOM (U+FEFF) — which stay glued into their word
+/// and contribute width, per CSS white-space processing.
+fn is_breaking_space(c: char) -> bool {
+    c.is_whitespace() && !matches!(c, '\u{00A0}' | '\u{202F}' | '\u{2007}' | '\u{FEFF}')
+}
+
 /// Lay out the inline/text children of `boxx` into line boxes, replacing `boxx.children` with a
 /// flat list of positioned `Text` boxes (one per wrapped line per run) plus any atomic
 /// inline-block boxes positioned on their line. Returns total height. `align` is the text
@@ -46,7 +54,7 @@ pub(crate) fn layout_inline_children(
             let h = if line_h > 0.0 {
                 line_h
             } else {
-                measurer.line_height(*font_size)
+                measurer.line_height(*font_size, None)
             };
             let fs = if max_fs > 0.0 { max_fs } else { *font_size };
             lines.push(PlacedLine {
@@ -64,7 +72,7 @@ pub(crate) fn layout_inline_children(
         let space_w = if cur.is_empty() || !leads_space {
             0.0
         } else {
-            measurer.text_width(" ", fs, false)
+            measurer.text_width(" ", fs, false, item.family())
         };
         // `text-indent` narrows only the first line box (the one currently being filled while no
         // line has been emitted yet); later lines get the full available width.
@@ -116,7 +124,7 @@ pub(crate) fn layout_inline_children(
         let lh = if line.height > 0.0 {
             line.height
         } else {
-            measurer.line_height(line_font)
+            measurer.line_height(line_font, None)
         };
         // The emitted Text box's own height matches the line advance.
         let text_lh = lh;
@@ -161,7 +169,8 @@ pub(crate) fn layout_inline_children(
                 };
                 let measure_fs = if run_fs > 0.0 { run_fs } else { line_font };
                 let mut tb = LayoutBox::new(BoxContent::Text(text), r.style, r.node);
-                let w = run_width(measurer, &tb_text(&tb), measure_fs, false, ls);
+                let fam = tb.style.font_family.as_deref().map(|s| s.to_string());
+                let w = run_width(measurer, &tb_text(&tb), measure_fs, false, ls, fam.as_deref());
                 tb.dimensions.content = Rect {
                     x: line_x + r.start_off,
                     y: y + voff,
@@ -224,8 +233,9 @@ pub(crate) fn run_width(
     px: f32,
     bold: bool,
     letter_spacing: f32,
+    family: Option<&str>,
 ) -> f32 {
-    let base = measurer.text_width(text, px, bold);
+    let base = measurer.text_width(text, px, bold, family);
     if letter_spacing != 0.0 {
         base + letter_spacing * text.chars().count() as f32
     } else {
@@ -271,6 +281,14 @@ pub(crate) enum InlineItem {
 }
 
 impl InlineItem {
+    /// The computed `font-family` of this item's text (for web-font selection), if it has any.
+    fn family(&self) -> Option<&str> {
+        match self {
+            InlineItem::Word { style, .. } => style.font_family.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Returns (advance_width, font_size, height, leads_with_space). `height` is the item's
     /// preferred line advance: the element's computed `line-height` if set, else the font metric.
     fn metrics(&self, measurer: &dyn TextMeasurer) -> (f32, f32, f32, bool) {
@@ -287,10 +305,11 @@ impl InlineItem {
                     style.font_size,
                     style.bold,
                     style.letter_spacing,
+                    style.font_family.as_deref(),
                 );
                 let lh = style
                     .line_height
-                    .unwrap_or_else(|| measurer.line_height(style.font_size));
+                    .unwrap_or_else(|| measurer.line_height(style.font_size, style.font_family.as_deref()));
                 (w, style.font_size, lh, *leads_space)
             }
             InlineItem::Atomic(b) => {
@@ -298,7 +317,7 @@ impl InlineItem {
                 (mb.width, b.style.font_size, mb.height, false)
             }
             InlineItem::Break { font_size } => {
-                (0.0, *font_size, measurer.line_height(*font_size), false)
+                (0.0, *font_size, measurer.line_height(*font_size, None), false)
             }
         }
     }
@@ -367,7 +386,16 @@ pub(crate) fn collect_inline_items(
                         });
                     }
                 } else {
-                    for word in text.split_whitespace() {
+                    // Break the run into words at *breaking* spaces. This is Unicode whitespace
+                    // EXCEPT the non-breaking spaces (`&nbsp;` U+00A0, narrow NBSP, figure space,
+                    // ZWNBSP), which stay part of their word and contribute width — while other
+                    // Unicode spaces (e.g. U+2001 EM QUAD) remain line-break opportunities. Empty
+                    // splits (leading/trailing/consecutive separators) are dropped, like
+                    // `split_whitespace`.
+                    for word in text
+                        .split(is_breaking_space)
+                        .filter(|w| !w.is_empty())
+                    {
                         out.push(InlineItem::Word {
                             text: word.to_string(),
                             style: child.style.clone(),

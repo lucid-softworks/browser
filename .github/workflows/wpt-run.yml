@@ -115,11 +115,12 @@ jobs:
           git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git wpt
           cd wpt
           # `css/support` holds shared CSS test helpers (e.g. interpolation-testcommon.js) that
-          # testharness tests under css/ load via /css/support/*. Without it those scripts 404, the
-          # test throws before registering any subtests, and the area reports 0/0 — e.g. css/CSS2/
-          # tables, whose only testharness tests are interpolation tests. Add it for css/ areas.
+          # testharness tests under css/ load via /css/support/*; `fonts` holds the Ahem test font
+          # (and ahem.css) that layout tests load to get exact glyph metrics. Without them those
+          # resources 404 — the helper test throws before registering subtests (area reports 0/0),
+          # and Ahem-based geometry assertions measure with the fallback font. Add both for css/ areas.
           extra=""
-          case "${{ matrix.dir }}" in css/*) extra="css/support" ;; esac
+          case "${{ matrix.dir }}" in css/*) extra="css/support fonts" ;; esac
           git sparse-checkout set tools third_party docs resources common $extra "${{ matrix.dir }}"
 
       - name: Map WPT hosts

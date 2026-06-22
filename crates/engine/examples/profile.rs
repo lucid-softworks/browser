@@ -52,10 +52,10 @@ fn main() {
 
 struct Stub;
 impl layout::TextMeasurer for Stub {
-    fn text_width(&self, s: &str, fs: f32, _bold: bool) -> f32 {
+    fn text_width(&self, s: &str, fs: f32, _bold: bool, _family: Option<&str>) -> f32 {
         s.chars().count() as f32 * fs * 0.5
     }
-    fn line_height(&self, fs: f32) -> f32 {
+    fn line_height(&self, fs: f32, _family: Option<&str>) -> f32 {
         fs * 1.2
     }
 }

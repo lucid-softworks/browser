@@ -296,6 +296,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         visible: cs.visibility == style::Visibility::Visible,
         letter_spacing: cs.letter_spacing,
         line_height: cs.line_height,
+        font_family: cs.font_family.as_deref().map(Box::from),
         // Only allocate the extras box when the element actually has a gradient/shadow/transform/
         // border-radius (all rare). border-radius lives here to keep the common PaintStyle small.
         extras: if cs.background_gradient.is_some()
@@ -1015,5 +1016,8 @@ pub(crate) fn collapse_whitespace(s: &str) -> String {
             last_was_space = false;
         }
     }
-    out.trim().to_string()
+    // Trim only ASCII whitespace (the collapsible kind) — NOT Unicode whitespace such as `&nbsp;`
+    // (U+00A0), which CSS preserves. Rust's `str::trim()` would strip nbsp, dropping a meaningful
+    // glyph (e.g. the width contributed by a trailing `&nbsp;`).
+    out.trim_matches(|c: char| c.is_ascii_whitespace()).to_string()
 }

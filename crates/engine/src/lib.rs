@@ -121,6 +121,10 @@ pub struct Engine {
     scale: f32,
     state: LoadState,
     font: Option<SystemFont>,
+    /// Loaded `@font-face` web fonts, keyed by lowercased family name. Populated from the page's
+    /// stylesheets after load; consulted (alongside `font`) when measuring/painting text whose
+    /// computed `font-family` names a declared face.
+    font_faces: HashMap<String, SystemFont>,
     /// Vertical scroll offset of the page content, in device pixels (0 = top). Clamped to
     /// the laid-out document height during `render`.
     scroll_y: f32,
@@ -1652,14 +1656,14 @@ mod tests {
         // implemented in parallel; we only assert the layout+paint path runs without panicking.
         struct TestMeasurer;
         impl layout::TextMeasurer for TestMeasurer {
-            fn text_width(&self, text: &str, px: f32, bold: bool) -> f32 {
+            fn text_width(&self, text: &str, px: f32, bold: bool, _family: Option<&str>) -> f32 {
                 let mut w = text.chars().count() as f32 * px * 0.5;
                 if bold {
                     w += text.chars().count() as f32;
                 }
                 w
             }
-            fn line_height(&self, px: f32) -> f32 {
+            fn line_height(&self, px: f32, _family: Option<&str>) -> f32 {
                 px * 1.3
             }
         }
@@ -1718,10 +1722,10 @@ mod tests {
         // half-opacity pixel is between the gradient and full white.
         struct M;
         impl layout::TextMeasurer for M {
-            fn text_width(&self, t: &str, px: f32, _b: bool) -> f32 {
+            fn text_width(&self, t: &str, px: f32, _b: bool, _family: Option<&str>) -> f32 {
                 t.chars().count() as f32 * px * 0.5
             }
-            fn line_height(&self, px: f32) -> f32 {
+            fn line_height(&self, px: f32, _family: Option<&str>) -> f32 {
                 px * 1.3
             }
         }
@@ -1790,10 +1794,10 @@ mod tests {
     // A no-op text measurer/font used by the paint render tests below.
     struct TM;
     impl layout::TextMeasurer for TM {
-        fn text_width(&self, t: &str, px: f32, _b: bool) -> f32 {
+        fn text_width(&self, t: &str, px: f32, _b: bool, _family: Option<&str>) -> f32 {
             t.chars().count() as f32 * px * 0.5
         }
-        fn line_height(&self, px: f32) -> f32 {
+        fn line_height(&self, px: f32, _family: Option<&str>) -> f32 {
             px * 1.3
         }
     }
@@ -2061,11 +2065,15 @@ mod tests {
         // FontMeasurer needs a real font; skip gracefully when none is present.
         use layout::TextMeasurer;
         if let Some(font) = SystemFont::load() {
-            let m = FontMeasurer { font: &font };
-            let plain = m.text_width("abc", 16.0, false);
-            let bold = m.text_width("abc", 16.0, true);
+            let faces = HashMap::new();
+            let m = FontMeasurer {
+                font: &font,
+                faces: &faces,
+            };
+            let plain = m.text_width("abc", 16.0, false, None);
+            let bold = m.text_width("abc", 16.0, true, None);
             assert!(bold > plain, "bold {bold} should exceed plain {plain}");
-            assert_eq!(m.line_height(10.0), 13.0);
+            assert_eq!(m.line_height(10.0, None), 13.0);
         }
     }
 
@@ -2124,10 +2132,10 @@ mod tests {
 
         struct M;
         impl layout::TextMeasurer for M {
-            fn text_width(&self, t: &str, px: f32, _b: bool) -> f32 {
+            fn text_width(&self, t: &str, px: f32, _b: bool, _family: Option<&str>) -> f32 {
                 t.chars().count() as f32 * px * 0.5
             }
-            fn line_height(&self, px: f32) -> f32 {
+            fn line_height(&self, px: f32, _family: Option<&str>) -> f32 {
                 px * 1.3
             }
         }

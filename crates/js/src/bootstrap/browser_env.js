@@ -6176,8 +6176,10 @@
       addEventListener: fn, removeEventListener: fn, dispatchEvent: function () { return false; },
       onloading: null, onloadingdone: null, onloadingerror: null
     };
-    // `ready` should be a thenable that resolves to the set itself (per spec resolves to the
-    // FontFaceSet). Make it resolve to the set without creating a cycle in JSON paths.
+    // `ready` resolves to the set itself (per spec, the FontFaceSet). The engine loads any
+    // @font-face web fonts and lays out with them BEFORE this page's scripts run, so an immediate
+    // resolve is correct: by the time `document.fonts.ready.then(...)` callbacks run, geometry
+    // already reflects the loaded fonts.
     fontFaces.ready = Promise.resolve(fontFaces);
     Object.defineProperty(document, "fonts", { value: fontFaces, enumerable: false, configurable: true, writable: true });
   }

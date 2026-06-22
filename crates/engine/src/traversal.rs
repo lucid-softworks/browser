@@ -1,14 +1,33 @@
 use crate::*;
 
-/// A [`layout::TextMeasurer`] backed by our [`SystemFont`], so layout can size text without
-/// knowing about font rasterization. Widths mirror what the painter actually draws.
+/// A [`layout::TextMeasurer`] backed by our [`SystemFont`] plus any loaded `@font-face` web fonts,
+/// so layout can size text without knowing about font rasterization. Widths mirror what the painter
+/// actually draws. `faces` maps a lowercased family name to its loaded font.
 pub(crate) struct FontMeasurer<'a> {
     pub(crate) font: &'a SystemFont,
+    pub(crate) faces: &'a std::collections::HashMap<String, SystemFont>,
+}
+
+impl FontMeasurer<'_> {
+    /// Pick the loaded font for a computed `font-family` list: the first comma-separated family that
+    /// names a loaded `@font-face` web font, else the system font.
+    pub(crate) fn pick(&self, family: Option<&str>) -> &SystemFont {
+        if let Some(list) = family {
+            for fam in list.split(',') {
+                let name = fam.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+                if let Some(face) = self.faces.get(&name) {
+                    return face;
+                }
+            }
+        }
+        self.font
+    }
 }
 
 impl layout::TextMeasurer for FontMeasurer<'_> {
-    fn text_width(&self, text: &str, px: f32, bold: bool) -> f32 {
-        let mut w: f32 = text.chars().map(|ch| self.font.advance(ch, px)).sum();
+    fn text_width(&self, text: &str, px: f32, bold: bool, family: Option<&str>) -> f32 {
+        let font = self.pick(family);
+        let mut w: f32 = text.chars().map(|ch| font.advance(ch, px)).sum();
         if bold {
             // Faux-bold draws each glyph twice with a 1px offset, widening the run by ~1px/glyph.
             w += text.chars().count() as f32;
@@ -16,7 +35,7 @@ impl layout::TextMeasurer for FontMeasurer<'_> {
         w
     }
 
-    fn line_height(&self, px: f32) -> f32 {
+    fn line_height(&self, px: f32, _family: Option<&str>) -> f32 {
         px * 1.3
     }
 }
@@ -466,11 +485,13 @@ pub(crate) fn collect_used_margins(b: &layout::LayoutBox, out: &mut HashMap<usiz
 /// `(rects, naturals, insets, scroll_y_css, doc_height_css)` in the exact shape `set_layout_rects`
 /// expects (CSS px). `None` when there's no font (then nothing is seeded).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_initial_rects(
     doc: &dom::Document,
     styles: &[css::Stylesheet],
     images: &HashMap<dom::NodeId, DecodedImage>,
     font: Option<&SystemFont>,
+    faces: &HashMap<String, SystemFont>,
     vp_w: u32,
     vp_h: u32,
     scale: f32,
@@ -492,7 +513,7 @@ pub(crate) fn compute_initial_rects(
     // would briefly see half-size boxes before the authoritative push lands).
     let vw = (vp_w as f32).max(1.0);
     let vh = (vp_h as f32).max(1.0);
-    let measurer = FontMeasurer { font };
+    let measurer = FontMeasurer { font, faces };
     let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
         .iter()
         .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))

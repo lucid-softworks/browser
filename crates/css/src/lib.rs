@@ -17,6 +17,22 @@ pub struct Stylesheet {
     /// `@namespace [prefix] url(...)` bindings, in source order. An empty `prefix` is the default
     /// namespace.
     pub namespace_rules: Vec<NamespaceRule>,
+    /// `@font-face { font-family: …; src: url(…) }` rules, in source order. The engine fetches each
+    /// `src` URL and registers the font under `family` so elements naming that family render with it.
+    pub font_face_rules: Vec<FontFaceRule>,
+}
+
+/// An `@font-face` rule: a family name and its candidate source URLs (in declared order).
+#[derive(Debug, Clone, Default)]
+pub struct FontFaceRule {
+    /// The `font-family` descriptor, with surrounding quotes stripped (e.g. `Ahem`).
+    pub family: String,
+    /// The `src` URLs in declared order (each `url(...)` token; `local(...)` and `format(...)` are
+    /// dropped). The engine tries them in turn and uses the first it can fetch and parse.
+    pub src: Vec<String>,
+    /// The absolute URL of the stylesheet this rule came from, to resolve relative `src` URLs
+    /// (per CSS, against the stylesheet, not the document). `None` for sheets parsed via [`parse`].
+    pub base_url: Option<String>,
 }
 
 /// A registered custom property from an `@property` rule.
@@ -85,21 +101,28 @@ fn parse_inner(css: &str, base_url: Option<&str>) -> Stylesheet {
             rule.base_url = Some(base.to_string());
         }
     }
-    let (property_rules, namespace_rules) = extract_top_level_at_rules(&bytes);
+    let (property_rules, namespace_rules, mut font_face_rules) = extract_top_level_at_rules(&bytes);
+    for ff in &mut font_face_rules {
+        ff.base_url = base_url.map(|b| b.to_string());
+    }
     Stylesheet {
         rules,
         property_rules,
         namespace_rules,
+        font_face_rules,
     }
 }
 
 /// Scan the (comment-stripped) source for the `@property` and `@namespace` at-rules the cascade
 /// needs. These are top-level (not nested in `@media`/etc.) in practice; a flat scan is sufficient
 /// for the CSSOM tests. Returns `(property_rules, namespace_rules)` in source order.
-fn extract_top_level_at_rules(bytes: &[char]) -> (Vec<PropertyRule>, Vec<NamespaceRule>) {
+fn extract_top_level_at_rules(
+    bytes: &[char],
+) -> (Vec<PropertyRule>, Vec<NamespaceRule>, Vec<FontFaceRule>) {
     let end = bytes.len();
     let mut props = Vec::new();
     let mut namespaces = Vec::new();
+    let mut font_faces = Vec::new();
     let mut pos = 0usize;
     while pos < end {
         match bytes[pos] {
@@ -139,6 +162,11 @@ fn extract_top_level_at_rules(bytes: &[char]) -> (Vec<PropertyRule>, Vec<Namespa
                         let body: String = bytes[body_start..body_end].iter().collect();
                         props.push(parse_property_body(&pname, &body));
                     }
+                } else if name == "font-face" {
+                    let body: String = bytes[body_start..body_end].iter().collect();
+                    if let Some(ff) = parse_font_face_body(&body) {
+                        font_faces.push(ff);
+                    }
                 }
                 pos = if body_end < end {
                     body_end + 1
@@ -152,7 +180,89 @@ fn extract_top_level_at_rules(bytes: &[char]) -> (Vec<PropertyRule>, Vec<Namespa
             _ => pos += 1,
         }
     }
-    (props, namespaces)
+    (props, namespaces, font_faces)
+}
+
+/// Parse an `@font-face` descriptor body into a [`FontFaceRule`]. Requires a `font-family` and at
+/// least one `url(...)` in `src`; returns `None` otherwise. `local(...)` and `format(...)` parts of
+/// `src` are ignored — only the fetchable `url(...)` sources are kept, in declared order.
+fn parse_font_face_body(body: &str) -> Option<FontFaceRule> {
+    let mut family: Option<String> = None;
+    let mut src: Vec<String> = Vec::new();
+    for (k, v) in parse_declarations(body) {
+        match k.as_str() {
+            "font-family" => {
+                // Strip one layer of surrounding quotes; keep the raw family name otherwise.
+                let t = v.trim();
+                let unq = t
+                    .strip_prefix('"')
+                    .and_then(|r| r.strip_suffix('"'))
+                    .or_else(|| t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+                    .unwrap_or(t);
+                if !unq.is_empty() {
+                    family = Some(unq.to_string());
+                }
+            }
+            "src" => {
+                // Split the comma-separated source list and keep each `url(...)`'s target.
+                for part in split_top_level_commas(&v) {
+                    let part = part.trim();
+                    if let Some(rest) = part.strip_prefix("url(") {
+                        if let Some(idx) = rest.find(')') {
+                            if let Some(u) = strip_url_or_string(&format!("url({}", &rest[..=idx])) {
+                                if !u.is_empty() {
+                                    src.push(u);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let family = family?;
+    if src.is_empty() {
+        return None;
+    }
+    Some(FontFaceRule {
+        family,
+        src,
+        base_url: None,
+    })
+}
+
+/// Split a declaration value on top-level commas (ignoring commas inside `(...)` or strings).
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    parts.push(chars[start..i].iter().collect());
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    parts.push(chars[start..].iter().collect());
+    parts
 }
 
 /// Parse a `@namespace` prelude: an optional prefix followed by a `url(...)` or string URI.

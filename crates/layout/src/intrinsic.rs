@@ -32,17 +32,19 @@ pub(crate) fn intrinsic_width(
     if !words.is_empty() {
         let mut line_w = 0.0f32;
         for (i, w) in words.iter().enumerate() {
+            let fam = w.style.font_family.as_deref();
             let ww = run_width(
                 measurer,
                 &w.text,
                 w.style.font_size,
                 w.style.bold,
                 w.style.letter_spacing,
+                fam,
             );
             let sp = if i == 0 {
                 0.0
             } else {
-                measurer.text_width(" ", w.style.font_size, w.style.bold)
+                measurer.text_width(" ", w.style.font_size, w.style.bold, fam)
             };
             line_w += ww + sp;
         }

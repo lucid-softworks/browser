@@ -8,6 +8,7 @@ impl Engine {
             scale: 1.0,
             state: LoadState::Empty,
             font: SystemFont::load(),
+            font_faces: HashMap::new(),
             scroll_y: 0.0,
             is_dark: false,
             layout_cache: None,
@@ -165,6 +166,10 @@ impl Engine {
                     // reads during load (getBoundingClientRect / elementFromPoint / caret*FromPoint)
                     // then see real geometry instead of 0/null. Best-effort: external CSS/images
                     // aren't loaded yet, and the engine re-lays-out + re-pushes authoritatively after.
+                    // Load @font-face web fonts before scripts so the seed layout measures text in
+                    // the right font (the inline cascade below names the family; the face is loaded
+                    // here from the page's stylesheets, including external ones like WPT's ahem.css).
+                    self.load_web_fonts_early(&final_doc, &base);
                     let initial_rects = {
                         let inline_styles = collect_inline_stylesheets(&final_doc, &base);
                         let no_images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
@@ -173,6 +178,7 @@ impl Engine {
                             &inline_styles,
                             &no_images,
                             self.font.as_ref(),
+                            &self.font_faces,
                             self.vp_w,
                             self.vp_h,
                             self.scale,
@@ -207,6 +213,9 @@ impl Engine {
                     None => HashMap::new(),
                 };
 
+                // Pick up any @font-face declared in runtime-injected stylesheets (most are already
+                // loaded by `load_web_fonts_early` before scripts; this catches script-added ones).
+                self.load_web_fonts(&styles, &base);
                 self.state = LoadState::Loaded {
                     url: meta.final_url,
                     doc,
@@ -252,6 +261,7 @@ impl Engine {
     pub(crate) fn install_partial(&mut self, doc: dom::Document, url: &str) {
         let base = base_url(&doc, url);
         let styles = collect_inline_stylesheets(&doc, &base);
+        self.load_web_fonts(&styles, &base);
         self.state = LoadState::Loaded {
             url: url.to_string(),
             doc: Some(doc),
@@ -260,6 +270,54 @@ impl Engine {
             images: HashMap::new(),
         };
         self.layout_cache = None;
+    }
+
+    /// Load `@font-face` web fonts BEFORE the page's scripts run, so the script-visible seed layout
+    /// (and `getBoundingClientRect`/`offsetWidth` reads in `document.fonts.ready.then(...)`) reflect
+    /// web-font metrics. Gated: only fetches external CSS when the page actually has external
+    /// stylesheets or an inline `@font-face`, so font-free inline-only pages pay nothing. (When it
+    /// does fetch, those sheets are fetched again for the post-script authoritative layout — a small
+    /// cost paid only by pages that ship CSS, in exchange for correct first-layout font metrics.)
+    pub(crate) fn load_web_fonts_early(&mut self, doc: &dom::Document, base: &str) {
+        let sources = collect_style_sources(doc, base);
+        let has_external = sources
+            .iter()
+            .any(|s| matches!(s, StyleSource::External(_)));
+        let inline_font_face = sources
+            .iter()
+            .any(|s| matches!(s, StyleSource::Inline(t) if t.contains("@font-face")));
+        if !has_external && !inline_font_face {
+            return;
+        }
+        let (styles, _console) = collect_stylesheets(doc, base);
+        self.load_web_fonts(&styles, base);
+    }
+
+    /// Fetch and register every `@font-face` declared in `styles`, so text whose `font-family` names
+    /// a declared face is measured/painted with that font. Relative `src` URLs resolve against the
+    /// stylesheet's own base (else `doc_base`). Already-loaded families and unfetchable/undecodable
+    /// sources (e.g. `woff2`, which fontdue can't parse) are skipped. Best-effort: any failure just
+    /// leaves the system font in use for that family. Called BEFORE the page's scripts run so the
+    /// first (script-visible) layout already reflects web-font metrics.
+    pub(crate) fn load_web_fonts(&mut self, styles: &[css::Stylesheet], doc_base: &str) {
+        for ff in styles.iter().flat_map(|s| s.font_face_rules.iter()) {
+            let key = ff.family.to_ascii_lowercase();
+            if self.font_faces.contains_key(&key) {
+                continue;
+            }
+            let sheet_base = ff.base_url.as_deref().unwrap_or(doc_base);
+            for src in &ff.src {
+                let Some(abs) = resolve_url(sheet_base, src) else {
+                    continue;
+                };
+                if let Ok(resp) = net::fetch(&abs) {
+                    if let Some(face) = SystemFont::from_bytes(resp.body) {
+                        self.font_faces.insert(key.clone(), face);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Paint the current state into `self.framebuffer` and hand a borrowed [`FrameView`] to the
@@ -350,7 +408,10 @@ impl Engine {
             // size at line ~315 — consistent with the layout viewport.
             let vw = (dw as f32 / self.scale).max(1.0);
             let vh = ((page_max_y - header_h) / self.scale).max(1.0);
-            let measurer = FontMeasurer { font };
+            let measurer = FontMeasurer {
+                font,
+                faces: &self.font_faces,
+            };
             let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
                 .iter()
                 .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))
