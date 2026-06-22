@@ -48,8 +48,10 @@ jobs:
       fail-fast: false
       matrix:
         # slug mirrors dir with `/` → `-`; used for unique artifact names (artifact names can't
-        # contain `/`). css/cssom, dom, domparsing, url are quick; html/dom is large; fetch is
-        # mostly network-dependent. All exclude tentative tests (skipped by the runner).
+        # contain `/`). css/cssom, dom, domparsing, url are quick; html/dom is large; fetch and
+        # service-workers are mostly network/worker-dependent (a chunk needs cross-origin or
+        # server-side infra the in-process runner can't provide). All exclude tentative tests
+        # (skipped by the runner).
         include:
           - { dir: css/cssom, slug: css-cssom }
           - { dir: dom,       slug: dom }
@@ -57,6 +59,7 @@ jobs:
           - { dir: html/dom,  slug: html-dom }
           - { dir: url,       slug: url }
           - { dir: fetch,     slug: fetch }
+          - { dir: service-workers, slug: service-workers }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
