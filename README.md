@@ -25,6 +25,38 @@ it for a hand-written implementation later is a localized change, not a refactor
 Everything else — HTML tokenizer/tree-builder, CSS parser, DOM, cascade, layout, the
 compositor — is ours.
 
+## Build & run
+
+### Prerequisites
+
+- **Rust** (stable) — install via [rustup](https://rustup.rs).
+- For App Shell: **Xcode command-line tools** (`xcode-select --install`)
+
+### Engine / tests only
+
+The engine is plain Rust and builds on **macOS, Linux, and Windows**:
+
+```sh
+cargo build --workspace # Build
+cargo test --workspace  # Build and run tests
+```
+
+### The App shell (macOS only)
+
+The app shell currently ships for **macOS** (Swift / AppKit), so a graphical browser today requires macOS.
+Run from the repo root:
+
+```sh
+bash scripts/build.sh              # debug: Rust lib + the Swift app
+./swift/.build/debug/Browser       # launch
+
+bash scripts/build.sh release      # optimized, bare executable
+./swift/.build/release/Browser     # launch
+
+bash scripts/build.sh release-app  # optimized + packaged + signed dist/Browser.app
+open dist/Browser.app              # launch
+```
+
 ## Architecture
 
 ```
@@ -65,22 +97,6 @@ near 4 GiB — every tab here is just heap inside our single **64-bit** process,
 engine (V8) uses no pointer compression. A tab is therefore limited only by the machine's
 RAM + swap. We set no `rlimit`, and size types on the hot paths are 64-bit (`net`'s body
 backstop sits at 16 GiB, the DOM arena indexes with `usize`).
-
-## Build & run
-
-The engine is plain Rust and builds on **macOS, Linux, and Windows**. The macOS app shell is
-built via `scripts/build.sh`:
-
-```sh
-bash scripts/build.sh              # debug: Rust lib + the Swift app
-./swift/.build/debug/Browser       # launch
-
-bash scripts/build.sh release      # optimized, bare executable
-bash scripts/build.sh release-app  # optimized + packaged + signed dist/Browser.app
-```
-
-Tests run on every platform: `cargo test --workspace`. (Only the *shell* is per-OS; the engine
-and all unit tests are cross-platform — CI runs them on macOS / Linux / Windows.)
 
 ## Contributing
 
