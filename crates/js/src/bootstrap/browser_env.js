@@ -6839,6 +6839,103 @@
     if (__cmpBP(parent, offset, this._ec, this._eo) < 0 && __cmpBP(parent, offset + 1, this._sc, this._so) > 0) { return true; }
     return false;
   };
+  // ---- "Clone the contents of a range" (DOM spec) --------------------------------------------
+  // Boundary-point compare in node ids (mirror of __cmpBP, which works on node objects).
+  function __cmpBPid(idA, offA, idB, offB) {
+    return globalThis.__cmpKey(globalThis.__pathKey(idA, offA), globalThis.__pathKey(idB, offB));
+  }
+  // `a` is an inclusive ancestor of `b` (the spec's "ancestor container": a === b or a contains b).
+  function __isInclAncestor(aId, bId) {
+    var c = bId;
+    while (c >= 0) { if (c === aId) { return true; } c = __parent(c); }
+    return false;
+  }
+  // A node is "contained" in (scId,so)..(ecId,eo): same root, (node,0) after start, (node,len) before end.
+  function __nodeContainedIn(id, scId, so, ecId, eo) {
+    if (globalThis.__rootId(id) !== globalThis.__rootId(scId)) { return false; }
+    var len = __rangeLength(__nodeFor(id));
+    return __cmpBPid(id, 0, scId, so) > 0 && __cmpBPid(id, len, ecId, eo) < 0;
+  }
+  // "Partially contained": an inclusive ancestor of exactly one of the two boundary nodes.
+  function __nodePartiallyContained(id, scId, ecId) {
+    var a = __isInclAncestor(id, scId), b = __isInclAncestor(id, ecId);
+    return (a && !b) || (b && !a);
+  }
+  function __isCharData(t) { return t === 3 || t === 4 || t === 7 || t === 8; }
+  // Returns a DocumentFragment node object holding clones of the range's contents (range left intact).
+  // Operates on a plain {_sc,_so,_ec,_eo} boundary record so recursive subranges need no live Range.
+  function __cloneRangeContents(rec) {
+    var frag = document.createDocumentFragment();
+    var fragId = frag.__node;
+    var scId = __idOf(rec._sc), so = rec._so, ecId = __idOf(rec._ec), eo = rec._eo;
+    // Collapsed range: empty fragment.
+    if (scId === ecId && so === eo) { return frag; }
+    var startType = __nodeType(scId);
+    // Both boundaries in the same CharacterData node: clone it, keeping only the selected substring.
+    if (scId === ecId && __isCharData(startType)) {
+      var c0 = globalThis.__cloneNode(scId, false);
+      var d0 = __textContent(scId) || "";
+      globalThis.__setTextContent(c0, d0.slice(so, eo));
+      globalThis.__appendChild(fragId, c0);
+      return frag;
+    }
+    // Common (inclusive) ancestor of both boundary nodes.
+    var caId = scId;
+    while (!__isInclAncestor(caId, ecId)) { caId = __parent(caId); }
+    var kids = __children(caId);
+    // First/last child of the common ancestor that's partially contained (null when a boundary node is
+    // itself an inclusive ancestor of the other).
+    var firstPC = -1, lastPC = -1;
+    if (!__isInclAncestor(scId, ecId)) {
+      for (var i = 0; i < kids.length; i++) { if (__nodePartiallyContained(kids[i], scId, ecId)) { firstPC = kids[i]; break; } }
+    }
+    if (!__isInclAncestor(ecId, scId)) {
+      for (var j = kids.length - 1; j >= 0; j--) { if (__nodePartiallyContained(kids[j], scId, ecId)) { lastPC = kids[j]; break; } }
+    }
+    // Children fully contained in the range, in tree order. A contained doctype is a HierarchyRequestError.
+    var contained = [];
+    for (var k = 0; k < kids.length; k++) {
+      if (__nodeContainedIn(kids[k], scId, so, ecId, eo)) {
+        if (__nodeType(kids[k]) === 10) { throw new globalThis.DOMException("A DocumentType node cannot be cloned into a fragment.", "HierarchyRequestError"); }
+        contained.push(kids[k]);
+      }
+    }
+    // Leading partial: a CharacterData boundary contributes its trailing substring; an element contributes
+    // a shallow clone filled by recursing into (start)..(child end).
+    if (firstPC >= 0 && __isCharData(__nodeType(firstPC))) {
+      var cf = globalThis.__cloneNode(scId, false);
+      var df = __textContent(scId) || "";
+      globalThis.__setTextContent(cf, df.slice(so));
+      globalThis.__appendChild(fragId, cf);
+    } else if (firstPC >= 0) {
+      var cfe = globalThis.__cloneNode(firstPC, false);
+      globalThis.__appendChild(fragId, cfe);
+      var sub1 = __cloneRangeContents({ _sc: __nodeFor(scId), _so: so, _ec: __nodeFor(firstPC), _eo: __rangeLength(__nodeFor(firstPC)) });
+      var sk1 = __children(sub1.__node).slice();
+      for (var a = 0; a < sk1.length; a++) { globalThis.__appendChild(cfe, sk1[a]); }
+    }
+    // Fully contained children: deep clones.
+    for (var c = 0; c < contained.length; c++) {
+      globalThis.__appendChild(fragId, globalThis.__cloneNode(contained[c], true));
+    }
+    // Trailing partial: mirror of the leading case.
+    if (lastPC >= 0 && __isCharData(__nodeType(lastPC))) {
+      var cl = globalThis.__cloneNode(ecId, false);
+      var dl = __textContent(ecId) || "";
+      globalThis.__setTextContent(cl, dl.slice(0, eo));
+      globalThis.__appendChild(fragId, cl);
+    } else if (lastPC >= 0) {
+      var cle = globalThis.__cloneNode(lastPC, false);
+      globalThis.__appendChild(fragId, cle);
+      var sub2 = __cloneRangeContents({ _sc: __nodeFor(lastPC), _so: 0, _ec: __nodeFor(ecId), _eo: eo });
+      var sk2 = __children(sub2.__node).slice();
+      for (var b = 0; b < sk2.length; b++) { globalThis.__appendChild(cle, sk2[b]); }
+    }
+    return frag;
+  }
+  Range.prototype.cloneContents = function () {
+    return __cloneRangeContents(this);
+  };
   Range.prototype.cloneRange = function () { var r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; };
   Range.prototype.detach = function () {};
   Range.prototype.createContextualFragment = function (html) {
