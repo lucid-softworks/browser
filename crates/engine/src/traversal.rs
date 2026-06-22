@@ -360,6 +360,68 @@ pub(crate) fn serialize_dom_node(
     }
 }
 
+/// Bake the backing scale (device pixel ratio) into a laid-out box tree, converting it from the
+/// CSS-px space layout runs in to the device-px space the rest of the engine paints and hit-tests
+/// in. Multiply every absolute length — box geometry, the box-model edges, font/line/letter
+/// metrics, positioned insets/margins, and the absolute paint extras (corner radius, shadow
+/// offsets/blur/spread, `transform` translation) — by `s`. Values already expressed as fractions of
+/// the box (gradient stops, `transform-origin`, the transform's linear part) are scale-invariant and
+/// left untouched. A `scale` of 1.0 (non-Retina) is a no-op.
+pub(crate) fn scale_layout_tree(b: &mut layout::LayoutBox, s: f32) {
+    if s == 1.0 {
+        return;
+    }
+    fn scale_edges(e: &mut layout::Edges, s: f32) {
+        e.top *= s;
+        e.right *= s;
+        e.bottom *= s;
+        e.left *= s;
+    }
+    let d = &mut b.dimensions;
+    d.content.x *= s;
+    d.content.y *= s;
+    d.content.width *= s;
+    d.content.height *= s;
+    scale_edges(&mut d.padding, s);
+    scale_edges(&mut d.border, s);
+    scale_edges(&mut d.margin, s);
+
+    b.style.font_size *= s;
+    b.style.letter_spacing *= s;
+    if let Some(lh) = b.style.line_height.as_mut() {
+        *lh *= s;
+    }
+    if let Some(ext) = b.style.extras.as_deref_mut() {
+        ext.border_radius *= s;
+        for sh in &mut ext.box_shadows {
+            sh.dx *= s;
+            sh.dy *= s;
+            sh.blur *= s;
+            sh.spread *= s;
+        }
+        // transform = [a, b, c, d, e, f]; e/f are the px translation (a..d are the unitless
+        // linear part — scale/rotation/skew — which must not be touched).
+        if let Some(t) = ext.transform.as_mut() {
+            t[4] *= s;
+            t[5] *= s;
+        }
+    }
+    if let Some(insets) = b.used_insets.as_mut() {
+        for v in insets.iter_mut() {
+            *v *= s;
+        }
+    }
+    if let Some(margins) = b.used_margins.as_mut() {
+        for v in margins.iter_mut() {
+            *v *= s;
+        }
+    }
+
+    for c in &mut b.children {
+        scale_layout_tree(c, s);
+    }
+}
+
 pub(crate) fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
     if let Some(node) = b.node {
         out.entry(node.0)
@@ -422,12 +484,14 @@ pub(crate) fn compute_initial_rects(
     f32,
 )> {
     let font = font?;
-    let dw = ((vp_w as f32) * scale).round().max(1.0) as u32;
-    let dh = ((vp_h as f32) * scale).round().max(1.0) as u32;
     style::set_viewport_metrics(vp_w as f32, vp_h as f32, scale);
     style::set_interaction_state(None, None);
-    let vw = (dw as f32).max(1.0);
-    let vh = (dh as f32).max(1.0);
+    // Lay out against the LOGICAL (CSS-px) viewport, then bake the backing scale into the tree —
+    // identical to the authoritative `ensure_layout` path, so the rects this seeds into the JS
+    // session match what the real layout pushes (otherwise HiDPI getBoundingClientRect reads
+    // would briefly see half-size boxes before the authoritative push lands).
+    let vw = (vp_w as f32).max(1.0);
+    let vh = (vp_h as f32).max(1.0);
     let measurer = FontMeasurer { font };
     let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
         .iter()
@@ -436,7 +500,10 @@ pub(crate) fn compute_initial_rects(
     collect_canvas_intrinsics(doc, &mut intrinsic_sizes);
     collect_svg_intrinsics(doc, &mut intrinsic_sizes);
     let (computed, _root_scheme_dark) = style::cascade_with_root_scheme(doc, styles, is_dark);
-    let root = layout::layout_document(doc, &computed, vw, vh, &measurer, &intrinsic_sizes, None);
+    let mut root = layout::layout_document(doc, &computed, vw, vh, &measurer, &intrinsic_sizes, None);
+    // CSS px → device px, matching `ensure_layout`. `collect_node_rects` below then yields device px,
+    // which the `inv` (1/scale) factor converts back to the CSS px the JS session stores.
+    scale_layout_tree(&mut root, scale);
     let content_h = root.dimensions.margin_box().height;
 
     let mut rects: HashMap<usize, layout::Rect> = HashMap::new();

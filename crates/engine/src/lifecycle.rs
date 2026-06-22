@@ -341,8 +341,15 @@ impl Engine {
             // Swift devtools panel, not painted by the engine.
             let _ = console;
             let page_max_y = dh as f32;
-            let vw = (dw as f32).max(1.0);
-            let vh = (page_max_y - header_h).max(1.0);
+            // Lay out against the LOGICAL (CSS-px) viewport, not the device framebuffer: a real
+            // browser lays out in CSS px and rasterizes at the backing scale. `dw`/`dh` are device
+            // px (= logical × scale), so divide back out here. The resulting CSS-px box tree is
+            // scaled to device px by `scale_layout_tree` below, which is the space the rest of the
+            // engine (painter, hit-testing, `getBoundingClientRect` ÷ scale, scrollbar) works in.
+            // This keeps the cascade's viewport metrics (media queries, `vw`/`vh`) — fed the logical
+            // size at line ~315 — consistent with the layout viewport.
+            let vw = (dw as f32 / self.scale).max(1.0);
+            let vh = ((page_max_y - header_h) / self.scale).max(1.0);
             let measurer = FontMeasurer { font };
             let mut intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
                 .iter()
@@ -357,7 +364,7 @@ impl Engine {
             collect_svg_intrinsics(d, &mut intrinsic_sizes);
             let (computed, root_scheme_dark) =
                 style::cascade_with_root_scheme(d, styles, self.is_dark);
-            let root = layout::layout_document(
+            let mut root = layout::layout_document(
                 d,
                 &computed,
                 vw,
@@ -366,6 +373,10 @@ impl Engine {
                 &intrinsic_sizes,
                 self.focused_node,
             );
+            // CSS px → device px: bake the backing scale into the box tree so every downstream
+            // consumer keeps working in device px (the painter blits 1:1, hit-testing matches the
+            // device-px cursor, `getBoundingClientRect` divides back to CSS px).
+            scale_layout_tree(&mut root, self.scale);
             let content_h = root.dimensions.margin_box().height;
             Some((root, content_h, root_scheme_dark))
         } else {

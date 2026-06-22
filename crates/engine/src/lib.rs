@@ -532,6 +532,41 @@ mod tests {
     }
 
     #[test]
+    fn retina_scale_renders_device_px_but_keeps_css_px_geometry() {
+        // The SAME 200x80 div on a 2x (Retina) backing. Layout runs in CSS px and is baked to device
+        // px, so: the framebuffer is 2x the logical viewport; CSS-facing geometry (getBoundingClientRect,
+        // innerWidth) stays in CSS px and is therefore IDENTICAL to the 1x case; devicePixelRatio reads 2.
+        // Regression: before HiDPI layout scaling, page content was laid out 1 device-px per CSS-px, so
+        // this div's rect came back halved ("100x40") and the page rendered at half physical size.
+        let html = "<html><body style=\"margin:0\">\
+            <div style=\"width:200px;height:80px\"></div>\
+            <script>window.__ready = true;</script></body></html>";
+        let path = std::env::temp_dir().join("browser_retina_scale_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(800, 600, 2.0); // 2x backing: device framebuffer is 1600x1200
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let fb = e.render();
+        assert_eq!(
+            (fb.width, fb.height),
+            (1600, 1200),
+            "framebuffer is the logical viewport x backing scale"
+        );
+
+        // CSS px is invariant to the backing scale — same values as the scale-1 test above. This is
+        // driven by the engine's per-instance `scale`, so it's deterministic. (We deliberately don't
+        // assert `window.innerWidth`/`devicePixelRatio` here: those read process-global display
+        // metrics that other tests sharing the process clobber under parallel execution.)
+        let wh = e.console_eval(
+            "var r = document.querySelector('div').getBoundingClientRect(); r.width + 'x' + r.height",
+        );
+        assert_eq!(wh, "200x80", "getBoundingClientRect stays in CSS px on Retina");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn hit_testing_apis_element_and_caret_from_point() {
         // A div with an explicit 200x80 box flush at the top-left. The engine lays it out and seeds
         // the JS session's rect table, so the hit-testing APIs resolve against real geometry.
