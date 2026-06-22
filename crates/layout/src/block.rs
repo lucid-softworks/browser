@@ -232,7 +232,7 @@ pub(crate) fn layout_block(
     resolve_out_of_flow(boxx, resolve_ctx, styles, measurer);
 
     // Apply a `position: relative` offset (after normal flow, without affecting siblings).
-    apply_relative_offset(boxx, styles);
+    apply_relative_offset(boxx, containing, styles);
 }
 
 /// Lay out a block's block-level children top-to-bottom. Returns the total content height
@@ -338,6 +338,17 @@ pub(crate) fn layout_out_of_flow(
     let horizontal =
         margin.left + margin.right + border.left + border.right + padding.left + padding.right;
 
+    // Resolve insets against the containing block. Percentage (and percentage-bearing `calc()`)
+    // insets can't be resolved at cascade time because their basis — the containing block's
+    // extent on the relevant axis — isn't known until now, so they're carried symbolically in
+    // `*_spec` and resolved here: left/right against `cb.width`, top/bottom against `cb.height`.
+    // Fall back to the pre-resolved px field for any path that set only it (e.g. the `inset`
+    // shorthand, which stores absolute lengths directly without a spec).
+    let inset_left = cs.left_spec.resolve_px(cb.width).or(cs.left);
+    let inset_right = cs.right_spec.resolve_px(cb.width).or(cs.right);
+    let inset_top = cs.top_spec.resolve_px(cb.height).or(cs.top);
+    let inset_bottom = cs.bottom_spec.resolve_px(cb.height).or(cs.bottom);
+
     // Content width:
     //   * explicit `width` wins;
     //   * `left` AND `right` both set with no width => stretch to fill between them;
@@ -346,7 +357,7 @@ pub(crate) fn layout_out_of_flow(
     //     border), so we strip the box's own horizontal padding/border back off to get content.
     let content_width = if let Some(w) = cs.width {
         w
-    } else if let (Some(l), Some(r)) = (cs.left, cs.right) {
+    } else if let (Some(l), Some(r)) = (inset_left, inset_right) {
         (cb.width - l - r - horizontal).max(0.0)
     } else {
         let intrinsic = intrinsic_width(boxx, styles, measurer);
@@ -361,7 +372,7 @@ pub(crate) fn layout_out_of_flow(
     // Over-constrained box (left, right AND width all set) with auto margin(s): the leftover inline
     // space goes to the auto margin(s) (CSS 2.2 §10.3.7) — centering when both are auto. Otherwise
     // auto margins stay 0 (the style crate already resolved them so).
-    if let (Some(l), Some(r)) = (cs.left, cs.right) {
+    if let (Some(l), Some(r)) = (inset_left, inset_right) {
         if cs.width.is_some() && (cs.margin_auto[1] || cs.margin_auto[3]) {
             let free = cb.width
                 - l
@@ -379,16 +390,16 @@ pub(crate) fn layout_out_of_flow(
 
     // Tentative content origin: relative to the containing block's top-left, offset by insets.
     // The insets address the box's *margin* box edge; we then add the box's own left/top edges.
-    let border_left_x = if let Some(l) = cs.left {
+    let border_left_x = if let Some(l) = inset_left {
         cb.x + l + margin.left
-    } else if let Some(r) = cs.right {
+    } else if let Some(r) = inset_right {
         cb.x + cb.width - r - (content_width + horizontal) + margin.left
     } else {
         cb.x
     };
-    let border_top_y = if let Some(t) = cs.top {
+    let border_top_y = if let Some(t) = inset_top {
         cb.y + t
-    } else if let Some(b) = cs.bottom {
+    } else if let Some(b) = inset_bottom {
         cb.y + cb.height - b // adjusted after height is known below
     } else {
         cb.y
@@ -438,8 +449,8 @@ pub(crate) fn layout_out_of_flow(
     boxx.dimensions.content.height = final_height;
 
     // If positioned by `bottom` (no `top`), re-anchor now that height is known.
-    if cs.top.is_none() {
-        if let Some(b) = cs.bottom {
+    if inset_top.is_none() {
+        if let Some(b) = inset_bottom {
             let new_border_top = cb.y + cb.height
                 - b
                 - (final_height
@@ -461,8 +472,8 @@ pub(crate) fn layout_out_of_flow(
     // (the parent's content-box top-left) instead of the laid-out (cb-origin) position.
     let mb = boxx.dimensions.margin_box();
     let (vert_auto, horiz_auto) = (
-        (cs.top.is_none() && cs.bottom.is_none()),
-        (cs.left.is_none() && cs.right.is_none()),
+        (inset_top.is_none() && inset_bottom.is_none()),
+        (inset_left.is_none() && inset_right.is_none()),
     );
     // Vertical: margin-box top relative to cb top (or static origin when both auto).
     let mb_top = if vert_auto { parent_content.y } else { mb.y };
@@ -486,6 +497,7 @@ pub(crate) fn layout_out_of_flow(
 /// (left/right, top/bottom) insets, without affecting siblings.
 pub(crate) fn apply_relative_offset(
     boxx: &mut LayoutBox,
+    containing: Rect,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) {
     let cs = match style_of(boxx, styles) {
@@ -495,16 +507,19 @@ pub(crate) fn apply_relative_offset(
     if cs.position != style::Position::Relative {
         return;
     }
-    let dx = if let Some(l) = cs.left {
+    // Percentage insets resolve against the containing block (width for left/right, height for
+    // top/bottom); `*_spec` carries them symbolically until now. Fall back to the pre-resolved px
+    // field for any path that set only it (e.g. the `inset` shorthand).
+    let dx = if let Some(l) = cs.left_spec.resolve_px(containing.width).or(cs.left) {
         l
-    } else if let Some(r) = cs.right {
+    } else if let Some(r) = cs.right_spec.resolve_px(containing.width).or(cs.right) {
         -r
     } else {
         0.0
     };
-    let dy = if let Some(t) = cs.top {
+    let dy = if let Some(t) = cs.top_spec.resolve_px(containing.height).or(cs.top) {
         t
-    } else if let Some(b) = cs.bottom {
+    } else if let Some(b) = cs.bottom_spec.resolve_px(containing.height).or(cs.bottom) {
         -b
     } else {
         0.0

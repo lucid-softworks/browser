@@ -1135,6 +1135,95 @@ mod tests {
     }
 
     #[test]
+    fn absolute_percentage_insets_resolve_against_containing_block() {
+        // Regression (wikipedia.org central language ring): an absolutely-positioned child with
+        // percentage `top`/`left` must anchor at that fraction of the positioned ancestor's
+        // padding box — not collapse to its top-left because the percentage was dropped.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let cb = doc.append_element(body, "div");
+        let item = doc.append_element(cb, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            cb,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Relative,
+                width: Some(400.0),
+                height: Some(200.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            item,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Absolute,
+                width: Some(50.0),
+                top_spec: style::InsetValue::Percent(20.0),
+                left_spec: style::InsetValue::Percent(75.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(cb)).unwrap();
+        let ibox = find_box(&root_box, &|x| x.node == Some(item)).unwrap();
+        let pad = pbox.dimensions.padding_box();
+        let c = ibox.dimensions.content;
+
+        // top: 20% of 200 = 40px below the padding-box top.
+        assert!((c.y - (pad.y + 40.0)).abs() < 0.01, "c.y={} pad.y={}", c.y, pad.y);
+        // left: 75% of 400 = 300px right of the padding-box left.
+        assert!((c.x - (pad.x + 300.0)).abs() < 0.01, "c.x={} pad.x={}", c.x, pad.x);
+    }
+
+    #[test]
+    fn relative_percentage_offset_resolves_against_containing_block() {
+        // `position: relative` with a percentage offset shifts by that fraction of the containing
+        // block (width for left, height for top).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let outer = doc.append_element(body, "div");
+        let inner = doc.append_element(outer, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            outer,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                width: Some(200.0),
+                height: Some(100.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            inner,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Relative,
+                height: Some(10.0),
+                left_spec: style::InsetValue::Percent(10.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox = find_box(&root_box, &|x| x.node == Some(inner)).unwrap();
+        // left: 10% of the 200px-wide containing block = 20px to the right of the normal-flow x.
+        assert!((ibox.dimensions.content.x - 20.0).abs() < 0.01, "x={}", ibox.dimensions.content.x);
+    }
+
+    #[test]
     fn absolute_bottom_anchors_near_parent_bottom() {
         let mut doc = dom::Document::new();
         let root = doc.root();
