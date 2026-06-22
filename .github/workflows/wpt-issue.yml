@@ -32,6 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
+      # This job never checks out the repo, so gh can't infer the target repository from a git remote
+      # (it would fail with "fatal: not a git repository"). Point gh at the repo explicitly.
+      GH_REPO: ${{ github.repository }}
       ISSUE: 40
       RUN_URL: ${{ github.event.workflow_run.html_url }}
     steps:
