@@ -1976,6 +1976,65 @@ mod tests {
     }
 
     #[test]
+    fn static_range_constructor_stores_boundary_points() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var div = document.createElement("div");
+                div.append("abc", document.createElement("span"), "ghi");
+                document.body.appendChild(div);
+                var text = div.firstChild;
+                var range = new StaticRange({
+                    startContainer: div,
+                    startOffset: 1,
+                    endContainer: text,
+                    endOffset: 20
+                });
+                var collapsed = new StaticRange({
+                    startContainer: div,
+                    startOffset: 0,
+                    endContainer: div,
+                    endOffset: 0
+                });
+                var errors = [];
+                function capture(fn) {
+                    try { fn(); errors.push("none"); }
+                    catch (e) { errors.push(e.name + ":" + (e instanceof DOMException)); }
+                }
+                capture(function () { new StaticRange(); });
+                capture(function () { new StaticRange({ startOffset: 0, endContainer: div, endOffset: 0 }); });
+                capture(function () {
+                    var dt = document.implementation.createDocumentType("html", "", "");
+                    new StaticRange({ startContainer: dt, startOffset: 0, endContainer: div, endOffset: 0 });
+                });
+                capture(function () {
+                    var attr = document.createAttribute("id");
+                    new StaticRange({ startContainer: attr, startOffset: 0, endContainer: attr, endOffset: 0 });
+                });
+                [
+                    range instanceof StaticRange,
+                    range instanceof AbstractRange,
+                    range.startContainer === div,
+                    range.startOffset,
+                    range.endContainer === text,
+                    range.endOffset,
+                    range.collapsed,
+                    collapsed.collapsed,
+                    errors.join("|")
+                ].join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true,true,true,1,true,20,false,true,TypeError:false|TypeError:false|InvalidNodeTypeError:true|InvalidNodeTypeError:true")
+        );
+    }
+
+    #[test]
     fn parsed_doctype_is_document_doctype() {
         // The parser produces a DocumentType node named "html" for `<!DOCTYPE html>`.
         let doc = html::parse("<!DOCTYPE html><html><head></head><body></body></html>");

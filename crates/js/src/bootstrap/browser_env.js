@@ -6968,6 +6968,62 @@
     while (c >= 0) { if (aChain[c]) { return __nodeFor(c); } c = __parent(c); }
     return this._sc;
   }, enumerable: true, configurable: true });
+  function __boundaryNodeType(node) {
+    var id = __idOf(node);
+    if (id >= 0) { return __nodeType(id); }
+    return (node && typeof node.nodeType === "number") ? node.nodeType : -1;
+  }
+  function StaticRange(init) {
+    if (!(this instanceof StaticRange)) { throw new TypeError("Constructor StaticRange requires 'new'."); }
+    if (arguments.length < 1 || init == null) {
+      throw new TypeError("Failed to construct 'StaticRange': 1 argument required.");
+    }
+    var dict = Object(init);
+    function required(name) {
+      if (!(name in dict) || dict[name] === undefined) {
+        throw new TypeError("Failed to construct 'StaticRange': member '" + name + "' is required.");
+      }
+      return dict[name];
+    }
+    function boundaryNode(name) {
+      var node = required(name);
+      var t = __boundaryNodeType(node);
+      if (node == null || t < 0) {
+        throw new TypeError("Failed to construct 'StaticRange': member '" + name + "' is not of type 'Node'.");
+      }
+      if (t === 2 || t === 10) {
+        __invNodeType("StaticRange boundary containers cannot be Attr or DocumentType nodes.");
+      }
+      return node;
+    }
+    this._sc = boundaryNode("startContainer");
+    this._so = required("startOffset") >>> 0;
+    this._ec = boundaryNode("endContainer");
+    this._eo = required("endOffset") >>> 0;
+  }
+  StaticRange.prototype = Object.create(AbstractRangeProto);
+  StaticRange.prototype.constructor = StaticRange;
+  try {
+    Object.defineProperty(StaticRange.prototype, Symbol.toStringTag,
+      { value: "StaticRange", writable: false, enumerable: false, configurable: true });
+  } catch (e) {}
+  Object.defineProperty(StaticRange.prototype, "startContainer", { get: function () { return this._sc; }, enumerable: true, configurable: true });
+  Object.defineProperty(StaticRange.prototype, "endContainer", { get: function () { return this._ec; }, enumerable: true, configurable: true });
+  Object.defineProperty(StaticRange.prototype, "startOffset", { get: function () { return this._so; }, enumerable: true, configurable: true });
+  Object.defineProperty(StaticRange.prototype, "endOffset", { get: function () { return this._eo; }, enumerable: true, configurable: true });
+  Object.defineProperty(StaticRange.prototype, "collapsed", { get: function () { return this._sc === this._ec && this._so === this._eo; }, enumerable: true, configurable: true });
+  Object.defineProperty(StaticRange.prototype, "commonAncestorContainer", { get: function () {
+    if (this._sc === this._ec) { return this._sc; }
+    var aId = __idOf(this._sc), bId = __idOf(this._ec);
+    if (aId < 0) { return this._ec; }
+    if (bId < 0) { return this._sc; }
+    var aChain = {}; var c = aId;
+    while (c >= 0) { aChain[c] = true; c = __parent(c); }
+    c = bId;
+    while (c >= 0) { if (aChain[c]) { return __nodeFor(c); } c = __parent(c); }
+    return this._sc;
+  }, enumerable: true, configurable: true });
+  def(globalThis, "StaticRange", StaticRange);
   Range.prototype.setStart = function (node, offset) {
     var off = __validBP(node, offset, "setStart");
     __setRangeStart(this, node, off);
