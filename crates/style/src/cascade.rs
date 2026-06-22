@@ -626,6 +626,8 @@ pub(crate) fn compute_element_style<'a>(
         display_block: false,
         display: Display::Inline,
         position: Position::Static,
+        float: Float::None,
+        clear: Clear::None,
         top: None,
         right: None,
         bottom: None,
@@ -993,6 +995,17 @@ pub(crate) fn compute_element_style<'a>(
     });
     if !display_was_set && style.display == Display::Inline && is_block_tag(&el.tag) {
         style.display = Display::Block;
+    }
+    // A floated box is blockified (CSS 2.2 §9.7): a non-`none` `float` forces inline-level displays
+    // to block so it lays out as a block-level float. (Absolute/fixed override float, handled below.)
+    if style.float != Float::None && matches!(style.display, Display::Inline | Display::InlineBlock)
+    {
+        style.display = Display::Block;
+    }
+    // `float` has no effect on absolutely positioned boxes (CSS 2.2 §9.7): `position:absolute`/
+    // `fixed` wins and the box is taken out of flow, not floated.
+    if matches!(style.position, Position::Absolute | Position::Fixed) {
+        style.float = Float::None;
     }
     if parent_hidden {
         style.display = Display::None;

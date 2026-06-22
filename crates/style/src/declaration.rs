@@ -548,6 +548,24 @@ pub(crate) fn apply_declaration(
             "sticky" => style.position = Position::Sticky,
             _ => {}
         },
+        "float" => match val.trim().to_ascii_lowercase().as_str() {
+            "none" => style.float = Float::None,
+            "left" => style.float = Float::Left,
+            "right" => style.float = Float::Right,
+            // `inline-start`/`inline-end` map per the (LTR) writing mode we assume.
+            "inline-start" => style.float = Float::Left,
+            "inline-end" => style.float = Float::Right,
+            _ => {}
+        },
+        "clear" => match val.trim().to_ascii_lowercase().as_str() {
+            "none" => style.clear = Clear::None,
+            "left" => style.clear = Clear::Left,
+            "right" => style.clear = Clear::Right,
+            "both" => style.clear = Clear::Both,
+            "inline-start" => style.clear = Clear::Left,
+            "inline-end" => style.clear = Clear::Right,
+            _ => {}
+        },
         // `overflow` (and the `-x`/`-y` longhands): we only need whether the box becomes a scroll
         // container (anything but `visible`), which is the containing block for `sticky` insets.
         "overflow" | "overflow-x" | "overflow-y" => {

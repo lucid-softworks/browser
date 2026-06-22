@@ -247,10 +247,45 @@ pub(crate) fn layout_block_children(
     let content = boxx.dimensions.content;
     let parent_align = text_align_of(boxx.node, styles);
     let mut cursor_y = content.y;
+    // Floats placed by this container (its own block formatting context). Empty for the common
+    // float-free page, in which case every helper below is a cheap no-op and the flow is unchanged.
+    let mut floats = FloatCtx::new(content.x, content.x + content.width);
     for child in &mut boxx.children {
         if is_out_of_flow(child, styles) {
             continue; // resolved separately; takes no space in flow
         }
+
+        let float = float_of(child, styles);
+        let clear = clear_of(child, styles);
+        // `clear` drops a box below the relevant earlier floats before it's placed.
+        let start_y = if floats.is_empty() {
+            cursor_y
+        } else {
+            floats.clear_to(clear, cursor_y)
+        };
+
+        if float != style::Float::None {
+            layout_float_child(
+                child,
+                content,
+                start_y,
+                float,
+                &mut floats,
+                ctx,
+                styles,
+                measurer,
+            );
+            // A float doesn't advance normal flow, but a `clear` on it still moves the pen down so
+            // following in-flow content starts below the cleared floats.
+            cursor_y = cursor_y.max(start_y);
+            continue;
+        }
+
+        // In-flow block: it stacks below previous siblings at the container's full content width.
+        // (Per CSS a block box keeps its full width beside floats — only its *line boxes* shorten,
+        // which inline layout handles separately; narrowing the box here would wrongly re-resolve a
+        // percentage `width` against the reduced band.)
+        cursor_y = start_y;
         // Each child's containing block is this box's content rect, but positioned so the
         // child stacks below previous siblings. We thread the running y via the containing
         // rect's y, and the child adds its own top margin/border/padding inside layout_block.
@@ -275,7 +310,56 @@ pub(crate) fn layout_block_children(
         }
         cursor_y += child.dimensions.margin_box().height;
     }
-    cursor_y - content.y
+    // The container must be tall enough to contain its floats (it owns their formatting context).
+    floats.max_bottom(cursor_y) - content.y
+}
+
+/// Lay out and place one floated child within `content` (the container's content rect), no higher
+/// than `start_y`. Sizes the float (explicit/percentage `width`, else shrink-to-fit), lays out its
+/// subtree, then positions its margin box via the [`FloatCtx`] (packing beside earlier floats and
+/// wrapping down when a row is full).
+#[allow(clippy::too_many_arguments)]
+fn layout_float_child(
+    child: &mut LayoutBox,
+    content: Rect,
+    start_y: f32,
+    side: style::Float,
+    floats: &mut FloatCtx,
+    ctx: Ctx,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    measurer: &dyn TextMeasurer,
+) {
+    // Hand `layout_block` a containing rect whose width makes it resolve the float's used width
+    // correctly, then reposition the result.
+    //   * explicit / percentage `width`: pass the container's FULL content width so `layout_block`'s
+    //     own `width` resolution matches (a percentage resolves against the containing block, not
+    //     the reduced float band — passing a narrowed width would apply the percentage twice).
+    //   * `auto` width: floats shrink-to-fit, which `layout_block` doesn't do, so pass a containing
+    //     width equal to the shrink-to-fit margin-box width and let it fill that.
+    let size_width = match resolved_width(child, styles, content.width) {
+        Some(_) => content.width,
+        None => {
+            let b = child.dimensions.border;
+            let p = child.dimensions.padding;
+            let m = child.dimensions.margin;
+            let own_edges = p.left + p.right + b.left + b.right;
+            let h_edges = own_edges + m.left + m.right;
+            let intrinsic = (intrinsic_width(child, styles, measurer) - own_edges).max(0.0);
+            let avail = (content.width - h_edges).max(0.0);
+            intrinsic.min(avail) + h_edges
+        }
+    };
+    let size_rc = Rect {
+        x: content.x,
+        y: start_y,
+        width: size_width,
+        height: 0.0,
+    };
+    grow_stack(|| layout_block(child, size_rc, ctx, styles, measurer));
+    let mb = child.dimensions.margin_box();
+    // Place the margin box and slide the whole subtree from its tentative origin to the slot.
+    let (fx, fy) = floats.place(mb.width, mb.height, start_y, side);
+    shift_subtree(child, fx - mb.x, fy - mb.y);
 }
 
 /// Position a replaced (image) box within `containing`. The content size was pre-computed at

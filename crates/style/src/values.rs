@@ -86,6 +86,25 @@ pub enum Position {
     Sticky,
 }
 
+/// CSS `float`. `none` = in normal flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Float {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+/// CSS `clear`: which side(s) a block moves below earlier floats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Clear {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
+}
+
 /// The *specified* value of an inset longhand (`top`/`right`/`bottom`/`left`), retained so the
 /// CSSOM "resolved value" algorithm can be applied at `getComputedStyle` time. Absolute lengths
 /// (incl. `em`/`rem`) are absolutized to px during the cascade; percentages and `calc()` mixing a
@@ -287,6 +306,10 @@ pub struct ComputedStyle {
     pub visibility: Visibility,
     /// CSS `position`. Not inherited.
     pub position: Position,
+    /// CSS `float`. Not inherited.
+    pub float: Float,
+    /// CSS `clear`. Not inherited.
+    pub clear: Clear,
     /// Inset `top` in px (`None` = auto). Percentages unsupported (stored as None).
     pub top: Option<f32>,
     pub right: Option<f32>,

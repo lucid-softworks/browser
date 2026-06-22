@@ -10,6 +10,7 @@ use std::collections::HashMap;
 mod block;
 mod build;
 mod flex;
+mod float;
 mod grid;
 mod inline;
 mod intrinsic;
@@ -19,6 +20,7 @@ mod types;
 
 pub(crate) use block::*;
 pub(crate) use build::*;
+pub(crate) use float::*;
 
 /// Run `f` with a guarantee of at least ~1 MiB of stack headroom, allocating a fresh stack segment
 /// if the current one is nearly exhausted. Wrap the per-level recursive call in the two layout
@@ -549,6 +551,129 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         assert_eq!(abox.dimensions.content.width, 200.0);
+    }
+
+    #[test]
+    fn floats_pack_left_to_right_then_wrap() {
+        // Three float:left divs of width 300 in an 800px body: two fit on the first row, the third
+        // wraps below. The container grows to contain them. (wikipedia.org footer project grid.)
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let a = doc.append_element(wrap, "div");
+        let b = doc.append_element(wrap, "div");
+        let c = doc.append_element(wrap, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(wrap, block_style(true));
+        let mut fl = |w: f32| style::ComputedStyle {
+            display: style::Display::Block,
+            display_block: true,
+            float: style::Float::Left,
+            width: Some(w),
+            height: Some(50.0),
+            ..Default::default()
+        };
+        styles.insert(a, fl(300.0));
+        styles.insert(b, fl(300.0));
+        styles.insert(c, fl(300.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ab = find_box(&root_box, &|x| x.node == Some(a))
+            .unwrap()
+            .dimensions
+            .content;
+        let bb = find_box(&root_box, &|x| x.node == Some(b))
+            .unwrap()
+            .dimensions
+            .content;
+        let cb = find_box(&root_box, &|x| x.node == Some(c))
+            .unwrap()
+            .dimensions
+            .content;
+        let wb = find_box(&root_box, &|x| x.node == Some(wrap))
+            .unwrap()
+            .dimensions
+            .content;
+
+        // a and b share the first row, packed left to right.
+        assert!((ab.y - bb.y).abs() < 0.01, "a.y={} b.y={}", ab.y, bb.y);
+        assert!(
+            bb.x > ab.x + 0.01,
+            "b should sit right of a: a.x={} b.x={}",
+            ab.x,
+            bb.x
+        );
+        // c doesn't fit (900 > 800) so it wraps to the next row, back at the left.
+        assert!(
+            cb.y > ab.y + 0.01,
+            "c should wrap below: a.y={} c.y={}",
+            ab.y,
+            cb.y
+        );
+        assert!(
+            (cb.x - ab.x).abs() < 0.01,
+            "c should align under a: a.x={} c.x={}",
+            ab.x,
+            cb.x
+        );
+        // The wrapper grew to contain both float rows (2 × 50).
+        assert!(wb.height >= 100.0 - 0.01, "wrapper height = {}", wb.height);
+    }
+
+    #[test]
+    fn clear_drops_block_below_floats() {
+        // A float:left followed by a clear:left block: the cleared block starts below the float.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let f = doc.append_element(wrap, "div");
+        let cleared = doc.append_element(wrap, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(wrap, block_style(true));
+        styles.insert(
+            f,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                float: style::Float::Left,
+                width: Some(100.0),
+                height: Some(80.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            cleared,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                clear: style::Clear::Left,
+                height: Some(20.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let fb = find_box(&root_box, &|x| x.node == Some(f))
+            .unwrap()
+            .dimensions
+            .content;
+        let cb = find_box(&root_box, &|x| x.node == Some(cleared))
+            .unwrap()
+            .dimensions
+            .content;
+        // The cleared block sits at or below the float's bottom edge.
+        assert!(
+            cb.y >= fb.y + fb.height - 0.01,
+            "cleared.y={} float.bottom={}",
+            cb.y,
+            fb.y + fb.height
+        );
     }
 
     #[test]

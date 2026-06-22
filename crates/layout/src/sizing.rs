@@ -222,6 +222,27 @@ pub(crate) fn is_out_of_flow(
     )
 }
 
+/// This box's `float` (defaults to `None`). The cascade already clears `float` on absolutely /
+/// fixed positioned boxes, so a non-`None` result here means a real, in-flow-affecting float.
+pub(crate) fn float_of(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> style::Float {
+    style_of(boxx, styles)
+        .map(|cs| cs.float)
+        .unwrap_or(style::Float::None)
+}
+
+/// This box's `clear` (defaults to `None`).
+pub(crate) fn clear_of(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> style::Clear {
+    style_of(boxx, styles)
+        .map(|cs| cs.clear)
+        .unwrap_or(style::Clear::None)
+}
+
 /// The text alignment of a box's node (defaults to Left).
 pub(crate) fn text_align_of(
     node: Option<dom::NodeId>,
