@@ -13814,6 +13814,105 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     def(globalThis, "Response", ResponseCtor);
   }
 
+  // --- Cache / CacheStorage (issue #56 stage 4) --------------------------------------------
+  // An in-memory CacheStorage exposed as `caches` on the window and (via the worker scope) the
+  // ServiceWorkerGlobalScope. Each Cache stores GET request/response pairs keyed by URL; add()/
+  // addAll() fetch then put(); match honours ignoreSearch/ignoreMethod. Responses are cloned in and
+  // out so a cached body is never consumed by a reader.
+  if (typeof globalThis.caches === "undefined") {
+    defClass("CacheStorage");
+    defClass("Cache");
+    var __cacheStore = Object.create(null); // name -> Cache instance, in insertion order via keys()
+    function __cacheBase() { try { return globalThis.location.href; } catch (e) { return undefined; } }
+    function __cacheReqUrl(input) {
+      if (input && typeof input === "object" && input.url != null) { return String(input.url); }
+      try { return (new globalThis.URL(String(input), __cacheBase())).href; } catch (e) { return String(input); }
+    }
+    function __cacheReqMethod(input) {
+      return (input && typeof input === "object" && input.method) ? String(input.method).toUpperCase() : "GET";
+    }
+    function __cacheClone(response) {
+      return (response && typeof response.clone === "function") ? response.clone() : response;
+    }
+    function __makeCache() {
+      var cache = Object.create(globalThis.Cache.prototype);
+      var entries = []; // { url, response }
+      function key(url, opts) { return (opts && opts.ignoreSearch) ? url.split("?")[0] : url; }
+      function findIndex(input, opts) {
+        if (!(opts && opts.ignoreMethod) && __cacheReqMethod(input) !== "GET") { return -1; }
+        var target = key(__cacheReqUrl(input), opts);
+        for (var i = 0; i < entries.length; i++) { if (key(entries[i].url, opts) === target) { return i; } }
+        return -1;
+      }
+      def(cache, "match", function (input, opts) {
+        var i = findIndex(input, opts);
+        return Promise.resolve(i >= 0 ? __cacheClone(entries[i].response) : undefined);
+      });
+      def(cache, "matchAll", function (input, opts) {
+        if (input === undefined) { return Promise.resolve(entries.map(function (e) { return __cacheClone(e.response); })); }
+        var i = findIndex(input, opts);
+        return Promise.resolve(i >= 0 ? [__cacheClone(entries[i].response)] : []);
+      });
+      def(cache, "put", function (request, response) {
+        if (__cacheReqMethod(request) !== "GET") { return Promise.reject(new TypeError("Cache.put: only GET requests can be cached.")); }
+        if (!response) { return Promise.reject(new TypeError("Cache.put: response required.")); }
+        if (response.status === 206) { return Promise.reject(new TypeError("Cache.put: a 206 Partial Content response cannot be cached.")); }
+        if (response.type === "error") { return Promise.reject(new TypeError("Cache.put: a network-error response cannot be cached.")); }
+        var url = __cacheReqUrl(request);
+        var rec = { url: url, response: __cacheClone(response) };
+        var idx = -1;
+        for (var i = 0; i < entries.length; i++) { if (entries[i].url === url) { idx = i; break; } }
+        if (idx >= 0) { entries[idx] = rec; } else { entries.push(rec); }
+        return Promise.resolve();
+      });
+      def(cache, "add", function (request) { return cache.addAll([request]); });
+      def(cache, "addAll", function (requests) {
+        var reqs = Array.prototype.slice.call(requests || []);
+        return Promise.all(reqs.map(function (r) {
+          if (__cacheReqMethod(r) !== "GET") { return Promise.reject(new TypeError("Cache.addAll: only GET requests can be cached.")); }
+          return globalThis.fetch(r).then(function (resp) {
+            if (!resp || !resp.ok) { throw new TypeError("Cache.addAll: request for '" + __cacheReqUrl(r) + "' failed (status " + (resp && resp.status) + ")."); }
+            return cache.put(r, resp);
+          });
+        })).then(function () { return undefined; });
+      });
+      def(cache, "delete", function (input, opts) {
+        var i = findIndex(input, opts);
+        if (i >= 0) { entries.splice(i, 1); return Promise.resolve(true); }
+        return Promise.resolve(false);
+      });
+      def(cache, "keys", function (input, opts) {
+        var list;
+        if (input === undefined) { list = entries; }
+        else { var i = findIndex(input, opts); list = i >= 0 ? [entries[i]] : []; }
+        return Promise.resolve(list.map(function (e) { try { return new globalThis.Request(e.url); } catch (x) { return { url: e.url, method: "GET" }; } }));
+      });
+      return cache;
+    }
+    var __cacheStorage = Object.create(globalThis.CacheStorage.prototype);
+    def(__cacheStorage, "open", function (name) { name = String(name); if (!__cacheStore[name]) { __cacheStore[name] = __makeCache(); } return Promise.resolve(__cacheStore[name]); });
+    def(__cacheStorage, "has", function (name) { return Promise.resolve(Object.prototype.hasOwnProperty.call(__cacheStore, String(name))); });
+    def(__cacheStorage, "delete", function (name) {
+      name = String(name);
+      if (Object.prototype.hasOwnProperty.call(__cacheStore, name)) { delete __cacheStore[name]; return Promise.resolve(true); }
+      return Promise.resolve(false);
+    });
+    def(__cacheStorage, "keys", function () { return Promise.resolve(Object.keys(__cacheStore)); });
+    def(__cacheStorage, "match", function (request, opts) {
+      opts = opts || {};
+      var names = opts.cacheName ? [opts.cacheName] : Object.keys(__cacheStore);
+      var i = 0;
+      function tryNext() {
+        if (i >= names.length) { return Promise.resolve(undefined); }
+        var c = __cacheStore[names[i++]];
+        if (!c) { return tryNext(); }
+        return c.match(request, opts).then(function (r) { return r !== undefined ? r : tryNext(); });
+      }
+      return tryNext();
+    });
+    def(globalThis, "caches", __cacheStorage);
+  }
+
   // --- URLSearchParams ---------------------------------------------------------------------
   if (typeof globalThis.URLSearchParams !== "function") {
     def(globalThis, "URLSearchParams", function (init) {
@@ -19245,6 +19344,44 @@ mod tests {
         assert_eq!(
             attr_of(&doc, body, "data-xorigin").as_deref(),
             Some("SecurityError")
+        );
+    }
+
+    #[test]
+    fn cache_storage_put_match_keys_delete() {
+        // CacheStorage/Cache: open a cache, put a Response, match it back (body intact via clone),
+        // enumerate keys, then delete. Exercised on the window global (also exposed in workers).
+        let (doc, body) = doc_with_body("");
+        let (doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var b = document.body;
+              caches.open('v1').then(function (c) {
+                return c.put(new Request('https://x/a'), new Response('hello'))
+                  .then(function () { return c.match('https://x/a'); })
+                  .then(function (r) { return r.text(); })
+                  .then(function (t) { b.setAttribute('data-match', t); })
+                  .then(function () { return c.keys(); })
+                  .then(function (keys) { b.setAttribute('data-keys', keys.length + ':' + keys[0].url); })
+                  .then(function () { return caches.has('v1'); })
+                  .then(function (h) { b.setAttribute('data-has', String(h)); })
+                  .then(function () { return c.delete('https://x/a'); })
+                  .then(function (d) { return c.match('https://x/a').then(function (m) { b.setAttribute('data-deleted', d + ':' + (m === undefined)); }); });
+              });
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert_eq!(attr_of(&doc, body, "data-match").as_deref(), Some("hello"));
+        assert_eq!(
+            attr_of(&doc, body, "data-keys").as_deref(),
+            Some("1:https://x/a")
+        );
+        assert_eq!(attr_of(&doc, body, "data-has").as_deref(), Some("true"));
+        assert_eq!(
+            attr_of(&doc, body, "data-deleted").as_deref(),
+            Some("true:true")
         );
     }
 
