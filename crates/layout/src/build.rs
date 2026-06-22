@@ -293,6 +293,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         vertical_align: cs.vertical_align,
         white_space: cs.white_space,
         opacity: cs.opacity,
+        visible: cs.visibility == style::Visibility::Visible,
         letter_spacing: cs.letter_spacing,
         line_height: cs.line_height,
         // Only allocate the extras box when the element actually has a gradient/shadow/transform/

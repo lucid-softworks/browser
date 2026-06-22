@@ -81,6 +81,11 @@ pub struct PaintStyle {
     /// Per-box opacity (0.0..=1.0); the painter multiplies painted alpha by this (and threads it
     /// to the subtree). 1.0 = fully opaque.
     pub opacity: f32,
+    /// `visibility: visible`. `false` for `hidden`/`collapse`: the box keeps its layout box but the
+    /// painter skips its own content (background, border, text, image). Because `visibility`
+    /// inherits, descendants are `false` too unless one opts back in with `visibility: visible` —
+    /// so the painter still recurses into children rather than culling the subtree.
+    pub visible: bool,
     /// Extra px advance added per character (`letter-spacing`). Painter uses it to space glyphs.
     pub letter_spacing: f32,
     /// Resolved `line-height` in px (`None` = use the font metric). Drives inline line advance.
@@ -127,6 +132,7 @@ impl Default for PaintStyle {
             vertical_align: style::VerticalAlign::Baseline,
             white_space: style::WhiteSpace::Normal,
             opacity: 1.0,
+            visible: true,
             letter_spacing: 0.0,
             line_height: None,
             extras: None,

@@ -206,7 +206,10 @@ pub(crate) fn paint_box_opacity(
         return;
     }
 
-    if !offscreen && opacity > 0.0 {
+    // `visibility: hidden`/`collapse` keeps the box in layout (so children still position and the
+    // run counter still advances below) but paints none of its OWN content. Children are recursed
+    // regardless — `visibility` inherits, but a descendant can opt back in with `visibility: visible`.
+    if !offscreen && opacity > 0.0 && b.style.visible {
         // (0) OUTER box-shadows: painted BEFORE the background so the box sits on top.
         if let Some(ex) = extras {
             for sh in &ex.box_shadows {
