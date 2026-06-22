@@ -1,0 +1,20 @@
+# Single source of truth for which WPT areas the conformance suite runs and reports on.
+#
+# One area per line, a path relative to the wpt repo root, in canonical display order — the order
+# the PR comment table (wpt.yml) and the tracker-issue table (wpt-issue.yml) render rows in. Both
+# those workflows and wpt.yml's run matrix read this file, so adding a line here is all it takes to
+# wire a new area into every place at once. Blank lines and `#` comments are ignored.
+#
+# The artifact slug for each area is derived by replacing `/` with `-` (artifact names can't contain
+# `/`); there's nothing to keep in sync by hand.
+#
+# css/cssom, dom, domparsing, url are quick; html/dom is large and dominates wall-clock; fetch and
+# service-workers are mostly network/worker-dependent (a chunk needs cross-origin or server-side
+# infra the in-process runner can't provide). All exclude tentative tests (skipped by the runner).
+css/cssom
+dom
+domparsing
+html/dom
+url
+fetch
+service-workers

@@ -5,9 +5,9 @@ name: WPT issue update
 #
 # Like wpt-comment.yml, this is a separate workflow_run handler rather than a job inside wpt.yml: it
 # keeps wpt.yml itself read-only (it runs on `pull_request`, where fork PRs get a read-only token) and
-# isolates the write permission to a workflow that never checks out PR code. It only downloads the
-# prebuilt per-area TSVs produced by wpt.yml and edits the issue body, so granting `issues: write` here
-# is safe.
+# isolates the write permission to a workflow that never runs PR code. It downloads the prebuilt
+# per-area TSVs produced by wpt.yml, sparse-checks-out only the shared area list (from main — the job
+# is gated to push-to-main runs), and edits the issue body, so granting `issues: write` here is safe.
 on:
   workflow_run:
     workflows: [WPT]
@@ -38,8 +38,17 @@ jobs:
       ISSUE: 40
       RUN_URL: ${{ github.event.workflow_run.html_url }}
     steps:
+      # The shared area list (canonical row order) lives in the repo, not the artifacts; sparse-check
+      # out just that one file from the main commit that triggered this run. Must precede the artifact
+      # download — checkout cleans the workspace.
+      - name: Check out area list
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          sparse-checkout: .github/wpt-areas.txt
+          sparse-checkout-cone-mode: false
       # The per-leg artifacts uploaded by wpt.yml's matrix; each holds a one-line TSV (dir, pass,
-      # total, pct). merge-multiple flattens all six into one directory.
+      # total, pct). merge-multiple flattens them all into one directory.
       - name: Download WPT results
         uses: actions/download-artifact@v4
         with:
@@ -52,8 +61,8 @@ jobs:
       - name: Build pass-rates table
         run: |
           rows=""; tp=0; tt=0; missing=0
-          # Canonical display order, matching the issue's existing table.
-          for dir in css/cssom dom domparsing html/dom url fetch service-workers; do
+          # Canonical display order from the shared area list, matching the PR comment and the matrix.
+          for dir in $(grep -vE '^\s*(#|$)' .github/wpt-areas.txt); do
             slug="${dir//\//-}"
             f="artifacts/${slug}.tsv"
             if [ ! -f "$f" ]; then missing=1; continue; fi

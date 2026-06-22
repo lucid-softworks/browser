@@ -33,11 +33,33 @@ permissions:
   contents: read
 
 jobs:
+  # Build the run matrix from .github/wpt-areas.txt — the single source of truth for which areas the
+  # suite covers — so the matrix, the PR-comment table, and the tracker-issue table can't drift. Each
+  # line becomes a {dir, slug} pair; slug mirrors dir with `/` → `-` (artifact names can't contain
+  # `/`). See that file for the per-area notes.
+  areas:
+    name: areas
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/wpt-areas.txt
+          sparse-checkout-cone-mode: false
+      - id: gen
+        run: |
+          matrix=$(grep -vE '^\s*(#|$)' .github/wpt-areas.txt | while read -r dir; do
+            printf '{"dir":"%s","slug":"%s"}\n' "$dir" "${dir//\//-}"
+          done | jq -s -c '{include: .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   # Each WPT area runs on its own runner in parallel. html/dom dominates wall-clock; fanning the
   # areas out means the suite finishes in ~max(area) instead of ~sum(area). Each leg emits a
   # one-line TSV (dir, pass, total, pct) + its HTML report + a live-streamed .log; the `report`
   # job stitches them together.
   wpt:
+    needs: areas
     name: wpt (${{ matrix.dir }})
     runs-on: ubuntu-latest
     # A buggy engine can drive a WPT test into an infinite loop inside a single tick() — the
@@ -46,20 +68,7 @@ jobs:
     timeout-minutes: 15
     strategy:
       fail-fast: false
-      matrix:
-        # slug mirrors dir with `/` → `-`; used for unique artifact names (artifact names can't
-        # contain `/`). css/cssom, dom, domparsing, url are quick; html/dom is large; fetch and
-        # service-workers are mostly network/worker-dependent (a chunk needs cross-origin or
-        # server-side infra the in-process runner can't provide). All exclude tentative tests
-        # (skipped by the runner).
-        include:
-          - { dir: css/cssom, slug: css-cssom }
-          - { dir: dom,       slug: dom }
-          - { dir: domparsing, slug: domparsing }
-          - { dir: html/dom,  slug: html-dom }
-          - { dir: url,       slug: url }
-          - { dir: fetch,     slug: fetch }
-          - { dir: service-workers, slug: service-workers }
+      matrix: ${{ fromJSON(needs.areas.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -111,10 +120,16 @@ jobs:
   # Collect every leg's TSV + HTML + log, build the combined table, and post the single sticky
   # comment. Runs even if some legs fail (fail-fast is off) so partial results still surface.
   report:
-    needs: wpt
+    needs: [areas, wpt]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # First, before anything writes to the workspace: checkout cleans it, so the artifact download
+      # and baseline restore below must come after. We only need the canonical area list.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/wpt-areas.txt
+          sparse-checkout-cone-mode: false
       - name: Download all results
         uses: actions/download-artifact@v4
         with:
@@ -139,8 +154,8 @@ jobs:
           # Render the signed change in passing subtests vs the baseline; ±0 for no change, — if the
           # area has no baseline yet.
           fmt() { if [ "$1" -gt 0 ]; then echo "+$1"; elif [ "$1" -lt 0 ]; then echo "$1"; else echo "±0"; fi; }
-          # Canonical display order, independent of which legs finished.
-          for dir in css/cssom dom domparsing html/dom url fetch; do
+          # Canonical display order from the shared area list, independent of which legs finished.
+          for dir in $(grep -vE '^\s*(#|$)' .github/wpt-areas.txt); do
             slug="${dir//\//-}"
             f="artifacts/${slug}.tsv"
             [ -f "$f" ] || continue
