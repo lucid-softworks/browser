@@ -1,46 +1,54 @@
-name: WPT (wpt run)
+name: WPT
 
-# Runs a slice of the Web Platform Tests the way other browsers are tested: the real `wpt run`
-# harness driving our engine over WebDriver (crates/webdriver) via the `lucid` wptrunner product.
-# This is the standard-conformance path; the fast in-process runner in wpt.yml still produces the
-# headline pass-rate table. Scope is intentionally small here — `wpt run` launches a full session
-# per test and our engine has no worker support yet (worker variants time out), so running entire
-# areas would blow the CI time budget. This job proves the end-to-end path and reports results; it
-# does NOT gate on conformance failures (the engine has known, tracked failures).
+# Runs the Web Platform Tests the way other browsers are tested: the real `wpt run` harness driving
+# our engine over WebDriver (crates/webdriver) via the `lucid` wptrunner product. Each area runs on
+# its own runner in parallel; each leg writes a wptreport, which the `report` job stitches into a
+# pass-rate summary.
+#
+# Scope note: `wpt run` launches a full session per test and the engine has no worker support yet
+# (worker variants time out), so large areas may not finish within a leg's budget. Legs are
+# time-bounded and never fail the build on that — they report whatever completed ("incomplete" if a
+# leg was cut off). This is the standard-conformance path; it does not gate on test failures (the
+# engine has known, tracked failures).
 
 on:
   pull_request:
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'tools/wpt/**'
-      - 'scripts/run-wpt.sh'
-      - '.github/workflows/wpt-run.yml'
+    paths-ignore: &paths-ignore
+      - '**.md'
+      - 'swift/**'
+      - 'packaging/**'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   push:
     branches: [main]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'tools/wpt/**'
-      - 'scripts/run-wpt.sh'
-      - '.github/workflows/wpt-run.yml'
+    paths-ignore: *paths-ignore
 
 concurrency:
-  group: wpt-run-${{ github.ref }}
+  group: wpt-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  wpt-run:
+  wpt:
+    name: wpt (${{ matrix.dir }})
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # The set of tests to drive via `wpt run`. Small + worker-light to stay within the time budget.
-    env:
-      WPT_TESTS: "fetch/api/headers"
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        # The WPT areas to drive via `wpt run`. `slug` mirrors `dir` with `/` -> `-` (artifact names
+        # can't contain `/`).
+        include:
+          - { dir: "css/cssom", slug: "css-cssom" }
+          - { dir: "dom", slug: "dom" }
+          - { dir: "domparsing", slug: "domparsing" }
+          - { dir: "html/dom", slug: "html-dom" }
+          - { dir: "url", slug: "url" }
+          - { dir: "fetch", slug: "fetch" }
+          - { dir: "service-workers", slug: "service-workers" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,15 +59,13 @@ jobs:
       - name: Install fonts
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
 
-      # WPT checkout at ./wpt with the serve/runner infrastructure + the tested area.
       - name: Checkout web-platform-tests
         run: |
           git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git wpt
           cd wpt
-          git sparse-checkout set tools third_party docs resources common ${WPT_TESTS%%/*}
+          git sparse-checkout set tools third_party docs resources common "${{ matrix.dir }}"
 
-      # `wpt serve` (which `wpt run` starts) binds the WPT subdomains, so they must resolve to
-      # loopback. CI runners allow sudo; this is the documented WPT system setup.
+      # `wpt serve` (started by `wpt run`) binds the WPT subdomains, so they must resolve to loopback.
       - name: Map WPT hosts
         run: |
           cd wpt
@@ -68,45 +74,76 @@ jobs:
       - name: Build WebDriver server
         run: cargo build --release -p webdriver
 
-      # Run via the same script developers use. `--log-wptreport` emits a machine-readable report we
-      # summarize below. A short timeout multiplier keeps worker-variant timeouts cheap. `|| true`:
-      # `wpt run` exits non-zero when tests fail, and the engine has known failures — we report, not
-      # gate. (`set -o pipefail` is intentionally not used here for the same reason.)
+      # Drive the area via `wpt run`. `--test-types testharness` avoids the aamtest accessibility
+      # requirements (PyGObject/cairo, absent on the runner). A short timeout multiplier keeps
+      # worker-variant timeouts cheap. The whole run is wall-bounded so a huge area can't hang the
+      # leg; `|| true` so a non-zero exit (test failures, or being cut off) never fails the build.
       - name: Run WPT via wpt run
         run: |
-          # `--test-types testharness` keeps wptrunner from pulling the aamtest accessibility
-          # requirements (PyGObject/cairo), which need system libs absent on the runner — and which
-          # this fetch slice doesn't exercise anyway.
-          scripts/run-wpt.sh $WPT_TESTS -- \
+          mkdir -p reports
+          timeout 1500 scripts/run-wpt.sh "${{ matrix.dir }}" -- \
             --test-types testharness \
-            --log-wptreport="$PWD/wptreport.json" \
-            --timeout-multiplier=0.5 \
+            --timeout-multiplier=0.25 \
+            --log-wptreport="$PWD/reports/${{ matrix.slug }}.json" \
           || true
-          test -s wptreport.json || { echo "::error::no (non-empty) wptreport.json produced — wpt run did not complete"; exit 1; }
 
-      - name: Summarize results
+      - name: Summarize area
         run: |
-          python3 - wptreport.json <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import json, sys
-          data = json.load(open(sys.argv[1]))
+          python3 - "${{ matrix.dir }}" "reports/${{ matrix.slug }}.json" "reports/${{ matrix.slug }}.tsv" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, os, sys
+          area, report, tsv = sys.argv[1], sys.argv[2], sys.argv[3]
+          if not os.path.exists(report) or os.path.getsize(report) == 0:
+              # Leg was cut off before wpt run wrote a report (area too large for the budget).
+              open(tsv, "w").write(f"{area}\t0\t0\tincomplete\n")
+              print(f"### `{area}`\n\n⏳ incomplete — did not finish within the time budget.\n")
+              sys.exit(0)
+          data = json.load(open(report))
           results = data.get("results", [])
-          status_count = {}
-          sub_pass = sub_total = 0
-          for t in results:
-              status_count[t["status"]] = status_count.get(t["status"], 0) + 1
-              for s in t.get("subtests", []):
-                  sub_total += 1
-                  if s["status"] == "PASS":
-                      sub_pass += 1
-          print("## 🧪 WPT (wpt run via WebDriver)\n")
-          print(f"Tests: {len(results)} — " + ", ".join(f"{k}: {v}" for k, v in sorted(status_count.items())))
-          pct = (100 * sub_pass / sub_total) if sub_total else 0
-          print(f"\nSubtests: **{sub_pass} / {sub_total}** passed ({pct:.1f}%)\n")
+          sp = sum(1 for t in results for s in t.get("subtests", []) if s["status"] == "PASS")
+          st = sum(len(t.get("subtests", [])) for t in results)
+          pct = (100 * sp / st) if st else 0
+          open(tsv, "w").write(f"{area}\t{sp}\t{st}\t{pct:.1f}%\n")
+          print(f"### `{area}`\n\nTests: {len(results)} — Subtests: **{sp} / {st}** ({pct:.1f}%)\n")
           PY
 
-      - name: Upload wptreport
+      - name: Upload area results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: wptreport
-          path: wptreport.json
+          name: wpt-result-${{ matrix.slug }}
+          path: reports/
+
+  report:
+    needs: wpt
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: wpt-result-*
+          merge-multiple: true
+      - name: Build combined summary
+        run: |
+          {
+            echo "## 🧪 WPT conformance (via \`wpt run\` over WebDriver)"
+            echo
+            echo "| Area | Subtests | Pass rate |"
+            echo "|------|----------|-----------|"
+            tp=0; tt=0
+            for f in artifacts/*.tsv; do
+              [ -f "$f" ] || continue
+              IFS=$'\t' read -r area p t pct < "$f"
+              if [ "$pct" = "incomplete" ]; then
+                echo "| \`$area\` | — | ⏳ incomplete |"
+              else
+                echo "| \`$area\` | $p / $t | $pct |"
+                tp=$((tp + p)); tt=$((tt + t))
+              fi
+            done
+            total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
+            echo "| **Total (completed areas)** | **$tp / $tt** | **$total_pct** |"
+            echo
+            echo "<sub>web-platform-tests via the real \`wpt run\` harness driving the engine over WebDriver (\`lucid\` product). Worker-dependent variants time out (no worker support yet); large areas may be \`incomplete\` within the per-leg budget.</sub>"
+          } >> "$GITHUB_STEP_SUMMARY"

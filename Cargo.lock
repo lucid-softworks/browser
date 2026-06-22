@@ -2900,13 +2900,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wpt-runner"
-version = "0.1.0"
-dependencies = [
- "engine",
-]
-
-[[package]]
 name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
