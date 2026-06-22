@@ -394,6 +394,41 @@ pub(crate) fn layout_image_box(boxx: &mut LayoutBox, containing: Rect) {
     // width/height already set at build time; leave them.
 }
 
+/// The (right-edge x, top y) of the last line of inline content in `b`'s subtree, or `None` when
+/// `b` holds no inline content. Used as the static-position origin for an absolutely-positioned box
+/// that follows inline text among its siblings (CSS 2.2 §10.3.7): such a box's hypothetical in-flow
+/// position is immediately after the preceding inline content, not at the container's top-left.
+fn inline_end_position(b: &LayoutBox) -> Option<(f32, f32)> {
+    fn visit(b: &LayoutBox, best: &mut Option<(f32, f32)>) {
+        let is_inline_leaf = matches!(
+            b.content,
+            BoxContent::Text(_)
+                | BoxContent::Image(_)
+                | BoxContent::Widget(_)
+                | BoxContent::Caret
+                | BoxContent::Marker(_)
+        );
+        if is_inline_leaf {
+            let r = b.dimensions.border_box();
+            let cand = (r.x + r.width, r.y);
+            // Prefer the lowest line (largest y); within the same line, the furthest-right edge.
+            let take = match *best {
+                Some((bx, by)) => cand.1 > by + 0.01 || ((cand.1 - by).abs() <= 0.01 && cand.0 > bx),
+                None => true,
+            };
+            if take {
+                *best = Some(cand);
+            }
+        }
+        for c in &b.children {
+            visit(c, best);
+        }
+    }
+    let mut best = None;
+    visit(b, &mut best);
+    best
+}
+
 /// Resolve out-of-flow (absolute / fixed) children of `boxx`: size and position them against
 /// their containing block, then lay out their own children.
 pub(crate) fn resolve_out_of_flow(
@@ -406,15 +441,46 @@ pub(crate) fn resolve_out_of_flow(
     // are `auto`) is its hypothetical in-flow origin — approximated by this parent's content-box
     // top-left. Captured before the loop so each child sees the same parent content rect.
     let parent_content = boxx.dimensions.content;
-    for child in &mut boxx.children {
-        match position_of(child, styles) {
+    // Tracks where in-flow inline content among the siblings ended, so an abspos that follows it
+    // gets the static x/y immediately after that content (e.g. `12345<span style=position:absolute>`
+    // sits after "12345", not at the container origin). Reset by a real block, which starts a line.
+    let mut inline_cursor: Option<(f32, f32)> = None;
+    for i in 0..boxx.children.len() {
+        match position_of(&boxx.children[i], styles) {
             style::Position::Absolute => {
-                layout_out_of_flow(child, ctx.positioned, parent_content, ctx, styles, measurer)
+                let child = &mut boxx.children[i];
+                layout_out_of_flow(
+                    child,
+                    ctx.positioned,
+                    parent_content,
+                    inline_cursor,
+                    ctx,
+                    styles,
+                    measurer,
+                );
             }
             style::Position::Fixed => {
-                layout_out_of_flow(child, ctx.viewport, parent_content, ctx, styles, measurer)
+                let child = &mut boxx.children[i];
+                layout_out_of_flow(
+                    child,
+                    ctx.viewport,
+                    parent_content,
+                    inline_cursor,
+                    ctx,
+                    styles,
+                    measurer,
+                );
             }
-            _ => {}
+            // In-flow sibling (static / relative / sticky): advance the inline cursor past its
+            // inline content; a real block box resets it (the next abspos would start a new line).
+            _ => match &boxx.children[i].content {
+                BoxContent::Block => inline_cursor = None,
+                _ => {
+                    if let Some(end) = inline_end_position(&boxx.children[i]) {
+                        inline_cursor = Some(end);
+                    }
+                }
+            },
         }
     }
 }
@@ -422,10 +488,14 @@ pub(crate) fn resolve_out_of_flow(
 /// Lay out an out-of-flow box against `cb` (its containing block rect = padding box of the
 /// nearest positioned ancestor, or the viewport). Insets resolve the position; size comes from
 /// explicit width/height or content.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn layout_out_of_flow(
     boxx: &mut LayoutBox,
     cb: Rect,
     parent_content: Rect,
+    // Static-position origin from preceding inline siblings `(x, y)`, when this box follows inline
+    // content. Overrides `cb`/`parent_content` for the axis (or axes) whose insets are both `auto`.
+    inline_static: Option<(f32, f32)>,
     ctx: Ctx,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
@@ -510,14 +580,15 @@ pub(crate) fn layout_out_of_flow(
     } else if let Some(r) = inset_right {
         cb.x + cb.width - r - (content_width + horizontal) + margin.left
     } else {
-        cb.x
+        // Both horizontal insets auto → static position: after preceding inline content if any.
+        inline_static.map(|(x, _)| x).unwrap_or(cb.x)
     };
     let border_top_y = if let Some(t) = inset_top {
         cb.y + t
     } else if let Some(b) = inset_bottom {
         cb.y + cb.height - b // adjusted after height is known below
     } else {
-        cb.y
+        inline_static.map(|(_, y)| y).unwrap_or(cb.y)
     };
 
     let x = border_left_x + margin.left + border.left + padding.left;
@@ -602,9 +673,18 @@ pub(crate) fn layout_out_of_flow(
         (inset_top.is_none() && inset_bottom.is_none()),
         (inset_left.is_none() && inset_right.is_none()),
     );
-    // Vertical: margin-box top relative to cb top (or static origin when both auto).
-    let mb_top = if vert_auto { parent_content.y } else { mb.y };
-    let mb_left = if horiz_auto { parent_content.x } else { mb.x };
+    // Vertical: margin-box top relative to cb top (or static origin when both auto — preceding
+    // inline content if any, else the parent content-box edge).
+    let mb_top = if vert_auto {
+        inline_static.map(|(_, y)| y).unwrap_or(parent_content.y)
+    } else {
+        mb.y
+    };
+    let mb_left = if horiz_auto {
+        inline_static.map(|(x, _)| x).unwrap_or(parent_content.x)
+    } else {
+        mb.x
+    };
     let used_top = mb_top - cb.y;
     let used_left = mb_left - cb.x;
     let used_bottom = (cb.y + cb.height) - (mb_top + mb.height);

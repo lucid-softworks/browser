@@ -1187,6 +1187,40 @@ pub(crate) fn prim_elem_metrics(
     } else {
         (w, h)
     };
+    // `offsetTop`/`offsetLeft` are relative to the offsetParent — the nearest positioned ancestor
+    // (per CSSOM-View): subtract its border-box origin and its top/left border widths
+    // (clientTop/clientLeft). With no positioned ancestor we keep document-absolute coordinates
+    // (offsetParent ≈ body at the origin), preserving prior behavior. `ax`/`ay` are the node's
+    // document-absolute border-box origin (CSS px), the same space `layout_rects` stores.
+    let (ol, ot) = {
+        let rects = state.layout_rects.borrow();
+        with_cascade_map(&state, |doc, map| {
+            let mut cur = node.and_then(|n| doc.get(n).parent);
+            let mut positioned = None;
+            while let Some(p) = cur {
+                if matches!(doc.get(p).data, dom::NodeData::Element(_))
+                    && map
+                        .get(&p)
+                        .map(|cs| cs.position != style::Position::Static)
+                        .unwrap_or(false)
+                {
+                    positioned = Some(p);
+                    break;
+                }
+                cur = doc.get(p).parent;
+            }
+            match positioned.and_then(|p| rects.get(&p.0).map(|r| (p, *r))) {
+                Some((p, (px, py, _, _))) => {
+                    let (bl, bt) = map
+                        .get(&p)
+                        .map(|cs| (cs.border.left, cs.border.top))
+                        .unwrap_or((0.0, 0.0));
+                    (ax - px - bl, ay - py - bt)
+                }
+                None => (ax, ay),
+            }
+        })
+    };
     let obj = v8::Object::new(scope);
     let put = |k: &str, v: f32| {
         let key = v8::String::new(scope, k).unwrap();
@@ -1206,8 +1240,8 @@ pub(crate) fn prim_elem_metrics(
     put("oh", h);
     put("cw", cw);
     put("ch", ch);
-    put("ot", ay);
-    put("ol", ax);
+    put("ot", ot);
+    put("ol", ol);
     put("sw", sw);
     put("sh", sh);
     rv.set(obj.into());
