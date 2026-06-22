@@ -5795,6 +5795,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     for (var i = 0; i < s.length; i++) {
       var cp = s.codePointAt(i);
       if (cp > 0xffff) { i++; }
+      // UTF-8 encode replaces lone surrogates with U+FFFD; encodeURIComponent would otherwise throw.
+      if (cp >= 0xd800 && cp <= 0xdfff) { cp = 0xfffd; }
       if (cp > 0x7e || isInSet(cp)) {
         var bytes = unescape(encodeURIComponent(String.fromCodePoint(cp)));
         for (var b = 0; b < bytes.length; b++) {
@@ -13238,7 +13240,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var RequestCtor = function (input, init) {
       init = init || {};
       var fromReq = input && typeof input === "object" && input.__isRequest;
-      this.url = fromReq ? input.url : ((input && input.url) ? String(input.url) : String(input));
+      // Per the Fetch standard, the input is parsed against the entry settings object's base URL,
+      // which percent-encodes the query/path (e.g. "?ß" -> "?%C3%9F"). A Request cloned from
+      // another Request already carries a parsed URL.
+      this.url = fromReq ? input.url : (function () {
+        var raw = (input && input.url) ? String(input.url) : String(input);
+        try {
+          var base;
+          try { base = (typeof document !== "undefined" && document.baseURI) ? document.baseURI : ((typeof location !== "undefined" && location.href) ? location.href : undefined); } catch (e) { base = undefined; }
+          return new globalThis.URL(raw, base).href;
+        } catch (e) { return raw; }
+      })();
       this.method = String(init.method || (fromReq && input.method) || "GET").toUpperCase();
       this.headers = new globalThis.Headers(init.headers || (fromReq ? input.headers : null) || {});
       this.body = init.body !== undefined ? init.body : (fromReq ? input.body : null);
@@ -13253,6 +13265,25 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     RequestCtor.prototype.clone = function () { return new globalThis.Request(this.url, this); };
     RequestCtor.prototype.text = function () { return Promise.resolve(this.body == null ? "" : String(this.body)); };
     RequestCtor.prototype.json = function () { try { return Promise.resolve(JSON.parse(this.body == null ? "null" : String(this.body))); } catch (e) { return Promise.reject(e); } };
+    RequestCtor.prototype.formData = function () {
+      var b = this.body;
+      // A FormData body is returned as a fresh copy (no re-serialization round-trip needed).
+      if (b && (b.__isFormData || (typeof globalThis.FormData === "function" && b instanceof globalThis.FormData))) {
+        var copy = new globalThis.FormData();
+        b.forEach(function (v, k) { copy.append(k, v); });
+        return Promise.resolve(copy);
+      }
+      if (__isBlobLike(b)) {
+        return __bodyToFormData(__blobTextSync(b), b.type || (this.headers && this.headers.get && this.headers.get("content-type")));
+      }
+      return __bodyToFormData(b == null ? "" : String(b), this.headers && this.headers.get && this.headers.get("content-type"));
+    };
+    RequestCtor.prototype.blob = function () {
+      var b = this.body;
+      if (__isBlobLike(b)) { return Promise.resolve(b); }
+      var ct = (this.headers && this.headers.get && this.headers.get("content-type")) || "";
+      return Promise.resolve(new globalThis.Blob([b == null ? "" : String(b)], { type: ct }));
+    };
     def(globalThis, "Request", RequestCtor);
   }
 
@@ -13262,20 +13293,44 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       this.status = init.status !== undefined ? (init.status | 0) : 200;
       this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
       this.ok = this.status >= 200 && this.status < 300;
-      this.headers = (init.headers && init.headers.entries) ? init.headers : new globalThis.Headers(init.headers || {});
+      // Reuse an existing Headers instance as-is, but build one for arrays/plain objects. (Arrays
+      // also expose `.entries`, so detect a Headers by its `.get`/`.append` methods instead.)
+      this.headers = (init.headers && typeof init.headers.get === "function" && typeof init.headers.append === "function") ? init.headers : new globalThis.Headers(init.headers || {});
       this.url = init.url ? String(init.url) : "";
       this.redirected = !!init.redirected;
       this.type = init.type || "default";
       this.bodyUsed = false;
       this.body = null;
-      this.__body = (body == null) ? "" : (typeof body === "string" ? body : (typeof body.toString === "function" ? body.toString() : String(body)));
+      // Body extraction: strings pass through; a FormData serializes to multipart/form-data (and
+      // supplies the boundary content-type); a Blob contributes its bytes + type; URLSearchParams
+      // becomes urlencoded; anything else is stringified. The content-type is only set when the
+      // init headers didn't already provide one.
+      if (body == null) {
+        this.__body = "";
+      } else if (typeof body === "string") {
+        this.__body = body;
+      } else if (body.__isFormData || (typeof globalThis.FormData === "function" && body instanceof globalThis.FormData)) {
+        var __rb = __genBoundary();
+        this.__body = __formDataToMultipart(body, __rb);
+        if (!this.headers.has("content-type")) { this.headers.set("content-type", "multipart/form-data; boundary=" + __rb); }
+      } else if (__isBlobLike(body)) {
+        this.__body = __blobTextSync(body);
+        if (!this.headers.has("content-type") && body.type) { this.headers.set("content-type", body.type); }
+      } else if (typeof globalThis.URLSearchParams === "function" && body instanceof globalThis.URLSearchParams) {
+        this.__body = body.toString();
+        if (!this.headers.has("content-type")) { this.headers.set("content-type", "application/x-www-form-urlencoded;charset=UTF-8"); }
+      } else if (typeof body.toString === "function") {
+        this.__body = body.toString();
+      } else {
+        this.__body = String(body);
+      }
       this.__isResponse = true;
     };
     ResponseCtor.prototype.text = function () { this.bodyUsed = true; return Promise.resolve(this.__body); };
     ResponseCtor.prototype.json = function () { this.bodyUsed = true; try { return Promise.resolve(JSON.parse(this.__body)); } catch (e) { return Promise.reject(e); } };
     ResponseCtor.prototype.arrayBuffer = function () { return Promise.resolve(new ArrayBuffer(0)); };
-    ResponseCtor.prototype.blob = function () { return Promise.resolve({ size: this.__body.length, type: (this.headers.get && this.headers.get("content-type")) || "" }); };
-    ResponseCtor.prototype.formData = function () { return Promise.reject(new TypeError("formData not supported")); };
+    ResponseCtor.prototype.blob = function () { this.bodyUsed = true; return Promise.resolve(new globalThis.Blob([this.__body], { type: (this.headers.get && this.headers.get("content-type")) || "" })); };
+    ResponseCtor.prototype.formData = function () { this.bodyUsed = true; return __bodyToFormData(this.__body, this.headers && this.headers.get && this.headers.get("content-type")); };
     // body: a ReadableStream of the response's bytes (UTF-8). Reading it marks the body used.
     Object.defineProperty(ResponseCtor.prototype, "body", {
       get: function () {
@@ -13689,6 +13744,125 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       fd.forEach(function (v, k) { parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(String(v))); });
     }
     return parts.join("&");
+  }
+
+  // Decode a Blob's bytes (UTF-8) to a JS string, synchronously (the async Blob.text() returns a
+  // Promise; for in-process body serialization we need the value directly).
+  function __blobTextSync(b) {
+    var bytes = (b && b.__blobBytes) || [];
+    var s = ""; for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+    try { return decodeURIComponent(escape(s)); } catch (e) { return s; }
+  }
+  function __isBlobLike(v) {
+    return v && typeof v === "object" && (v.__blobBytes !== undefined || (typeof globalThis.Blob === "function" && v instanceof globalThis.Blob));
+  }
+  // A boundary made only of lowercase ASCII + digits so it is stable under toLowerCase() (the
+  // response-form-data WPT lowercases the whole body and re-parses). A monotonic counter keeps it
+  // unique without relying on Math.random.
+  var __mpBoundarySeq = 0;
+  function __genBoundary() { __mpBoundarySeq++; return "----formdataboundary" + __mpBoundarySeq + "x" + (__mpBoundarySeq * 2654435761 % 100000000); }
+  // Escape a name/filename for a Content-Disposition parameter per the spec (CR/LF/" only).
+  function __mpEscapeName(s) {
+    return String(s).replace(/\r\n|\r|\n/g, "%0D%0A").replace(/"/g, "%22");
+  }
+  // Serialize a FormData-like into a multipart/form-data body string for the given boundary.
+  function __formDataToMultipart(fd, boundary) {
+    var crlf = "\r\n", out = "", entries = [];
+    if (fd && typeof fd.forEach === "function") { fd.forEach(function (v, k) { entries.push([k, v]); }); }
+    for (var i = 0; i < entries.length; i++) {
+      var name = entries[i][0], value = entries[i][1];
+      out += "--" + boundary + crlf;
+      if (__isBlobLike(value)) {
+        var filename = (value.name != null) ? value.name : "blob";
+        out += 'Content-Disposition: form-data; name="' + __mpEscapeName(name) + '"; filename="' + __mpEscapeName(filename) + '"' + crlf;
+        out += "Content-Type: " + (value.type || "application/octet-stream") + crlf + crlf;
+        out += __blobTextSync(value) + crlf;
+      } else {
+        out += 'Content-Disposition: form-data; name="' + __mpEscapeName(name) + '"' + crlf + crlf;
+        out += String(value) + crlf;
+      }
+    }
+    out += "--" + boundary + "--" + crlf;
+    return out;
+  }
+  // Parse a multipart/form-data body string into a FormData, or return null on malformed input
+  // (the caller turns null into a rejected TypeError). Follows the WHATWG multipart parser closely
+  // enough to satisfy the response-form-data WPT's valid/invalid cases.
+  function __parseMultipart(input, boundary) {
+    var CRLF = "\r\n", dash = "--" + boundary, endDelim = dash + "--", pos = 0;
+    var fd = new globalThis.FormData();
+    function startsWith(s, at) { return input.substr(at, s.length) === s; }
+    function skipLWS() { while (pos < input.length && (input.charAt(pos) === " " || input.charAt(pos) === "\t")) { pos++; } }
+    while (true) {
+      // Closing delimiter "--boundary--": the body ends here; only transport padding + CRLF (or
+      // end of input) may follow, otherwise the body is malformed.
+      if (startsWith(endDelim, pos)) {
+        pos += endDelim.length;
+        skipLWS();
+        if (pos >= input.length || startsWith(CRLF, pos)) { return fd; }
+        return null;
+      }
+      // Part delimiter "--boundary" + transport padding + CRLF.
+      if (!startsWith(dash, pos)) { return null; }
+      pos += dash.length;
+      skipLWS();
+      if (!startsWith(CRLF, pos)) { return null; }
+      pos += 2;
+      // Part headers, terminated by a blank line.
+      var name = null, filename = null, ctype = null;
+      while (true) {
+        var nl = input.indexOf(CRLF, pos);
+        if (nl < 0) { return null; }
+        var line = input.slice(pos, nl);
+        pos = nl + 2;
+        if (line === "") { break; }
+        var ci = line.indexOf(":");
+        if (ci < 0) { continue; }
+        var hname = line.slice(0, ci).trim().toLowerCase();
+        var hval = line.slice(ci + 1).trim();
+        if (hname === "content-disposition") {
+          var nm = /name="([^"]*)"/i.exec(hval);
+          if (nm) { name = nm[1]; }
+          var fm = /filename="([^"]*)"/i.exec(hval);
+          if (fm) { filename = fm[1]; }
+        } else if (hname === "content-type") {
+          ctype = hval;
+        }
+      }
+      if (name === null) { return null; }
+      // Body runs until the CRLF that precedes the next boundary.
+      var idx = input.indexOf(CRLF + dash, pos);
+      if (idx < 0) { return null; }
+      var bodyStr = input.slice(pos, idx);
+      pos = idx + 2; // leave position at the boundary for the next iteration
+      if (filename !== null) {
+        fd.append(name, new globalThis.File([bodyStr], filename, { type: ctype || "" }));
+      } else {
+        fd.append(name, bodyStr);
+      }
+    }
+  }
+  // Shared body -> FormData consumption for Request/Response. `bodyStr` is the serialized body,
+  // `contentType` its media type. Returns a Promise<FormData> (rejects with TypeError when the
+  // media type is neither multipart/form-data nor application/x-www-form-urlencoded, or when a
+  // multipart body is malformed).
+  function __bodyToFormData(bodyStr, contentType) {
+    var ct = String(contentType || "");
+    var lower = ct.toLowerCase();
+    if (lower.indexOf("multipart/form-data") === 0) {
+      var bm = /boundary=("?)([^";]+)\1/i.exec(ct);
+      if (!bm) { return Promise.reject(new TypeError("Missing multipart/form-data boundary")); }
+      var fd = __parseMultipart(String(bodyStr == null ? "" : bodyStr), bm[2]);
+      if (fd === null) { return Promise.reject(new TypeError("Failed to parse multipart/form-data body")); }
+      return Promise.resolve(fd);
+    }
+    if (lower.indexOf("application/x-www-form-urlencoded") === 0) {
+      var out = new globalThis.FormData();
+      var sp = new globalThis.URLSearchParams(String(bodyStr == null ? "" : bodyStr));
+      sp.forEach(function (v, k) { out.append(k, v); });
+      return Promise.resolve(out);
+    }
+    return Promise.reject(new TypeError("Body cannot be parsed as FormData"));
   }
 
   // Async fetch plumbing. `fetch()` calls the non-blocking native `__startFetch`, which spawns a
