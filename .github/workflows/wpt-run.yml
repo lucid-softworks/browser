@@ -74,11 +74,15 @@ jobs:
       # gate. (`set -o pipefail` is intentionally not used here for the same reason.)
       - name: Run WPT via wpt run
         run: |
+          # `--test-types testharness` keeps wptrunner from pulling the aamtest accessibility
+          # requirements (PyGObject/cairo), which need system libs absent on the runner — and which
+          # this fetch slice doesn't exercise anyway.
           scripts/run-wpt.sh $WPT_TESTS -- \
+            --test-types testharness \
             --log-wptreport="$PWD/wptreport.json" \
             --timeout-multiplier=0.5 \
           || true
-          test -f wptreport.json || { echo "::error::no wptreport.json produced — wpt run did not complete"; exit 1; }
+          test -s wptreport.json || { echo "::error::no (non-empty) wptreport.json produced — wpt run did not complete"; exit 1; }
 
       - name: Summarize results
         run: |
