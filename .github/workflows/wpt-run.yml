@@ -6,24 +6,18 @@ name: WPT
 # `wpt run` launches a session per test, so a whole area (dom ≈ 600 files, fetch ≈ 540) is far too
 # slow to run as a single leg. Instead each area is split into balanced CHUNKS (`wpt run
 # --total-chunks/--this-chunk`) that run as parallel matrix legs, so wall-clock is roughly the
-# slowest single chunk + per-leg setup. The `report` job sums an area's chunks back into one row.
-# Same areas we've always tracked — just parallelized.
+# slowest single chunk + per-leg setup. Same areas we've always tracked — just parallelized.
+#
+# Runs NIGHTLY only (not on PRs): the full suite is slow and PR feedback comes from `ci.yml`
+# (cargo fmt/clippy/test). Each leg uploads its raw `wptreport` JSON as an artifact; there is no
+# aggregated report/PR-comment job.
 #
 # It does not gate on test failures (the engine has known, tracked failures); legs are also
 # wall-bounded so a pathological hang can't stall the build.
 
 on:
-  pull_request:
-    paths-ignore: &paths-ignore
-      - '**.md'
-      - 'swift/**'
-      - 'packaging/**'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
-  push:
-    branches: [main]
-    paths-ignore: *paths-ignore
+  schedule:
+    - cron: '0 7 * * *' # nightly at 07:00 UTC
 
 concurrency:
   group: wpt-${{ github.ref }}
@@ -170,113 +164,3 @@ jobs:
         with:
           name: wpt-result-${{ matrix.slug }}-${{ matrix.chunk }}
           path: reports/
-
-  report:
-    needs: wpt
-    if: always()
-    runs-on: ubuntu-latest
-    # Allow posting the comment directly for same-repo PRs (see "Comment on PR" below). Fork PRs get
-    # a read-only token regardless, so they fall back to wpt-comment.yml (a workflow_run handler).
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Download all results
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          pattern: wpt-result-*
-          merge-multiple: true
-
-      # Restore the latest main baseline (per-area pass/total). On a PR the exact key never matches,
-      # so the `wpt-baseline-run-` prefix falls through to the newest cache — which only main writes
-      # (caches created on the default branch are visible to PR runs). Absent before main has ever
-      # cached; the report then shows "—" deltas.
-      - name: Restore main baseline
-        uses: actions/cache/restore@v4
-        with:
-          path: baseline
-          key: wpt-baseline-run-${{ github.sha }}
-          restore-keys: |
-            wpt-baseline-run-
-
-      - name: Build combined report
-        run: |
-          mkdir -p comment baseline
-          python3 - artifacts comment/report.md baseline <<'PY'
-          import glob, os, sys
-          artifacts, out_md, basedir = sys.argv[1], sys.argv[2], sys.argv[3]
-          # Sum each area's chunk results into one (pass, total, any-chunk-incomplete).
-          areas, order = {}, []
-          for f in sorted(glob.glob(os.path.join(artifacts, "*.tsv"))):
-              for line in open(f):
-                  area, p, t, st = line.rstrip("\n").split("\t")
-                  if area not in areas:
-                      areas[area] = [0, 0, False]; order.append(area)
-                  rec = areas[area]
-                  rec[0] += int(p); rec[1] += int(t)
-                  rec[2] |= (st == "incomplete")
-          slug = lambda a: a.replace("/", "-")
-          def fmt(d):
-              return f"+{d:,}" if d > 0 else (f"{d:,}" if d < 0 else "±0")
-          # Read the restored baseline BEFORE we overwrite it with this run's numbers.
-          base = {}
-          for area in order:
-              bf = os.path.join(basedir, slug(area) + ".tsv")
-              if os.path.exists(bf):
-                  base[area] = int(open(bf).read().split("\t")[1])
-          out = ["## 🧪 WPT conformance (via `wpt run` over WebDriver)\n",
-                 "| Area | Subtests | Pass rate | Δ vs `main` |",
-                 "|------|----------|-----------|------------|"]
-          tp = tt = tdelta = 0; have_base = False
-          for area in order:
-              p, t, inc = areas[area]
-              tp += p; tt += t
-              pct = f"{100*p/t:.1f}%" if t else "—"
-              note = " ⚠️ partial" if inc else ""
-              delta = "—"
-              if area in base:
-                  d = p - base[area]; delta = fmt(d); tdelta += d; have_base = True
-              out.append(f"| `{area}` | {p:,} / {t:,} | {pct}{note} | {delta} |")
-          total_pct = f"{100*tp/tt:.1f}%" if tt else "—"
-          total_delta = fmt(tdelta) if have_base else "—"
-          out.append(f"| **Total** | **{tp:,} / {tt:,}** | **{total_pct}** | **{total_delta}** |")
-          out.append("\n<sub>Δ vs `main` is the change in passing subtests against the latest `main` baseline (`—` when none exists yet). web-platform-tests via the real `wpt run` harness driving the engine over WebDriver (`lucid` product); each area is sharded into parallel chunks. Worker-dependent variants time out (no worker support yet); ⚠️ partial means a chunk was cut off.</sub>")
-          open(out_md, "w").write("\n".join(out) + "\n")
-          # Publish this run's per-area numbers as the (new) baseline contents to be cached.
-          for area in order:
-              p, t, _ = areas[area]
-              open(os.path.join(basedir, slug(area) + ".tsv"), "w").write(f"{area}\t{p}\t{t}\n")
-          PY
-          cat comment/report.md >> "$GITHUB_STEP_SUMMARY"
-
-      # On main, publish this run's per-area numbers as the new baseline. The key is per-commit so the
-      # save always succeeds (cache keys are immutable); PR runs pick it up via the restore-keys prefix.
-      - name: Save main baseline
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: baseline
-          key: wpt-baseline-run-${{ github.sha }}
-
-      # On PRs, stage the comment + PR number for wpt-comment.yml to post (a workflow_run handler, so
-      # it works for fork PRs whose `pull_request` token is read-only). Pushes to main don't comment.
-      - name: Stage PR comment
-        if: github.event_name == 'pull_request'
-        run: echo "${{ github.event.pull_request.number }}" > comment/pr-number.txt
-      - name: Upload comment artifact
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: wpt-comment
-          path: comment/
-
-      # Same-repo PRs can post directly (the token has write access), so the comment shows up on this
-      # run. Fork PRs (read-only token) skip this and get the comment via wpt-comment.yml instead.
-      - name: Comment on PR
-        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          header: wpt-report
-          number: ${{ github.event.pull_request.number }}
-          path: comment/report.md
