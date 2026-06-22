@@ -122,5 +122,5 @@ jobs:
               ``,
               `- Open a PR that says \`Closes #${issue_number}\` so it auto-closes on merge.`,
               `- Changed your mind? Comment \`/unclaim\` to release it.`,
-              `- See [\`crates/wpt-runner/README.md\`](https://github.com/${owner}/${repo}/blob/main/crates/wpt-runner/README.md) for running the test locally.`,
+              `- See [\`docs/running-wpt.md\`](https://github.com/${owner}/${repo}/blob/main/docs/running-wpt.md) for running the test locally.`,
             ].join('\n'));

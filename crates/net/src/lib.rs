@@ -14,14 +14,110 @@ use std::sync::OnceLock;
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
+        let mut builder = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(10))
             .timeout_read(std::time::Duration::from_secs(15))
             .max_idle_connections_per_host(16)
             // Persist cookies across requests AND redirects so logins/sessions survive.
-            .cookie_store(cookie_store::CookieStore::new(None))
-            .build()
+            .cookie_store(cookie_store::CookieStore::new(None));
+        // Test-driving env knobs (no effect on normal browsing):
+        //  - `WPT_INSECURE_TLS`: accept any server certificate. The WebDriver server sets this so
+        //    `.https` WPT tests load over TLS against `wpt serve`'s self-signed cert without needing
+        //    the checkout's CA path (matches the `acceptInsecureCerts` capability it advertises).
+        //  - `WPT_CA_FILE`: trust a specific extra CA (the WPT `tools/certs/cacert.pem`).
+        if let Some(cfg) = wpt_tls_config() {
+            builder = builder.tls_config(std::sync::Arc::new(cfg));
+        }
+        builder.build()
     })
+}
+
+/// A test-only rustls client config, or `None` to leave the agent on its default trust store.
+/// `WPT_INSECURE_TLS` disables certificate verification entirely; otherwise `WPT_CA_FILE` adds an
+/// extra trusted CA on top of the usual webpki roots. A missing/unparseable `WPT_CA_FILE` degrades
+/// gracefully to `None`.
+fn wpt_tls_config() -> Option<rustls::ClientConfig> {
+    // `ring` is a hard dependency, so the provider is always present — no default-provider panic.
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+    if std::env::var_os("WPT_INSECURE_TLS").is_some() {
+        return rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .ok()?
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(insecure::NoVerify(provider)))
+            .with_no_client_auth()
+            .into();
+    }
+
+    let ca_path = std::env::var("WPT_CA_FILE").ok()?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let pem = std::fs::read(ca_path).ok()?;
+    for cert in rustls_pemfile::certs(&mut &pem[..]).flatten() {
+        let _ = roots.add(cert);
+    }
+    rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+        .into()
+}
+
+/// A rustls verifier that accepts any server certificate — for driving WPT (`wpt serve` uses a
+/// self-signed cert) under `WPT_INSECURE_TLS` only. Signature checks still run against the provider.
+mod insecure {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::crypto::CryptoProvider;
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    pub struct NoVerify(pub Arc<CryptoProvider>);
+
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
 }
 
 /// A mainstream desktop-Safari User-Agent so sites serve us their normal content.
@@ -185,6 +281,19 @@ fn request_streaming_inner(
     on_chunk: &mut dyn FnMut(&[u8]),
 ) -> Result<ResponseMeta, String> {
     let method_uc = method.to_ascii_uppercase();
+
+    // `about:blank` (and bare `about:`) is the empty initial document every browsing context starts
+    // on. There's no network involved — serve a minimal empty HTML document so the engine has a real
+    // scriptable `about:blank` (used by new windows / WebDriver sessions before the first navigation).
+    if url == "about:blank" || url == "about:" {
+        let html = b"<!DOCTYPE html><html><head></head><body></body></html>";
+        on_chunk(html);
+        return Ok(ResponseMeta {
+            status: 200,
+            content_type: "text/html; charset=utf-8".to_string(),
+            final_url: url.to_string(),
+        });
+    }
 
     if let Some(path) = url.strip_prefix("file://") {
         // file:// is a local read; method/body/headers don't apply. A local read isn't
@@ -351,8 +460,14 @@ fn cache_dir() -> Option<std::path::PathBuf> {
 /// cache is disabled or the URL shouldn't be cached.
 fn cache_path(url: &str) -> Option<std::path::PathBuf> {
     // Never disk-cache local dev servers (e.g. the WPT runner): they serve mutable content at stable
-    // URLs, so a cache hit would mask edits.
-    if url.contains("://localhost") || url.contains("://127.0.0.1") || url.contains("://[::1]") {
+    // URLs, so a cache hit would mask edits. This includes the WPT hostnames (`web-platform.test` &
+    // friends), which resolve to loopback and serve per-run-regenerated tests/endpoints — caching
+    // them replays a previous run's body and silently corrupts conformance results.
+    if url.contains("://localhost")
+        || url.contains("://127.0.0.1")
+        || url.contains("://[::1]")
+        || url.contains("web-platform.test")
+    {
         return None;
     }
     let dir = cache_dir()?;

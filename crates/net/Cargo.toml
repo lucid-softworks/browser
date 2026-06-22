@@ -8,6 +8,12 @@ license.workspace = true
 # `cookies` so the shared agent persists Set-Cookie across requests AND redirects (stay logged in).
 ureq = { version = "2", features = ["cookies"] }
 cookie_store = "0.21"
+# Same rustls (0.23) / webpki-roots backend ureq uses, so adding the WPT test CA to the trust store
+# (gated behind `WPT_CA_FILE`, used only by wpt-runner) doesn't pull a second TLS stack. `ring` is
+# pinned so a process-default CryptoProvider always exists and building a ClientConfig can't panic.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 # Pure-Rust WebSocket client (handles ws:// and wss://). rustls TLS to match ureq's backend
 # (rustls 0.23) so we don't pull a second TLS stack. `webpki-roots` ships Mozilla's root store so
 # wss:// works without depending on the OS trust store.

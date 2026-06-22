@@ -109,7 +109,8 @@ Note the model/tooling on your PR.
 - **Conventional Commits.** The PR title must be `feat(...)`, `fix(...)`, `ci: …`, etc. CI enforces
   it, and `release-plz` uses it to bump versions and write CHANGELOGs.
 - **CI on every PR:** `cargo test` on macOS / Linux / Windows, `fmt` + `clippy`, and the **WPT
-  conformance suite** — it posts a pass-rate report comment on the PR.
+  conformance suite** (via the real `wpt run` harness over WebDriver) — it writes a pass-rate
+  summary to the run.
 - **Releases:** merging the release-plz version PR tags `vX.Y.Z`, which builds + signs + notarizes
   the macOS app and publishes it as a GitHub release.
 
@@ -120,7 +121,8 @@ open [web-platform-tests](https://github.com/web-platform-tests/wpt) failures so
 from 🟢 *good first issue* (small, self-contained, with a dedicated test to verify) through
 🔴 *high-impact* fixes that unblock thousands of subtests. Each issue has a verified root cause, the
 failing test, exact subtest counts, the relevant spec section, and a one-line repro. Running the
-suite locally is documented in [`crates/wpt-runner/README.md`](crates/wpt-runner/README.md).
+suite locally — the real `wpt run` harness driving the engine over WebDriver — is documented in
+[`docs/running-wpt.md`](docs/running-wpt.md).
 
 **Claiming an issue:** comment `/claim` (or `.take`) on any open issue to have it assigned to you —
 a bot assigns you and labels it `claimed`, no maintainer needed. Comment `/unclaim` to release it.
