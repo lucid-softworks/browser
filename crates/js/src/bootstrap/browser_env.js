@@ -5527,6 +5527,10 @@
     def(document, "appendChild", function (child) {
       var id = docNode(); var c = reqNode(child, "appendChild"); __insertNode(id, c, -1); return child;
     });
+    if (typeof document.hasChildNodes !== "function") {
+      def(document, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
+    }
+    if (document.nodeName === undefined) { def(document, "nodeName", "#document"); }
     def(document, "insertBefore", function (newNode, refNode) {
       var id = docNode(); var c = reqNode(newNode, "insertBefore");
       var r = (refNode == null) ? -1 : ((refNode && typeof refNode.__node === "number") ? refNode.__node : -1);
@@ -6358,6 +6362,9 @@
       if (proto) { try { def(proto, k, consts[k]); } catch (e) {} }
     }
   })(NodeCtor.prototype);
+  // hasChildNodes() on the shared Node prototype, so non-element nodes (document, text, comment,
+  // doctype, …) answer it too. Element wrappers install their own faster override in enrichElement.
+  def(NodeCtor.prototype, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
   defClass("EventTarget");
   defClass("CharacterData", NodeCtor);
   defClass("Text", globalThis.CharacterData);
@@ -6512,6 +6519,7 @@
     "MutationRecord", "AnimationEffect", "KeyframeEffect", "Animation", "AnimationTimeline",
     "CSSStyleValue", "StylePropertyMap", "VisualViewport", "Selection", "TextMetrics",
     "TimeRanges", "ValidityState", "HTMLFormControlsCollection", "RadioNodeList",
+    "NodeIterator", "TreeWalker",
   ];
   for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
 
@@ -6598,6 +6606,60 @@
   // (the "live range" steps the spec attaches to insert/remove/replace-data/split). Ranges added to
   // a Selection are tracked here too, since the Selection holds them by reference.
   var __liveRanges = [];
+  // The registry of every live NodeIterator. DOM removals consult it to run the "NodeIterator
+  // pre-removing steps" (https://dom.spec.whatwg.org/#nodeiterator-pre-removing-steps), keeping each
+  // iterator's reference node valid after a node it points into is removed. Populated by
+  // document.createNodeIterator below.
+  var __liveNodeIterators = [];
+  // True if `ancestor` is an inclusive ancestor of `node` (i.e. ancestor === node, or ancestor
+  // contains node). Walks parent pointers; identity falls back to node-id equality.
+  function __isInclusiveAncestor(ancestor, node) {
+    var n = node;
+    while (n != null) {
+      if (__sameNode(n, ancestor)) { return true; }
+      n = n.parentNode;
+    }
+    return false;
+  }
+  // Node identity that tolerates wrapper churn: same object, or same underlying arena node id.
+  function __sameNode(a, b) {
+    if (a === b) { return true; }
+    if (a == null || b == null) { return false; }
+    var ia = __idOf(a);
+    return ia >= 0 && ia === __idOf(b);
+  }
+  // The NodeIterator pre-removing steps for a single node id about to be detached from the tree. Run
+  // BEFORE the node leaves the tree (parent/siblings still intact). Mirrors the spec algorithm: for
+  // each iterator whose reference lies inside the removed subtree (but whose root does not), advance
+  // the reference past the subtree, or fall back to the node preceding it.
+  function __runNodeIteratorPreRemove(toBeRemovedId) {
+    var removed = __nodeFor(toBeRemovedId);
+    if (removed == null) { return; }
+    for (var i = 0; i < __liveNodeIterators.length; i++) {
+      var it = __liveNodeIterators[i];
+      // Terminate unless the removed node strictly contains the reference (and is not at/above root).
+      if (__isInclusiveAncestor(removed, it._root)) { continue; }
+      if (!__isInclusiveAncestor(removed, it._reference)) { continue; }
+      if (it._pointerBefore) {
+        // First following node within root that is outside the removed subtree, if any.
+        var next = null, n = removed;
+        while (n != null && !__sameNode(n, it._root)) {
+          if (n.nextSibling != null) { next = n.nextSibling; break; }
+          n = n.parentNode;
+        }
+        if (next != null) { it._reference = next; continue; }
+        it._pointerBefore = false;
+      }
+      // Otherwise point at the node immediately preceding the removed node in tree order.
+      var prev = removed.previousSibling;
+      if (prev == null) {
+        it._reference = removed.parentNode;
+      } else {
+        while (prev.lastChild != null) { prev = prev.lastChild; }
+        it._reference = prev;
+      }
+    }
+  }
   // A range is created with its boundary points at (current global document, 0).
   function Range() {
     var d = globalThis.document || null;
@@ -6934,9 +6996,13 @@
     }
     if (typeof nativeRemoveChild === "function") {
       def(globalThis, "__removeChild", function (parentId, nodeId) {
-        if (__liveRanges.length && typeof nodeId === "number" && nodeId >= 0) {
-          var idx = __children(parentId).indexOf(nodeId);
-          if (idx >= 0) { __rangesRemove(nodeId, parentId, idx); }
+        if (typeof nodeId === "number" && nodeId >= 0) {
+          // Run the NodeIterator pre-removing steps before the node leaves the tree.
+          if (__liveNodeIterators.length) { __runNodeIteratorPreRemove(nodeId); }
+          if (__liveRanges.length) {
+            var idx = __children(parentId).indexOf(nodeId);
+            if (idx >= 0) { __rangesRemove(nodeId, parentId, idx); }
+          }
         }
         return nativeRemoveChild(parentId, nodeId);
       });
@@ -8694,72 +8760,228 @@
     });
   }
 
-  // createTreeWalker / createNodeIterator — snapshot the accepted descendants of `root` in
-  // document order (whatToShow bitmask + optional NodeFilter callback / {acceptNode}); FILTER_REJECT
-  // prunes a subtree, FILTER_SKIP / a whatToShow miss skips the node but keeps descending.
-  function __makeWalkerNodes(root, whatToShow, filterArg) {
-    var mask = (whatToShow === undefined || whatToShow === null) ? 0xFFFFFFFF : (whatToShow >>> 0);
-    var filterFn = null;
-    if (typeof filterArg === "function") { filterFn = filterArg; }
-    else if (filterArg && typeof filterArg.acceptNode === "function") { filterFn = function (n) { return filterArg.acceptNode(n); }; }
-    function verdict(n) {
-      var t = n.nodeType || 0;
-      var shown = t > 0 && (mask & (1 << (t - 1))) !== 0;
-      if (!shown) { return 3; }
-      if (filterFn) { try { return filterFn(n) || 1; } catch (e) { return 2; } }
-      return 1;
+  // NodeIterator / TreeWalker (https://dom.spec.whatwg.org/#traversal). Both are live, filtered views
+  // over the tree rooted at `root` — they navigate parent/sibling/child pointers on demand rather
+  // than snapshotting, so they observe mutations (and NodeIterator runs pre-removing steps). Backed
+  // by the real interface prototypes so instances stringify as "[object NodeIterator]" / "[object
+  // TreeWalker]" and their attributes are read-only per WebIDL.
+  var __niProto = (globalThis.NodeIterator && globalThis.NodeIterator.prototype) || Object.prototype;
+  var __twProto = (globalThis.TreeWalker && globalThis.TreeWalker.prototype) || Object.prototype;
+  var FILTER_ACCEPT = 1, FILTER_REJECT = 2, FILTER_SKIP = 3;
+
+  // "Filter" a node within a traverser: combine the whatToShow bitmask with the NodeFilter callback.
+  // Returns FILTER_ACCEPT/REJECT/SKIP. Sets the traversal-active flag around the user callback so a
+  // reentrant call throws InvalidStateError; the WebIDL return value is coerced to an unsigned long.
+  function __filterNode(traverser, node) {
+    if (traverser._active) {
+      throw new globalThis.DOMException("NodeFilter is already executing.", "InvalidStateError");
     }
-    var out = [];
-    function visit(n) {
-      var v = verdict(n);
-      if (v === 2) { return; }
-      if (v === 1) { out.push(n); }
-      var kids = n.childNodes;
-      if (kids) { for (var i = 0; i < kids.length; i++) { visit(kids[i]); } }
+    var t = node.nodeType;
+    if (((1 << (t - 1)) & traverser._whatToShow) === 0) { return FILTER_SKIP; }
+    var filter = traverser._filter;
+    if (filter == null) { return FILTER_ACCEPT; }
+    traverser._active = true;
+    var result;
+    try {
+      result = (typeof filter === "function") ? filter(node) : filter.acceptNode(node);
+    } finally {
+      traverser._active = false;
     }
-    var kids = root && root.childNodes;
-    if (kids) { for (var i = 0; i < kids.length; i++) { visit(kids[i]); } }
-    return out;
+    return result >>> 0;
   }
-  function __makeTreeWalker(root, whatToShow, filterArg) {
-    var nodes = __makeWalkerNodes(root, whatToShow, filterArg);
-    var idx = -1;
-    var w = { root: root, whatToShow: (whatToShow >>> 0) || 0xFFFFFFFF, filter: filterArg || null, currentNode: root };
-    w.nextNode = function () { if (idx + 1 < nodes.length) { idx++; w.currentNode = nodes[idx]; return nodes[idx]; } return null; };
-    w.previousNode = function () { if (idx > 0) { idx--; w.currentNode = nodes[idx]; return nodes[idx]; } idx = -1; w.currentNode = root; return null; };
-    w.parentNode = function () { var p = w.currentNode && w.currentNode.parentNode; if (p && p !== root) { w.currentNode = p; return p; } return null; };
-    w.firstChild = function () { return w.nextNode(); };
-    w.lastChild = function () { if (nodes.length) { idx = nodes.length - 1; w.currentNode = nodes[idx]; return nodes[idx]; } return null; };
-    w.nextSibling = function () { return null; };
-    w.previousSibling = function () { return null; };
-    return w;
+
+  // ---- read-only attribute accessors shared shape ----
+  function __defReadonly(proto, name, field) {
+    Object.defineProperty(proto, name, {
+      get: function () { return this[field]; }, enumerable: true, configurable: true
+    });
   }
-  function __makeNodeIterator(root, whatToShow, filterArg) {
-    var nodes = __makeWalkerNodes(root, whatToShow, filterArg);
-    var idx = -1;
-    var it = { root: root, whatToShow: (whatToShow >>> 0) || 0xFFFFFFFF, filter: filterArg || null, referenceNode: root, pointerBeforeReferenceNode: true };
-    it.nextNode = function () { if (idx + 1 < nodes.length) { idx++; it.referenceNode = nodes[idx]; return nodes[idx]; } return null; };
-    it.previousNode = function () { if (idx >= 0) { var n = nodes[idx]; idx--; it.referenceNode = idx >= 0 ? nodes[idx] : root; return n; } return null; };
-    it.detach = function () {};
-    return it;
+
+  // ---- TreeWalker ----
+  __defReadonly(__twProto, "root", "_root");
+  __defReadonly(__twProto, "whatToShow", "_whatToShow");
+  __defReadonly(__twProto, "filter", "_filter");
+  Object.defineProperty(__twProto, "currentNode", {
+    get: function () { return this._current; },
+    set: function (v) {
+      if (v == null || typeof v !== "object" || typeof v.nodeType !== "number") {
+        throw new TypeError("Failed to set the 'currentNode' property on 'TreeWalker': parameter is not of type 'Node'.");
+      }
+      this._current = v;
+    },
+    enumerable: true, configurable: true
+  });
+  // "Traverse children" of currentNode (type "first" => first child onward, "last" => last child back).
+  function __twTraverseChildren(tw, type) {
+    var node = (type === "first") ? tw._current.firstChild : tw._current.lastChild;
+    while (node != null) {
+      var result = __filterNode(tw, node);
+      if (result === FILTER_ACCEPT) { tw._current = node; return node; }
+      if (result === FILTER_SKIP) {
+        var child = (type === "first") ? node.firstChild : node.lastChild;
+        if (child != null) { node = child; continue; }
+      }
+      while (node != null) {
+        var sibling = (type === "first") ? node.nextSibling : node.previousSibling;
+        if (sibling != null) { node = sibling; break; }
+        var parent = node.parentNode;
+        if (parent == null || __sameNode(parent, tw._root) || __sameNode(parent, tw._current)) { return null; }
+        node = parent;
+      }
+    }
+    return null;
   }
+  // "Traverse siblings" of currentNode (type "next" => forward, "previous" => backward).
+  function __twTraverseSiblings(tw, type) {
+    var node = tw._current;
+    if (__sameNode(node, tw._root)) { return null; }
+    while (true) {
+      var sibling = (type === "next") ? node.nextSibling : node.previousSibling;
+      while (sibling != null) {
+        node = sibling;
+        var result = __filterNode(tw, node);
+        if (result === FILTER_ACCEPT) { tw._current = node; return node; }
+        sibling = (type === "next") ? node.firstChild : node.lastChild;
+        if (result === FILTER_REJECT || sibling == null) {
+          sibling = (type === "next") ? node.nextSibling : node.previousSibling;
+        }
+      }
+      node = node.parentNode;
+      if (node == null || __sameNode(node, tw._root)) { return null; }
+      if (__filterNode(tw, node) === FILTER_ACCEPT) { return null; }
+    }
+  }
+  def(__twProto, "parentNode", function () {
+    var node = this._current;
+    while (node != null && !__sameNode(node, this._root)) {
+      node = node.parentNode;
+      if (node != null && __filterNode(this, node) === FILTER_ACCEPT) { this._current = node; return node; }
+    }
+    return null;
+  });
+  def(__twProto, "firstChild", function () { return __twTraverseChildren(this, "first"); });
+  def(__twProto, "lastChild", function () { return __twTraverseChildren(this, "last"); });
+  def(__twProto, "nextSibling", function () { return __twTraverseSiblings(this, "next"); });
+  def(__twProto, "previousSibling", function () { return __twTraverseSiblings(this, "previous"); });
+  def(__twProto, "nextNode", function () {
+    var node = this._current;
+    var result = FILTER_ACCEPT;
+    while (true) {
+      while (result !== FILTER_REJECT && node.firstChild != null) {
+        node = node.firstChild;
+        result = __filterNode(this, node);
+        if (result === FILTER_ACCEPT) { this._current = node; return node; }
+      }
+      var sibling = null, temporary = node;
+      while (temporary != null) {
+        if (__sameNode(temporary, this._root)) { return null; }
+        sibling = temporary.nextSibling;
+        if (sibling != null) { node = sibling; break; }
+        temporary = temporary.parentNode;
+      }
+      if (temporary == null) { return null; }
+      result = __filterNode(this, node);
+      if (result === FILTER_ACCEPT) { this._current = node; return node; }
+    }
+  });
+  def(__twProto, "previousNode", function () {
+    var node = this._current;
+    while (!__sameNode(node, this._root)) {
+      var sibling = node.previousSibling;
+      while (sibling != null) {
+        node = sibling;
+        var result = __filterNode(this, node);
+        while (result !== FILTER_REJECT && node.lastChild != null) {
+          node = node.lastChild;
+          result = __filterNode(this, node);
+        }
+        if (result === FILTER_ACCEPT) { this._current = node; return node; }
+        sibling = node.previousSibling;
+      }
+      if (__sameNode(node, this._root) || node.parentNode == null) { return null; }
+      node = node.parentNode;
+      if (__filterNode(this, node) === FILTER_ACCEPT) { this._current = node; return node; }
+    }
+    return null;
+  });
+
+  // ---- NodeIterator ----
+  __defReadonly(__niProto, "root", "_root");
+  __defReadonly(__niProto, "whatToShow", "_whatToShow");
+  __defReadonly(__niProto, "filter", "_filter");
+  __defReadonly(__niProto, "referenceNode", "_reference");
+  __defReadonly(__niProto, "pointerBeforeReferenceNode", "_pointerBefore");
+  // First node following `node` within root's subtree (preorder next, never escaping root).
+  function __followingWithinRoot(node, root) {
+    if (node.firstChild != null) { return node.firstChild; }
+    var n = node;
+    while (n != null && !__sameNode(n, root)) {
+      if (n.nextSibling != null) { return n.nextSibling; }
+      n = n.parentNode;
+    }
+    return null;
+  }
+  // First node preceding `node` within root's subtree (preorder predecessor; null at root).
+  function __precedingWithinRoot(node, root) {
+    if (__sameNode(node, root)) { return null; }
+    var prev = node.previousSibling;
+    if (prev != null) {
+      while (prev.lastChild != null) { prev = prev.lastChild; }
+      return prev;
+    }
+    return node.parentNode;
+  }
+  function __niTraverse(it, forward) {
+    var node = it._reference;
+    var beforeNode = it._pointerBefore;
+    while (true) {
+      if (forward) {
+        if (!beforeNode) {
+          var f = __followingWithinRoot(node, it._root);
+          if (f == null) { return null; }
+          node = f;
+        } else { beforeNode = false; }
+      } else {
+        if (beforeNode) {
+          var p = __precedingWithinRoot(node, it._root);
+          if (p == null) { return null; }
+          node = p;
+        } else { beforeNode = true; }
+      }
+      if (__filterNode(it, node) === FILTER_ACCEPT) { break; }
+    }
+    it._reference = node;
+    it._pointerBefore = beforeNode;
+    return node;
+  }
+  def(__niProto, "nextNode", function () { return __niTraverse(this, true); });
+  def(__niProto, "previousNode", function () { return __niTraverse(this, false); });
+  def(__niProto, "detach", function () {});
+
+  // whatToShow: omitted/undefined => SHOW_ALL (WebIDL default 0xFFFFFFFF); an explicit value
+  // (including null, which coerces to 0) is taken as an unsigned long. filter: null when omitted.
+  function __normWhatToShow(whatToShow) { return whatToShow === undefined ? 0xFFFFFFFF : (whatToShow >>> 0); }
+  function __normFilter(filter) { return (filter === undefined || filter === null) ? null : filter; }
   if (typeof globalThis.document !== "undefined" && globalThis.document) {
-    if (typeof globalThis.document.createTreeWalker !== "function") {
-      def(globalThis.document, "createTreeWalker", function (root, whatToShow, filter) {
-        if (arguments.length < 1 || root == null || typeof root.__node !== "number") {
-          throw new TypeError("Failed to execute 'createTreeWalker' on 'Document': parameter 1 is not of type 'Node'.");
-        }
-        return __makeTreeWalker(root, whatToShow, filter);
-      });
-    }
-    if (typeof globalThis.document.createNodeIterator !== "function") {
-      def(globalThis.document, "createNodeIterator", function (root, whatToShow, filter) {
-        if (arguments.length < 1 || root == null || typeof root.__node !== "number") {
-          throw new TypeError("Failed to execute 'createNodeIterator' on 'Document': parameter 1 is not of type 'Node'.");
-        }
-        return __makeNodeIterator(root, whatToShow, filter);
-      });
-    }
+    def(globalThis.document, "createTreeWalker", function (root, whatToShow, filter) {
+      if (arguments.length < 1 || root == null || typeof root.__node !== "number") {
+        throw new TypeError("Failed to execute 'createTreeWalker' on 'Document': parameter 1 is not of type 'Node'.");
+      }
+      var tw = Object.create(__twProto);
+      tw._root = root; tw._whatToShow = __normWhatToShow(whatToShow); tw._filter = __normFilter(filter);
+      tw._current = root; tw._active = false;
+      return tw;
+    });
+    def(globalThis.document, "createNodeIterator", function (root, whatToShow, filter) {
+      if (arguments.length < 1 || root == null || typeof root.__node !== "number") {
+        throw new TypeError("Failed to execute 'createNodeIterator' on 'Document': parameter 1 is not of type 'Node'.");
+      }
+      var it = Object.create(__niProto);
+      it._root = root; it._whatToShow = __normWhatToShow(whatToShow); it._filter = __normFilter(filter);
+      it._reference = root; it._pointerBefore = true; it._active = false;
+      __liveNodeIterators.push(it);
+      return it;
+    });
   }
 
   // TextEncoder / TextDecoder — UTF-8 only (the common case). Pure JS over Uint8Array.
