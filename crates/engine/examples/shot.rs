@@ -20,6 +20,10 @@ fn main() {
     let code = engine.load_url(&url);
     eprintln!("load_url -> {code}");
 
+    for line in engine.console_lines() {
+        eprintln!("console: {line}");
+    }
+
     let fb = engine.render();
     let (fw, fh, stride) = (fb.width, fb.height, fb.stride);
     eprintln!("framebuffer {fw}x{fh} stride {stride}");
