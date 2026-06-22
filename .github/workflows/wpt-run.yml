@@ -137,11 +137,11 @@ jobs:
           path: artifacts
           pattern: wpt-result-*
           merge-multiple: true
-      - name: Build combined summary
+      - name: Build combined report
         run: |
-          python3 - artifacts <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p comment
+          python3 - artifacts comment/report.md <<'PY'
           import glob, os, sys
-          from collections import defaultdict
           areas = {}  # area -> [pass, total, any_incomplete]
           order = []
           for f in sorted(glob.glob(os.path.join(sys.argv[1], "*.tsv"))):
@@ -153,17 +153,33 @@ jobs:
                   rec[0] += int(p); rec[1] += int(t)
                   if st == "incomplete":
                       rec[2] = True
-          print("## 🧪 WPT conformance (via `wpt run` over WebDriver)\n")
-          print("| Area | Subtests | Pass rate |")
-          print("|------|----------|-----------|")
+          out = []
+          out.append("## 🧪 WPT conformance (via `wpt run` over WebDriver)\n")
+          out.append("| Area | Subtests | Pass rate |")
+          out.append("|------|----------|-----------|")
           tp = tt = 0
           for area in order:
               p, t, inc = areas[area]
               tp += p; tt += t
               pct = f"{100*p/t:.1f}%" if t else "—"
               note = " ⚠️ partial" if inc else ""
-              print(f"| `{area}` | {p} / {t} | {pct}{note} |")
+              out.append(f"| `{area}` | {p:,} / {t:,} | {pct}{note} |")
           total_pct = f"{100*tp/tt:.1f}%" if tt else "—"
-          print(f"| **Total** | **{tp} / {tt}** | **{total_pct}** |")
-          print("\n<sub>web-platform-tests via the real `wpt run` harness driving the engine over WebDriver (`lucid` product). Each area is sharded into parallel chunks. Worker-dependent variants time out (no worker support yet); ⚠️ partial means a chunk was cut off.</sub>")
+          out.append(f"| **Total** | **{tp:,} / {tt:,}** | **{total_pct}** |")
+          out.append("\n<sub>web-platform-tests via the real `wpt run` harness driving the engine over WebDriver (`lucid` product). Each area is sharded into parallel chunks. Worker-dependent variants time out (no worker support yet); ⚠️ partial means a chunk was cut off.</sub>")
+          md = "\n".join(out) + "\n"
+          open(sys.argv[2], "w").write(md)
           PY
+          cat comment/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # On PRs, stage the comment + PR number for wpt-comment.yml to post (a workflow_run handler, so
+      # it works for fork PRs whose `pull_request` token is read-only). Pushes to main don't comment.
+      - name: Stage PR comment
+        if: github.event_name == 'pull_request'
+        run: echo "${{ github.event.pull_request.number }}" > comment/pr-number.txt
+      - name: Upload comment artifact
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-comment
+          path: comment/
