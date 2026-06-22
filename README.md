@@ -25,6 +25,38 @@ it for a hand-written implementation later is a localized change, not a refactor
 Everything else — HTML tokenizer/tree-builder, CSS parser, DOM, cascade, layout, the
 compositor — is ours.
 
+## Build & run
+
+### Prerequisites
+
+- **Rust** (stable) — install via [rustup](https://rustup.rs).
+- For App Shell: **Xcode command-line tools** (`xcode-select --install`)
+
+### Engine / tests only
+
+The engine is plain Rust and builds on **macOS, Linux, and Windows**:
+
+```sh
+cargo build --workspace # Build
+cargo test --workspace  # Build and run tests
+```
+
+### The App shell (macOS only)
+
+The app shell currently ships for **macOS** (Swift / AppKit), so a graphical browser today requires macOS.
+Run from the repo root:
+
+```sh
+bash scripts/build.sh              # debug: Rust lib + the Swift app
+./swift/.build/debug/Browser       # launch
+
+bash scripts/build.sh release      # optimized, bare executable
+./swift/.build/release/Browser     # launch
+
+bash scripts/build.sh release-app  # optimized + packaged + signed dist/Browser.app
+open dist/Browser.app              # launch
+```
+
 ## Architecture
 
 ```
@@ -66,22 +98,6 @@ engine (V8) uses no pointer compression. A tab is therefore limited only by the 
 RAM + swap. We set no `rlimit`, and size types on the hot paths are 64-bit (`net`'s body
 backstop sits at 16 GiB, the DOM arena indexes with `usize`).
 
-## Build & run
-
-The engine is plain Rust and builds on **macOS, Linux, and Windows**. The macOS app shell is
-built via `scripts/build.sh`:
-
-```sh
-bash scripts/build.sh              # debug: Rust lib + the Swift app
-./swift/.build/debug/Browser       # launch
-
-bash scripts/build.sh release      # optimized, bare executable
-bash scripts/build.sh release-app  # optimized + packaged + signed dist/Browser.app
-```
-
-Tests run on every platform: `cargo test --workspace`. (Only the *shell* is per-OS; the engine
-and all unit tests are cross-platform — CI runs them on macOS / Linux / Windows.)
-
 ## Contributing
 
 This project is built **LLM-first**. We strongly prefer changes authored by a capable coding
@@ -93,7 +109,8 @@ Note the model/tooling on your PR.
 - **Conventional Commits.** The PR title must be `feat(...)`, `fix(...)`, `ci: …`, etc. CI enforces
   it, and `release-plz` uses it to bump versions and write CHANGELOGs.
 - **CI on every PR:** `cargo test` on macOS / Linux / Windows, `fmt` + `clippy`, and the **WPT
-  conformance suite** — it posts a pass-rate report comment on the PR.
+  conformance suite** (via the real `wpt run` harness over WebDriver) — it writes a pass-rate
+  summary to the run.
 - **Releases:** merging the release-plz version PR tags `vX.Y.Z`, which builds + signs + notarizes
   the macOS app and publishes it as a GitHub release.
 
@@ -104,7 +121,8 @@ open [web-platform-tests](https://github.com/web-platform-tests/wpt) failures so
 from 🟢 *good first issue* (small, self-contained, with a dedicated test to verify) through
 🔴 *high-impact* fixes that unblock thousands of subtests. Each issue has a verified root cause, the
 failing test, exact subtest counts, the relevant spec section, and a one-line repro. Running the
-suite locally is documented in [`crates/wpt-runner/README.md`](crates/wpt-runner/README.md).
+suite locally — the real `wpt run` harness driving the engine over WebDriver — is documented in
+[`docs/running-wpt.md`](docs/running-wpt.md).
 
 **Claiming an issue:** comment `/claim` (or `.take`) on any open issue to have it assigned to you —
 a bot assigns you and labels it `claimed`, no maintainer needed. Comment `/unclaim` to release it.

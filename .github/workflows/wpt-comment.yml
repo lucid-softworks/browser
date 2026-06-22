@@ -1,6 +1,6 @@
 name: WPT comment
 
-# Posts the WPT conformance report produced by wpt.yml back onto the PR.
+# Posts the WPT conformance report produced by the WPT workflow (wpt-run.yml) back onto the PR.
 #
 # Why this is a separate workflow: PRs from forks get a read-only GITHUB_TOKEN, so the WPT workflow
 # (which runs on `pull_request`) can't post a comment — it fails with "Resource not accessible by
