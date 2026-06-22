@@ -6690,7 +6690,17 @@
   })();
   defClass("CDATASection", globalThis.Text);
   defClass("ProcessingInstruction", globalThis.CharacterData);
-  defClass("DocumentFragment", NodeCtor);
+  var DocumentFragmentCtor = defClass("DocumentFragment", NodeCtor);
+  try {
+    if (DocumentFragmentCtor && DocumentFragmentCtor.prototype) {
+      def(DocumentFragmentCtor.prototype, "getElementById", function (idStr) {
+        var rootId = this && this.__node;
+        if (typeof rootId !== "number") { return null; }
+        var found = globalThis.__findElementByIdWithin(rootId, String(idStr));
+        return found >= 0 ? globalThis.__nodeFor(found) : null;
+      });
+    }
+  } catch (e) {}
   defClass("ShadowRoot", globalThis.DocumentFragment);
   defClass("DocumentType", NodeCtor);
   defClass("Attr", NodeCtor);
@@ -8092,7 +8102,7 @@
             get childElementCount() { var k = __children(tplNode), n = 0; for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { n++; } } return n; },
             querySelector: function (s) { try { return tpl.querySelector(s); } catch (e) { return null; } },
             querySelectorAll: function (s) { try { return tpl.querySelectorAll(s); } catch (e) { return []; } },
-            getElementById: function (gid) { try { return tpl.querySelector('#' + gid); } catch (e) { return null; } },
+            getElementById: function (gid) { var found = globalThis.__findElementByIdWithin(tplNode, String(gid)); return found >= 0 ? nodeAt(found) : null; },
             cloneNode: function () { return this; },
           };
           try { def(tpl, "__contentFrag", frag); } catch (e) { tpl.__contentFrag = frag; }

@@ -677,22 +677,27 @@ impl<'a> Parser<'a> {
         }
 
         // Decide the destination based on the current mode and whether this is metadata.
-        match self.mode {
-            InsertMode::Initial | InsertMode::BeforeHtml | InsertMode::BeforeHead => {
-                if is_metadata(&tag) {
-                    self.ensure_head();
-                } else {
-                    self.ensure_body();
+        // Children of <template> are its inert contents, so keep inserting under the template
+        // instead of letting a flow child implicitly close <head> and open <body>.
+        let in_template = self.open.iter().any(|&id| self.tag_of(id) == "template");
+        if !in_template {
+            match self.mode {
+                InsertMode::Initial | InsertMode::BeforeHtml | InsertMode::BeforeHead => {
+                    if is_metadata(&tag) {
+                        self.ensure_head();
+                    } else {
+                        self.ensure_body();
+                    }
                 }
-            }
-            InsertMode::InHead => {
-                if !is_metadata(&tag) {
-                    // First flow content: implicitly close head, open body.
-                    self.ensure_body();
+                InsertMode::InHead => {
+                    if !is_metadata(&tag) {
+                        // First flow content: implicitly close head, open body.
+                        self.ensure_body();
+                    }
+                    // Metadata stays in head (current parent is head).
                 }
-                // Metadata stays in head (current parent is head).
+                InsertMode::InBody => {}
             }
-            InsertMode::InBody => {}
         }
 
         // "In body" auto-closing: certain start tags implicitly close an open `<p>`, list item, or
@@ -1672,6 +1677,25 @@ mod tests {
         assert_skeleton(&doc);
         assert_eq!(tag_of(&doc, children(&doc, head_of(&doc))[0]), "title");
         assert!(children(&doc, body_of(&doc)).is_empty());
+    }
+
+    #[test]
+    fn template_keeps_flow_content_as_children() {
+        let doc = parse(r#"<template><div id="bar"><span id="foo"></span></div></template>"#);
+        assert_skeleton(&doc);
+        let template = children(&doc, head_of(&doc))
+            .into_iter()
+            .find(|&id| tag_of(&doc, id) == "template")
+            .expect("template should stay in head");
+        let div = children(&doc, template)[0];
+        assert_eq!(tag_of(&doc, div), "div");
+        let div_attrs = match &doc.get(div).data {
+            NodeData::Element(e) => &e.attrs,
+            _ => panic!("expected div element"),
+        };
+        assert_eq!(div_attrs.get("id").map(String::as_str), Some("bar"));
+        let span = children(&doc, div)[0];
+        assert_eq!(tag_of(&doc, span), "span");
     }
 
     #[test]

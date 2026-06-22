@@ -301,6 +301,22 @@
     visit(rootId, true);
     return out;
   }
+  function findElementByIdWithin(rootId, idStr) {
+    var target = String(idStr);
+    if (target === "") { return -1; }
+    function visit(nid) {
+      var kids = __children(nid);
+      for (var i = 0; i < kids.length; i++) {
+        var kid = kids[i];
+        if (__nodeType(kid) === 1 && __getAttr(kid, "id") === target) { return kid; }
+        var found = visit(kid);
+        if (found >= 0) { return found; }
+      }
+      return -1;
+    }
+    return visit(rootId);
+  }
+  def(globalThis, "__findElementByIdWithin", findElementByIdWithin);
 
   // --- Namespace lookup (DOM standard §node tree) ---------------------------------------------
   // These operate on raw node ids so they can be shared by Element / Document / Attr / DocumentType
