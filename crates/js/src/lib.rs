@@ -13120,22 +13120,98 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   if (typeof globalThis.Worker !== "function") {
     def(globalThis, "Worker", function () { this.postMessage = fn; this.terminate = fn; this.onmessage = null; this.onerror = null; this.addEventListener = fn; this.removeEventListener = fn; });
   }
-  // --- Service Workers (stage 1: container + registration plumbing — see issue #56) --------
-  // `navigator.serviceWorker` is a real `ServiceWorkerContainer`; `register()` validates the
-  // script/scope URLs (same-origin, max-scope), fetches the script to confirm it exists and is a
-  // JS resource, then creates a `ServiceWorkerRegistration` whose `ServiceWorker` is advanced
-  // through the installing -> installed -> activating -> activated lifecycle (firing `updatefound`
-  // on the registration and `statechange` on the worker). The worker script is NOT yet executed —
-  // there is no `ServiceWorkerGlobalScope`, no install/activate handlers, and no fetch
-  // interception (stages 2-3). `controller` therefore stays null (no client is claimed).
+  // --- MessageChannel / MessagePort --------------------------------------------------------
+  // An entangled pair of ports: postMessage on one delivers a `message` MessageEvent on the other,
+  // asynchronously (a task), after the receiving port is started. A port starts on the first
+  // start() call or implicitly when its `onmessage` handler is assigned. Transferred MessagePorts
+  // are passed by reference (single isolate) and surfaced as `event.ports`.
+  if (typeof globalThis.MessageChannel !== "function") {
+    defClass("MessagePort", globalThis.EventTarget);
+    defClass("MessageChannel");
+    // Structured clone that preserves transferable MessagePorts by reference (so an entangled port
+    // survives the hop) and otherwise deep-copies plain data. Falls back to identity for exotic
+    // objects (Blob, ArrayBuffer, typed arrays) which the tests pass through unchanged.
+    def(globalThis, "__swClone", function (value) {
+      var seen = (typeof Map === "function") ? new Map() : null;
+      function clone(v) {
+        if (v === null || typeof v !== "object") { return v; }
+        if (v instanceof globalThis.MessagePort) { return v; }
+        if (v instanceof ArrayBuffer) { return v; }
+        if (typeof Blob === "function" && v instanceof Blob) { return v; }
+        if (ArrayBuffer.isView(v)) { return v; }
+        if (seen && seen.has(v)) { return seen.get(v); }
+        var out;
+        if (Array.isArray(v)) { out = []; if (seen) { seen.set(v, out); } for (var i = 0; i < v.length; i++) { out[i] = clone(v[i]); } return out; }
+        out = {}; if (seen) { seen.set(v, out); }
+        for (var k in v) { if (Object.prototype.hasOwnProperty.call(v, k)) { out[k] = clone(v[k]); } }
+        return out;
+      }
+      return clone(value);
+    });
+    function __swPorts(transfer) {
+      var ports = [];
+      if (transfer && transfer.length) {
+        for (var i = 0; i < transfer.length; i++) { if (transfer[i] instanceof globalThis.MessagePort) { ports.push(transfer[i]); } }
+      }
+      return ports;
+    }
+    def(globalThis, "__swExtractPorts", __swPorts);
+    function __swMakePort() {
+      var port = Object.create(globalThis.MessagePort.prototype);
+      installEvents(port);
+      var started = false, queue = [], onmsg = null;
+      port.__entangled = null; port.__closed = false;
+      function deliver(msg) {
+        var ev = new globalThis.MessageEvent("message", { data: msg.data, ports: msg.ports || [], origin: "" });
+        port.dispatchEvent(ev);
+      }
+      def(port, "postMessage", function (data, transfer) {
+        var other = port.__entangled;
+        if (!other || other.__closed) { return; }
+        var cloned = globalThis.__swClone(data);
+        var ports = __swPorts(transfer);
+        setTimeout(function () { other.__receive(cloned, ports); }, 0);
+      });
+      def(port, "start", function () { if (started) { return; } started = true; var q = queue; queue = []; for (var i = 0; i < q.length; i++) { deliver(q[i]); } });
+      def(port, "close", function () { port.__closed = true; });
+      def(port, "__receive", function (data, ports) { var msg = { data: data, ports: ports }; if (started) { deliver(msg); } else { queue.push(msg); } });
+      Object.defineProperty(port, "onmessage", {
+        get: function () { return onmsg; },
+        set: function (v) { onmsg = (typeof v === "function") ? v : null; port.start(); },
+        enumerable: true, configurable: true
+      });
+      port.onmessageerror = null;
+      return port;
+    }
+    def(globalThis, "MessageChannel", function () {
+      var p1 = __swMakePort(), p2 = __swMakePort();
+      p1.__entangled = p2; p2.__entangled = p1;
+      Object.defineProperty(this, "port1", { value: p1, enumerable: true, configurable: true });
+      Object.defineProperty(this, "port2", { value: p2, enumerable: true, configurable: true });
+    });
+  }
+
+  // --- Service Workers (stages 1-2: container, registration, worker execution — see issue #56) --
+  // `navigator.serviceWorker` is a real `ServiceWorkerContainer`. `register()` validates the
+  // script/scope URLs (same-origin, max-scope), fetches the script, then runs it in a
+  // `ServiceWorkerGlobalScope` and drives the install -> installed -> activating -> activated
+  // lifecycle, dispatching `install`/`activate` as `ExtendableEvent`s and awaiting `waitUntil()`.
+  // The worker can `skipWaiting()`, `clients.claim()` (which sets `controller`), exchange messages
+  // with the page (`postMessage`/`ExtendableMessageEvent`/`Client.postMessage`), and `importScripts`.
+  // Fetch interception (FetchEvent dispatch into the page's resource loads) is stage 3.
   if (typeof globalThis.ServiceWorker !== "function") {
     defClass("ServiceWorker", globalThis.EventTarget);
     defClass("ServiceWorkerRegistration", globalThis.EventTarget);
     defClass("ServiceWorkerContainer", globalThis.EventTarget);
+    defClass("ServiceWorkerGlobalScope", globalThis.EventTarget);
+    defClass("Clients");
+    defClass("Client");
+    defClass("WindowClient", globalThis.Client);
     if (typeof globalThis.NavigationPreloadManager !== "function") { defClass("NavigationPreloadManager"); }
 
     var __swRegs = [];           // live ServiceWorkerRegistration objects, in registration order
     var __swReadyResolve = null; // pending resolver for navigator.serviceWorker.ready, if any
+    var __swClientSeq = 0;       // monotonic source for client ids
 
     function __swBase() { try { return globalThis.location.href; } catch (e) { return "about:blank"; } }
     function __swNoFrag(u) { try { u.hash = ""; } catch (e) {} return u; }
@@ -13150,9 +13226,139 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       Object.defineProperty(sw, "state", { get: function () { return state; }, enumerable: true, configurable: true });
       sw.onstatechange = null;
       sw.onerror = null;
-      def(sw, "postMessage", function () {}); // stage 2 wires this to the ServiceWorkerGlobalScope
+      sw.__scope = null;       // the ServiceWorkerGlobalScope once the script runs
+      sw.__skipWaiting = false;
+      // Page -> worker postMessage: dispatch an ExtendableMessageEvent on the worker global scope,
+      // with the page exposed as event.source (a WindowClient that can postMessage back).
+      def(sw, "postMessage", function (data, transfer) {
+        var scope = sw.__scope; if (!scope) { return; }
+        var cloned = globalThis.__swClone(data);
+        var ports = globalThis.__swExtractPorts(transfer);
+        setTimeout(function () {
+          var ev = new globalThis.ExtendableMessageEvent("message", {
+            data: cloned, origin: __swPageOrigin(), lastEventId: "",
+            source: __swPageClient(), ports: ports
+          });
+          scope.dispatchEvent(ev);
+        }, 0);
+      });
       def(sw, "__setState", function (s) { if (state === s) { return; } state = s; fireOn(sw, "statechange"); });
       return sw;
+    }
+
+    function __swPageOrigin() { try { return (new globalThis.URL(__swBase())).origin; } catch (e) { return ""; } }
+
+    // The page, as seen from a worker: a WindowClient whose postMessage delivers a `message`
+    // MessageEvent to navigator.serviceWorker (event.source = the controlling worker).
+    var __swPageClientObj = null;
+    function __swPageClient() {
+      if (__swPageClientObj) { return __swPageClientObj; }
+      var c = Object.create(globalThis.WindowClient.prototype);
+      var id = "client-" + (++__swClientSeq);
+      Object.defineProperty(c, "id", { value: id, enumerable: true, configurable: true });
+      Object.defineProperty(c, "url", { get: function () { return __swBase(); }, enumerable: true, configurable: true });
+      Object.defineProperty(c, "type", { value: "window", enumerable: true, configurable: true });
+      Object.defineProperty(c, "frameType", { value: "top-level", enumerable: true, configurable: true });
+      Object.defineProperty(c, "visibilityState", { value: "visible", enumerable: true, configurable: true });
+      Object.defineProperty(c, "focused", { value: true, enumerable: true, configurable: true });
+      def(c, "focus", function () { return Promise.resolve(c); });
+      def(c, "navigate", function () { return Promise.resolve(c); });
+      def(c, "postMessage", function (data, transfer) {
+        var cloned = globalThis.__swClone(data);
+        var ports = globalThis.__swExtractPorts(transfer);
+        setTimeout(function () {
+          var ev = new globalThis.MessageEvent("message", {
+            data: cloned, origin: __swPageOrigin(), lastEventId: "",
+            source: __swContainer.controller || null, ports: ports
+          });
+          __swContainer.dispatchEvent(ev);
+        }, 0);
+      });
+      __swPageClientObj = c;
+      return c;
+    }
+
+    // self.clients in the worker scope. matchAll/get expose the page client; claim() makes the
+    // worker the page's controller (firing controllerchange).
+    function __swMakeClients(reg, sw) {
+      var clients = Object.create(globalThis.Clients.prototype);
+      def(clients, "get", function (id) { var c = __swPageClient(); return Promise.resolve(c.id === id ? c : undefined); });
+      def(clients, "matchAll", function (opts) {
+        opts = opts || {};
+        // Only return the page client when this worker controls it (claimed), or when uncontrolled
+        // clients are explicitly requested.
+        var controls = __swContainer.controller === sw;
+        return Promise.resolve((controls || opts.includeUncontrolled) ? [__swPageClient()] : []);
+      });
+      def(clients, "openWindow", function () { return Promise.resolve(null); });
+      def(clients, "claim", function () {
+        if (sw.state === "activating" || sw.state === "activated") {
+          if (__swMatchesClient(reg.scope) && __swContainer.controller !== sw) {
+            __swContainer.controller = sw;
+            fireOn(__swContainer, "controllerchange");
+          }
+        }
+        return Promise.resolve();
+      });
+      return clients;
+    }
+
+    // Build the ServiceWorkerGlobalScope and run the worker script inside it. The script executes in
+    // a function whose parameters shadow the worker-scoped globals (self, registration, clients,
+    // skipWaiting, importScripts, ...), so bare references resolve to the scope; `globalThis` is left
+    // as the real global so shared constructors (URL, MessageChannel, Response, ...) remain reachable.
+    function __swExecuteWorker(reg, sw, scriptHref, source) {
+      var scope = Object.create(globalThis.ServiceWorkerGlobalScope.prototype);
+      installEvents(scope);
+      scope.self = scope;
+      // testharness.js (run inside the worker via importScripts) selects its test environment with
+      // `'ServiceWorkerGlobalScope' in self && self instanceof ServiceWorkerGlobalScope`; expose the
+      // constructor on the scope so a worker-side test reports its results back to the page.
+      Object.defineProperty(scope, "ServiceWorkerGlobalScope", { value: globalThis.ServiceWorkerGlobalScope, enumerable: false, configurable: true });
+      scope.oninstall = null; scope.onactivate = null; scope.onfetch = null;
+      scope.onmessage = null; scope.onmessageerror = null;
+      Object.defineProperty(scope, "registration", { value: reg, enumerable: true, configurable: true });
+      Object.defineProperty(scope, "serviceWorker", { value: sw, enumerable: true, configurable: true });
+      try { Object.defineProperty(scope, "location", { value: new globalThis.URL(scriptHref), enumerable: true, configurable: true }); } catch (e) {}
+      var clients = __swMakeClients(reg, sw);
+      Object.defineProperty(scope, "clients", { value: clients, enumerable: true, configurable: true });
+      var caches = (typeof globalThis.caches === "object" && globalThis.caches) ? globalThis.caches : undefined;
+      Object.defineProperty(scope, "caches", { value: caches, enumerable: true, configurable: true });
+      def(scope, "skipWaiting", function () { sw.__skipWaiting = true; return Promise.resolve(); });
+      def(scope, "fetch", function () { return globalThis.fetch.apply(globalThis, arguments); });
+      var runInScope = function (src, url) {
+        var fn = (globalThis.Function)(
+          "self", "registration", "clients", "location", "caches", "skipWaiting",
+          "importScripts", "fetch", "addEventListener", "removeEventListener", "dispatchEvent",
+          src + "\n//# sourceURL=" + url + "\n"
+        );
+        fn.call(scope, scope, reg, clients, scope.location, caches, scope.skipWaiting,
+          scope.importScripts, scope.fetch, scope.addEventListener, scope.removeEventListener, scope.dispatchEvent);
+      };
+      def(scope, "importScripts", function () {
+        for (var i = 0; i < arguments.length; i++) {
+          var u = (new globalThis.URL(String(arguments[i]), scriptHref)).href;
+          var env = globalThis.__request("GET", u, "", "{}");
+          if (!env) { throw new TypeError("Failed to execute 'importScripts': could not fetch " + u); }
+          var parsed; try { parsed = JSON.parse(env); } catch (e) { throw new TypeError("Failed to execute 'importScripts': bad response for " + u); }
+          if (!parsed.ok) { throw new TypeError("Failed to execute 'importScripts': HTTP " + parsed.status + " for " + u); }
+          runInScope(parsed.body || "", u);
+        }
+      });
+      sw.__scope = scope;
+      runInScope(source || "", scriptHref);
+      return scope;
+    }
+
+    // Dispatch a lifecycle ExtendableEvent into the worker scope and await its waitUntil() promises.
+    function __swDispatchExtendable(scope, type) {
+      var ev = new globalThis.ExtendableEvent(type);
+      var s = globalThis.__eventState(ev);
+      s.__active = true;
+      scope.dispatchEvent(ev);
+      s.__active = false;
+      var extend = s.__extend || [];
+      return extend.length ? Promise.all(extend)["then"](function () {}, function () {}) : Promise.resolve();
     }
 
     function __swMakeNavPreload() {
@@ -13190,9 +13396,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       def(reg, "unregister", function () {
         var i = __swRegs.indexOf(reg), found = i >= 0;
         if (found) { __swRegs.splice(i, 1); }
+        // Mark the held worker objects redundant (fires statechange on the refs callers captured),
+        // then clear the slots so the registration reports installing/waiting/active === null.
         if (active && active.__setState) { active.__setState("redundant"); }
         if (waiting && waiting.__setState) { waiting.__setState("redundant"); }
         if (installing && installing.__setState) { installing.__setState("redundant"); }
+        if (__swContainer.controller === active) { __swContainer.controller = null; }
+        reg.__setSlots(null, null, null);
         return Promise.resolve(found);
       });
       def(reg, "getNotifications", function () { return Promise.resolve([]); });
@@ -13202,25 +13412,49 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       return reg;
     }
 
-    // Advance a freshly-registered worker through the lifecycle, one event-loop turn per state so a
-    // client awaiting `register()` can read `registration.installing` and attach `statechange`
-    // listeners (via wait_for_state) before any transition fires.
-    function __swLifecycle(reg, sw) {
-      setTimeout(function () {
-        if (__swRegs.indexOf(reg) < 0) { return; }
-        reg.__setSlots(null, sw, null); sw.__setState("installed");
-        setTimeout(function () {
-          if (__swRegs.indexOf(reg) < 0) { return; }
-          reg.__setSlots(null, null, sw); sw.__setState("activating");
-          setTimeout(function () {
-            if (__swRegs.indexOf(reg) < 0) { return; }
-            sw.__setState("activated");
-            if (__swReadyResolve && __swMatchesClient(reg.scope)) {
-              var r = __swReadyResolve; __swReadyResolve = null; r(reg);
-            }
-          }, 0);
+    // Advance an already-evaluated worker (its `scope` built by __swExecuteWorker during register())
+    // through the lifecycle. The sequence is deferred a macrotask past register()'s resolution so the
+    // registering client can synchronously read `registration.installing` and attach
+    // `updatefound`/`statechange` listeners first. Turn 1 fires `updatefound`; turn 2 dispatches
+    // `install` (awaiting waitUntil) -> "installed"; turn 3 dispatches `activate` -> "activated" —
+    // unless a prior active worker still controls a client and the new worker did not skipWaiting(),
+    // in which case it stays "installed" (waiting). Each phase gets its own event-loop turn so a
+    // client's awaits (possibly delayed a microtask by promise adoption, e.g. wait_for_update) settle
+    // and the next listener is attached before the next transition fires.
+    function __swLifecycle(reg, sw, scope, priorActive) {
+      var gone = function () { return __swRegs.indexOf(reg) < 0; };
+      setTimeout(function () { // turn 1: announce the new worker
+        if (gone()) { return; }
+        fireOn(reg, "updatefound");
+        setTimeout(function () { // turn 2: install
+          if (gone()) { return; }
+          __swDispatchExtendable(scope, "install").then(function () {
+            if (gone()) { return; }
+            reg.__setSlots(null, sw, priorActive || null);
+            sw.__setState("installed");
+            if (priorActive && !sw.__skipWaiting) { return; } // wait behind the active worker
+            setTimeout(function () { // turn 3: activate
+              if (gone()) { return; }
+              if (priorActive && priorActive.__setState) { priorActive.__setState("redundant"); }
+              reg.__setSlots(null, null, sw);
+              sw.__setState("activating");
+              __swDispatchExtendable(scope, "activate").then(function () {
+                if (gone()) { return; }
+                sw.__setState("activated");
+                if (__swReadyResolve && __swMatchesClient(reg.scope)) { var r = __swReadyResolve; __swReadyResolve = null; r(reg); }
+              });
+            }, 0);
+          });
         }, 0);
       }, 0);
+    }
+
+    // Per spec the worker script is evaluated before `registration.installing` is set, so the worker
+    // observes installing === null during its own evaluation. Returns the built scope, or null after
+    // marking the worker redundant if the script threw (register() then rejects).
+    function __swEvalWorker(reg, sw, scriptHref, source) {
+      try { return __swExecuteWorker(reg, sw, scriptHref, source); }
+      catch (e) { sw.__setState("redundant"); (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); return null; }
     }
 
     var __SW_JS_MIME = {
@@ -13278,28 +13512,35 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           if (scopeHref.indexOf(maxScope) !== 0) {
             throw new globalThis.DOMException("Failed to register a ServiceWorker: the path of the provided scope is not under the max scope allowed.", "SecurityError");
           }
-        }).then(function () {
+          return res.text ? res.text() : ""; // the worker script source, run in the global scope
+        }).then(function (source) {
+          var evalErr = new globalThis.DOMException("Failed to register a ServiceWorker: the script threw an error during evaluation.", "AbortError");
           var existing = null;
           for (var i = 0; i < __swRegs.length; i++) { if (__swRegs[i].scope === scopeHref) { existing = __swRegs[i]; break; } }
           if (existing) {
             var slots = existing.__slots();
             // Same script already installed: re-register resolves with the same registration object.
             if (slots.active && slots.active.scriptURL === scriptHref) { resolve(existing); return; }
-            // Different script (or none active yet): update in place with a fresh worker.
+            // Different script (or none active yet): update in place with a fresh worker. Evaluate it
+            // while installing is still null, then set it installing. The old active worker (if any)
+            // keeps controlling clients until the new one activates.
             var sw2 = __swMakeWorker(scriptHref);
+            var scope2 = __swEvalWorker(existing, sw2, scriptHref, source);
+            if (!scope2) { reject(evalErr); return; }
             existing.__setSlots(sw2, slots.waiting, slots.active);
-            fireOn(existing, "updatefound");
             resolve(existing);
-            __swLifecycle(existing, sw2);
+            __swLifecycle(existing, sw2, scope2, slots.active); // fires updatefound itself
             return;
           }
           var reg = __swMakeRegistration(scopeHref, updateViaCache);
           var sw = __swMakeWorker(scriptHref);
-          reg.__setSlots(sw, null, null);
           __swRegs.push(reg);
-          fireOn(reg, "updatefound");
+          // Evaluate the worker (installing still null) before exposing it as registration.installing.
+          var scope = __swEvalWorker(reg, sw, scriptHref, source);
+          if (!scope) { __swRegs.splice(__swRegs.indexOf(reg), 1); reject(evalErr); return; }
+          reg.__setSlots(sw, null, null);
           resolve(reg);
-          __swLifecycle(reg, sw);
+          __swLifecycle(reg, sw, scope, null); // fires updatefound itself
         }).catch(function (err) { reject(err); });
       });
     }
@@ -13330,7 +13571,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     __swContainer.oncontrollerchange = null;
     __swContainer.onmessage = null;
     __swContainer.onmessageerror = null;
-    // No client is claimed by a freshly-registered worker, so the page has no controller (stage 3).
+    // controller is null until a worker calls clients.claim() (stage 1 registration alone does not
+    // retroactively control the already-loaded page); claim() sets it and fires controllerchange.
     Object.defineProperty(__swContainer, "controller", { value: null, enumerable: true, configurable: true, writable: true });
     Object.defineProperty(__swContainer, "ready", {
       get: function () {
@@ -14240,6 +14482,35 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     defSubclass("DeviceMotionEvent", Event, { acceleration: null, accelerationIncludingGravity: null, rotationRate: null, interval: 0 });
     defSubclass("DeviceOrientationEvent", Event, { alpha: null, beta: null, gamma: null, absolute: false });
     defSubclass("TextEvent", UIEvent, { data: "" });
+    // Service Worker events (see issue #56). ExtendableEvent.waitUntil collects lifetime-extending
+    // promises onto the event's internal state; the SW lifecycle awaits them. FetchEvent.respondWith
+    // stashes the response promise for the fetch-interception path (stage 3).
+    var ExtendableEvent = defSubclass("ExtendableEvent", Event, {});
+    ExtendableEvent.prototype.waitUntil = function (p) {
+      var s = st(this);
+      if (!s.dispatching && !s.__active) {
+        throw new globalThis.DOMException("Failed to execute 'waitUntil' on 'ExtendableEvent': The event handler is already finished.", "InvalidStateError");
+      }
+      if (!s.__extend) { s.__extend = []; }
+      s.__extend.push(Promise.resolve(p));
+    };
+    defSubclass("ExtendableMessageEvent", ExtendableEvent, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
+    var FetchEvent = defSubclass("FetchEvent", ExtendableEvent, {
+      request: null, clientId: "", resultingClientId: "", replacesClientId: "",
+      preloadResponse: null, handled: null
+    }, function (init) {
+      if (!("request" in init) || !init.request) {
+        throw new TypeError("Failed to construct 'FetchEvent': required member request is undefined.");
+      }
+    });
+    FetchEvent.prototype.respondWith = function (r) {
+      var s = st(this);
+      if (s.__responded) { throw new globalThis.DOMException("Failed to execute 'respondWith' on 'FetchEvent': The event has already been responded to.", "InvalidStateError"); }
+      s.__responded = true;
+      s.__response = Promise.resolve(r);
+      if (!s.__extend) { s.__extend = []; }
+      s.__extend.push(s.__response["catch"](function () {}));
+    };
 
     // document.createEvent legacy factory: case-insensitive name -> interface, per the DOM spec
     // table. Returns an UNINITIALIZED event (type==="") whose prototype is the interface's
@@ -15014,6 +15285,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 /// Maximum number of `__runDueTimers()` iterations when draining the event loop.
 const EVENT_LOOP_CAP: usize = 10_000;
 
+/// Wall-clock ceiling for a single [`drain_event_loop`] call before the watchdog forcibly terminates
+/// V8 execution. The drain's own time budget is checked only *between* timer/microtask callbacks, so
+/// a script that infinite-loops *inside* one callback (e.g. a service worker with `while (true) {}`,
+/// used by some WPT tests to pin a worker in the "parsed" state) would otherwise wedge the session
+/// thread forever. Set well above any legitimate synchronous callback or network-bound drain (capped
+/// at 15s) so it only ever trips on a true in-tick hang.
+const DRAIN_WATCHDOG_SECS: u64 = 20;
+
 /// Compile + run a single source string in the current context, capturing console + error.
 /// Drains the per-call console buffer of the [`HostState`] into the result. Never panics on a JS
 /// error: it is captured into `EvalOutput.error` via a `TryCatch`.
@@ -15125,6 +15404,26 @@ fn drain_event_loop(
          if (typeof __fireLifecycleEvents === 'function') { __fireLifecycleEvents(); }",
         "<lifecycle>",
     );
+
+    // Arm the in-tick-hang watchdog (see DRAIN_WATCHDOG_SECS): a background thread that terminates
+    // V8 execution if this drain doesn't signal completion in time. Disarmed below before the trailing
+    // internal evals; if it fired, the pending termination is cancelled so the isolate stays usable.
+    let wd_handle = scope.thread_safe_handle();
+    let (wd_stop_tx, wd_stop_rx) = std::sync::mpsc::channel::<()>();
+    let wd_tripped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wd_tripped_bg = wd_tripped.clone();
+    let wd_thread = std::thread::Builder::new()
+        .name("js-drain-watchdog".to_string())
+        .spawn(move || {
+            if wd_stop_rx
+                .recv_timeout(std::time::Duration::from_secs(DRAIN_WATCHDOG_SECS))
+                .is_err()
+            {
+                wd_tripped_bg.store(true, std::sync::atomic::Ordering::SeqCst);
+                wd_handle.terminate_execution();
+            }
+        })
+        .ok();
 
     let start = std::time::Instant::now();
     // Idle budget keeps ticks snappy; the network budget is raised because a page legitimately
@@ -15239,8 +15538,24 @@ fn drain_event_loop(
         }
     }
 
+    // Disarm the watchdog. If it tripped, the page/worker infinite-looped inside a callback: cancel
+    // the V8 termination so the isolate is reusable, and note it so the hang is visible in output.
+    let _ = wd_stop_tx.send(());
+    if let Some(h) = wd_thread {
+        let _ = h.join();
+    }
+    let wd_fired = wd_tripped.load(std::sync::atomic::Ordering::SeqCst);
+    if wd_fired || scope.is_execution_terminating() {
+        scope.cancel_terminate_execution();
+    }
+
     // Collect timer/microtask errors recorded JS-side.
     let mut extra: Vec<String> = Vec::new();
+    if wd_fired {
+        extra.push(format!(
+            "⚠ event-loop watchdog: execution exceeded {DRAIN_WATCHDOG_SECS}s and was terminated (in-tick infinite loop?)"
+        ));
+    }
     if let Some(joined) = eval_to_string(scope, "(globalThis.__timerErrors || []).join('\\u0000')")
     {
         for e in joined.split('\u{0}') {
@@ -18878,6 +19193,33 @@ mod tests {
     }
 
     #[test]
+    fn message_channel_entangled_ports_deliver_both_ways() {
+        // A MessageChannel's two ports are entangled: postMessage on one delivers a `message` event
+        // on the other (after the event-loop turn), in both directions. Assigning onmessage starts
+        // the port implicitly.
+        let (doc, body) = doc_with_body("");
+        let (doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var b = document.body;
+              var mc = new MessageChannel();
+              mc.port1.onmessage = function (e) { b.setAttribute('data-on1', e.data); };
+              mc.port2.addEventListener('message', function (e) { b.setAttribute('data-on2', e.data); });
+              mc.port2.start();
+              mc.port2.postMessage('to-1');
+              mc.port1.postMessage('to-2');
+              b.setAttribute('data-port', String(mc.port1 instanceof MessagePort));
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert_eq!(attr_of(&doc, body, "data-on1").as_deref(), Some("to-1"));
+        assert_eq!(attr_of(&doc, body, "data-on2").as_deref(), Some("to-2"));
+        assert_eq!(attr_of(&doc, body, "data-port").as_deref(), Some("true"));
+    }
+
+    #[test]
     fn add_event_listener_signal_option_removes_on_abort() {
         let out = env_eval(
             "https://example.com/",
@@ -20078,6 +20420,57 @@ mod tests {
         assert_eq!(attr("data-initial").as_deref(), Some("installing"));
         assert_eq!(attr("data-final").as_deref(), Some("activated"));
         assert_eq!(attr("data-hdr").as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn service_worker_runs_script_and_round_trips_messages() {
+        // The worker script executes in a ServiceWorkerGlobalScope: it can call skipWaiting() and
+        // register a `message` listener that replies through event.source (the page client). After
+        // activation the page posts a message to registration.active and receives the worker's reply
+        // on navigator.serviceWorker, exercising the full page<->worker messaging bridge.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                navigator.serviceWorker.onmessage = function (e) {
+                  document.body.setAttribute('data-reply', e.data);
+                };
+                navigator.serviceWorker.register('sw.js').then(function (reg) {
+                  var w = reg.installing;
+                  w.addEventListener('statechange', function () {
+                    if (w.state === 'activated') { reg.active.postMessage('ping'); }
+                  });
+                });
+            "#
+            .to_string(),
+        );
+        // The worker script (JSON-escaped into the envelope body): reply via event.source.postMessage.
+        let worker_body = "self.skipWaiting();\\nself.addEventListener('message', function (e) { e.source.postMessage('pong:' + e.data); });";
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(move |_m, u, _b, _h| {
+                Some(format!(
+                    r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/javascript","body":"{worker_body}"}}"#
+                ))
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let reply = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-reply").cloned(),
+            _ => None,
+        };
+        assert_eq!(reply.as_deref(), Some("pong:ping"));
     }
 
     #[test]
