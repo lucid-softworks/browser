@@ -5246,6 +5246,123 @@
       def(doc, "createRange", function () { return createRangeForDocument(doc); });
       return doc;
     }
+    var HTML_NS = "http://www.w3.org/1999/xhtml";
+    // Install the read-only metadata an off-document (created) Document exposes per the DOM/HTML
+    // specs. A document built off to the side has no browsing context, so `location` is null and its
+    // URL is "about:blank"; it is always parsed as standards-mode UTF-8.
+    function installDocMeta(doc, contentType) {
+      function ro(name, value) {
+        Object.defineProperty(doc, name, { get: function () { return value; }, enumerable: true, configurable: true });
+      }
+      ro("contentType", contentType);
+      ro("characterSet", "UTF-8");
+      ro("charset", "UTF-8");
+      ro("inputEncoding", "UTF-8");
+      ro("compatMode", "CSS1Compat");
+      ro("URL", "about:blank");
+      ro("documentURI", "about:blank");
+      ro("location", null);
+    }
+    // The first HTML-namespace <title> element in tree order (the "title element" the HTML spec's
+    // document.title getter reads), or null. Walks the facade's live arena tree.
+    function findTitleElement(doc) {
+      var de = doc.documentElement;
+      if (!de) { return null; }
+      var stack = [de];
+      while (stack.length) {
+        var el = stack.shift();
+        if (el && el.nodeType === 1 && el.localName === "title" && el.namespaceURI === HTML_NS) { return el; }
+        var kids = el && el.childNodes;
+        if (kids) { for (var i = 0; i < kids.length; i++) { if (kids[i] && kids[i].nodeType === 1) { stack.push(kids[i]); } } }
+      }
+      return null;
+    }
+    // Wire `document.title` (get/set) on an off-document facade, resolving against its own tree (the
+    // global `document.title` uses arena-global helpers that don't apply to a detached document).
+    function installDocTitle(doc) {
+      Object.defineProperty(doc, "title", {
+        get: function () {
+          var t = findTitleElement(doc);
+          if (!t) { return ""; }
+          // Child text content, with HTML whitespace stripped/collapsed.
+          var s = t.textContent || "";
+          return s.replace(/[ \t\n\f\r]+/g, " ").replace(/^ | $/g, "");
+        },
+        set: function (v) {
+          var t = findTitleElement(doc);
+          if (!t) {
+            var de = doc.documentElement;
+            if (!de) { return; }
+            var head = null, kids = de.childNodes;
+            for (var i = 0; i < kids.length; i++) { if (kids[i].nodeType === 1 && kids[i].localName === "head") { head = kids[i]; break; } }
+            t = doc.createElement("title");
+            (head || de).appendChild(t);
+          }
+          t.textContent = v == null ? "" : String(v);
+        },
+        enumerable: true, configurable: true
+      });
+    }
+    // Build an empty, arena-backed Document facade of the given `kind` ("html" => HTMLDocument with
+    // case-folding createElement; "xml" => XMLDocument with case-preserving createElement). `docNs`
+    // is the document's namespace (used to decide createElement's namespace for an XML document). The
+    // returned document has no doctype and no document element; callers append those.
+    function buildBareDocument(kind, docNs, contentType) {
+      var isXML = kind === "xml";
+      var ctorName = isXML ? "XMLDocument" : "HTMLDocument";
+      // createElement's namespace for an XML document is the HTML namespace only for an
+      // application/xhtml+xml document; otherwise the null namespace. An HTML document always uses
+      // the HTML namespace and ASCII-lowercases.
+      var elNs = isXML ? (docNs === HTML_NS ? HTML_NS : null) : HTML_NS;
+      var doc = {
+        nodeType: 9, nodeName: "#document", doctype: null,
+        caretPositionFromPoint: function () { return null; },
+        caretRangeFromPoint: function () { return null; },
+        elementFromPoint: function () { return null; },
+        elementsFromPoint: function () { return []; },
+        lookupNamespaceURI: function () { var de = this.documentElement; return de && de.lookupNamespaceURI ? de.lookupNamespaceURI.apply(de, arguments) : null; },
+        lookupPrefix: function () { var de = this.documentElement; return de && de.lookupPrefix ? de.lookupPrefix.apply(de, arguments) : null; },
+        isDefaultNamespace: function (ns) { var de = this.documentElement; return de && de.isDefaultNamespace ? de.isDefaultNamespace.apply(de, arguments) : (ns == null || ns === ""); },
+        createElement: isXML
+          ? function (name) { return globalThis.__createElementCasePreserving(elNs, name); }
+          : function (tag) { return document.createElement(tag); },
+        createElementNS: function (ns, qn) { return document.createElementNS(ns, qn); },
+        createAttribute: isXML
+          ? function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm, nm); }
+          : function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm.toLowerCase(), nm.toLowerCase()); },
+        createAttributeNS: function (ns, qn) { var ex = globalThis.__validateAndExtractName(ns, qn); return globalThis.__makeAttrNode(ex.namespace, ex.prefix, ex.localName, String(qn)); },
+        createTextNode: function (s) { return document.createTextNode(s); },
+        createComment: function (s) { return document.createComment(s); },
+        createCDATASection: isXML
+          ? function (data) { return globalThis.__canonNode(globalThis.__wrapNode(globalThis.__createCData(String(data == null ? "" : data)))); }
+          : function () { throw new globalThis.DOMException("This DOM method is only valid on XML documents.", "NotSupportedError"); },
+        createDocumentFragment: function () { return document.createDocumentFragment(); },
+        createProcessingInstruction: function (target, data) { return document.createProcessingInstruction(target, data); },
+        importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
+        getElementById: function (id) { var de = this.documentElement; return de && de.querySelector ? de.querySelector('#' + id) : null; },
+        querySelector: function (s) { var de = this.documentElement; return de && de.querySelector ? de.querySelector(s) : null; },
+        querySelectorAll: function (s) { var de = this.documentElement; return de && de.querySelectorAll ? de.querySelectorAll(s) : []; },
+        getElementsByTagName: function (t) { var de = this.documentElement; return de && de.getElementsByTagName ? de.getElementsByTagName(t) : []; },
+      };
+      doc.implementation = {
+        hasFeature: function () { return true; },
+        createDocumentType: function (n, p, s) { return makeDoctypeFor(doc, n, p, s); },
+        createHTMLDocument: function (t2) { return document.implementation.createHTMLDocument(t2); },
+        createDocument: function (ns, q, dt) { return document.implementation.createDocument(ns, q, dt); },
+      };
+      Object.defineProperty(doc, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
+      Object.defineProperty(doc, "nodeValue", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
+      backDocWithArena(doc, []);
+      // documentElement / doctype resolve live from the arena children.
+      Object.defineProperty(doc, "documentElement", { get: function () { var k = this.childNodes; for (var i = 0; i < k.length; i++) { if (k[i] && k[i].nodeType === 1) { return k[i]; } } return null; }, enumerable: true, configurable: true });
+      Object.defineProperty(doc, "doctype", { get: function () { var k = this.childNodes; for (var i = 0; i < k.length; i++) { if (k[i] && k[i].nodeType === 10) { return k[i]; } } return null; }, enumerable: true, configurable: true });
+      installDocMeta(doc, contentType);
+      installDocTitle(doc);
+      doc.cloneNode = function () { return buildBareDocument(kind, docNs, contentType); };
+      var ctor = globalThis[ctorName];
+      if (ctor && ctor.prototype) { try { Object.setPrototypeOf(doc, ctor.prototype); } catch (e) {} }
+      return doc;
+    }
     def(document, "implementation", {
       hasFeature: function () { return true; },
       createDocumentType: function (name, pub, sys) { return makeDoctypeFor(document, name, pub, sys); },
@@ -5254,12 +5371,17 @@
         var headEl = document.createElement("head");
         var bodyEl = document.createElement("body");
         htmlEl.appendChild(headEl); htmlEl.appendChild(bodyEl);
-        if (title !== undefined && title !== null) {
-          var t = document.createElement("title"); t.textContent = String(title); headEl.appendChild(t);
+        // createHTMLDocument(title): the title argument is optional. When PRESENT (including an
+        // explicit null, which stringifies to "null") a <title> is created; only an omitted argument
+        // (undefined) leaves the head empty.
+        if (title !== undefined) {
+          // Always append a Text node child (even for the empty string), per the createHTMLDocument
+          // algorithm — `textContent = ""` would leave the <title> childless.
+          var t = document.createElement("title"); t.appendChild(document.createTextNode(String(title))); headEl.appendChild(t);
         }
         var doc;
         doc = {
-          nodeType: 9, nodeName: '#document', documentElement: htmlEl, head: headEl, body: bodyEl, title: title ? String(title) : "",
+          nodeType: 9, nodeName: '#document', documentElement: htmlEl, head: headEl, body: bodyEl,
           doctype: null,
           // A document created off to the side has no associated browsing context / viewport, so per
           // CSSOM-View these always return null regardless of the coordinates passed.
@@ -5276,10 +5398,9 @@
             createHTMLDocument: function (t2) { return document.implementation.createHTMLDocument(t2); },
             createDocument: function (ns, q, dt) { return document.implementation.createDocument(ns, q, dt); },
           },
-          cloneNode: function (deep) {
-            var c = document.implementation.createHTMLDocument(this.title);
-            return c;
-          },
+          // Cloning a document does NOT run the createHTMLDocument algorithm (no doctype/html/head/
+          // body/title get synthesised); a shallow clone is a brand-new empty HTML document.
+          cloneNode: function () { return buildBareDocument("html", HTML_NS, "text/html"); },
           createElement: function (tag) { return document.createElement(tag); },
           createElementNS: function (ns, tag) { return document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag); },
           createAttribute: function (name) {
@@ -5313,23 +5434,45 @@
         // appendChild / childNodes / traversal work on the off-document tree.
         backDocWithArena(doc, [doctype && typeof doctype.__node === "number" ? doctype.__node : -1,
                                htmlEl && typeof htmlEl.__node === "number" ? htmlEl.__node : -1]);
+        installDocMeta(doc, "text/html");
+        installDocTitle(doc);
+        var hdoc = globalThis.HTMLDocument;
+        if (hdoc && hdoc.prototype) { try { Object.setPrototypeOf(doc, hdoc.prototype); } catch (e) {} }
         return doc;
       },
-      createDocument: function (namespace) {
-        // An XML document: like createHTMLDocument but case-preserving for createAttribute, and
-        // createElement assigns the null namespace (the HTML namespace only when the document's own
-        // namespace is the HTML namespace, i.e. an application/xhtml+xml document).
-        var d = this.createHTMLDocument("");
+      createDocument: function (namespace, qualifiedName, doctype) {
+        // DOMImplementation.createDocument(namespace, qualifiedName, doctype) per
+        // https://dom.spec.whatwg.org/#dom-domimplementation-createdocument — an empty XMLDocument
+        // (no html/head/body scaffold), optionally carrying a root element and a doctype.
+        // namespace and qualifiedName are required (non-optional) WebIDL arguments.
+        if (arguments.length < 2) {
+          throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': 2 arguments required, but only " + arguments.length + " present.");
+        }
         var docNs = (namespace === undefined || namespace === null || namespace === "") ? null : String(namespace);
-        var elNs = docNs === "http://www.w3.org/1999/xhtml" ? docNs : null;
-        d.createElement = function (name) { return globalThis.__createElementWithNs(elNs, name); };
-        // An XML document supports createCDATASection (overriding createHTMLDocument's HTML refusal).
-        d.createCDATASection = function (data) { return globalThis.__canonNode(globalThis.__wrapNode(globalThis.__createCData(String(data == null ? "" : data)))); };
-        d.createAttribute = function (name) {
-          var nm = String(name);
-          if (nm.length === 0) { globalThis.__invalidCharacterError(); }
-          return globalThis.__makeAttrNode(null, null, nm, nm);
-        };
+        // WebIDL: `optional DocumentType? doctype = null` — undefined/null => no doctype; any other
+        // non-DocumentType value is a TypeError.
+        var dt = null;
+        if (doctype !== undefined && doctype !== null) {
+          if (!(typeof doctype === "object" && doctype.nodeType === 10 && typeof doctype.__node === "number")) {
+            throw new TypeError("Failed to execute 'createDocument' on 'DOMImplementation': parameter 3 is not of type 'DocumentType'.");
+          }
+          // Canonicalize so the wrapper the caller holds is the same object `doc.doctype` (which
+          // resolves children through __nodeFor) later returns — identity checks depend on it.
+          dt = (typeof globalThis.__canonNode === "function") ? globalThis.__canonNode(doctype) : doctype;
+        }
+        // qualifiedName is a [LegacyNullToEmptyString] DOMString: null => "", but undefined (like any
+        // other value) stringifies normally (=> "undefined"). A non-empty name is validated (and may
+        // throw InvalidCharacterError/NamespaceError) BEFORE the document is otherwise built.
+        var qn = qualifiedName === null ? "" : String(qualifiedName);
+        var rootEl = qn === "" ? null : document.createElementNS(docNs, qn);
+        // contentType is determined by the document's namespace.
+        var contentType = docNs === "http://www.w3.org/1999/xhtml" ? "application/xhtml+xml"
+                        : docNs === "http://www.w3.org/2000/svg" ? "image/svg+xml"
+                        : "application/xml";
+        var d = buildBareDocument("xml", docNs, contentType);
+        // Append the doctype (if any) then the document element, in that order.
+        if (dt) { d.appendChild(dt); try { Object.defineProperty(dt, "ownerDocument", { value: d, configurable: true, enumerable: true }); } catch (e) {} }
+        if (rootEl) { d.appendChild(rootEl); }
         return d;
       },
     });

@@ -205,6 +205,24 @@
     return true;
   }
   function isValidName(s) { return isValidNameImpl(s, false); }
+  // The "validate and extract" QName split is more lenient than the strict XML QName grammar (and
+  // matches what browsers/WPT implement): once a colon is found, the prefix and the local part are
+  // checked on their own. A prefix only needs to be a non-empty run of NameChars — its first
+  // character need NOT be a NameStartChar (so "0:a" is accepted). A local part must start with a
+  // NameStartChar OR a colon (so "f::oo" splits to the local part ":oo", which is accepted — the
+  // colon there is treated as part of the local name), then NameChars (colons included).
+  function isValidPrefix(p) {
+    if (p.length === 0) { return false; }
+    for (var i = 0; i < p.length; i++) { if (!isNameChar(p.charCodeAt(i))) { return false; } }
+    return true;
+  }
+  function isValidLocalPart(s) {
+    if (s.length === 0) { return false; }
+    var c0 = s.charCodeAt(0);
+    if (!(isNameStartChar(c0) || c0 === 0x3A)) { return false; }
+    for (var i = 1; i < s.length; i++) { if (!isNameChar(s.charCodeAt(i))) { return false; } }
+    return true;
+  }
 
   function invalidCharacterError() {
     throw new globalThis.DOMException("The string contains invalid characters.", "InvalidCharacterError");
@@ -224,10 +242,10 @@
     if (ci >= 0) {
       prefix = qname.slice(0, ci);
       localName = qname.slice(ci + 1);
-      // Prefix must be a non-empty colon-free Name; the local name (everything after the first
-      // colon) is validated as a Name that may itself contain further colons.
-      if (prefix.length === 0 || !isValidNameImpl(prefix, false)) { invalidCharacterError(); }
-      if (localName.length === 0 || !isValidNameImpl(localName, true)) { invalidCharacterError(); }
+      // Prefix: a non-empty run of NameChars (first char need not be a NameStartChar). Local part:
+      // starts with a NameStartChar or a colon, then NameChars (further colons permitted).
+      if (!isValidPrefix(prefix)) { invalidCharacterError(); }
+      if (!isValidLocalPart(localName)) { invalidCharacterError(); }
     } else {
       if (!isValidNameImpl(qname, false)) { invalidCharacterError(); }
     }
@@ -1433,6 +1451,20 @@
     __nsMeta[id] = {
       namespaceURI: (namespaceURI === undefined || namespaceURI === null || namespaceURI === "") ? null : String(namespaceURI),
       prefix: null, localName: local, qualifiedName: local, isHTML: isHtml
+    };
+    return wrap(id);
+  });
+  // Like __createElementWithNs, but NEVER ASCII-lowercases the name — the createElement steps for an
+  // *XML* document (e.g. one from document.implementation.createDocument) preserve case even when the
+  // element lands in the HTML namespace (an application/xhtml+xml document). namespaceURI is set as
+  // given (the empty string and null both map to the null namespace).
+  def(globalThis, "__createElementCasePreserving", function (namespaceURI, name) {
+    var nm = String(name);
+    if (!isValidNameImpl(nm, true)) { invalidCharacterError(); }
+    var ns = (namespaceURI === undefined || namespaceURI === null || namespaceURI === "") ? null : String(namespaceURI);
+    var id = __createElement(nm);
+    __nsMeta[id] = {
+      namespaceURI: ns, prefix: null, localName: nm, qualifiedName: nm, isHTML: ns === HTML_NS
     };
     return wrap(id);
   });
