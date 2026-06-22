@@ -515,6 +515,39 @@ mod tests {
     }
 
     #[test]
+    fn hyperlink_username_password_reflect_userinfo() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var a = document.createElement("a");
+                a.href = "http://user:pass@example.test/path";
+                var r = [a.username, a.password];
+                a.username = "new user";
+                a.password = "p@ss word";
+                r.push(a.username, a.password, a.href);
+
+                var area = document.createElement("area");
+                area.href = "https://area:secret@example.test/map";
+                r.push(area.username, area.password);
+
+                a.href = "mailto:name@example.test";
+                a.username = "ignored";
+                a.password = "also-ignored";
+                r.push(a.href, a.username, a.password);
+                r.join("|");
+            "#
+            .to_string()],
+            "https://example.com/base/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("user|pass|new%20user|p%40ss%20word|http://new%20user:p%40ss%20word@example.test/path|area|secret|mailto:name@example.test||")
+        );
+    }
+
+    #[test]
     fn reflection_input_enum_boolean_limited_long() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
