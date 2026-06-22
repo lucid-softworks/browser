@@ -676,6 +676,7 @@ pub(crate) fn compute_element_style<'a>(
         line_height: parent.line_height,
         text_transform: parent.text_transform,
         letter_spacing: parent.letter_spacing,
+        text_indent: parent.text_indent,
         white_space: parent.white_space,
         visibility: parent.visibility,
         list_style_type: parent.list_style_type,

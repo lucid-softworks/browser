@@ -66,6 +66,7 @@ impl Default for ComputedStyle {
             line_height: None,
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
+            text_indent: 0.0,
             white_space: WhiteSpace::Normal,
             visibility: Visibility::Visible,
             list_style_type: ListStyleType::Disc,

@@ -5328,8 +5328,38 @@
         configurable: true, enumerable: true
       });
     }
-    if (!("scrollTop" in el)) { el.scrollTop = 0; }
-    if (!("scrollLeft" in el)) { el.scrollLeft = 0; }
+    // scrollLeft/scrollTop are accessors that clamp the assigned offset to the element's scroll
+    // range [0, scrollWidth-clientWidth] / [0, scrollHeight-clientHeight] (per CSSOM-View): a write
+    // past the maximum scrollable distance settles at the maximum (and a non-scrollable box stays
+    // at 0). The backing value lives on a private own-property; the getter re-clamps to the current
+    // range so a later layout change can't leave a stale out-of-range offset.
+    if (typeof node === "number") {
+      [["scrollLeft", "sw", "cw", "__scrollLeftVal"], ["scrollTop", "sh", "ch", "__scrollTopVal"]]
+        .forEach(function (spec) {
+          var prop = spec[0], sizeF = spec[1], clientF = spec[2], backing = spec[3];
+          var __sd = null;
+          try { __sd = Object.getOwnPropertyDescriptor(el, prop); } catch (eS) {}
+          if (__sd && (__sd.get || __sd.set)) { return; } // page already defined an accessor
+          var clamp = function (self, v) {
+            v = Number(v); if (!isFinite(v)) { v = 0; }
+            var m = __elemMetrics(self.__node);
+            var max = m ? Math.max(0, (m[sizeF] || 0) - (m[clientF] || 0)) : 0;
+            if (v < 0) { v = 0; } else if (v > max) { v = max; }
+            return v;
+          };
+          Object.defineProperty(el, prop, {
+            get: function () { return clamp(this, this[backing] || 0); },
+            set: function (v) {
+              Object.defineProperty(this, backing,
+                { value: clamp(this, v), writable: true, configurable: true, enumerable: false });
+            },
+            configurable: true, enumerable: true
+          });
+        });
+    } else {
+      if (!("scrollTop" in el)) { el.scrollTop = 0; }
+      if (!("scrollLeft" in el)) { el.scrollLeft = 0; }
+    }
     if (!("offsetWidth" in el)) { el.offsetWidth = 0; }
     if (!("offsetHeight" in el)) { el.offsetHeight = 0; }
     if (!("clientWidth" in el)) { el.clientWidth = 0; }

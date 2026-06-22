@@ -901,6 +901,14 @@ pub(crate) fn apply_declaration(
                 style.letter_spacing = px;
             }
         }
+        // `text-indent`: length applied to the first line of a block container. Percentages
+        // (resolved against the containing block width at layout time) are not yet supported, so a
+        // `%` value is ignored. The `each-line`/`hanging` keywords are likewise not handled.
+        "text-indent" => {
+            if let Some(px) = parse_length(val) {
+                style.text_indent = px;
+            }
+        }
         "white-space" => match val.trim().to_ascii_lowercase().as_str() {
             "normal" => style.white_space = WhiteSpace::Normal,
             "nowrap" => style.white_space = WhiteSpace::Nowrap,

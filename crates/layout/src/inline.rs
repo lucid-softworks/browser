@@ -12,6 +12,7 @@ use std::collections::HashMap;
 pub(crate) fn layout_inline_children(
     boxx: &mut LayoutBox,
     align: TextAlignLocal,
+    text_indent: f32,
     ctx: Ctx,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
@@ -65,7 +66,14 @@ pub(crate) fn layout_inline_children(
         } else {
             measurer.text_width(" ", fs, false)
         };
-        if !cur.is_empty() && cursor_x + space_w + w > avail {
+        // `text-indent` narrows only the first line box (the one currently being filled while no
+        // line has been emitted yet); later lines get the full available width.
+        let line_avail = if lines.is_empty() {
+            (avail - text_indent).max(0.0)
+        } else {
+            avail
+        };
+        if !cur.is_empty() && cursor_x + space_w + w > line_avail {
             lines.push(PlacedLine {
                 items: std::mem::take(&mut cur),
                 width: cursor_x,
@@ -97,7 +105,7 @@ pub(crate) fn layout_inline_children(
     let mut new_children: Vec<LayoutBox> = Vec::new();
     let mut y = content.y;
     let mut total_h = 0.0f32;
-    for line in &lines {
+    for (line_idx, line) in lines.iter().enumerate() {
         let line_font = if line.max_font_size > 0.0 {
             line.max_font_size
         } else {
@@ -112,10 +120,13 @@ pub(crate) fn layout_inline_children(
         };
         // The emitted Text box's own height matches the line advance.
         let text_lh = lh;
+        // `text-indent` shifts the first line's start by the indent and shrinks its alignment box.
+        let indent = if line_idx == 0 { text_indent } else { 0.0 };
+        let line_avail = (avail - indent).max(0.0);
         let line_x = match align {
-            TextAlignLocal::Left => content.x,
-            TextAlignLocal::Center => content.x + (avail - line.width).max(0.0) / 2.0,
-            TextAlignLocal::Right => content.x + (avail - line.width).max(0.0),
+            TextAlignLocal::Left => content.x + indent,
+            TextAlignLocal::Center => content.x + indent + (line_avail - line.width).max(0.0) / 2.0,
+            TextAlignLocal::Right => content.x + indent + (line_avail - line.width).max(0.0),
         };
 
         // Words on this line: emit a `Text` box per contiguous run of words sharing the same

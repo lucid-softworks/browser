@@ -403,6 +403,8 @@ pub struct ComputedStyle {
     pub text_transform: TextTransform,
     /// `letter-spacing` in px added per character (0 = normal). Inherits.
     pub letter_spacing: f32,
+    /// `text-indent` in px applied to the first line of a block container (0 = none). Inherits.
+    pub text_indent: f32,
     /// `white-space` processing mode (collapse vs preserve spaces/newlines). Inherits.
     pub white_space: WhiteSpace,
     /// `list-style-type` marker style for `display: list-item` boxes (`ul`/`ol`/`li`). Inherits.

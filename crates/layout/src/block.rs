@@ -200,7 +200,8 @@ pub(crate) fn layout_block(
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
                 let align = text_align_of(boxx.node, styles);
-                layout_inline_children(boxx, align, child_ctx, styles, measurer)
+                let indent = text_indent_of(boxx.node, styles);
+                layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
             } else {
                 0.0
             }
@@ -246,6 +247,10 @@ pub(crate) fn layout_block_children(
 ) -> f32 {
     let content = boxx.dimensions.content;
     let parent_align = text_align_of(boxx.node, styles);
+    // `text-indent` applies to the first formatted line of the block container — i.e. the first
+    // in-flow inline (anonymous) box. Tracked so later anonymous boxes aren't re-indented.
+    let parent_indent = text_indent_of(boxx.node, styles);
+    let mut indent_unused = parent_indent != 0.0;
     let mut cursor_y = content.y;
     // Floats placed by this container (its own block formatting context). Empty for the common
     // float-free page, in which case every helper below is a cheap no-op and the flow is unchanged.
@@ -301,11 +306,24 @@ pub(crate) fn layout_block_children(
             }
             BoxContent::Image(_) | BoxContent::Widget(_) => layout_image_box(child, containing),
             BoxContent::Anonymous => {
-                // Anonymous blocks inherit the establishing block's text-align.
-                layout_anonymous(child, containing, parent_align, ctx, styles, measurer)
+                // Anonymous blocks inherit the establishing block's text-align; the first one also
+                // carries the block's `text-indent` (consumed so siblings aren't re-indented).
+                let indent = if indent_unused {
+                    indent_unused = false;
+                    parent_indent
+                } else {
+                    0.0
+                };
+                layout_anonymous(child, containing, parent_align, indent, ctx, styles, measurer)
             }
             _ => {
-                layout_anonymous(child, containing, parent_align, ctx, styles, measurer);
+                let indent = if indent_unused {
+                    indent_unused = false;
+                    parent_indent
+                } else {
+                    0.0
+                };
+                layout_anonymous(child, containing, parent_align, indent, ctx, styles, measurer);
             }
         }
         cursor_y += child.dimensions.margin_box().height;
@@ -539,7 +557,8 @@ pub(crate) fn layout_out_of_flow(
                     layout_block_children(boxx, child_ctx, styles, measurer)
                 } else if !boxx.children.is_empty() {
                     let align = text_align_of(boxx.node, styles);
-                    layout_inline_children(boxx, align, child_ctx, styles, measurer)
+                    let indent = text_indent_of(boxx.node, styles);
+                    layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
                 } else {
                     0.0
                 }
@@ -652,6 +671,7 @@ pub(crate) fn layout_anonymous(
     boxx: &mut LayoutBox,
     containing: Rect,
     align: TextAlignLocal,
+    text_indent: f32,
     ctx: Ctx,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
@@ -665,6 +685,6 @@ pub(crate) fn layout_anonymous(
         width: containing.width,
         height: 0.0,
     };
-    let h = layout_inline_children(boxx, align, ctx, styles, measurer);
+    let h = layout_inline_children(boxx, align, text_indent, ctx, styles, measurer);
     boxx.dimensions.content.height = h;
 }

@@ -478,7 +478,8 @@ pub(crate) fn layout_flex_item_contents(
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
                 let align = text_align_of(boxx.node, styles);
-                layout_inline_children(boxx, align, child_ctx, styles, measurer)
+                let indent = text_indent_of(boxx.node, styles);
+                layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
             } else {
                 0.0
             }

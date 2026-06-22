@@ -254,3 +254,14 @@ pub(crate) fn text_align_of(
         _ => TextAlignLocal::Left,
     }
 }
+
+/// The `text-indent` (px) of a box's node — the first-line indent of the block container (0 when
+/// none / box-less). Inline layout offsets the first line's start by this amount.
+pub(crate) fn text_indent_of(
+    node: Option<dom::NodeId>,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> f32 {
+    node.and_then(|n| styles.get(&n))
+        .map(|cs| cs.text_indent)
+        .unwrap_or(0.0)
+}
