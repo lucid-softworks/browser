@@ -1,0 +1,108 @@
+name: WPT (wpt run)
+
+# Runs a slice of the Web Platform Tests the way other browsers are tested: the real `wpt run`
+# harness driving our engine over WebDriver (crates/webdriver) via the `lucid` wptrunner product.
+# This is the standard-conformance path; the fast in-process runner in wpt.yml still produces the
+# headline pass-rate table. Scope is intentionally small here — `wpt run` launches a full session
+# per test and our engine has no worker support yet (worker variants time out), so running entire
+# areas would blow the CI time budget. This job proves the end-to-end path and reports results; it
+# does NOT gate on conformance failures (the engine has known, tracked failures).
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/wpt/**'
+      - 'scripts/run-wpt.sh'
+      - '.github/workflows/wpt-run.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/wpt/**'
+      - 'scripts/run-wpt.sh'
+      - '.github/workflows/wpt-run.yml'
+
+concurrency:
+  group: wpt-run-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  wpt-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The set of tests to drive via `wpt run`. Small + worker-light to stay within the time budget.
+    env:
+      WPT_TESTS: "fetch/api/headers"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-deps
+
+      - name: Install fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
+
+      # WPT checkout at ./wpt with the serve/runner infrastructure + the tested area.
+      - name: Checkout web-platform-tests
+        run: |
+          git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git wpt
+          cd wpt
+          git sparse-checkout set tools third_party docs resources common ${WPT_TESTS%%/*}
+
+      # `wpt serve` (which `wpt run` starts) binds the WPT subdomains, so they must resolve to
+      # loopback. CI runners allow sudo; this is the documented WPT system setup.
+      - name: Map WPT hosts
+        run: |
+          cd wpt
+          python3 ./wpt make-hosts-file | sudo tee -a /etc/hosts >/dev/null
+
+      - name: Build WebDriver server
+        run: cargo build --release -p webdriver
+
+      # Run via the same script developers use. `--log-wptreport` emits a machine-readable report we
+      # summarize below. A short timeout multiplier keeps worker-variant timeouts cheap. `|| true`:
+      # `wpt run` exits non-zero when tests fail, and the engine has known failures — we report, not
+      # gate. (`set -o pipefail` is intentionally not used here for the same reason.)
+      - name: Run WPT via wpt run
+        run: |
+          scripts/run-wpt.sh $WPT_TESTS -- \
+            --log-wptreport="$PWD/wptreport.json" \
+            --timeout-multiplier=0.5 \
+          || true
+          test -f wptreport.json || { echo "::error::no wptreport.json produced — wpt run did not complete"; exit 1; }
+
+      - name: Summarize results
+        run: |
+          python3 - wptreport.json <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, sys
+          data = json.load(open(sys.argv[1]))
+          results = data.get("results", [])
+          status_count = {}
+          sub_pass = sub_total = 0
+          for t in results:
+              status_count[t["status"]] = status_count.get(t["status"], 0) + 1
+              for s in t.get("subtests", []):
+                  sub_total += 1
+                  if s["status"] == "PASS":
+                      sub_pass += 1
+          print("## 🧪 WPT (wpt run via WebDriver)\n")
+          print(f"Tests: {len(results)} — " + ", ".join(f"{k}: {v}" for k, v in sorted(status_count.items())))
+          pct = (100 * sub_pass / sub_total) if sub_total else 0
+          print(f"\nSubtests: **{sub_pass} / {sub_total}** passed ({pct:.1f}%)\n")
+          PY
+
+      - name: Upload wptreport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wptreport
+          path: wptreport.json
