@@ -64,8 +64,30 @@ jobs:
           matrix=$(printf "$entries" | jq -s -c '{include: .}')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
+  # Build the WebDriver server ONCE and share the binary with every matrix leg via an artifact.
+  # Otherwise each of the dozens of `wpt` legs recompiles + relinks the `webdriver` crate (the
+  # Swatinem cache restores the V8 *dependencies*, but the workspace crate itself still builds per
+  # leg). The binary statically embeds V8, so it's self-contained and portable across the identical
+  # ubuntu-latest runners.
+  webdriver:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-deps
+      - name: Build WebDriver server
+        run: cargo build --release -p webdriver
+      - name: Upload WebDriver binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: webdriver-bin
+          path: target/release/webdriver
+          retention-days: 1
+
   wpt:
-    needs: scope
+    needs: [scope, webdriver]
     name: wpt (${{ matrix.dir }} ${{ matrix.chunk }}/${{ matrix.chunks }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -74,10 +96,16 @@ jobs:
       matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+
+      # The prebuilt WebDriver binary (from the `webdriver` job) — no cargo/Rust toolchain needed in
+      # these legs, since `run-wpt.sh` uses `$WEBDRIVER_BIN` and skips its own build.
+      - name: Download WebDriver server
+        uses: actions/download-artifact@v4
         with:
-          shared-key: release-deps
+          name: webdriver-bin
+          path: bin
+      - name: Make WebDriver executable
+        run: chmod +x bin/webdriver
 
       - name: Install fonts
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
@@ -93,14 +121,14 @@ jobs:
           cd wpt
           python3 ./wpt make-hosts-file | sudo tee -a /etc/hosts >/dev/null
 
-      - name: Build WebDriver server
-        run: cargo build --release -p webdriver
-
       # Drive this chunk via `wpt run`. `--test-types testharness` avoids the aamtest accessibility
       # requirements (PyGObject/cairo, absent on the runner). `--chunk-type hash` balances tests
       # evenly across chunks. A short timeout multiplier keeps worker-variant timeouts cheap. The run
-      # is wall-bounded; `|| true` so failures / a cut-off never fail the build.
+      # is wall-bounded; `|| true` so failures / a cut-off never fail the build. `WEBDRIVER_BIN`
+      # points `run-wpt.sh` at the prebuilt binary so it skips its own `cargo build`.
       - name: Run WPT via wpt run
+        env:
+          WEBDRIVER_BIN: ${{ github.workspace }}/bin/webdriver
         run: |
           mkdir -p reports
           timeout 1500 scripts/run-wpt.sh "${{ matrix.dir }}" -- \

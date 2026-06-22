@@ -56,10 +56,16 @@ open(path, "w").write(src)
 PY
 fi
 
-# 3. Build the WebDriver server.
-echo "building webdriver…" >&2
-cargo build --release -p webdriver --manifest-path "$ROOT/Cargo.toml" >&2
-WD="$ROOT/target/release/webdriver"
+# 3. The WebDriver server. Use a prebuilt binary when `$WEBDRIVER_BIN` is set and executable (CI
+#    builds it once and shares it across all WPT legs); otherwise build it here.
+if [ -n "${WEBDRIVER_BIN:-}" ] && [ -x "$WEBDRIVER_BIN" ]; then
+  WD="$WEBDRIVER_BIN"
+  echo "using prebuilt webdriver: $WD" >&2
+else
+  echo "building webdriver…" >&2
+  cargo build --release -p webdriver --manifest-path "$ROOT/Cargo.toml" >&2
+  WD="$ROOT/target/release/webdriver"
+fi
 
 # 4. Run. The webdriver binary disables the net disk-cache itself (automation must not serve stale
 #    resources). `--no-pause-after-test` keeps it non-interactive.
