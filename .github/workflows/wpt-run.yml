@@ -130,6 +130,11 @@ jobs:
     needs: wpt
     if: always()
     runs-on: ubuntu-latest
+    # Allow posting the comment directly for same-repo PRs (see "Comment on PR" below). Fork PRs get
+    # a read-only token regardless, so they fall back to wpt-comment.yml (a workflow_run handler).
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Download all results
         uses: actions/download-artifact@v4
@@ -183,3 +188,13 @@ jobs:
         with:
           name: wpt-comment
           path: comment/
+
+      # Same-repo PRs can post directly (the token has write access), so the comment shows up on this
+      # run. Fork PRs (read-only token) skip this and get the comment via wpt-comment.yml instead.
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: wpt-report
+          number: ${{ github.event.pull_request.number }}
+          path: comment/report.md
