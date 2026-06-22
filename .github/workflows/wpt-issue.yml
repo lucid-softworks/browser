@@ -53,7 +53,7 @@ jobs:
         run: |
           rows=""; tp=0; tt=0; missing=0
           # Canonical display order, matching the issue's existing table.
-          for dir in css/cssom dom domparsing html/dom url fetch; do
+          for dir in css/cssom dom domparsing html/dom url fetch service-workers; do
             slug="${dir//\//-}"
             f="artifacts/${slug}.tsv"
             if [ ! -f "$f" ]; then missing=1; continue; fi
