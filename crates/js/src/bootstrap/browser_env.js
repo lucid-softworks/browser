@@ -445,7 +445,7 @@
   globalThis.moveTo = fn; globalThis.moveBy = fn; globalThis.resizeTo = fn; globalThis.resizeBy = fn;
   globalThis.focus = fn; globalThis.blur = fn; globalThis.print = fn;
   globalThis.open = function () { return null; }; globalThis.close = fn; globalThis.stop = fn;
-  globalThis.getSelection = function () { return null; };
+  // getSelection is installed later (alongside Range/Selection) with a real Selection implementation.
   globalThis.alert = fn; globalThis.confirm = function () { return false; }; globalThis.prompt = function () { return null; };
 
   // --- matchMedia (real evaluation against the live viewport) ------------------------------
@@ -6594,10 +6594,15 @@
   // boundary points within a single text container), getBoundingClientRect/getClientRects (caret or
   // text-span geometry), and cloneRange. Enough for the CSSOM caret tests and common callers.
   var AbstractRangeProto = (globalThis.AbstractRange && globalThis.AbstractRange.prototype) || Object.prototype;
+  // The registry of every live Range. DOM mutations consult it to keep boundary points valid
+  // (the "live range" steps the spec attaches to insert/remove/replace-data/split). Ranges added to
+  // a Selection are tracked here too, since the Selection holds them by reference.
+  var __liveRanges = [];
   // A range is created with its boundary points at (current global document, 0).
   function Range() {
     var d = globalThis.document || null;
     this._sc = d; this._so = 0; this._ec = d; this._eo = 0;
+    __liveRanges.push(this);
   }
   Range.prototype = Object.create(AbstractRangeProto);
   Range.prototype.constructor = Range;
@@ -6834,6 +6839,162 @@
     }
   })();
   try { def(globalThis, "Range", Range); } catch (e) {}
+
+  // ---- Live-range maintenance (DOM "live range" steps) ---------------------------------------
+  // Every DOM mutation that can disturb a Range boundary point runs the matching adjustment over
+  // __liveRanges. These mirror the steps the DOM spec attaches to the "replace data", "split",
+  // "insert", and "remove" algorithms. All work in node ids; boundary nodes are canonicalized via
+  // __nodeFor so identity (e.g. `range.startContainer === newNode`) holds.
+
+  // "Replace data" (node, offset, count, data): boundaries inside the replaced span clamp to offset;
+  // boundaries past it shift by the net length change.
+  function __rangesReplaceData(nodeId, offset, count, dataLen) {
+    var delta = dataLen - count, end = offset + count;
+    for (var i = 0; i < __liveRanges.length; i++) {
+      var r = __liveRanges[i];
+      if (__idOf(r._sc) === nodeId) {
+        if (r._so > offset && r._so <= end) { r._so = offset; }
+        else if (r._so > end) { r._so += delta; }
+      }
+      if (__idOf(r._ec) === nodeId) {
+        if (r._eo > offset && r._eo <= end) { r._eo = offset; }
+        else if (r._eo > end) { r._eo += delta; }
+      }
+    }
+  }
+  def(globalThis, "__rangesReplaceData", __rangesReplaceData);
+
+  // "Insert": `count` nodes were inserted into `parentId` at `index`. Boundaries in the parent past
+  // the insertion point shift right by count.
+  function __rangesInsert(parentId, index, count) {
+    for (var i = 0; i < __liveRanges.length; i++) {
+      var r = __liveRanges[i];
+      if (__idOf(r._sc) === parentId && r._so > index) { r._so += count; }
+      if (__idOf(r._ec) === parentId && r._eo > index) { r._eo += count; }
+    }
+  }
+  def(globalThis, "__rangesInsert", __rangesInsert);
+
+  // a is an inclusive descendant of b (a === b, or a is nested under b). Computed BEFORE removal,
+  // while the tree is still intact.
+  function __isInclusiveDescendant(aId, bId) {
+    var c = aId;
+    while (c >= 0) { if (c === bId) { return true; } c = __parent(c); }
+    return false;
+  }
+
+  // "Remove": `nodeId` (at `index` of `parentId`) is about to be removed. Boundaries inside the
+  // removed subtree collapse to (parent, index); boundaries in the parent past it shift left by one.
+  // Must run BEFORE the node leaves the tree.
+  function __rangesRemove(nodeId, parentId, index) {
+    if (!__liveRanges.length) { return; }
+    var parentNode = __nodeFor(parentId);
+    for (var i = 0; i < __liveRanges.length; i++) {
+      var r = __liveRanges[i];
+      if (__isInclusiveDescendant(__idOf(r._sc), nodeId)) { r._sc = parentNode; r._so = index; }
+      else if (__idOf(r._sc) === parentId && r._so > index) { r._so -= 1; }
+      if (__isInclusiveDescendant(__idOf(r._ec), nodeId)) { r._ec = parentNode; r._eo = index; }
+      else if (__idOf(r._ec) === parentId && r._eo > index) { r._eo -= 1; }
+    }
+  }
+  def(globalThis, "__rangesRemove", __rangesRemove);
+
+  // The Text "split" range steps (run AFTER the new node is inserted, BEFORE the trailing data is
+  // removed): boundaries in `node` past `offset` move into `newNode`; boundaries at the parent slot
+  // immediately after `node` shift right by one.
+  function __rangesSplit(nodeId, newNodeId, offset, parentId, nodeIndex) {
+    var newNode = __nodeFor(newNodeId);
+    for (var i = 0; i < __liveRanges.length; i++) {
+      var r = __liveRanges[i];
+      if (__idOf(r._sc) === nodeId && r._so > offset) { r._sc = newNode; r._so -= offset; }
+      else if (parentId >= 0 && __idOf(r._sc) === parentId && r._so === nodeIndex + 1) { r._so += 1; }
+      if (__idOf(r._ec) === nodeId && r._eo > offset) { r._ec = newNode; r._eo -= offset; }
+      else if (parentId >= 0 && __idOf(r._ec) === parentId && r._eo === nodeIndex + 1) { r._eo += 1; }
+    }
+  }
+  def(globalThis, "__rangesSplit", __rangesSplit);
+
+  // Wrap the native tree-mutation primitives so every insert/remove (including the implicit removal
+  // when a parented node is moved) runs the live-range steps. Cheap no-op when no ranges exist.
+  (function () {
+    var nativeInsertBefore = globalThis.__insertBefore;
+    var nativeRemoveChild = globalThis.__removeChild;
+    if (typeof nativeInsertBefore === "function") {
+      def(globalThis, "__insertBefore", function (parentId, nodeId, refId) {
+        if (__liveRanges.length && typeof nodeId === "number" && nodeId >= 0) {
+          var oldParent = __parent(nodeId);
+          if (oldParent >= 0) { __rangesRemove(nodeId, oldParent, __children(oldParent).indexOf(nodeId)); }
+          var ret = nativeInsertBefore(parentId, nodeId, refId);
+          var ni = __children(parentId).indexOf(nodeId);
+          if (ni >= 0) { __rangesInsert(parentId, ni, 1); }
+          return ret;
+        }
+        return nativeInsertBefore(parentId, nodeId, refId);
+      });
+    }
+    if (typeof nativeRemoveChild === "function") {
+      def(globalThis, "__removeChild", function (parentId, nodeId) {
+        if (__liveRanges.length && typeof nodeId === "number" && nodeId >= 0) {
+          var idx = __children(parentId).indexOf(nodeId);
+          if (idx >= 0) { __rangesRemove(nodeId, parentId, idx); }
+        }
+        return nativeRemoveChild(parentId, nodeId);
+      });
+    }
+  })();
+
+  // ---- Selection (https://w3c.github.io/selection-api/) --------------------------------------
+  // A minimal but spec-faithful Selection: a single optional range, held by reference so it tracks
+  // DOM mutations through __liveRanges. window.getSelection()/document.getSelection() return one
+  // shared instance.
+  var SelectionCtor = globalThis.Selection;
+  var __selectionProto = (SelectionCtor && SelectionCtor.prototype) || Object.prototype;
+  function __makeSelection() {
+    var sel = Object.create(__selectionProto);
+    sel._ranges = [];
+    return sel;
+  }
+  function __selStart(sel) { return sel._ranges.length ? sel._ranges[0] : null; }
+  Object.defineProperty(__selectionProto, "rangeCount", { get: function () { return this._ranges.length; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "isCollapsed", {
+    get: function () { var r = __selStart(this); return r ? (r._sc === r._ec && r._so === r._eo) : true; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(__selectionProto, "type", {
+    get: function () { var r = __selStart(this); if (!r) { return "None"; } return (r._sc === r._ec && r._so === r._eo) ? "Caret" : "Range"; },
+    enumerable: true, configurable: true
+  });
+  Object.defineProperty(__selectionProto, "anchorNode", { get: function () { var r = __selStart(this); return r ? r._sc : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "anchorOffset", { get: function () { var r = __selStart(this); return r ? r._so : 0; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "focusNode", { get: function () { var r = __selStart(this); return r ? r._ec : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "focusOffset", { get: function () { var r = __selStart(this); return r ? r._eo : 0; }, enumerable: true, configurable: true });
+  def(__selectionProto, "getRangeAt", function (index) {
+    index = index >>> 0;
+    if (index >= this._ranges.length) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
+    return this._ranges[index];
+  });
+  def(__selectionProto, "addRange", function (range) {
+    if (!(range instanceof Range)) {
+      throw new TypeError("Failed to execute 'addRange' on 'Selection': parameter 1 is not of type 'Range'.");
+    }
+    // Only ranges rooted in this selection's document take effect, and there is at most one range.
+    if (globalThis.__rootId(__idOf(range._sc)) !== __idOf(globalThis.document)) { return; }
+    if (this._ranges.length) { return; }
+    this._ranges = [range];
+  });
+  def(__selectionProto, "removeRange", function (range) {
+    var i = this._ranges.indexOf(range);
+    if (i < 0) { throw new globalThis.DOMException("Could not find the given range.", "NotFoundError"); }
+    this._ranges.splice(i, 1);
+  });
+  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; });
+  def(__selectionProto, "empty", function () { this._ranges = []; });
+  def(__selectionProto, "toString", function () { var r = __selStart(this); return r ? r.toString() : ""; });
+
+  var __selection = null;
+  function getSelection() { if (!__selection) { __selection = __makeSelection(); } return __selection; }
+  globalThis.getSelection = getSelection;
+  try { def(globalThis.document, "getSelection", getSelection); } catch (e) {}
 
   // CaretPosition: { offsetNode, offset, getClientRect() }. getClientRect() returns a FRESH DOMRect
   // each call (the WPT test asserts identity differs between calls).

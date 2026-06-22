@@ -433,6 +433,9 @@
     }
     var nt = nodeId >= 0 ? __nodeType(nodeId) : -1;
     if (nt === 9) { hierarchyRequestError("Nodes of type Document may not be inserted."); }
+    // A DocumentType may only live in a Document; a Text node may not be a child of a Document.
+    if (nt === 10 && pt !== 9) { hierarchyRequestError("Only a Document may contain a DocumentType."); }
+    if (nt === 3 && pt === 9) { hierarchyRequestError("A Text node may not be a child of a Document."); }
     if (nodeId >= 0 && (nt === 1 || nt === 3 || nt === 8 || nt === 11) && (pt === 9)) {
       // Documents have additional constraints, but our tree is HTML-shaped; allow elements/fragments.
     }
@@ -669,7 +672,17 @@
       // DocumentFragment, Text, Comment, PI) the concatenation / data computed natively.
       get: function () { var t = __nodeType(id); return (t === 9 || t === 10) ? null : __textContent(id); },
       // Setter is a no-op on Document/DocumentType (textContent is null there).
-      set: function (v) { var t = __nodeType(id); if (t === 9 || t === 10) { return; } __setTextContent(id, v == null ? "" : String(v)); },
+      set: function (v) {
+        var t = __nodeType(id); if (t === 9 || t === 10) { return; }
+        var s = v == null ? "" : String(v);
+        // On a CharacterData node this is "replace data" over the whole node (adjusts live ranges);
+        // on an Element it replaces children, which the native handles.
+        if (t === 3 || t === 4 || t === 7 || t === 8) {
+          var old = __textContent(id).length;
+          __setTextContent(id, s);
+          if (globalThis.__rangesReplaceData) { globalThis.__rangesReplaceData(id, 0, old, s.length); }
+        } else { __setTextContent(id, s); }
+      },
       enumerable: true, configurable: true
     });
     // `data` mirrors textContent — used by Vue when patching text/comment anchors. This is a
@@ -681,7 +694,8 @@
       // string "undefined", 0 -> "0", etc.).
       Object.defineProperty(el, "data", {
         get: function () { return __textContent(id); },
-        set: function (v) { __setTextContent(id, v === null ? "" : String(v)); },
+        // Setting data is "replace data" over the whole node: adjust live ranges accordingly.
+        set: function (v) { __cdReplace(0, __textContent(id).length, v === null ? "" : String(v)); },
         enumerable: true, configurable: true
       });
       // CharacterData.length: the number of UTF-16 code units in `data`.
@@ -698,6 +712,8 @@
         if (offset > len) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
         if (offset + count > len) { count = len - offset; }
         __setTextContent(id, d.slice(0, offset) + insert + d.slice(offset + count));
+        // Live-range step: keep any Range boundary points inside this node valid.
+        if (globalThis.__rangesReplaceData) { globalThis.__rangesReplaceData(id, offset, count, insert.length); }
       };
       def(el, "substringData", function (offset, count) {
         if (arguments.length < 2) { throw new TypeError("Failed to execute 'substringData': 2 arguments required."); }
@@ -709,8 +725,33 @@
       });
       def(el, "appendData", function (data) {
         if (arguments.length < 1) { throw new TypeError("Failed to execute 'appendData': 1 argument required."); }
-        __setTextContent(id, __textContent(id) + String(data));
+        __cdReplace(__textContent(id).length, 0, String(data));
       });
+      // Text.splitText(offset): split this node at offset, returning the new sibling that holds the
+      // trailing data. Per the DOM "split" algorithm, the new node is inserted (live-range insert
+      // step), the split-specific live-range steps run, then the trailing data is removed from this
+      // node (live-range replace-data step).
+      if (__nodeType(id) === 3) {
+        def(el, "splitText", function (offset) {
+          if (arguments.length < 1) { throw new TypeError("Failed to execute 'splitText' on 'Text': 1 argument required, but only 0 present."); }
+          offset = offset >>> 0;
+          var d = __textContent(id);
+          var len = d.length;
+          if (offset > len) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
+          var count = len - offset;
+          var newId = __createText(d.slice(offset));
+          var parent = __parent(id);
+          if (parent >= 0) {
+            var sibs = __children(parent);
+            var myIdx = sibs.indexOf(id);
+            var refId = (myIdx + 1 < sibs.length) ? sibs[myIdx + 1] : -1;
+            __insertBefore(parent, newId, refId);
+            if (globalThis.__rangesSplit) { globalThis.__rangesSplit(id, newId, offset, parent, myIdx); }
+          }
+          __cdReplace(offset, count, "");
+          return globalThis.__nodeFor(newId);
+        });
+      }
       def(el, "insertData", function (offset, data) {
         if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertData': 2 arguments required."); }
         __cdReplace(offset >>> 0, 0, String(data));
@@ -728,7 +769,16 @@
       // nodeValue is the data for the CharacterData kinds (Text=3, CDATASection=4, PI=7, Comment=8);
       // null for everything else.
       get: function () { var t = __nodeType(id); return (t === 3 || t === 4 || t === 7 || t === 8) ? __textContent(id) : null; },
-      set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
+      set: function (v) {
+        var t = __nodeType(id);
+        var s = v == null ? "" : String(v);
+        // "Replace data" over the whole node for CharacterData kinds (adjusts live ranges).
+        if (t === 3 || t === 4 || t === 7 || t === 8) {
+          var old = __textContent(id).length;
+          __setTextContent(id, s);
+          if (globalThis.__rangesReplaceData) { globalThis.__rangesReplaceData(id, 0, old, s.length); }
+        } else { __setTextContent(id, s); }
+      },
       enumerable: true, configurable: true
     });
     Object.defineProperty(el, "innerHTML", {
@@ -1079,6 +1129,11 @@
       var nid = requireNodeArg(newNode, "replaceChild"), oid = requireNodeArg(oldNode, "replaceChild");
       if (__parent(oid) !== id) { notFoundError("The node to be replaced is not a child of this node."); }
       if (isInclusiveAncestor(nid, id)) { hierarchyRequestError("The new child element contains the parent."); }
+      // The replacement must itself be insertable here: not a Document, and (since the parent is an
+      // Element) not a DocumentType. Checked before any mutation so a failure leaves the tree intact.
+      var nnt = __nodeType(nid);
+      if (nnt === 9) { hierarchyRequestError("Nodes of type Document may not be inserted."); }
+      if (nnt === 10 && __nodeType(id) !== 9) { hierarchyRequestError("Only a Document may contain a DocumentType."); }
       // Reference child = oldNode's next sibling, unless that's newNode itself (then newNode's next).
       var sibs = __children(id); var idx = sibs.indexOf(oid);
       var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
