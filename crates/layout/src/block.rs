@@ -315,7 +315,15 @@ pub(crate) fn layout_block_children(
                 } else {
                     0.0
                 };
-                layout_anonymous(child, containing, parent_align, indent, ctx, styles, measurer)
+                layout_anonymous(
+                    child,
+                    containing,
+                    parent_align,
+                    indent,
+                    ctx,
+                    styles,
+                    measurer,
+                )
             }
             _ => {
                 let indent = if indent_unused {
@@ -324,7 +332,15 @@ pub(crate) fn layout_block_children(
                 } else {
                     0.0
                 };
-                layout_anonymous(child, containing, parent_align, indent, ctx, styles, measurer);
+                layout_anonymous(
+                    child,
+                    containing,
+                    parent_align,
+                    indent,
+                    ctx,
+                    styles,
+                    measurer,
+                );
             }
         }
         cursor_y += child.dimensions.margin_box().height;
@@ -414,7 +430,9 @@ fn inline_end_position(b: &LayoutBox) -> Option<(f32, f32)> {
             let cand = (r.x + r.width, r.y);
             // Prefer the lowest line (largest y); within the same line, the furthest-right edge.
             let take = match *best {
-                Some((bx, by)) => cand.1 > by + 0.01 || ((cand.1 - by).abs() <= 0.01 && cand.0 > bx),
+                Some((bx, by)) => {
+                    cand.1 > by + 0.01 || ((cand.1 - by).abs() <= 0.01 && cand.0 > bx)
+                }
                 None => true,
             };
             if take {

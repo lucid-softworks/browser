@@ -170,7 +170,14 @@ pub(crate) fn layout_inline_children(
                 let measure_fs = if run_fs > 0.0 { run_fs } else { line_font };
                 let mut tb = LayoutBox::new(BoxContent::Text(text), r.style, r.node);
                 let fam = tb.style.font_family.as_deref().map(|s| s.to_string());
-                let w = run_width(measurer, &tb_text(&tb), measure_fs, false, ls, fam.as_deref());
+                let w = run_width(
+                    measurer,
+                    &tb_text(&tb),
+                    measure_fs,
+                    false,
+                    ls,
+                    fam.as_deref(),
+                );
                 tb.dimensions.content = Rect {
                     x: line_x + r.start_off,
                     y: y + voff,
@@ -307,18 +314,21 @@ impl InlineItem {
                     style.letter_spacing,
                     style.font_family.as_deref(),
                 );
-                let lh = style
-                    .line_height
-                    .unwrap_or_else(|| measurer.line_height(style.font_size, style.font_family.as_deref()));
+                let lh = style.line_height.unwrap_or_else(|| {
+                    measurer.line_height(style.font_size, style.font_family.as_deref())
+                });
                 (w, style.font_size, lh, *leads_space)
             }
             InlineItem::Atomic(b) => {
                 let mb = b.dimensions.margin_box();
                 (mb.width, b.style.font_size, mb.height, false)
             }
-            InlineItem::Break { font_size } => {
-                (0.0, *font_size, measurer.line_height(*font_size, None), false)
-            }
+            InlineItem::Break { font_size } => (
+                0.0,
+                *font_size,
+                measurer.line_height(*font_size, None),
+                false,
+            ),
         }
     }
 }
@@ -392,10 +402,7 @@ pub(crate) fn collect_inline_items(
                     // Unicode spaces (e.g. U+2001 EM QUAD) remain line-break opportunities. Empty
                     // splits (leading/trailing/consecutive separators) are dropped, like
                     // `split_whitespace`.
-                    for word in text
-                        .split(is_breaking_space)
-                        .filter(|w| !w.is_empty())
-                    {
+                    for word in text.split(is_breaking_space).filter(|w| !w.is_empty()) {
                         out.push(InlineItem::Word {
                             text: word.to_string(),
                             style: child.style.clone(),

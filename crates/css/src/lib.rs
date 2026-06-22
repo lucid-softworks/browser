@@ -209,7 +209,8 @@ fn parse_font_face_body(body: &str) -> Option<FontFaceRule> {
                     let part = part.trim();
                     if let Some(rest) = part.strip_prefix("url(") {
                         if let Some(idx) = rest.find(')') {
-                            if let Some(u) = strip_url_or_string(&format!("url({}", &rest[..=idx])) {
+                            if let Some(u) = strip_url_or_string(&format!("url({}", &rest[..=idx]))
+                            {
                                 if !u.is_empty() {
                                     src.push(u);
                                 }

@@ -1019,5 +1019,6 @@ pub(crate) fn collapse_whitespace(s: &str) -> String {
     // Trim only ASCII whitespace (the collapsible kind) — NOT Unicode whitespace such as `&nbsp;`
     // (U+00A0), which CSS preserves. Rust's `str::trim()` would strip nbsp, dropping a meaningful
     // glyph (e.g. the width contributed by a trailing `&nbsp;`).
-    out.trim_matches(|c: char| c.is_ascii_whitespace()).to_string()
+    out.trim_matches(|c: char| c.is_ascii_whitespace())
+        .to_string()
 }
