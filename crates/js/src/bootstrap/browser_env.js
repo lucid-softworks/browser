@@ -6367,8 +6367,31 @@
   def(NodeCtor.prototype, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
   defClass("EventTarget");
   defClass("CharacterData", NodeCtor);
-  defClass("Text", globalThis.CharacterData);
-  defClass("Comment", globalThis.CharacterData);
+  var TextCtor = defClass("Text", globalThis.CharacterData);
+  var CommentCtor = defClass("Comment", globalThis.CharacterData);
+  (function () {
+    function textData(args) {
+      return (args.length === 0 || args[0] === undefined) ? "" : String(args[0]);
+    }
+    var textProto = TextCtor && TextCtor.prototype;
+    var commentProto = CommentCtor && CommentCtor.prototype;
+    function Text(data) {
+      return globalThis.__canonNode(globalThis.__wrapNode(globalThis.__createText(textData(arguments))));
+    }
+    function Comment(data) {
+      return globalThis.__canonNode(globalThis.__wrapNode(globalThis.__createComment(textData(arguments))));
+    }
+    if (textProto) {
+      Text.prototype = textProto;
+      try { Object.defineProperty(Text.prototype, "constructor", { value: Text, writable: true, configurable: true }); } catch (e) {}
+    }
+    if (commentProto) {
+      Comment.prototype = commentProto;
+      try { Object.defineProperty(Comment.prototype, "constructor", { value: Comment, writable: true, configurable: true }); } catch (e) {}
+    }
+    def(globalThis, "Text", Text);
+    def(globalThis, "Comment", Comment);
+  })();
   defClass("CDATASection", globalThis.Text);
   defClass("ProcessingInstruction", globalThis.CharacterData);
   defClass("DocumentFragment", NodeCtor);

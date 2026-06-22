@@ -3011,6 +3011,44 @@ mod tests {
     }
 
     #[test]
+    fn text_and_comment_constructors_create_character_data_nodes() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+            var textDefault = new Text();
+            var textUndefined = new Text(undefined);
+            var textNull = new Text(null);
+            var commentDefault = new Comment();
+            var commentUndefined = new Comment(undefined);
+            var commentNumber = new Comment(42);
+            [
+              textDefault.nodeType,
+              textDefault.data,
+              textDefault.textContent,
+              textDefault.ownerDocument === document,
+              textDefault instanceof Text,
+              textDefault instanceof CharacterData,
+              textUndefined.data,
+              textNull.data,
+              commentDefault.nodeType,
+              commentDefault.data,
+              commentDefault.textContent,
+              commentDefault.ownerDocument === document,
+              commentDefault instanceof Comment,
+              commentDefault instanceof CharacterData,
+              commentUndefined.data,
+              commentNumber.data
+            ].join("|")
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("3|||true|true|true||null|8|||true|true|true||42")
+        );
+    }
+
+    #[test]
     fn insert_adjacent_html_inserts_parsed_nodes() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
