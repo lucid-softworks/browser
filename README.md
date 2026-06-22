@@ -175,3 +175,13 @@ Done: networking + external CSS/JS · HTML→DOM · tabs · JS (DOM bindings + t
 env) · CSS cascade · box-model + flexbox/grid/positioning layout + paint · scrolling · images.
 Roadmap: z-index paint order · floats · margin collapsing · fuller grid · `data:`/SVG images ·
 DOM events on input · `fetch`/XHR · concurrent fetch · GPU rendering.
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=lucid-softworks%2Fbrowser&type=timeline&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lucid-softworks/browser&type=timeline&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lucid-softworks/browser&type=timeline&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lucid-softworks/browser&type=timeline&legend=top-left" />
+ </picture>
+</a>
