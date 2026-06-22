@@ -3808,10 +3808,10 @@
       }
     } catch (e) { return v; }
     var p = parseURL(resolved);
-    var host = p.host || "";
-    var ret = p.protocol + "//" + host + p.pathname + p.search + p.hash;
-    if (ret === "//") { return v; }
-    return ret;
+    // Serialize the resolved record. Only special/authority URLs get the `//` separator — a
+    // non-special scheme with an opaque path (e.g. `data:`, `mailto:`) must never gain one.
+    if (p.__invalid || p.href === "") { return v; }
+    return p.href;
   }
   var __refl = (function () {
     var maxInt = 2147483647, minInt = -2147483648;
