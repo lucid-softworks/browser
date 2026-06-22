@@ -1,5 +1,17 @@
 use crate::*;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+thread_local! {
+    static EMPTY_VARS: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
+}
+
+/// A shared, empty custom-property environment. Returns a cheap `Arc` clone of a per-thread
+/// singleton so constructing a default [`ComputedStyle`] (or a node that inherits no vars) doesn't
+/// allocate a fresh map.
+pub(crate) fn empty_vars() -> Arc<HashMap<String, String>> {
+    EMPTY_VARS.with(Arc::clone)
+}
 
 /// The four sides of a box (margin / border / padding thicknesses, or content insets), in px.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -427,7 +439,12 @@ pub struct ComputedStyle {
     /// This element's resolved custom properties (`--name` -> value), case-sensitive. Populated
     /// from the cascade's `var` environment so `getComputedStyle(el).getPropertyValue("--x")`
     /// can read them. Not enumerated by [`property_names`](Self::property_names).
-    pub custom_props: HashMap<String, String>,
+    ///
+    /// Stored behind an [`Arc`] so the (often large — hundreds of entries on token-heavy sites
+    /// like wikipedia.org) inherited environment is shared, not deep-cloned, across the ~99% of
+    /// elements that declare no custom property of their own. The cascade only allocates a new map
+    /// when an element actually changes the environment (copy-on-write).
+    pub custom_props: Arc<HashMap<String, String>>,
 }
 
 /// Parsed CSS `color-scheme` value. The property lists the schemes a page supports; the browser

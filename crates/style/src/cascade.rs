@@ -1,5 +1,6 @@
 use crate::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Compute a [`ComputedStyle`] for every element node in `doc`, using the built-in UA
 /// stylesheet first, then the supplied author `sheets` (in document order), then each
@@ -85,7 +86,7 @@ pub(crate) fn cascade_locked(
     // The root inherits from a fresh default style (now themed by the resolved scheme above).
     let initial = ComputedStyle::default();
     // Custom properties (`--name`) inherit; the root starts with an empty environment.
-    let initial_vars: HashMap<String, String> = HashMap::new();
+    let initial_vars: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
     cascade_node(
         doc,
         doc.root(),
@@ -136,7 +137,7 @@ pub fn cascade_subtree(
     let ua = user_agent_stylesheet();
     let index = SelectorIndex::build(&ua, sheets);
     let initial = ComputedStyle::default();
-    let initial_vars: HashMap<String, String> = HashMap::new();
+    let initial_vars: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
     let mut out = HashMap::new();
     cascade_node(
         doc,
@@ -184,7 +185,7 @@ pub(crate) fn resolve_root_color_scheme(doc: &dom::Document, sheets: &[css::Styl
     let ua = user_agent_stylesheet();
     let index = SelectorIndex::build(&ua, sheets);
     let initial = ComputedStyle::default();
-    let initial_vars: HashMap<String, String> = HashMap::new();
+    let initial_vars: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
 
     let mut scheme = ColorScheme::Normal;
     if let Some(html) = find_element(doc, "html") {
@@ -570,7 +571,7 @@ pub(crate) fn cascade_node(
     doc: &dom::Document,
     id: dom::NodeId,
     parent: &ComputedStyle,
-    parent_vars: &HashMap<String, String>,
+    parent_vars: &Arc<HashMap<String, String>>,
     parent_hidden: bool,
     index: &SelectorIndex,
     out: &mut HashMap<dom::NodeId, ComputedStyle>,
@@ -605,13 +606,13 @@ pub(crate) fn compute_element_style<'a>(
     node_id: dom::NodeId,
     el: &dom::ElementData,
     parent: &ComputedStyle,
-    parent_vars: &HashMap<String, String>,
+    parent_vars: &Arc<HashMap<String, String>>,
     parent_hidden: bool,
     index: &'a SelectorIndex<'a>,
-) -> (ComputedStyle, HashMap<String, String>) {
+) -> (ComputedStyle, Arc<HashMap<String, String>>) {
     // Start from inherited values; non-inherited properties get reset below.
     let mut style = ComputedStyle {
-        custom_props: HashMap::new(),
+        custom_props: empty_vars(),
         direction: parent.direction,       // inherited
         writing_mode: parent.writing_mode, // inherited
         color: parent.color,
@@ -863,38 +864,53 @@ pub(crate) fn compute_element_style<'a>(
     // Build this element's custom-property environment: inherit the ancestors' vars, then
     // override with any `--name: value` declared on this element (in cascade order, so the
     // winning declaration applies last).
-    let mut vars = parent_vars.clone();
-    let mut declared_here: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for m in &matches {
-        for (prop, val) in m.decls {
-            if let Some(name) = prop.strip_prefix("--") {
-                let key = format!("--{name}");
-                declared_here.insert(key.clone());
-                vars.insert(key, val.clone());
-            }
-        }
-    }
-    // Apply `@property` registrations to the custom-property environment. A registered
-    // non-inherited property that this element did NOT declare resets to its initial value
-    // (it does not inherit). Any registered property with an initial value that is still absent
-    // is seeded with that initial value (so it appears in the computed-style enumeration on every
-    // element). `*`-syntax registrations without an initial value are not seeded.
-    REGISTERED_PROPERTIES.with(|c| {
-        for pr in c.borrow().iter() {
-            if !pr.inherits && !declared_here.contains(&pr.name) {
-                if let Some(iv) = &pr.initial_value {
-                    vars.insert(pr.name.clone(), iv.clone());
-                } else {
-                    // Non-inherited, no initial value: it must not carry an inherited value.
-                    vars.remove(&pr.name);
-                }
-            } else if !vars.contains_key(&pr.name) {
-                if let Some(iv) = &pr.initial_value {
-                    vars.insert(pr.name.clone(), iv.clone());
+    //
+    // Copy-on-write: custom properties inherit, and on token-heavy sites the inherited set is
+    // large (hundreds of entries). The vast majority of elements declare none of their own, so
+    // unless this element either declares a `--var` OR there are `@property` registrations that may
+    // reset/seed the environment, we share the parent's `Arc` untouched instead of deep-cloning it.
+    let declares_var = matches
+        .iter()
+        .any(|m| m.decls.iter().any(|(prop, _)| prop.starts_with("--")));
+    let has_registered = REGISTERED_PROPERTIES.with(|c| !c.borrow().is_empty());
+    let vars: Arc<HashMap<String, String>> = if !declares_var && !has_registered {
+        Arc::clone(parent_vars)
+    } else {
+        let mut vars = (**parent_vars).clone();
+        let mut declared_here: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in &matches {
+            for (prop, val) in m.decls {
+                if let Some(name) = prop.strip_prefix("--") {
+                    let key = format!("--{name}");
+                    declared_here.insert(key.clone());
+                    vars.insert(key, val.clone());
                 }
             }
         }
-    });
+        // Apply `@property` registrations to the custom-property environment. A registered
+        // non-inherited property that this element did NOT declare resets to its initial value
+        // (it does not inherit). Any registered property with an initial value that is still
+        // absent is seeded with that initial value (so it appears in the computed-style
+        // enumeration on every element). `*`-syntax registrations without an initial value are
+        // not seeded.
+        REGISTERED_PROPERTIES.with(|c| {
+            for pr in c.borrow().iter() {
+                if !pr.inherits && !declared_here.contains(&pr.name) {
+                    if let Some(iv) = &pr.initial_value {
+                        vars.insert(pr.name.clone(), iv.clone());
+                    } else {
+                        // Non-inherited, no initial value: it must not carry an inherited value.
+                        vars.remove(&pr.name);
+                    }
+                } else if !vars.contains_key(&pr.name) {
+                    if let Some(iv) = &pr.initial_value {
+                        vars.insert(pr.name.clone(), iv.clone());
+                    }
+                }
+            }
+        });
+        Arc::new(vars)
+    };
 
     // Now apply the regular declarations, resolving any `var(...)` references against `vars`
     // and supplying the current/inherited color for `currentColor`/`inherit`.

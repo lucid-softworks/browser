@@ -1,5 +1,4 @@
 use crate::*;
-use std::collections::HashMap;
 
 impl Default for ComputedStyle {
     fn default() -> Self {
@@ -84,7 +83,7 @@ impl Default for ComputedStyle {
             before: None,
             after: None,
             color_scheme: ColorScheme::Normal,
-            custom_props: HashMap::new(),
+            custom_props: empty_vars(),
         }
     }
 }
