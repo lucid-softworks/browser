@@ -61,13 +61,15 @@ jobs:
       - name: Build pass-rates table
         run: |
           rows=""; tp=0; tt=0; missing=0
+          # Group digits into thousands (108441 -> 108,441) for readable subtest counts.
+          comma() { local n="$1" out=""; while [ "${#n}" -gt 3 ]; do out=",${n: -3}$out"; n="${n:0:${#n}-3}"; done; printf '%s%s' "$n" "$out"; }
           # Canonical display order from the shared area list, matching the PR comment and the matrix.
           for dir in $(grep -vE '^\s*(#|$)' .github/wpt-areas.txt); do
             slug="${dir//\//-}"
             f="artifacts/${slug}.tsv"
             if [ ! -f "$f" ]; then missing=1; continue; fi
             IFS=$'\t' read -r d p t pct < "$f"
-            rows="${rows}| \`${d}\` | ${p} / ${t} | ${pct} |\n"
+            rows="${rows}| \`${d}\` | $(comma "$p") / $(comma "$t") | ${pct} |\n"
             tp=$((tp + p)); tt=$((tt + t))
           done
           # Defensive: if any area's TSV is absent the table would be incomplete, so bail rather than
@@ -82,7 +84,7 @@ jobs:
             echo "| Area | Subtests | Pass rate |"
             echo "|------|----------|-----------|"
             printf "%b" "$rows"
-            echo "| **Total** | **${tp} / ${tt}** | **${total_pct}** |"
+            echo "| **Total** | **$(comma "$tp") / $(comma "$tt")** | **${total_pct}** |"
             echo
             echo "<sub>Auto-updated from [\`${GITHUB_SHA:0:7}\`](${RUN_URL}) on push to \`main\`.</sub>"
             echo "<!-- WPT-PASS-RATES:END -->"
