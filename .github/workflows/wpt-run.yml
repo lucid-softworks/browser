@@ -114,7 +114,13 @@ jobs:
         run: |
           git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git wpt
           cd wpt
-          git sparse-checkout set tools third_party docs resources common "${{ matrix.dir }}"
+          # `css/support` holds shared CSS test helpers (e.g. interpolation-testcommon.js) that
+          # testharness tests under css/ load via /css/support/*. Without it those scripts 404, the
+          # test throws before registering any subtests, and the area reports 0/0 — e.g. css/CSS2/
+          # tables, whose only testharness tests are interpolation tests. Add it for css/ areas.
+          extra=""
+          case "${{ matrix.dir }}" in css/*) extra="css/support" ;; esac
+          git sparse-checkout set tools third_party docs resources common $extra "${{ matrix.dir }}"
 
       - name: Map WPT hosts
         run: |
