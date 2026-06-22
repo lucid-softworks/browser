@@ -2383,6 +2383,26 @@ mod tests {
     }
 
     #[test]
+    fn location_url_setters_convert_lone_surrogates_to_usvstring() {
+        let out = env_eval(
+            "https://example.com/base",
+            r#"
+              var lone = String.fromCharCode(0xd999);
+              location.hash = lone;
+              var hash = location.hash;
+              location.href = "about:blank#" + lone;
+              var href = location.href;
+              [hash, href].join("|")
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("#%EF%BF%BD|about:blank#%EF%BF%BD")
+        );
+    }
+
+    #[test]
     fn local_storage_round_trips_and_tracks_length() {
         let out = env_eval(
             "https://example.com/",
