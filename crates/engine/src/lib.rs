@@ -561,7 +561,10 @@ mod tests {
         let wh = e.console_eval(
             "var r = document.querySelector('div').getBoundingClientRect(); r.width + 'x' + r.height",
         );
-        assert_eq!(wh, "200x80", "getBoundingClientRect stays in CSS px on Retina");
+        assert_eq!(
+            wh, "200x80",
+            "getBoundingClientRect stays in CSS px on Retina"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

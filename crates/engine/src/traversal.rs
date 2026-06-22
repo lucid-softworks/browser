@@ -500,7 +500,8 @@ pub(crate) fn compute_initial_rects(
     collect_canvas_intrinsics(doc, &mut intrinsic_sizes);
     collect_svg_intrinsics(doc, &mut intrinsic_sizes);
     let (computed, _root_scheme_dark) = style::cascade_with_root_scheme(doc, styles, is_dark);
-    let mut root = layout::layout_document(doc, &computed, vw, vh, &measurer, &intrinsic_sizes, None);
+    let mut root =
+        layout::layout_document(doc, &computed, vw, vh, &measurer, &intrinsic_sizes, None);
     // CSS px → device px, matching `ensure_layout`. `collect_node_rects` below then yields device px,
     // which the `inv` (1/scale) factor converts back to the CSS px the JS session stores.
     scale_layout_tree(&mut root, scale);
