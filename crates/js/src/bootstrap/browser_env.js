@@ -3758,7 +3758,8 @@
     audio: "HTMLAudioElement", iframe: "HTMLIFrameElement", template: "HTMLTemplateElement",
     h1: "HTMLHeadingElement", h2: "HTMLHeadingElement", h3: "HTMLHeadingElement",
     h4: "HTMLHeadingElement", h5: "HTMLHeadingElement", h6: "HTMLHeadingElement",
-    body: "HTMLBodyElement", html: "HTMLHtmlElement", head: "HTMLHeadElement",
+    body: "HTMLBodyElement", frameset: "HTMLFrameSetElement",
+    html: "HTMLHtmlElement", head: "HTMLHeadElement",
     script: "HTMLScriptElement", style: "HTMLStyleElement", link: "HTMLLinkElement",
     meta: "HTMLMetaElement", title: "HTMLTitleElement"
   };
@@ -5482,6 +5483,66 @@
       return doc;
     }
     var HTML_NS = "http://www.w3.org/1999/xhtml";
+    function isHtmlNamedElement(node, localName) {
+      return !!(node && node.nodeType === 1 && node.namespaceURI === HTML_NS && node.localName === localName);
+    }
+    function documentElementOf(doc) {
+      var kids = doc.childNodes || [];
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i] && kids[i].nodeType === 1) { return kids[i]; }
+      }
+      return null;
+    }
+    function doctypeOf(doc) {
+      var kids = doc.childNodes || [];
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i] && kids[i].nodeType === 10) { return kids[i]; }
+      }
+      return null;
+    }
+    function headOf(doc) {
+      var root = documentElementOf(doc);
+      if (!isHtmlNamedElement(root, "html")) { return null; }
+      var kids = root.childNodes || [];
+      for (var i = 0; i < kids.length; i++) {
+        if (isHtmlNamedElement(kids[i], "head")) { return kids[i]; }
+      }
+      return null;
+    }
+    function bodyOf(doc) {
+      var root = documentElementOf(doc);
+      if (!isHtmlNamedElement(root, "html")) { return null; }
+      var kids = root.childNodes || [];
+      for (var i = 0; i < kids.length; i++) {
+        if (isHtmlNamedElement(kids[i], "body") || isHtmlNamedElement(kids[i], "frameset")) { return kids[i]; }
+      }
+      return null;
+    }
+    function hierarchyRequestError(msg) {
+      throw new globalThis.DOMException(msg || "The operation would yield an incorrect node tree.", "HierarchyRequestError");
+    }
+    function installDocumentTreeAccessors(doc) {
+      Object.defineProperty(doc, "documentElement", { get: function () { return documentElementOf(this); }, enumerable: true, configurable: true });
+      Object.defineProperty(doc, "doctype", { get: function () { return doctypeOf(this); }, enumerable: true, configurable: true });
+      Object.defineProperty(doc, "head", { get: function () { return headOf(this); }, enumerable: true, configurable: true });
+      Object.defineProperty(doc, "body", {
+        get: function () { return bodyOf(this); },
+        set: function (value) {
+          if (!value || typeof value !== "object" || value.nodeType !== 1) {
+            throw new TypeError("Failed to set the 'body' property on 'Document': value is not an HTML body or frameset element.");
+          }
+          if (!isHtmlNamedElement(value, "body") && !isHtmlNamedElement(value, "frameset")) {
+            hierarchyRequestError("Document.body must be a body or frameset element.");
+          }
+          var root = documentElementOf(this);
+          if (!root) { hierarchyRequestError("Cannot set Document.body without a document element."); }
+          var old = bodyOf(this);
+          if (old) { old.parentNode.replaceChild(value, old); }
+          else { root.appendChild(value); }
+        },
+        enumerable: true, configurable: true
+      });
+    }
     // Install the read-only metadata an off-document (created) Document exposes per the DOM/HTML
     // specs. A document built off to the side has no browsing context, so `location` is null and its
     // URL is "about:blank"; it is always parsed as standards-mode UTF-8.
@@ -5588,9 +5649,7 @@
       Object.defineProperty(doc, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
       Object.defineProperty(doc, "nodeValue", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
       backDocWithArena(doc, []);
-      // documentElement / doctype resolve live from the arena children.
-      Object.defineProperty(doc, "documentElement", { get: function () { var k = this.childNodes; for (var i = 0; i < k.length; i++) { if (k[i] && k[i].nodeType === 1) { return k[i]; } } return null; }, enumerable: true, configurable: true });
-      Object.defineProperty(doc, "doctype", { get: function () { var k = this.childNodes; for (var i = 0; i < k.length; i++) { if (k[i] && k[i].nodeType === 10) { return k[i]; } } return null; }, enumerable: true, configurable: true });
+      installDocumentTreeAccessors(doc);
       installDocMeta(doc, contentType);
       installDocTitle(doc);
       doc.cloneNode = function () { return buildBareDocument(kind, docNs, contentType); };
@@ -5669,6 +5728,7 @@
         // appendChild / childNodes / traversal work on the off-document tree.
         backDocWithArena(doc, [doctype && typeof doctype.__node === "number" ? doctype.__node : -1,
                                htmlEl && typeof htmlEl.__node === "number" ? htmlEl.__node : -1]);
+        installDocumentTreeAccessors(doc);
         installDocMeta(doc, "text/html");
         installDocTitle(doc);
         var hdoc = globalThis.HTMLDocument;
@@ -5711,6 +5771,7 @@
         return d;
       },
     });
+    installDocumentTreeAccessors(document);
   }
   if (typeof document.getElementsByName !== "function") {
     def(document, "getElementsByName", function (n) {
@@ -6650,7 +6711,7 @@
     "HTMLTableColElement", "HTMLTableCaptionElement", "HTMLHeadingElement", "HTMLPreElement",
     "HTMLQuoteElement", "HTMLHRElement", "HTMLBRElement", "HTMLScriptElement",
     "HTMLStyleElement", "HTMLLinkElement", "HTMLMetaElement", "HTMLTitleElement",
-    "HTMLHeadElement", "HTMLBodyElement", "HTMLHtmlElement", "HTMLCanvasElement",
+    "HTMLHeadElement", "HTMLBodyElement", "HTMLFrameSetElement", "HTMLHtmlElement", "HTMLCanvasElement",
     "HTMLVideoElement", "HTMLAudioElement", "HTMLMediaElement", "HTMLSourceElement",
     "HTMLTrackElement", "HTMLIFrameElement", "HTMLEmbedElement", "HTMLObjectElement",
     "HTMLPictureElement", "HTMLTemplateElement", "HTMLSlotElement", "HTMLDataListElement",

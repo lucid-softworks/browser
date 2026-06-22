@@ -1970,6 +1970,70 @@ mod tests {
     }
 
     #[test]
+    fn created_html_document_body_is_live_and_settable() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                function emptyHTMLDocument() {
+                    var doc = document.implementation.createHTMLDocument("");
+                    doc.removeChild(doc.documentElement);
+                    return doc;
+                }
+
+                var childless = emptyHTMLDocument();
+                var childlessBody = childless.body === null;
+
+                var noBody = emptyHTMLDocument();
+                noBody.appendChild(noBody.createElement("html"));
+                var emptyHtmlBody = noBody.body === null;
+
+                var doc = emptyHTMLDocument();
+                var html = doc.appendChild(doc.createElement("html"));
+                var frameset = html.appendChild(doc.createElement("frameset"));
+                var body = html.appendChild(doc.createElement("body"));
+                var firstBody = doc.body === frameset;
+                var replacement = doc.createElement("body");
+                doc.body = replacement;
+
+                var noRoot = emptyHTMLDocument();
+                var noRootError = "";
+                try { noRoot.body = noRoot.createElement("body"); }
+                catch (e) { noRootError = e.name; }
+
+                var badType = "";
+                try { document.body = "text"; }
+                catch (e) { badType = e.name; }
+
+                var badElement = "";
+                try { document.body = document.createElement("div"); }
+                catch (e) { badElement = e.name; }
+
+                [
+                    childlessBody,
+                    emptyHtmlBody,
+                    firstBody,
+                    frameset instanceof HTMLFrameSetElement,
+                    frameset.parentNode === null,
+                    doc.body === replacement,
+                    replacement instanceof HTMLBodyElement,
+                    body.parentNode === html,
+                    noRootError,
+                    badType,
+                    badElement
+                ].join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true,true,true,true,true,true,true,true,HierarchyRequestError,TypeError,HierarchyRequestError")
+        );
+    }
+
+    #[test]
     fn create_range_is_available_on_every_document() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
