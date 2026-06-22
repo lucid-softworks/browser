@@ -29,15 +29,9 @@ final class Config {
         homepage = hp
     }
 
-    /// Default homepage: the generated WPT results report at the repo root if present, else a web
-    /// default. Override it via the Settings window.
-    static var defaultHomepage: String {
-        let report = "/Users/luna/code/imlunahey/browser/wpt-report.html"
-        if FileManager.default.fileExists(atPath: report) {
-            return URL(fileURLWithPath: report).absoluteString
-        }
-        return "https://browserscore.dev"
-    }
+    /// Default homepage and new-tab page: `about:blank`, the empty initial document (matching real
+    /// browsers' default). Override it via the Settings window.
+    static var defaultHomepage: String { "about:blank" }
 
     private func save() {
         let obj: [String: Any] = ["homepage": homepage]

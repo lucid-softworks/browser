@@ -501,10 +501,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Seed the new engine with the current OS appearance so its first cascade uses the right
         // prefers-color-scheme (rather than the default light).
         if let engine = tab.engine { browser_engine_set_color_scheme(engine, isDarkAppearance) }
-        if let initialURL = initialURL, !initialURL.isEmpty {
-            tab.urlString = initialURL
-            tab.title = hostTitle(from: initialURL)
-        }
+        // A tab always starts on a real document; with no explicit URL it opens `about:blank` (the
+        // empty initial document), so new tabs / the last-tab-closed replacement are scriptable and
+        // render a clean blank page rather than nothing.
+        let resolved = initialURL.flatMap { $0.isEmpty ? nil : $0 } ?? "about:blank"
+        tab.urlString = resolved
+        tab.title = hostTitle(from: resolved)
         tabs.append(tab)
         activeIndex = tabs.count - 1
         rebuildTabBar()
@@ -629,7 +631,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// Reflect the active tab's URL + nav state into the toolbar UI.
     private func syncUIToActiveTab() {
         guard let tab = activeTab else { return }
-        urlField.stringValue = tab.urlString
+        // Show an empty address bar for the blank initial document (a "New Tab"), so the user can
+        // just type — rather than displaying the literal "about:blank".
+        urlField.stringValue = (tab.urlString == "about:blank" || tab.urlString == "about:") ? "" : tab.urlString
         updateNavButtons()
         if tab.isLoading {
             progress.startAnimation(nil)
@@ -644,6 +648,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func hostTitle(from urlString: String) -> String {
+        // The empty initial document presents as a "New Tab", not the literal "about:blank".
+        if urlString == "about:blank" || urlString == "about:" { return "New Tab" }
         if let url = URL(string: urlString), let host = url.host {
             return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
         }
