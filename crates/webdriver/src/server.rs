@@ -56,11 +56,9 @@ impl Session {
         self.next_window += 1;
         let mut engine = engine::Engine::new();
         engine.set_viewport(self.width, self.height, self.scale);
-        if let Some(url) = blank_page_url() {
-            engine.load_url(&url);
-            for _ in 0..5 {
-                engine.tick();
-            }
+        engine.load_url("about:blank");
+        for _ in 0..5 {
+            engine.tick();
         }
         self.parked.insert(
             handle.clone(),
@@ -413,14 +411,11 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let mut engine = engine::Engine::new();
     let scale = 1.0f32;
     engine.set_viewport(width, height, scale);
-    // Start on a blank page so script execution / find work before the first navigation (a real
-    // browser's initial document is `about:blank`). Our `net` layer has no `about:` handler, so we
-    // materialize a tiny blank HTML file and load it via `file://`.
-    if let Some(url) = blank_page_url() {
-        engine.load_url(&url);
-        for _ in 0..5 {
-            engine.tick();
-        }
+    // Start on `about:blank` (a real browser's initial document) so script execution / find work
+    // before the first navigation.
+    engine.load_url("about:blank");
+    for _ in 0..5 {
+        engine.tick();
     }
 
     let id = format!(
@@ -455,20 +450,6 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
         ("sessionId", Json::Str(id)),
         ("capabilities", returned_caps),
     ]))
-}
-
-/// Write (once) a blank HTML document to the temp dir and return its `file://` URL. Used as the
-/// initial document for new sessions. Returns `None` if the file can't be written.
-fn blank_page_url() -> Option<String> {
-    let path = std::env::temp_dir().join("browser_wd_blank.html");
-    if !path.exists() {
-        std::fs::write(
-            &path,
-            "<!DOCTYPE html><html><head><title></title></head><body></body></html>",
-        )
-        .ok()?;
-    }
-    Some(format!("file://{}", path.display()))
 }
 
 /// Extract a `{width,height}` from a capabilities object, accepting a couple of common shapes.

@@ -53,9 +53,12 @@ curl -s -X POST localhost:4444/session/browser-wd-00000001/execute/sync \
 - **Screenshots**: `engine.render()` produces an RGBA `Framebuffer`; we repack it to a tight
   `image::RgbaImage` (the framebuffer stride may exceed `width*4`), encode PNG via the `image`
   crate (already an engine dependency), and base64-encode it.
-- **Initial document**: a new session starts on a blank `file://` page so script execution / find
-  work before the first navigation (a real browser's initial document is `about:blank`; our `net`
-  layer has no `about:` handler).
+- **Initial document**: a new session (and each new window) starts on `about:blank` — a real empty
+  HTML document the `net` layer serves for `about:blank`/`about:` — so script execution / find work
+  before the first navigation.
+- **Windows**: a session holds the current window inline plus any number of parked background
+  windows, each its own headless `Engine`. `New Window` spins up a fresh `about:blank` engine;
+  `Close Window` drops it and promotes a survivor. This backs wptrunner's per-test window.
 
 ## Supported commands
 
@@ -102,4 +105,5 @@ Responses are `{"value": <result>}` with HTTP 200 on success. Errors are
 - **Back / Forward** are stubs (the engine has no history stack wired up yet).
 - **Element screenshot** crops the full-page framebuffer to the element rect rather than rendering
   the element in isolation.
-- **`data:` URLs** are not supported by the `net` layer; navigate to `http(s)://` or `file://`.
+- **`data:` URLs** are not supported by the `net` layer; navigate to `http(s)://`, `file://`, or
+  `about:blank`.

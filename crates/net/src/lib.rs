@@ -212,6 +212,19 @@ fn request_streaming_inner(
 ) -> Result<ResponseMeta, String> {
     let method_uc = method.to_ascii_uppercase();
 
+    // `about:blank` (and bare `about:`) is the empty initial document every browsing context starts
+    // on. There's no network involved — serve a minimal empty HTML document so the engine has a real
+    // scriptable `about:blank` (used by new windows / WebDriver sessions before the first navigation).
+    if url == "about:blank" || url == "about:" {
+        let html = b"<!DOCTYPE html><html><head></head><body></body></html>";
+        on_chunk(html);
+        return Ok(ResponseMeta {
+            status: 200,
+            content_type: "text/html; charset=utf-8".to_string(),
+            final_url: url.to_string(),
+        });
+    }
+
     if let Some(path) = url.strip_prefix("file://") {
         // file:// is a local read; method/body/headers don't apply. A local read isn't
         // meaningfully chunked, so deliver the whole content in a single `on_chunk` call.
