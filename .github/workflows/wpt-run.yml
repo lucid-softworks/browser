@@ -39,8 +39,18 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
+    # `dir:chunks` per area; chunk counts are sized so each leg is ~150 test files (the slowest
+    # tolerable leg). CSS2 flow/positioning subdirs and the modern CSS modules are tracked
+    # individually rather than via the whole `css/` tree (tens of thousands of files) to keep the
+    # matrix bounded. Edit AREAS to change coverage.
     env:
-      AREAS: "css/cssom:2 dom:4 domparsing:1 html/dom:3 url:1 fetch:4 service-workers:3"
+      AREAS: >-
+        css/cssom:2 dom:4 domparsing:1 html/dom:3 url:1 fetch:4 service-workers:3
+        css/CSS2/abspos:1 css/CSS2/box-display:1 css/CSS2/floats:1 css/CSS2/floats-clear:1
+        css/CSS2/linebox:1 css/CSS2/margin-padding-clear:1 css/CSS2/normal-flow:2
+        css/CSS2/positioning:2 css/CSS2/tables:2
+        css/css-align:2 css/css-break:1 css/css-flexbox:4 css/css-grid:6 css/css-position:3
+        css/css-sizing:2 css/css-text:8 css/css-tables:2
     steps:
       - id: gen
         run: |
