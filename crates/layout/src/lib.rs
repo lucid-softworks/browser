@@ -19,6 +19,17 @@ mod types;
 
 pub(crate) use block::*;
 pub(crate) use build::*;
+
+/// Run `f` with a guarantee of at least ~1 MiB of stack headroom, allocating a fresh stack segment
+/// if the current one is nearly exhausted. Wrap the per-level recursive call in the two layout
+/// descents (box-tree build, block layout) with this so a pathologically deep DOM grows the stack
+/// instead of overflowing it — debug frames are large enough that a few hundred levels would
+/// otherwise abort. The fast path (plenty of headroom) is just a stack-pointer check.
+#[inline]
+pub(crate) fn grow_stack<R>(f: impl FnOnce() -> R) -> R {
+    // 64 KiB red zone: if less remains, allocate a 1 MiB segment before recursing.
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, f)
+}
 pub(crate) use flex::*;
 pub(crate) use grid::*;
 pub(crate) use inline::*;

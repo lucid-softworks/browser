@@ -2264,7 +2264,10 @@ mod tests {
         let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
             e.tag == "div"
         });
-        assert_eq!(cs.get_property("caret-color"), "");
+        // Properties we don't model resolve to the empty string (not their initial value).
+        // (`caret-color`/`outline-color` ARE modeled — they resolve to the used color — so they're
+        // covered separately, not here.)
+        assert_eq!(cs.get_property("transform"), "");
         assert_eq!(cs.get_property("cursor"), "");
         assert_eq!(cs.get_property("--custom-var"), "");
         assert_eq!(cs.get_property("transition"), "");

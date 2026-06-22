@@ -261,7 +261,9 @@ pub(crate) fn layout_block_children(
             height: 0.0,
         };
         match &child.content {
-            BoxContent::Block => layout_block(child, containing, ctx, styles, measurer),
+            BoxContent::Block => {
+                grow_stack(|| layout_block(child, containing, ctx, styles, measurer))
+            }
             BoxContent::Image(_) | BoxContent::Widget(_) => layout_image_box(child, containing),
             BoxContent::Anonymous => {
                 // Anonymous blocks inherit the establishing block's text-align.

@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 dom = { path = "../dom" }
 style = { path = "../style" }
+# Grows the stack on demand at the two layout recursion points (box-tree build + block layout) so
+# deeply-nested DOMs don't overflow the (smaller) debug stack. Same approach rustc/servo use.
+stacker = "0.1"
 
 [lints]
 workspace = true

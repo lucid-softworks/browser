@@ -801,7 +801,7 @@ pub(crate) fn build_box(
             if el.tag.eq_ignore_ascii_case("li") {
                 push_li_marker(doc, id, cs, &mut children);
             }
-            children.extend(build_children(doc, id, bx_ctx));
+            children.extend(grow_stack(|| build_children(doc, id, bx_ctx)));
             if let Some(after) = &cs.after {
                 if let Some(b) = build_pseudo_box(id, after) {
                     children.push(b);
