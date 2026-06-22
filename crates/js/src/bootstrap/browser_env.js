@@ -662,11 +662,41 @@
     if (options && typeof options === "object") { return !!options.capture; }
     return !!options;
   }
+  var __eventHandlerProps = [
+    "onanimationstart", "onanimationend", "onanimationiteration", "ontransitionend",
+    "onwebkitanimationstart", "onwebkitanimationend", "onwebkitanimationiteration",
+    "onwebkittransitionend"
+  ];
+  var __eventTypeToHandlerProp = {
+    webkitAnimationStart: "onwebkitanimationstart",
+    webkitAnimationEnd: "onwebkitanimationend",
+    webkitAnimationIteration: "onwebkitanimationiteration",
+    webkitTransitionEnd: "onwebkittransitionend"
+  };
+  function __handlerPropForEventType(type) {
+    return __eventTypeToHandlerProp[type] || ("on" + type);
+  }
+  function __installEventHandlerProps(target) {
+    var handlers = target.__eventHandlers;
+    if (!handlers) { handlers = Object.create(null); def(target, "__eventHandlers", handlers); }
+    for (var i = 0; i < __eventHandlerProps.length; i++) {
+      (function (prop) {
+        if (Object.prototype.hasOwnProperty.call(target, prop)) { return; }
+        Object.defineProperty(target, prop, {
+          get: function () { return handlers[prop] || null; },
+          set: function (value) { handlers[prop] = (typeof value === "function") ? value : null; },
+          enumerable: true,
+          configurable: true
+        });
+      })(__eventHandlerProps[i]);
+    }
+  }
   function installEvents(target) {
     if (!target || typeof target !== "object") { return; }
     if (target.__listeners) { return; } // already installed
     var registry = Object.create(null); // type -> [ {cb, capture, once} ]
     def(target, "__listeners", registry);
+    __installEventHandlerProps(target);
     def(target, "addEventListener", function (type, cb, options) {
       if (typeof cb !== "function") { return; }
       type = String(type);
@@ -720,7 +750,7 @@
       }
     }
     if (includeOn) {
-      var on = target["on" + type];
+      var on = target[__handlerPropForEventType(type)];
       if (typeof on === "function") {
         try { on.call(target, ev); } catch (e2) { (globalThis.__timerErrors || []).push((e2 && e2.stack) || String(e2)); }
       }

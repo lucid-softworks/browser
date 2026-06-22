@@ -832,6 +832,48 @@ mod tests {
     }
 
     #[test]
+    fn webkit_prefixed_event_handlers_use_prefixed_event_types() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var div = document.createElement("div");
+                var hits = [];
+                var lower = false;
+                var upper = false;
+                div.addEventListener("webkitAnimationStart", function () { hits.push("listener"); });
+                div.addEventListener("webkitanimationstart", function () { lower = true; });
+                div.addEventListener("WEBKITANIMATIONSTART", function () { upper = true; });
+                var initial = [
+                    div.onanimationstart === null,
+                    div.onwebkitanimationstart === null
+                ].join("|");
+                div.onanimationstart = function () { hits.push("unprefixed"); };
+                div.onwebkitanimationstart = function () { hits.push("prefixed"); };
+                var distinct = div.onanimationstart !== div.onwebkitanimationstart;
+                div.dispatchEvent(new AnimationEvent("webkitAnimationStart"));
+                div.dispatchEvent(new AnimationEvent("animationstart"));
+                [
+                    initial,
+                    distinct,
+                    hits.join("|"),
+                    lower,
+                    upper,
+                    window.onwebkittransitionend === null,
+                    document.onwebkitanimationend === null
+                ].join(",")
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true|true,true,listener|prefixed|unprefixed,false,false,true,true")
+        );
+    }
+
+    #[test]
     fn dispatch_event_rejects_invalid_and_active_events() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
