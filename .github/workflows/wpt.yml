@@ -154,6 +154,8 @@ jobs:
           # Render the signed change in passing subtests vs the baseline; ±0 for no change, — if the
           # area has no baseline yet.
           fmt() { if [ "$1" -gt 0 ]; then echo "+$1"; elif [ "$1" -lt 0 ]; then echo "$1"; else echo "±0"; fi; }
+          # Group digits into thousands (108441 -> 108,441) for readable subtest counts.
+          comma() { local n="$1" out=""; while [ "${#n}" -gt 3 ]; do out=",${n: -3}$out"; n="${n:0:${#n}-3}"; done; printf '%s%s' "$n" "$out"; }
           # Canonical display order from the shared area list, independent of which legs finished.
           for dir in $(grep -vE '^\s*(#|$)' .github/wpt-areas.txt); do
             slug="${dir//\//-}"
@@ -169,7 +171,7 @@ jobs:
               delta=$(fmt "$dp")
               tdelta=$((tdelta + dp))
             fi
-            rows="${rows}| \`${d}\` | ${p} / ${t} | ${pct} | ${delta} |\n"
+            rows="${rows}| \`${d}\` | $(comma "$p") / $(comma "$t") | ${pct} | ${delta} |\n"
             tp=$((tp + p)); tt=$((tt + t))
           done
           total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
@@ -184,7 +186,7 @@ jobs:
             echo "| Area | Subtests | Pass rate | Δ vs \`main\` |"
             echo "|------|----------|-----------|------------|"
             printf "%b" "$rows"
-            echo "| **Total** | **${tp} / ${tt}** | **${total_pct}** | **${total_delta}** |"
+            echo "| **Total** | **$(comma "$tp") / $(comma "$tt")** | **${total_pct}** | **${total_delta}** |"
             echo
             echo "<sub>Δ vs \`main\` is the change in passing subtests against the latest \`main\` baseline (\`—\` when no baseline exists yet). web-platform-tests via \`crates/wpt-runner\`. Full HTML reports are attached as the \`wpt-reports\` artifact on this run.</sub>"
           } > comment/report.md
