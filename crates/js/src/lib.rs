@@ -13120,6 +13120,235 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   if (typeof globalThis.Worker !== "function") {
     def(globalThis, "Worker", function () { this.postMessage = fn; this.terminate = fn; this.onmessage = null; this.onerror = null; this.addEventListener = fn; this.removeEventListener = fn; });
   }
+  // --- Service Workers (stage 1: container + registration plumbing — see issue #56) --------
+  // `navigator.serviceWorker` is a real `ServiceWorkerContainer`; `register()` validates the
+  // script/scope URLs (same-origin, max-scope), fetches the script to confirm it exists and is a
+  // JS resource, then creates a `ServiceWorkerRegistration` whose `ServiceWorker` is advanced
+  // through the installing -> installed -> activating -> activated lifecycle (firing `updatefound`
+  // on the registration and `statechange` on the worker). The worker script is NOT yet executed —
+  // there is no `ServiceWorkerGlobalScope`, no install/activate handlers, and no fetch
+  // interception (stages 2-3). `controller` therefore stays null (no client is claimed).
+  if (typeof globalThis.ServiceWorker !== "function") {
+    defClass("ServiceWorker", globalThis.EventTarget);
+    defClass("ServiceWorkerRegistration", globalThis.EventTarget);
+    defClass("ServiceWorkerContainer", globalThis.EventTarget);
+    if (typeof globalThis.NavigationPreloadManager !== "function") { defClass("NavigationPreloadManager"); }
+
+    var __swRegs = [];           // live ServiceWorkerRegistration objects, in registration order
+    var __swReadyResolve = null; // pending resolver for navigator.serviceWorker.ready, if any
+
+    function __swBase() { try { return globalThis.location.href; } catch (e) { return "about:blank"; } }
+    function __swNoFrag(u) { try { u.hash = ""; } catch (e) {} return u; }
+    // A registration's scope controls a client when scope is a prefix of the client URL.
+    function __swMatchesClient(scopeHref) { try { return __swBase().indexOf(scopeHref) === 0; } catch (e) { return false; } }
+
+    function __swMakeWorker(scriptHref) {
+      var sw = Object.create(globalThis.ServiceWorker.prototype);
+      installEvents(sw);
+      var state = "installing";
+      Object.defineProperty(sw, "scriptURL", { value: scriptHref, enumerable: true, configurable: true });
+      Object.defineProperty(sw, "state", { get: function () { return state; }, enumerable: true, configurable: true });
+      sw.onstatechange = null;
+      sw.onerror = null;
+      def(sw, "postMessage", function () {}); // stage 2 wires this to the ServiceWorkerGlobalScope
+      def(sw, "__setState", function (s) { if (state === s) { return; } state = s; fireOn(sw, "statechange"); });
+      return sw;
+    }
+
+    function __swMakeNavPreload() {
+      var enabled = false, headerValue = "true";
+      var npm = Object.create(globalThis.NavigationPreloadManager.prototype);
+      def(npm, "enable", function () { enabled = true; return Promise.resolve(); });
+      def(npm, "disable", function () { enabled = false; return Promise.resolve(); });
+      def(npm, "setHeaderValue", function (v) {
+        if (arguments.length < 1) { return Promise.reject(new TypeError("Failed to execute 'setHeaderValue' on 'NavigationPreloadManager': 1 argument required, but only 0 present.")); }
+        var s = String(v);
+        for (var i = 0; i < s.length; i++) {
+          var c = s.charCodeAt(i);
+          // ByteString: code units must fit in a byte; header value: no NUL/CR/LF.
+          if (c > 0xff) { return Promise.reject(new TypeError("Failed to execute 'setHeaderValue' on 'NavigationPreloadManager': the value cannot be converted to a ByteString.")); }
+          if (c === 0 || c === 13 || c === 10) { return Promise.reject(new TypeError("Failed to execute 'setHeaderValue' on 'NavigationPreloadManager': the value is not a valid header value.")); }
+        }
+        headerValue = s; return Promise.resolve();
+      });
+      def(npm, "getState", function () { return Promise.resolve({ enabled: enabled, headerValue: headerValue }); });
+      return npm;
+    }
+
+    function __swMakeRegistration(scopeHref, updateViaCache) {
+      var reg = Object.create(globalThis.ServiceWorkerRegistration.prototype);
+      installEvents(reg);
+      var installing = null, waiting = null, active = null;
+      Object.defineProperty(reg, "scope", { value: scopeHref, enumerable: true, configurable: true });
+      Object.defineProperty(reg, "updateViaCache", { value: updateViaCache, enumerable: true, configurable: true });
+      Object.defineProperty(reg, "installing", { get: function () { return installing; }, enumerable: true, configurable: true });
+      Object.defineProperty(reg, "waiting", { get: function () { return waiting; }, enumerable: true, configurable: true });
+      Object.defineProperty(reg, "active", { get: function () { return active; }, enumerable: true, configurable: true });
+      Object.defineProperty(reg, "navigationPreload", { value: __swMakeNavPreload(), enumerable: true, configurable: true });
+      reg.onupdatefound = null;
+      def(reg, "update", function () { return Promise.resolve(reg); });
+      def(reg, "unregister", function () {
+        var i = __swRegs.indexOf(reg), found = i >= 0;
+        if (found) { __swRegs.splice(i, 1); }
+        if (active && active.__setState) { active.__setState("redundant"); }
+        if (waiting && waiting.__setState) { waiting.__setState("redundant"); }
+        if (installing && installing.__setState) { installing.__setState("redundant"); }
+        return Promise.resolve(found);
+      });
+      def(reg, "getNotifications", function () { return Promise.resolve([]); });
+      def(reg, "showNotification", function () { return Promise.resolve(); });
+      def(reg, "__setSlots", function (i, w, a) { installing = i; waiting = w; active = a; });
+      def(reg, "__slots", function () { return { installing: installing, waiting: waiting, active: active }; });
+      return reg;
+    }
+
+    // Advance a freshly-registered worker through the lifecycle, one event-loop turn per state so a
+    // client awaiting `register()` can read `registration.installing` and attach `statechange`
+    // listeners (via wait_for_state) before any transition fires.
+    function __swLifecycle(reg, sw) {
+      setTimeout(function () {
+        if (__swRegs.indexOf(reg) < 0) { return; }
+        reg.__setSlots(null, sw, null); sw.__setState("installed");
+        setTimeout(function () {
+          if (__swRegs.indexOf(reg) < 0) { return; }
+          reg.__setSlots(null, null, sw); sw.__setState("activating");
+          setTimeout(function () {
+            if (__swRegs.indexOf(reg) < 0) { return; }
+            sw.__setState("activated");
+            if (__swReadyResolve && __swMatchesClient(reg.scope)) {
+              var r = __swReadyResolve; __swReadyResolve = null; r(reg);
+            }
+          }, 0);
+        }, 0);
+      }, 0);
+    }
+
+    var __SW_JS_MIME = {
+      "text/javascript": 1, "application/javascript": 1, "application/x-javascript": 1,
+      "text/ecmascript": 1, "application/ecmascript": 1, "text/x-javascript": 1
+    };
+
+    function __swRegister(url, options) {
+      return new Promise(function (resolve, reject) {
+        var base = __swBase(), scriptURL, scopeURL;
+        try { scriptURL = __swNoFrag(new globalThis.URL(url, base)); }
+        catch (e) { reject(new TypeError("Failed to register a ServiceWorker: the script URL is invalid.")); return; }
+        // Scheme + encoded-slash checks reject with TypeError, before the origin (SecurityError) checks.
+        if (scriptURL.protocol !== "http:" && scriptURL.protocol !== "https:") {
+          reject(new TypeError("Failed to register a ServiceWorker: the URL protocol of the script ('" + scriptURL.protocol + "') is not supported.")); return;
+        }
+        if (/%2f|%5c/i.test(scriptURL.pathname)) {
+          reject(new TypeError("Failed to register a ServiceWorker: the script URL includes an encoded slash or backslash.")); return;
+        }
+        var updateViaCache = (options && options.updateViaCache) || "imports";
+        try {
+          scopeURL = (options && options.scope != null)
+            ? __swNoFrag(new globalThis.URL(String(options.scope), base))
+            : __swNoFrag(new globalThis.URL("./", scriptURL)); // default scope: the script's directory
+        } catch (e2) { reject(new TypeError("Failed to register a ServiceWorker: the scope URL is invalid.")); return; }
+        if (scopeURL.protocol !== "http:" && scopeURL.protocol !== "https:") {
+          reject(new TypeError("Failed to register a ServiceWorker: the URL protocol of the scope ('" + scopeURL.protocol + "') is not supported.")); return;
+        }
+        if (/%2f|%5c/i.test(scopeURL.pathname)) {
+          reject(new TypeError("Failed to register a ServiceWorker: the scope URL includes an encoded slash or backslash.")); return;
+        }
+
+        var pageOrigin;
+        try { pageOrigin = (new globalThis.URL(base)).origin; } catch (e3) { pageOrigin = null; }
+        if (scriptURL.origin !== pageOrigin) {
+          reject(new globalThis.DOMException("Failed to register a ServiceWorker: the origin of the provided scriptURL does not match the current origin.", "SecurityError")); return;
+        }
+        if (scopeURL.origin !== pageOrigin) {
+          reject(new globalThis.DOMException("Failed to register a ServiceWorker: the origin of the provided scope does not match the current origin.", "SecurityError")); return;
+        }
+
+        var scriptHref = scriptURL.href, scopeHref = scopeURL.href;
+        var scriptDir = (new globalThis.URL("./", scriptURL)).href;
+
+        globalThis.fetch(scriptHref).then(function (res) {
+          if (!res || !res.ok) { throw new TypeError("Failed to register a ServiceWorker: the script resource fetch failed."); }
+          var hdr = (res.headers && res.headers.get) ? res.headers : null;
+          var mime = (hdr && (hdr.get("content-type") || "")).split(";")[0].trim().toLowerCase();
+          if (mime && !__SW_JS_MIME[mime]) {
+            throw new globalThis.DOMException("Failed to register a ServiceWorker: the script has an unsupported MIME type ('" + mime + "').", "SecurityError");
+          }
+          // Max scope is the script directory, widened by a Service-Worker-Allowed response header.
+          var allowed = hdr && hdr.get("service-worker-allowed");
+          var maxScope = allowed ? (new globalThis.URL(allowed, scriptURL)).href : scriptDir;
+          if (scopeHref.indexOf(maxScope) !== 0) {
+            throw new globalThis.DOMException("Failed to register a ServiceWorker: the path of the provided scope is not under the max scope allowed.", "SecurityError");
+          }
+        }).then(function () {
+          var existing = null;
+          for (var i = 0; i < __swRegs.length; i++) { if (__swRegs[i].scope === scopeHref) { existing = __swRegs[i]; break; } }
+          if (existing) {
+            var slots = existing.__slots();
+            // Same script already installed: re-register resolves with the same registration object.
+            if (slots.active && slots.active.scriptURL === scriptHref) { resolve(existing); return; }
+            // Different script (or none active yet): update in place with a fresh worker.
+            var sw2 = __swMakeWorker(scriptHref);
+            existing.__setSlots(sw2, slots.waiting, slots.active);
+            fireOn(existing, "updatefound");
+            resolve(existing);
+            __swLifecycle(existing, sw2);
+            return;
+          }
+          var reg = __swMakeRegistration(scopeHref, updateViaCache);
+          var sw = __swMakeWorker(scriptHref);
+          reg.__setSlots(sw, null, null);
+          __swRegs.push(reg);
+          fireOn(reg, "updatefound");
+          resolve(reg);
+          __swLifecycle(reg, sw);
+        }).catch(function (err) { reject(err); });
+      });
+    }
+
+    var __swContainer = Object.create(globalThis.ServiceWorkerContainer.prototype);
+    installEvents(__swContainer);
+    def(__swContainer, "register", function (url, options) {
+      if (url == null) { return Promise.reject(new TypeError("Failed to execute 'register' on 'ServiceWorkerContainer': 1 argument required, but only 0 present.")); }
+      return __swRegister(String(url), options || {});
+    });
+    def(__swContainer, "getRegistration", function (clientURL) {
+      var base = __swBase(), target, u;
+      try { u = (clientURL != null && clientURL !== "") ? new globalThis.URL(String(clientURL), base) : new globalThis.URL(base); }
+      catch (e) { return Promise.reject(new TypeError("Failed to execute 'getRegistration' on 'ServiceWorkerContainer': the clientURL is invalid.")); }
+      if (u.origin !== (new globalThis.URL(base)).origin) {
+        return Promise.reject(new globalThis.DOMException("Failed to execute 'getRegistration' on 'ServiceWorkerContainer': the origin of the provided documentURL does not match the current origin.", "SecurityError"));
+      }
+      target = __swNoFrag(u).href;
+      var best, bestLen = -1;
+      for (var i = 0; i < __swRegs.length; i++) {
+        var sc = __swRegs[i].scope;
+        if (target.indexOf(sc) === 0 && sc.length > bestLen) { best = __swRegs[i]; bestLen = sc.length; }
+      }
+      return Promise.resolve(best);
+    });
+    def(__swContainer, "getRegistrations", function () { return Promise.resolve(__swRegs.slice()); });
+    def(__swContainer, "startMessages", function () {});
+    __swContainer.oncontrollerchange = null;
+    __swContainer.onmessage = null;
+    __swContainer.onmessageerror = null;
+    // No client is claimed by a freshly-registered worker, so the page has no controller (stage 3).
+    Object.defineProperty(__swContainer, "controller", { value: null, enumerable: true, configurable: true, writable: true });
+    Object.defineProperty(__swContainer, "ready", {
+      get: function () {
+        if (!__swContainer.__readyPromise) {
+          var match;
+          for (var i = 0; i < __swRegs.length; i++) {
+            if (__swRegs[i].__active && __swRegs[i].__active() && __swMatchesClient(__swRegs[i].scope)) { match = __swRegs[i]; break; }
+          }
+          __swContainer.__readyPromise = match
+            ? Promise.resolve(match)
+            : new Promise(function (res) { __swReadyResolve = res; });
+        }
+        return __swContainer.__readyPromise;
+      },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(globalThis.navigator, "serviceWorker", { value: __swContainer, enumerable: true, configurable: true });
+  }
   if (typeof globalThis.WebSocket !== "function") {
     // Real WebSocket: __wsConnect spawns a host socket thread (net::ws_run) and returns an id.
     // The host delivers events via __wsDeliver(id, kind, payload) during the Rust drain; send/close
@@ -18592,6 +18821,63 @@ mod tests {
     }
 
     #[test]
+    fn service_worker_container_and_interfaces_present() {
+        // navigator.serviceWorker is a real ServiceWorkerContainer (EventTarget) exposing the
+        // registration methods, with the lifecycle interface objects defined globally.
+        let out = env_eval(
+            "https://example.com/",
+            "var c = navigator.serviceWorker; \
+             [typeof c.register, typeof c.getRegistration, typeof c.getRegistrations, \
+              c instanceof ServiceWorkerContainer, String(c.controller), typeof c.ready.then, \
+              typeof ServiceWorker, typeof ServiceWorkerRegistration, \
+              Object.prototype.toString.call(c)].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("function|function|function|true|null|function|function|function|[object ServiceWorkerContainer]")
+        );
+    }
+
+    #[test]
+    fn service_worker_register_validation_rejections() {
+        // register()/getRegistration() reject synchronously (no script fetch) for a non-http(s)
+        // scope scheme and an encoded slash in the scope (TypeError), and for a cross-origin
+        // documentURL (SecurityError). The reasons are observed after the microtask drain.
+        let (doc, body) = doc_with_body("");
+        let (doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var b = document.body;
+              var rej = function (attr) {
+                return function (e) { b.setAttribute(attr, (e && e.name) || String(e)); };
+              };
+              navigator.serviceWorker.register('sw.js', { scope: 'data:text/html,' })
+                .then(function () { b.setAttribute('data-scheme', 'resolved'); }, rej('data-scheme'));
+              navigator.serviceWorker.register('sw.js', { scope: 'scope%2fx' })
+                .then(function () { b.setAttribute('data-encoded', 'resolved'); }, rej('data-encoded'));
+              navigator.serviceWorker.getRegistration('http://other.example/')
+                .then(function () { b.setAttribute('data-xorigin', 'resolved'); }, rej('data-xorigin'));
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert_eq!(
+            attr_of(&doc, body, "data-scheme").as_deref(),
+            Some("TypeError")
+        );
+        assert_eq!(
+            attr_of(&doc, body, "data-encoded").as_deref(),
+            Some("TypeError")
+        );
+        assert_eq!(
+            attr_of(&doc, body, "data-xorigin").as_deref(),
+            Some("SecurityError")
+        );
+    }
+
+    #[test]
     fn add_event_listener_signal_option_removes_on_abort() {
         let out = env_eval(
             "https://example.com/",
@@ -19736,6 +20022,62 @@ mod tests {
             Some("AA"),
             "data-a should be set by the resolved fetch"
         );
+    }
+
+    #[test]
+    fn service_worker_register_runs_lifecycle_to_activated() {
+        // With a fetcher that serves the worker script as JS, register() resolves with a
+        // ServiceWorkerRegistration whose worker starts in "installing" and is advanced through the
+        // lifecycle to "activated" (becoming the registration's active worker) during the init
+        // drain. The registration's navigationPreload also round-trips a header value.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                navigator.serviceWorker.register('sw.js').then(function (reg) {
+                  var w = reg.installing;
+                  document.body.setAttribute('data-initial', w ? w.state : 'none');
+                  w.addEventListener('statechange', function () {
+                    if (w.state === 'activated') {
+                      document.body.setAttribute('data-final', reg.active === w ? 'activated' : 'mismatch');
+                    }
+                  });
+                  return reg.navigationPreload.setHeaderValue('hello')
+                    .then(function () { return reg.navigationPreload.getState(); })
+                    .then(function (s) { document.body.setAttribute('data-hdr', s.headerValue); });
+                }, function (e) { document.body.setAttribute('data-err', (e && e.name) || String(e)); });
+            "#
+            .to_string(),
+        );
+        // Serve any requested URL as a JavaScript resource (echoing the URL into the envelope).
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                Some(format!(
+                    r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/javascript","body":"// worker"}}"#
+                ))
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(attr("data-err"), None, "register should not reject");
+        assert_eq!(attr("data-initial").as_deref(), Some("installing"));
+        assert_eq!(attr("data-final").as_deref(), Some("activated"));
+        assert_eq!(attr("data-hdr").as_deref(), Some("hello"));
     }
 
     #[test]
