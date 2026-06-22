@@ -14,14 +14,40 @@ use std::sync::OnceLock;
 fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
+        let mut builder = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(10))
             .timeout_read(std::time::Duration::from_secs(15))
             .max_idle_connections_per_host(16)
             // Persist cookies across requests AND redirects so logins/sessions survive.
-            .cookie_store(cookie_store::CookieStore::new(None))
-            .build()
+            .cookie_store(cookie_store::CookieStore::new(None));
+        // wpt-runner sets `WPT_CA_FILE` to the WPT test CA (`tools/certs/cacert.pem`) so `.https`
+        // conformance tests load over TLS against `wpt serve`. No effect on normal browsing.
+        if let Ok(ca) = std::env::var("WPT_CA_FILE") {
+            if let Some(cfg) = wpt_tls_config(&ca) {
+                builder = builder.tls_config(std::sync::Arc::new(cfg));
+            }
+        }
+        builder.build()
     })
+}
+
+/// Build a rustls client config that trusts the usual webpki roots *plus* the WPT test CA at
+/// `ca_path`. Returns `None` (and leaves the agent on its default trust store) if the file is
+/// missing or unparseable, so a stale `WPT_CA_FILE` degrades gracefully instead of breaking fetches.
+fn wpt_tls_config(ca_path: &str) -> Option<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let pem = std::fs::read(ca_path).ok()?;
+    for cert in rustls_pemfile::certs(&mut &pem[..]).flatten() {
+        let _ = roots.add(cert);
+    }
+    // `ring` is a hard dependency above, so the provider is always present — no default-provider panic.
+    rustls::ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_root_certificates(roots)
+        .with_no_client_auth()
+        .into()
 }
 
 /// A mainstream desktop-Safari User-Agent so sites serve us their normal content.

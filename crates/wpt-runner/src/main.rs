@@ -10,10 +10,18 @@
 //!   e.g. `wpt-runner ./wpt dom/nodes 200`
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Host `wpt serve` serves the primary origin on (its default `browser_host`). Must be mapped to a
+/// loopback address in `/etc/hosts` (see the README) — `wpt serve` resolves it to bind, and our
+/// engine resolves it to fetch.
+const WPT_HOST: &str = "web-platform.test";
+const WPT_HTTP_PORT: u16 = 8000;
+const WPT_HTTPS_PORT: u16 = 8443;
 
 /// Our replacement for WPT's `testharnessreport.js`: turn off the harness's DOM output (it would
 /// `appendChild` into a `#log`/body that test fixtures often lack) and capture the structured
@@ -177,6 +185,131 @@ fn serve(stream: &mut TcpStream, root: &Path, port: u16) {
     let _ = stream.write_all(&body);
 }
 
+/// Where tests are served from. Default is our built-in single-origin static server; with
+/// `WPT_WPTSERVE=1` we drive the real `wpt serve` instead — it runs the `.py` endpoints, does full
+/// `.sub` substitution, generates the `.any`/`.window`/`.worker` variants, and serves multiple
+/// origins + `.https`, which the static server can't.
+enum Backend {
+    /// Built-in static file server on an ephemeral loopback port (http only).
+    Static(u16),
+    /// A spawned `wpt serve` child. On drop we restore the overridden report file and kill the child.
+    WptServe {
+        child: Child,
+        /// `<root>/resources/testharnessreport.js`, overridden with [`REPORT_JS`] while we run.
+        report_path: PathBuf,
+        /// The file's original bytes, restored on drop so the checkout is left untouched.
+        report_orig: Vec<u8>,
+    },
+}
+
+impl Backend {
+    /// Absolute base origin for a test whose name is `name`. `wpt serve` decides scheme by filename:
+    /// `*.https.*` tests must be loaded over TLS from a secure context.
+    fn origin(&self, name: &str) -> String {
+        match self {
+            Backend::Static(port) => format!("http://127.0.0.1:{port}"),
+            Backend::WptServe { .. } if name.contains(".https.") => {
+                format!("https://{WPT_HOST}:{WPT_HTTPS_PORT}")
+            }
+            Backend::WptServe { .. } => format!("http://{WPT_HOST}:{WPT_HTTP_PORT}"),
+        }
+    }
+
+    fn is_wptserve(&self) -> bool {
+        matches!(self, Backend::WptServe { .. })
+    }
+}
+
+impl Drop for Backend {
+    fn drop(&mut self) {
+        if let Backend::WptServe {
+            child,
+            report_path,
+            report_orig,
+        } = self
+        {
+            let _ = std::fs::write(report_path, report_orig);
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The (short-name, root-relative-url-path) pairs to actually load for a discovered test file.
+///
+/// Plain `.html` tests map to themselves. `.any.js`/`.window.js`/`.worker.js` aren't files the
+/// browser loads directly — `wpt serve` *generates* HTML wrappers for them — so in `wpt serve` mode
+/// we emit those generated URLs (the window-context variants; `*.worker.html`/`*.any.worker.html`
+/// are skipped for now since our worker support is thin and they'd mostly time out). In static mode
+/// the `.js` forms yield nothing, since our static server can't generate them.
+fn test_variants(rel: &str, wptserve: bool) -> Vec<String> {
+    for (suffix, gen) in [
+        (".any.js", ".any.html"),
+        (".window.js", ".window.html"),
+        (".worker.js", ".worker.html"),
+    ] {
+        if let Some(stem) = rel.strip_suffix(suffix) {
+            return if wptserve {
+                vec![format!("{stem}{gen}")]
+            } else {
+                vec![]
+            };
+        }
+    }
+    vec![rel.to_string()]
+}
+
+/// Spawn `wpt serve` rooted at the WPT checkout. Instead of the buggy `--inject-script` path (its
+/// wrapper 500s on any response lacking a Content-Type, e.g. `record-headers.py`'s store), we swap
+/// the checkout's `resources/testharnessreport.js` for [`REPORT_JS`] — the report hook
+/// `testharness.js` loads right after itself, restored on drop. Blocks until the http port accepts
+/// connections (or panics on timeout — almost always a missing `/etc/hosts` map).
+fn start_wptserve(root: &Path) -> Backend {
+    let report_path = root.join("resources/testharnessreport.js");
+    let report_orig = std::fs::read(&report_path).expect("read testharnessreport.js");
+    std::fs::write(&report_path, REPORT_JS).expect("override testharnessreport.js");
+    let log = std::fs::File::create("/tmp/wptserve.log").expect("create wptserve log");
+
+    let child = Command::new("python3")
+        .current_dir(root)
+        .arg("./wpt")
+        .arg("serve")
+        // h2 needs extra deps and a separate origin; conformance tests we target don't require it.
+        .arg("--no-h2")
+        .stdout(Stdio::from(log.try_clone().expect("clone log")))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn `wpt serve` (is python3 on PATH and the WPT `tools/` checked out?)");
+
+    // Wait for readiness. `wpt serve` first builds a venv + installs deps on a cold checkout, so be
+    // generous. It binds `WPT_HOST`, which must resolve via /etc/hosts.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let addr = format!("{WPT_HOST}:{WPT_HTTP_PORT}");
+    while Instant::now() < deadline {
+        if let Ok(sock) = addr.to_socket_addrs().map(|mut a| a.next()) {
+            if let Some(sock) = sock {
+                if TcpStream::connect_timeout(&sock, Duration::from_millis(500)).is_ok() {
+                    return Backend::WptServe {
+                        child,
+                        report_path,
+                        report_orig,
+                    };
+                }
+            }
+        } else {
+            // Restore before bailing so a failed start doesn't leave the checkout modified.
+            let _ = std::fs::write(&report_path, &report_orig);
+            panic!(
+                "cannot resolve {WPT_HOST} — map the WPT subdomains to 127.0.0.1 in /etc/hosts \
+                 (`cd wpt && python3 ./wpt make-hosts-file | sudo tee -a /etc/hosts`)"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let _ = std::fs::write(&report_path, &report_orig);
+    panic!("`wpt serve` did not come up within 120s — see /tmp/wptserve.log");
+}
+
 /// Recursively collect runnable testharness files under `dir`, skipping the obvious non-tests
 /// (references, manual tests, support files, the resources dir).
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -206,6 +339,16 @@ fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
                 continue;
             }
             out.push(p);
+        } else if name.ends_with(".any.js")
+            || name.ends_with(".window.js")
+            || name.ends_with(".worker.js")
+        {
+            // testharness `.js` tests: `wpt serve` generates HTML wrappers for these (see
+            // `test_variants`). Skipped in static mode, which can't generate them.
+            if name.contains(".tentative.") {
+                continue;
+            }
+            out.push(p);
         }
     }
 }
@@ -224,10 +367,20 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(usize::MAX);
 
-    // Start the static server on an ephemeral port.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    {
+    // Pick a serving backend. Default: our built-in static server (single-origin, http only,
+    // dependency-free) — keeps the default CI run unchanged. Opt in to the real `wpt serve` with
+    // `WPT_WPTSERVE=1` for `.py` endpoints, full `.sub` substitution, multi-origin, and `.https`.
+    let backend = if std::env::var("WPT_WPTSERVE").is_ok() {
+        // Trust the WPT test CA so the engine can load `.https` tests over TLS (see `net::agent`).
+        let ca = root.join("tools/certs/cacert.pem");
+        if ca.is_file() {
+            std::env::set_var("WPT_CA_FILE", &ca);
+        }
+        start_wptserve(&root)
+    } else {
+        // Built-in static server on an ephemeral port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
         let root = root.clone();
         std::thread::spawn(move || {
             for mut s in listener.incoming().flatten() {
@@ -235,7 +388,8 @@ fn main() {
                 std::thread::spawn(move || serve(&mut s, &root, port));
             }
         });
-    }
+        Backend::Static(port)
+    };
 
     let mut all = Vec::new();
     let target = root.join(subpath);
@@ -246,38 +400,56 @@ fn main() {
         collect_tests(&target, &mut all);
     }
     all.sort();
-    // Keep only testharness.js tests (skip reftests / visual tests, which have no JS result).
-    let mut tests: Vec<PathBuf> = all
-        .into_iter()
-        .filter(|p| {
-            std::fs::read_to_string(p)
-                .map(|s| s.contains("testharness.js"))
-                .unwrap_or(false)
-        })
-        .collect();
+    // Build the (short-name, absolute-url) list to run. `.html` tests are kept only if they load
+    // testharness.js (skips reftests / visual tests); `.js` tests expand to their generated HTML
+    // variants (`wpt serve` mode only — see `test_variants`).
+    let wptserve = backend.is_wptserve();
+    let mut tests: Vec<(String, String)> = Vec::new();
+    for path in &all {
+        let rel = path
+            .strip_prefix(&*root)
+            .unwrap()
+            .to_string_lossy()
+            .replace(' ', "%20");
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let is_js = name.ends_with(".any.js")
+            || name.ends_with(".window.js")
+            || name.ends_with(".worker.js");
+        if is_js {
+            for variant in test_variants(&rel, wptserve) {
+                let vname = variant.rsplit('/').next().unwrap_or(&variant).to_string();
+                let url = format!("{}/{variant}", backend.origin(&vname));
+                tests.push((variant, url));
+            }
+        } else if std::fs::read_to_string(path)
+            .map(|s| s.contains("testharness.js"))
+            .unwrap_or(false)
+        {
+            let url = format!("{}/{rel}", backend.origin(&name));
+            tests.push((rel, url));
+        }
+    }
     let total_found = tests.len();
     tests.truncate(max);
+    let backend_name = match backend {
+        Backend::Static(port) => format!("static :{port}"),
+        Backend::WptServe { .. } => format!("wpt serve {WPT_HOST}:{WPT_HTTP_PORT}/{WPT_HTTPS_PORT}"),
+    };
     eprintln!(
-        "running {} testharness tests from {} (server :{})",
+        "running {} testharness tests from {} ({backend_name})",
         tests.len().min(total_found),
         subpath,
-        port
     );
 
     let (mut files_ok, mut sub_pass, mut sub_fail, mut harness_err, mut timeouts) =
         (0, 0u64, 0u64, 0u64, 0u64);
     // (name, pass, fail, state, detail) for the HTML report. pass/fail = -1 for timeout/harness-err.
     let mut rows: Vec<(String, i64, i64, &'static str, String)> = Vec::new();
-    for path in &tests {
-        let rel = path
-            .strip_prefix(&*root)
-            .unwrap()
-            .to_string_lossy()
-            .replace(' ', "%20");
-        let url = format!("http://127.0.0.1:{port}/{rel}");
+    for (short, url) in &tests {
+        let short = short.clone();
         let mut e = engine::Engine::new();
         e.set_viewport(800, 600, 1.0);
-        e.load_url(&url);
+        e.load_url(url);
 
         // Tick until the harness reports completion or we time out (~10s wall).
         let start = Instant::now();
@@ -293,11 +465,6 @@ fn main() {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let short = path
-            .strip_prefix(&*root)
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
         if !done {
             timeouts += 1;
             println!("TIMEOUT  {short}");
