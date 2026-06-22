@@ -397,7 +397,10 @@ pub(crate) fn layout_flex(
 }
 
 /// The `order` of a flex item.
-pub(crate) fn order_of(boxx: &LayoutBox, styles: &HashMap<dom::NodeId, style::ComputedStyle>) -> i32 {
+pub(crate) fn order_of(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> i32 {
     style_of(boxx, styles).map(|cs| cs.order).unwrap_or(0)
 }
 
@@ -484,4 +487,3 @@ pub(crate) fn layout_flex_item_contents(
     resolve_out_of_flow(boxx, child_ctx, styles, measurer);
     laid_out
 }
-

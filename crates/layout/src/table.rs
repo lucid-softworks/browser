@@ -571,4 +571,3 @@ pub(crate) fn layout_table_captions(
     }
     y - content.y
 }
-

@@ -739,4 +739,3 @@ pub(crate) fn start_session(
     }
     (Some(session), snapshot, notes)
 }
-

@@ -50,7 +50,11 @@ pub(crate) fn parse_color(val: &str) -> Option<(u8, u8, u8)> {
 /// Handles `transparent` (→ alpha 0), `#rgba`/`#rrggbbaa` hex alpha, and the `/ alpha` or
 /// 4th-component alpha of `rgba()`/`hsla()`. `currentColor` resolves to `current` (opaque).
 /// Used by gradients and box-shadows where alpha matters. Returns `None` if unrecognized.
-pub(crate) fn parse_rgba_ctx(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) -> Option<Rgba> {
+pub(crate) fn parse_rgba_ctx(
+    val: &str,
+    current: (u8, u8, u8),
+    inherited: (u8, u8, u8),
+) -> Option<Rgba> {
     let v = val.trim();
     let lower = v.to_ascii_lowercase();
     match lower.as_str() {
@@ -374,4 +378,3 @@ pub(crate) fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
         _ => None,
     }
 }
-

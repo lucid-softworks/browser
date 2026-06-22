@@ -591,4 +591,3 @@ pub(crate) fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
         v.parse::<f32>().ok().filter(|n| *n > 0.0)
     }
 }
-

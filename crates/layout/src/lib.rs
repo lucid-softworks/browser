@@ -7,25 +7,25 @@
 
 use std::collections::HashMap;
 
-mod types;
-mod sizing;
-mod build;
 mod block;
-mod intrinsic;
+mod build;
 mod flex;
-mod table;
 mod grid;
 mod inline;
+mod intrinsic;
+mod sizing;
+mod table;
+mod types;
 
-pub use types::*;
-pub(crate) use sizing::*;
-pub(crate) use build::*;
 pub(crate) use block::*;
-pub(crate) use intrinsic::*;
+pub(crate) use build::*;
 pub(crate) use flex::*;
-pub(crate) use table::*;
 pub(crate) use grid::*;
 pub(crate) use inline::*;
+pub(crate) use intrinsic::*;
+pub(crate) use sizing::*;
+pub(crate) use table::*;
+pub use types::*;
 
 /// Lay out `doc` (with its computed `styles`) into a tree of positioned boxes that fits a
 /// viewport `viewport_width` pixels wide. Height is driven by content. The returned root box
@@ -76,7 +76,6 @@ pub fn layout_document(
     layout_block(&mut root, containing, ctx, styles, measurer);
     root
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -67,4 +67,3 @@ pub(crate) fn intrinsic_width(
 
     edges + max_inline.max(max_block)
 }
-

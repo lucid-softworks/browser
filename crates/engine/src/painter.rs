@@ -760,7 +760,15 @@ pub(crate) fn fill_circle(fb: &mut Framebuffer, cx: f32, cy: f32, rad: f32, c: C
 
 /// Draw a 1px-ish line between two device-space points (Bresenham, `t`-px square brush) at `c`.
 /// Used for the checkbox check mark's two strokes.
-pub(crate) fn draw_line(fb: &mut Framebuffer, x0: f32, y0: f32, x1: f32, y1: f32, t: i32, c: Color) {
+pub(crate) fn draw_line(
+    fb: &mut Framebuffer,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    t: i32,
+    c: Color,
+) {
     let t = t.max(1);
     let (mut x0, mut y0) = (x0.round() as i32, y0.round() as i32);
     let (x1, y1) = (x1.round() as i32, y1.round() as i32);
@@ -1498,7 +1506,6 @@ pub(crate) fn paint_box_shadow(
         }
     }
 }
-
 
 /// A simple computed vertical gradient — proof the pixels came from our code.
 /// The page canvas background. CSS "background propagation": the canvas takes the root element's

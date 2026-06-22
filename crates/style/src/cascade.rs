@@ -296,7 +296,10 @@ pub(crate) struct SelectorIndex<'a> {
 }
 
 impl<'a> SelectorIndex<'a> {
-    pub(crate) fn build(ua: &'a css::Stylesheet, author: &'a [css::Stylesheet]) -> SelectorIndex<'a> {
+    pub(crate) fn build(
+        ua: &'a css::Stylesheet,
+        author: &'a [css::Stylesheet],
+    ) -> SelectorIndex<'a> {
         let mut idx = SelectorIndex {
             by_id: HashMap::new(),
             by_class: HashMap::new(),
@@ -354,15 +357,19 @@ impl<'a> SelectorIndex<'a> {
 // these via `set_viewport_metrics` before each cascade, so they reflect the real window size and
 // backing scale — and because the cascade re-runs on resize, media/container queries and viewport
 // units respond to window resizing. Stored as f32 bits in atomics (0 = unset → fall back below).
-pub(crate) static VIEWPORT_W_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-pub(crate) static VIEWPORT_H_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-pub(crate) static VIEWPORT_DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub(crate) static VIEWPORT_W_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+pub(crate) static VIEWPORT_H_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+pub(crate) static VIEWPORT_DPR_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 
 /// Live OS appearance used to evaluate `@media (prefers-color-scheme: dark|light)` during the
 /// cascade. `true` = Dark. The engine sets this via [`set_color_scheme_dark`] on launch and on
 /// every Light/Dark toggle; the cascade re-runs (layout cache invalidated) so dark-mode stylesheet
 /// rules take effect. Mirrors the same flag in the `js` crate (which drives the JS `matchMedia`).
-pub(crate) static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Set the logical viewport size (CSS px) and device pixel ratio used by the cascade for media
 /// queries and viewport units. Call before [`cascade`] whenever the viewport changes.
@@ -1254,4 +1261,3 @@ pub fn compute_pseudo_style(
     );
     Some(ps)
 }
-

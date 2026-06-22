@@ -355,7 +355,10 @@ pub(crate) fn presentational_hints(
 
 /// Walk up from `node_id` to the nearest ancestor `<table>` element, returning its element data
 /// (used to read `border`/`cellpadding` for a descendant cell's presentational hints).
-pub(crate) fn ancestor_table(doc: &dom::Document, node_id: dom::NodeId) -> Option<&dom::ElementData> {
+pub(crate) fn ancestor_table(
+    doc: &dom::Document,
+    node_id: dom::NodeId,
+) -> Option<&dom::ElementData> {
     let mut cur = doc.get(node_id).parent;
     while let Some(id) = cur {
         let node = doc.get(id);
@@ -947,4 +950,3 @@ pub(crate) fn apply_declaration(
         _ => {}
     }
 }
-

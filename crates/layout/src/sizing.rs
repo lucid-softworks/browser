@@ -158,7 +158,10 @@ pub(crate) fn image_content_size(
 
 /// True if an Image box is block-level (computed display block/flex/grid, the legacy
 /// `display_block` flag, or out-of-flow). Otherwise the image is atomic inline-level.
-pub(crate) fn image_is_block(boxx: &LayoutBox, styles: &HashMap<dom::NodeId, style::ComputedStyle>) -> bool {
+pub(crate) fn image_is_block(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> bool {
     match style_of(boxx, styles) {
         None => false,
         Some(cs) => {
@@ -209,7 +212,10 @@ pub(crate) fn position_of(
 }
 
 /// True if a box is taken out of normal flow (absolutely or fixed positioned).
-pub(crate) fn is_out_of_flow(boxx: &LayoutBox, styles: &HashMap<dom::NodeId, style::ComputedStyle>) -> bool {
+pub(crate) fn is_out_of_flow(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> bool {
     matches!(
         position_of(boxx, styles),
         style::Position::Absolute | style::Position::Fixed
@@ -227,4 +233,3 @@ pub(crate) fn text_align_of(
         _ => TextAlignLocal::Left,
     }
 }
-

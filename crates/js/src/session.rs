@@ -733,4 +733,3 @@ pub(crate) fn session_thread_main(
     drop(context);
     drop(isolate);
 }
-

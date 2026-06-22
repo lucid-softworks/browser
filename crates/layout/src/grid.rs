@@ -239,7 +239,12 @@ pub(crate) fn layout_grid(
 }
 
 /// Resolve a track list into pixel widths within `avail`, accounting for `gap` between tracks.
-pub(crate) fn resolve_tracks(tracks: &[style::TrackSize], avail: f32, gap: f32, num: usize) -> Vec<f32> {
+pub(crate) fn resolve_tracks(
+    tracks: &[style::TrackSize],
+    avail: f32,
+    gap: f32,
+    num: usize,
+) -> Vec<f32> {
     let total_gap = gap * (num.saturating_sub(1) as f32);
     let space = (avail - total_gap).max(0.0);
     // Fixed (px + pct) consume space first; fr share the remainder; auto gets equal share of
@@ -362,7 +367,10 @@ pub(crate) fn resolve_row_heights(
 /// returns `(None-like)` via the column being unknown — callers handle `None` separately, so here
 /// we encode auto-start as returning column 0 with the caller checking `start`. To keep the
 /// signature simple this returns `(Option<usize>, span)`.
-pub(crate) fn placement_to_cell(p: Option<style::GridPlacement>, num: usize) -> (Option<usize>, usize) {
+pub(crate) fn placement_to_cell(
+    p: Option<style::GridPlacement>,
+    num: usize,
+) -> (Option<usize>, usize) {
     match p {
         None => (None, 1),
         Some(pl) => {
@@ -386,4 +394,3 @@ pub(crate) fn placement_to_cell(p: Option<style::GridPlacement>, num: usize) -> 
         }
     }
 }
-

@@ -180,7 +180,11 @@ pub(crate) fn copy_children_into(
 }
 
 /// Depth-first search for the first element whose tag equals `tag` (ASCII case-insensitive).
-pub(crate) fn find_by_tag(doc: &dom::Document, root: dom::NodeId, tag: &str) -> Option<dom::NodeId> {
+pub(crate) fn find_by_tag(
+    doc: &dom::Document,
+    root: dom::NodeId,
+    tag: &str,
+) -> Option<dom::NodeId> {
     if let dom::NodeData::Element(e) = &doc.get(root).data {
         if e.tag.eq_ignore_ascii_case(tag) {
             return Some(root);
@@ -195,7 +199,12 @@ pub(crate) fn find_by_tag(doc: &dom::Document, root: dom::NodeId, tag: &str) -> 
 }
 
 /// Collect every element matching `tag` (ASCII case-insensitive), document order.
-pub(crate) fn collect_by_tag(doc: &dom::Document, root: dom::NodeId, tag: &str, out: &mut Vec<dom::NodeId>) {
+pub(crate) fn collect_by_tag(
+    doc: &dom::Document,
+    root: dom::NodeId,
+    tag: &str,
+    out: &mut Vec<dom::NodeId>,
+) {
     if let dom::NodeData::Element(e) = &doc.get(root).data {
         if e.tag.eq_ignore_ascii_case(tag) {
             out.push(root);
@@ -225,4 +234,3 @@ pub(crate) fn find_by_id(doc: &dom::Document, root: dom::NodeId, id: &str) -> Op
 // ---------------------------------------------------------------------------------------------
 // CSS selector engine (type / .class / #id / compound / descendant). Reused verbatim.
 // ---------------------------------------------------------------------------------------------
-

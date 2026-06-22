@@ -198,21 +198,20 @@ impl Default for Engine {
     }
 }
 
-
-mod lifecycle;
-mod input;
 mod debug;
-mod traversal;
+mod input;
+mod lifecycle;
 mod painter;
 mod resources;
 mod scripting;
 mod text_helpers;
+mod traversal;
 
 pub(crate) use painter::*;
-pub(crate) use text_helpers::*;
-pub(crate) use traversal::*;
 pub use resources::*;
 pub use scripting::*;
+pub(crate) use text_helpers::*;
+pub(crate) use traversal::*;
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,3 @@
-
 /// An axis-aligned rectangle in CSS pixels (top-left origin, y grows downward).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {

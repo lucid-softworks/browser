@@ -10,7 +10,11 @@ pub(crate) fn render_value(scope: &mut v8::PinScope, value: v8::Local<v8::Value>
 }
 
 /// Read positional argument `i` from a callback as a Rust string (JS-coerced). Missing → "".
-pub(crate) fn arg_str(scope: &mut v8::PinScope, args: &v8::FunctionCallbackArguments, i: i32) -> String {
+pub(crate) fn arg_str(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments,
+    i: i32,
+) -> String {
     if i >= args.length() {
         return String::new();
     }
@@ -277,7 +281,11 @@ pub(crate) fn prim_pi_target(
 /// Deep/shallow clone of `id` in the arena. The clone is parentless. Element attributes are copied;
 /// with `deep`, children are recursively cloned and appended. Returns the new node id (or the
 /// original `id` if it's out of range). `__nsMeta` is copied JS-side by the wrapper.
-pub(crate) fn clone_node_arena(doc: &mut dom::Document, id: dom::NodeId, deep: bool) -> dom::NodeId {
+pub(crate) fn clone_node_arena(
+    doc: &mut dom::Document,
+    id: dom::NodeId,
+    deep: bool,
+) -> dom::NodeId {
     let data = doc.get(id).data.clone();
     let new_id = doc.alloc(data, None);
     if deep {
@@ -1976,4 +1984,3 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
         prim_computed_style_names,
     );
 }
-

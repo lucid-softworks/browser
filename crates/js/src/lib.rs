@@ -285,24 +285,23 @@ fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
 // implementation — these are pure Rust and unchanged in behavior.
 // ---------------------------------------------------------------------------------------------
 
-
 mod dom_helpers;
-mod selector;
-mod primitives;
-mod style_query;
 mod eval_loop;
-mod runtime;
 mod modules;
+mod primitives;
+mod runtime;
+mod selector;
 mod session;
+mod style_query;
 
 pub(crate) use dom_helpers::*;
-pub(crate) use selector::*;
-pub use primitives::*;
-pub(crate) use style_query::*;
 pub use eval_loop::*;
-pub use runtime::*;
 pub use modules::*;
+pub use primitives::*;
+pub use runtime::*;
+pub(crate) use selector::*;
 pub use session::*;
+pub(crate) use style_query::*;
 
 #[cfg(test)]
 mod tests {

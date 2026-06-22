@@ -9,17 +9,17 @@
 //! selector (`*`), and grouped comma lists. A single compound like `p.note` (a tag plus one
 //! class/id) is also handled. Descendant combinators (`div p`) are NOT supported.
 
-mod values;
-mod computed_style;
-mod serialize;
 mod cascade;
-mod variables;
-mod queries;
-mod declaration;
-mod parse_props;
-mod lengths;
 mod colors;
+mod computed_style;
+mod declaration;
+mod lengths;
+mod parse_props;
+mod queries;
 mod selector;
+mod serialize;
+mod values;
+mod variables;
 
 pub use cascade::*;
 pub use computed_style::*;

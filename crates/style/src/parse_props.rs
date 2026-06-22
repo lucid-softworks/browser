@@ -367,7 +367,11 @@ pub(crate) fn parse_mask(val: &str) -> Option<MaskImage> {
 /// explicit position are distributed evenly between their neighbors (0..1). Stop positions
 /// expressed as `%` resolve directly; `px` lengths are resolved as a fraction of an assumed
 /// 200px gradient line (best-effort, since the real line length isn't known until paint).
-pub(crate) fn parse_gradient(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) -> Option<Gradient> {
+pub(crate) fn parse_gradient(
+    val: &str,
+    current: (u8, u8, u8),
+    inherited: (u8, u8, u8),
+) -> Option<Gradient> {
     let v = val.trim();
     let lower = v.to_ascii_lowercase();
     let (is_radial, body) = if let Some(rest) = strip_func(&lower, v, "linear-gradient") {
@@ -539,7 +543,11 @@ pub(crate) fn split_stop(part: &str) -> (&str, Option<f32>) {
 /// Parse a `box-shadow` value (comma-separated list) into [`BoxShadow`] layers. Each layer is
 /// `[inset]? <dx> <dy> [<blur>] [<spread>] [<color>]`. Color defaults to `current` (currentColor).
 /// Returns an empty vec if nothing parsed.
-pub(crate) fn parse_box_shadows(val: &str, current: (u8, u8, u8), inherited: (u8, u8, u8)) -> Vec<BoxShadow> {
+pub(crate) fn parse_box_shadows(
+    val: &str,
+    current: (u8, u8, u8),
+    inherited: (u8, u8, u8),
+) -> Vec<BoxShadow> {
     let v = val.trim();
     if v.eq_ignore_ascii_case("none") || v.is_empty() {
         return Vec::new();
@@ -850,4 +858,3 @@ pub(crate) fn parse_transform_origin(val: &str) -> (f32, f32) {
     }
     (x, y)
 }
-

@@ -66,7 +66,10 @@ pub(crate) fn with_computed_style<R>(
 
 /// Walk up from `id` to the nearest `<iframe>` facade-document root (its body carries a
 /// `data-frame-host` attribute = the host iframe's node id). Returns `(facade_root, iframe_node)`.
-pub(crate) fn find_facade_root(doc: &dom::Document, id: dom::NodeId) -> Option<(dom::NodeId, dom::NodeId)> {
+pub(crate) fn find_facade_root(
+    doc: &dom::Document,
+    id: dom::NodeId,
+) -> Option<(dom::NodeId, dom::NodeId)> {
     let mut cur = Some(id);
     while let Some(c) = cur {
         if c.0 < doc.len() {
@@ -876,4 +879,3 @@ pub(crate) fn prim_attr_names(
     let arr = js_str_array(scope, &names);
     rv.set(arr);
 }
-

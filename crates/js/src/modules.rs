@@ -539,4 +539,3 @@ pub(crate) fn js_string_literal(s: &str) -> String {
     out.push('"');
     out
 }
-

@@ -236,7 +236,11 @@ pub(crate) fn char_index_in_run(run: &TextRun, font: &SystemFont, x: f32) -> usi
 /// little for inter-line slack) contains `p.y`; among candidate runs on that line, the one whose
 /// horizontal span contains `p.x`, else the nearest. Falls back to the closest run by vertical
 /// distance when the point is above/below all text.
-pub(crate) fn resolve_text_position(runs: &[TextRun], font: &SystemFont, p: Point) -> (usize, usize) {
+pub(crate) fn resolve_text_position(
+    runs: &[TextRun],
+    font: &SystemFont,
+    p: Point,
+) -> (usize, usize) {
     if runs.is_empty() {
         return (0, 0);
     }
@@ -687,7 +691,10 @@ pub(crate) fn collect_content_rects(b: &layout::LayoutBox, out: &mut HashMap<usi
 /// Seed `out` with the intrinsic size of every `<canvas>` element: its `width`/`height` attributes,
 /// or the spec default 300×150 when absent. Layout treats `<canvas>` as a replaced element and uses
 /// this (the same way an `<img>`'s decoded size is used) for aspect-ratio-preserving sizing.
-pub(crate) fn collect_canvas_intrinsics(doc: &dom::Document, out: &mut HashMap<dom::NodeId, (f32, f32)>) {
+pub(crate) fn collect_canvas_intrinsics(
+    doc: &dom::Document,
+    out: &mut HashMap<dom::NodeId, (f32, f32)>,
+) {
     for i in 0..doc.len() {
         let id = dom::NodeId(i);
         if let dom::NodeData::Element(e) = &doc.get(id).data {
@@ -711,7 +718,10 @@ pub(crate) fn collect_canvas_intrinsics(doc: &dom::Document, out: &mut HashMap<d
 /// Seed `out` with the intrinsic size of every inline `<svg>` element: its `width`/`height` attrs,
 /// else its `viewBox` width/height, else the spec default 300×150. Layout treats `<svg>` as a
 /// replaced element and uses this for sizing (the same way an `<img>`'s decoded size is used).
-pub(crate) fn collect_svg_intrinsics(doc: &dom::Document, out: &mut HashMap<dom::NodeId, (f32, f32)>) {
+pub(crate) fn collect_svg_intrinsics(
+    doc: &dom::Document,
+    out: &mut HashMap<dom::NodeId, (f32, f32)>,
+) {
     for i in 0..doc.len() {
         let id = dom::NodeId(i);
         if let dom::NodeData::Element(e) = &doc.get(id).data {
@@ -761,7 +771,10 @@ pub(crate) fn is_editable_text_field(doc: &dom::Document, id: dom::NodeId) -> bo
 
 /// Walk from `node` up the ancestor chain, returning the first node (including `node` itself) that
 /// is an editable text field (see [`is_editable_text_field`]), or `None` if none is found.
-pub(crate) fn editable_text_ancestor(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
+pub(crate) fn editable_text_ancestor(
+    doc: &dom::Document,
+    node: dom::NodeId,
+) -> Option<dom::NodeId> {
     let mut cur = Some(node);
     while let Some(id) = cur {
         if id.0 >= doc.len() {
@@ -858,7 +871,11 @@ pub(crate) fn details_toggle_target(doc: &dom::Document, node: dom::NodeId) -> O
 }
 
 /// Depth-first search for the first element whose `id` attribute equals `id`.
-pub(crate) fn find_by_attr_id(doc: &dom::Document, root: dom::NodeId, id: &str) -> Option<dom::NodeId> {
+pub(crate) fn find_by_attr_id(
+    doc: &dom::Document,
+    root: dom::NodeId,
+    id: &str,
+) -> Option<dom::NodeId> {
     if root.0 >= doc.len() {
         return None;
     }
@@ -955,4 +972,3 @@ pub(crate) fn submit_target_form(doc: &dom::Document, node: dom::NodeId) -> Opti
     }
     control.and_then(|c| ancestor_form(doc, c))
 }
-

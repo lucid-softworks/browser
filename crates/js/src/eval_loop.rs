@@ -46,7 +46,8 @@ pub(crate) static DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 /// and, in parallel, the CSS `@media (prefers-color-scheme)` cascade (the `style` crate keeps its
 /// own copy, set on the same engine path). Process-global so the engine (any thread) can update it
 /// and the JS worker reads the live value on every media-query evaluation.
-pub(crate) static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Set the logical viewport size (px) and device pixel ratio surfaced to page JS.
 pub fn set_device_metrics(width: u32, height: u32, device_pixel_ratio: f32) {
@@ -226,7 +227,9 @@ pub(crate) fn eval_source(scope: &mut v8::PinScope, source: &str, name: &str) ->
 }
 
 /// Format a caught exception (message + stack) into an error string matching the prior shape.
-pub(crate) fn format_exception(tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>) -> String {
+pub(crate) fn format_exception(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>,
+) -> String {
     if let Some(exception) = tc.exception() {
         // Prefer a stack trace if present; otherwise fall back to the exception's string form.
         if let Some(stack) = tc.stack_trace() {
@@ -506,7 +509,10 @@ pub(crate) fn deliver_fetch_completion(scope: &mut v8::PinScope, completion: Fet
 /// via `__wsDeliver(id, kind, payload)`. Returns whether any event was delivered. No-op when
 /// `ws_evt_rx` is `None` (the no-DOM / run-once paths that never open a socket). A `close` event
 /// (kind 3) also drops the socket's outgoing sender so its thread can exit.
-pub(crate) fn deliver_ws_events(scope: &mut v8::PinScope, ws_evt_rx: Option<&Receiver<WsEvent>>) -> bool {
+pub(crate) fn deliver_ws_events(
+    scope: &mut v8::PinScope,
+    ws_evt_rx: Option<&Receiver<WsEvent>>,
+) -> bool {
     let rx = match ws_evt_rx {
         Some(rx) => rx,
         None => return false,
@@ -567,4 +573,3 @@ pub(crate) fn eval_to_string(scope: &mut v8::PinScope, source: &str) -> Option<S
 // ---------------------------------------------------------------------------------------------
 // Public API: Runtime, eval_batch, run_with_dom, run_modules.
 // ---------------------------------------------------------------------------------------------
-

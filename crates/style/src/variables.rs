@@ -53,7 +53,11 @@ pub(crate) fn resolve_vars(value: &str, vars: &HashMap<String, String>) -> Strin
 
 pub(crate) const VAR_MAX_DEPTH: usize = 32;
 
-pub(crate) fn resolve_vars_depth(value: &str, vars: &HashMap<String, String>, depth: usize) -> String {
+pub(crate) fn resolve_vars_depth(
+    value: &str,
+    vars: &HashMap<String, String>,
+    depth: usize,
+) -> String {
     if depth >= VAR_MAX_DEPTH || !value.contains("var(") {
         return value.to_string();
     }
@@ -126,4 +130,3 @@ pub(crate) fn split_first_comma(s: &str) -> (&str, Option<&str>) {
     }
     (s, None)
 }
-

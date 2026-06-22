@@ -6,7 +6,11 @@ use crate::*;
 /// The cascade now matches via [`SelectorIndex`] rather than calling this per rule, but it is
 /// retained as the reference single-rule matcher (used by tests / external callers).
 #[allow(dead_code)]
-pub(crate) fn rule_specificity(selectors: &[String], doc: &dom::Document, id: dom::NodeId) -> Option<u32> {
+pub(crate) fn rule_specificity(
+    selectors: &[String],
+    doc: &dom::Document,
+    id: dom::NodeId,
+) -> Option<u32> {
     let mut best: Option<u32> = None;
     for sel in selectors {
         if let Some(c) = compile_selector(sel) {
@@ -1401,7 +1405,12 @@ pub(crate) fn attr_matches(el: &dom::ElementData, a: &AttrSel) -> bool {
 }
 
 /// Match a pseudo-class against an element node.
-pub(crate) fn pseudo_matches(doc: &dom::Document, id: dom::NodeId, el: &dom::ElementData, p: &Pseudo) -> bool {
+pub(crate) fn pseudo_matches(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    el: &dom::ElementData,
+    p: &Pseudo,
+) -> bool {
     match p {
         Pseudo::Root => el.tag.eq_ignore_ascii_case("html"),
         Pseudo::FirstChild => element_index(doc, id).map(|(i, _)| i == 0).unwrap_or(false),
@@ -1508,7 +1517,11 @@ pub(crate) fn is_form_control(tag: &str) -> bool {
 }
 
 /// Is `ancestor` an ancestor of `descendant` (strictly above it)?
-pub(crate) fn is_ancestor(doc: &dom::Document, ancestor: dom::NodeId, descendant: dom::NodeId) -> bool {
+pub(crate) fn is_ancestor(
+    doc: &dom::Document,
+    ancestor: dom::NodeId,
+    descendant: dom::NodeId,
+) -> bool {
     if descendant.0 >= doc.len() {
         return false;
     }
@@ -1536,7 +1549,11 @@ pub(crate) fn element_index(doc: &dom::Document, id: dom::NodeId) -> Option<(usi
 }
 
 /// (index-among-same-type-siblings, total-same-type-siblings) for `id`.
-pub(crate) fn type_index(doc: &dom::Document, id: dom::NodeId, tag: &str) -> Option<(usize, usize)> {
+pub(crate) fn type_index(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    tag: &str,
+) -> Option<(usize, usize)> {
     let parent = parent_of(doc, id)?;
     let kids = &doc.get(parent).children;
     let same: Vec<dom::NodeId> = kids
@@ -1651,4 +1668,3 @@ pub(crate) fn user_agent_stylesheet() -> css::Stylesheet {
          label { display: inline-block }";
     css::parse(&sheet.replace("{TEXT}", &text))
 }
-

@@ -266,4 +266,3 @@ pub(crate) fn is_block_tag(tag: &str) -> bool {
             | "hr"
     )
 }
-

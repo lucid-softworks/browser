@@ -196,4 +196,3 @@ pub(crate) fn draw_console_panel(
         baseline = line_baseline.max(baseline + line_h);
     }
 }
-

@@ -166,7 +166,12 @@ pub(crate) fn bar_fraction(el: &dom::ElementData, is_progress: bool) -> Option<f
 /// Give a drawn-widget box an explicit content size: the element's CSS width/height if set, else
 /// the supplied intrinsic default. Widgets are replaced-element-like, so block layout must not try
 /// to stretch/shrink them past this; we set the content rect directly (like the image/caret path).
-pub(crate) fn size_widget_box(bx: &mut LayoutBox, cs: &style::ComputedStyle, default_w: f32, default_h: f32) {
+pub(crate) fn size_widget_box(
+    bx: &mut LayoutBox,
+    cs: &style::ComputedStyle,
+    default_w: f32,
+    default_h: f32,
+) {
     bx.dimensions.content.width = cs.width.unwrap_or(default_w).max(1.0);
     bx.dimensions.content.height = cs.height.unwrap_or(default_h).max(1.0);
 }
@@ -333,7 +338,11 @@ pub(crate) struct BuildCtx<'a> {
 
 /// Build the child boxes for `parent_id`'s children, wrapping runs of inline children in
 /// anonymous blocks when the parent also contains block children.
-pub(crate) fn build_children(doc: &dom::Document, parent_id: dom::NodeId, bx: &BuildCtx) -> Vec<LayoutBox> {
+pub(crate) fn build_children(
+    doc: &dom::Document,
+    parent_id: dom::NodeId,
+    bx: &BuildCtx,
+) -> Vec<LayoutBox> {
     let styles = bx.styles;
     // First, produce a flat list of child boxes (each tagged block vs inline).
     let mut flat: Vec<LayoutBox> = Vec::new();
@@ -642,7 +651,10 @@ pub(crate) fn build_replaced_or_control(
 ///
 /// Returns `None` only for `display: none`. An empty content string still yields a box (it may
 /// carry a visible background/border); the inner `Text` child is skipped when the string is empty.
-pub(crate) fn build_pseudo_box(originating: dom::NodeId, cs: &style::ComputedStyle) -> Option<LayoutBox> {
+pub(crate) fn build_pseudo_box(
+    originating: dom::NodeId,
+    cs: &style::ComputedStyle,
+) -> Option<LayoutBox> {
     if cs.display_none {
         return None;
     }
@@ -678,7 +690,12 @@ pub(crate) fn build_pseudo_box(originating: dom::NodeId, cs: &style::ComputedSty
 /// Build the box (or boxes) for a single DOM node, pushing into `out`. May push nothing
 /// (hidden / non-rendered / empty text) or several (an inline element contributes its own
 /// box; its rendered text/children become that box's children).
-pub(crate) fn build_box(doc: &dom::Document, id: dom::NodeId, bx_ctx: &BuildCtx, out: &mut Vec<LayoutBox>) {
+pub(crate) fn build_box(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    bx_ctx: &BuildCtx,
+    out: &mut Vec<LayoutBox>,
+) {
     let styles = bx_ctx.styles;
     let intrinsic_sizes = bx_ctx.intrinsic_sizes;
     let focused = bx_ctx.focused;
@@ -999,4 +1016,3 @@ pub(crate) fn collapse_whitespace(s: &str) -> String {
     }
     out.trim().to_string()
 }
-
