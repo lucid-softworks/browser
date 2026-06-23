@@ -5366,6 +5366,13 @@
     if (typeof el.blur !== "function") { def(el, "blur", fn); }
     if (typeof el.click !== "function") { def(el, "click", fn); }
     if (typeof el.cloneNode !== "function") { def(el, "cloneNode", function () { return this; }); }
+    // Web Animations: minimal `Element.animate()` returning an Animation whose `finished`/`ready`
+    // promises settle (after the effect's delay+duration). We don't composite animations, so styles
+    // aren't actually interpolated — but this unblocks the very common pattern of awaiting a throwaway
+    // animation to sync with a frame (e.g. WPT's `waitForCompositorReady`: `body.animate({opacity:
+    // [0,1]},{duration:1}).finished`). `getAnimations()` reports none (we keep no running set).
+    if (typeof el.animate !== "function") { def(el, "animate", function (_keyframes, options) { return globalThis.__makeAnimation(options); }); }
+    if (typeof el.getAnimations !== "function") { def(el, "getAnimations", function () { return []; }); }
     if (typeof el.isEqualNode !== "function") { def(el, "isEqualNode", function (other) { return globalThis.__nodesEqual(this, other); }); }
     // Declarative partial-update methods (WICG): {append,prepend,before,after,replaceWith}HTML[Unsafe].
     globalThis.__addPartialMethods(el);
@@ -9370,6 +9377,57 @@
   if (typeof globalThis.structuredClone !== "function") {
     def(globalThis, "structuredClone", function (v) { try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; } });
   }
+
+  // Minimal Web Animations `Animation` for `Element.animate()`. We don't run/composite animations,
+  // so this models only the lifecycle: `finished`/`ready` promises and play-state, with the effect
+  // treated as completing after its `delay + duration`. Enough for the common "await a throwaway
+  // animation to sync a frame" idiom; tests that read interpolated values will still fail (as they
+  // would without `animate` at all), not error.
+  def(globalThis, "__makeAnimation", function (options) {
+    var dur = 0, delay = 0;
+    if (typeof options === "number") {
+      dur = options;
+    } else if (options && typeof options === "object") {
+      dur = Number(options.duration) || 0;
+      delay = Number(options.delay) || 0;
+    }
+    if (!isFinite(dur) || dur < 0) { dur = 0; }
+    if (!isFinite(delay) || delay < 0) { delay = 0; }
+    var anim = { playState: "running", currentTime: 0, startTime: null, playbackRate: 1,
+                 id: "", effect: null, timeline: null, onfinish: null, oncancel: null,
+                 pending: false };
+    var settle;
+    anim.finished = new Promise(function (resolve) { settle = resolve; });
+    // Swallow rejection-less completion; cancel just resolves the lifecycle for our purposes.
+    anim.ready = Promise.resolve(anim);
+    var done = false;
+    function finishNow() {
+      if (done) { return; }
+      done = true;
+      anim.playState = "finished";
+      anim.currentTime = delay + dur;
+      settle(anim);
+      if (typeof anim.onfinish === "function") { try { anim.onfinish.call(anim, { type: "finish" }); } catch (e) {} }
+    }
+    anim.play = function () { anim.playState = "running"; };
+    anim.pause = function () { anim.playState = "paused"; };
+    anim.reverse = function () {};
+    anim.finish = function () { finishNow(); };
+    anim.cancel = function () {
+      if (done) { return; }
+      done = true;
+      anim.playState = "idle";
+      anim.currentTime = null;
+      settle(anim); // resolve rather than reject: nothing awaits a cancellation here
+      if (typeof anim.oncancel === "function") { try { anim.oncancel.call(anim, { type: "cancel" }); } catch (e) {} }
+    };
+    anim.updatePlaybackRate = fn;
+    anim.addEventListener = fn;
+    anim.removeEventListener = fn;
+    anim.dispatchEvent = function () { return false; };
+    setTimeout(finishNow, delay + dur);
+    return anim;
+  });
 
   // CSS namespace: CSS.supports (feature detection — optimistic), CSS.escape (selector escaping),
   // and no-op registerProperty. Pages reference `CSS` directly (ReferenceError otherwise).
