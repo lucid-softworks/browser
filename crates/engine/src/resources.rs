@@ -535,7 +535,9 @@ pub(crate) fn collect_images(
     for (node, url) in data_targets {
         let r = decode_data_url(&url)
             .ok_or_else(|| "malformed data: URL".to_string())
-            .and_then(|b| decode_image(&b).ok_or_else(|| "decode failed".to_string()));
+            .and_then(|b| {
+                decode_any_image(&b, "", &url).ok_or_else(|| "decode failed".to_string())
+            });
         results.push((node, url, r));
     }
 
@@ -557,7 +559,7 @@ pub(crate) fn collect_images(
                             .into_iter()
                             .map(|(node, url)| {
                                 let r = net::fetch(&url).and_then(|resp| {
-                                    decode_image(&resp.body)
+                                    decode_any_image(&resp.body, &resp.content_type, &url)
                                         .ok_or_else(|| "decode failed".to_string())
                                 });
                                 (node, url, r)
@@ -689,12 +691,35 @@ pub(crate) fn fetch_favicon(url: &str, font: Option<&SystemFont>) -> Option<Deco
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let is_svg = ctype.contains("svg") || path.ends_with(".svg") || bytes_look_like_svg(&bytes);
-    if is_svg {
-        decode_svg_favicon(&bytes, font)
+    if is_svg_source(&ctype, &path, &bytes) {
+        decode_svg_sized(&bytes, FAVICON_PX, FAVICON_PX, font)
     } else {
         decode_image(&bytes)
     }
+}
+
+/// Decode image bytes whose format may be SVG (which the `image` crate can't handle) — used by
+/// `<img>` collection. Raster formats go through [`decode_image`]; SVG is parsed and rasterized at
+/// its intrinsic size via the engine's own renderer (text in SVG images isn't drawn — no font is
+/// threaded into the off-main-thread image fetch). `ctype` is the response content-type (may be
+/// empty for `data:` URLs), `url` the source URL (for the `.svg` extension hint).
+pub(crate) fn decode_any_image(bytes: &[u8], ctype: &str, url: &str) -> Option<DecodedImage> {
+    let ct = ctype.to_ascii_lowercase();
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_svg_source(&ct, &path, bytes) {
+        decode_svg_image(bytes)
+    } else {
+        decode_image(bytes)
+    }
+}
+
+/// Whether a fetched resource is SVG, by content-type, `.svg` extension, or a markup sniff.
+fn is_svg_source(ctype: &str, path: &str, bytes: &[u8]) -> bool {
+    ctype.contains("svg") || path.ends_with(".svg") || bytes_look_like_svg(bytes)
 }
 
 /// Heuristic sniff for SVG markup (covers responses served with a wrong/missing content-type).
@@ -706,27 +731,47 @@ fn bytes_look_like_svg(bytes: &[u8]) -> bool {
         || ((s.starts_with("<?xml") || s.starts_with("<!--")) && s.contains("<svg"))
 }
 
-/// Parse standalone SVG markup and rasterize its first `<svg>` element to a square favicon bitmap.
-fn decode_svg_favicon(bytes: &[u8], font: Option<&SystemFont>) -> Option<DecodedImage> {
-    fn find_svg(doc: &dom::Document, id: dom::NodeId) -> Option<dom::NodeId> {
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("svg") {
-                return Some(id);
-            }
+/// The node id of the first `<svg>` element anywhere in `doc`.
+fn find_svg_root(doc: &dom::Document, id: dom::NodeId) -> Option<dom::NodeId> {
+    if let dom::NodeData::Element(e) = &doc.get(id).data {
+        if e.tag.eq_ignore_ascii_case("svg") {
+            return Some(id);
         }
-        for &c in &doc.get(id).children {
-            if let Some(s) = find_svg(doc, c) {
-                return Some(s);
-            }
-        }
-        None
     }
+    for &c in &doc.get(id).children {
+        if let Some(s) = find_svg_root(doc, c) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Parse standalone SVG markup and rasterize its first `<svg>` element to a `w`×`h` bitmap.
+fn decode_svg_sized(
+    bytes: &[u8],
+    w: u32,
+    h: u32,
+    font: Option<&SystemFont>,
+) -> Option<DecodedImage> {
     let markup = String::from_utf8_lossy(bytes);
     let doc = html::parse(&markup);
-    let svg_id = find_svg(&doc, doc.root())?;
-    Some(crate::svg::rasterize_svg(
-        &doc, svg_id, FAVICON_PX, FAVICON_PX, font,
-    ))
+    let svg_id = find_svg_root(&doc, doc.root())?;
+    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, font))
+}
+
+/// Parse standalone SVG markup and rasterize it at its intrinsic size (from width/height/viewBox),
+/// clamped so a missing/huge size can't blow up memory. For `<img src="*.svg">`.
+fn decode_svg_image(bytes: &[u8]) -> Option<DecodedImage> {
+    let markup = String::from_utf8_lossy(bytes);
+    let doc = html::parse(&markup);
+    let svg_id = find_svg_root(&doc, doc.root())?;
+    let (iw, ih) = match &doc.get(svg_id).data {
+        dom::NodeData::Element(e) => crate::svg::intrinsic_size(e),
+        _ => return None,
+    };
+    let w = (iw.round() as u32).clamp(1, 1024);
+    let h = (ih.round() as u32).clamp(1, 1024);
+    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, None))
 }
 
 /// Whether `bytes` look like a JPEG XL stream: either the raw codestream marker (`FF 0A`) or the
