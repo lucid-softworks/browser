@@ -2983,6 +2983,46 @@ mod tests {
     }
 
     #[test]
+    fn font_family_invalid_list_is_rejected_and_escaped_quotes_round_trip() {
+        // Regression: a quoted family-name followed by more content (`"times" new roman`) is a
+        // syntax error — the declaration must be dropped, not stored as a mangled, unbalanced-quote
+        // value. And a *valid* family with an escaped quote (`'\"times new roman'`) must serialize
+        // idempotently: re-assigning the serialized form converges instead of growing backslashes
+        // on every round-trip. Either bug previously let CSSOM set/serialize loops blow up
+        // (unbounded allocation) and hang the engine on css/css-fonts/test_font_family_parsing.html.
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                // Invalid: string followed by idents -> whole list dropped, leaving fontFamily empty.
+                r#"var a = document.createElement("div"); a.style.fontFamily = "arial, helvetica, \"times\" new roman, sans-serif"; a.style.fontFamily"#.to_string(),
+                // Valid escaped quote: assign, read back, re-assign repeatedly; the length must be
+                // stable across iterations (idempotent), not grow.
+                r#"var b = document.createElement("div"); b.style.fontFamily = 'arial, \'\\"times new roman\', sans-serif'; var lens = []; for (var k = 0; k < 8; k++) { var p = b.style.fontFamily; b.style.fontFamily = "x"; b.style.fontFamily = p; lens.push(b.style.fontFamily.length); } lens.join(",")"#.to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(""),
+            "invalid list must be dropped"
+        );
+        assert_eq!(out[1].error, None, "{:?}", out[1]);
+        // All eight reads report the same length -> serialization converged.
+        let lens = out[1].value.as_deref().unwrap_or("");
+        let stable = lens
+            .split(',')
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == 1;
+        assert!(
+            stable,
+            "font-family serialization not idempotent: lens = {lens}"
+        );
+    }
+
+    #[test]
     fn style_css_text_round_trips_and_drops_invalid() {
         let (doc, body) = doc_with_body("");
         let (doc, out) = run_with_dom(

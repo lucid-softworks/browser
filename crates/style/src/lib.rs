@@ -466,17 +466,33 @@ mod tests {
     fn font_family_serializes_with_canonical_quoting() {
         // Generic families/CSS-wide keywords stay quoted; valid ident sequences unquote.
         assert_eq!(
-            serialize_font_family("'Times New Roman'"),
-            "Times New Roman"
+            serialize_font_family("'Times New Roman'").as_deref(),
+            Some("Times New Roman")
         );
-        assert_eq!(serialize_font_family("\"serif\""), "\"serif\"");
-        assert_eq!(serialize_font_family("'34J'"), "\"34J\"");
-        assert_eq!(serialize_font_family("'A  B'"), "\"A  B\"");
-        assert_eq!(serialize_font_family("Veronica"), "Veronica");
         assert_eq!(
-            serialize_font_family("Twisty Tie, '34J', \"serif\", Veronica, sans-serif"),
-            "Twisty Tie, \"34J\", \"serif\", Veronica, sans-serif"
+            serialize_font_family("\"serif\"").as_deref(),
+            Some("\"serif\"")
         );
+        assert_eq!(serialize_font_family("'34J'").as_deref(), Some("\"34J\""));
+        assert_eq!(serialize_font_family("'A  B'").as_deref(), Some("\"A  B\""));
+        assert_eq!(
+            serialize_font_family("Veronica").as_deref(),
+            Some("Veronica")
+        );
+        assert_eq!(
+            serialize_font_family("Twisty Tie, '34J', \"serif\", Veronica, sans-serif").as_deref(),
+            Some("Twisty Tie, \"34J\", \"serif\", Veronica, sans-serif")
+        );
+        // A quoted string followed by more content (or an unterminated quote) is invalid -> dropped.
+        assert_eq!(
+            serialize_font_family("arial, \"times\" new roman, sans-serif"),
+            None
+        );
+        assert_eq!(serialize_font_family("'times' new roman"), None);
+        assert_eq!(serialize_font_family("\"unterminated"), None);
+        // An escaped quote inside a properly-closed string stays valid (closing quote is the last
+        // char; the `\"` is part of the body, not a terminator).
+        assert!(serialize_font_family("'\\\"times new roman'").is_some());
     }
 
     #[test]
