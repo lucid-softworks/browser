@@ -421,18 +421,22 @@ pub(crate) fn apply_declaration(
         "background-repeat" => style.background_repeat = parse_bg_repeat(val),
         "background-position" => style.background_position = parse_bg_position(val),
         "background-image" => {
-            if let Some(g) = parse_gradient(val, current_color, inherited_color) {
-                style.background_gradient = Some(g);
-                style.background_image_url = None;
-            } else if val.trim().eq_ignore_ascii_case("none") {
-                style.background_gradient = None;
-                style.background_image_url = None;
-            } else if let Some(u) = extract_css_url(val) {
+            // A `url()` image layer wins over a gradient: `background-image` can be a comma list of
+            // layers (e.g. `linear-gradient(transparent,transparent), url(sprite.svg)` — Wikipedia's
+            // `.sprite`). We only render one, and the image is what matters there (such gradients are
+            // usually transparent overlays).
+            if let Some(u) = extract_css_url(val) {
                 // Resolve against this declaration's base — the stylesheet base for a rule, or the
                 // document base for an inline style (set on the MatchEntry) — so getComputedStyle
                 // reports the absolute (resolved) url per CSSOM.
                 style.background_image_url = Some(resolve_css_url(&u, base));
                 style.background_gradient = None;
+            } else if let Some(g) = parse_gradient(val, current_color, inherited_color) {
+                style.background_gradient = Some(g);
+                style.background_image_url = None;
+            } else if val.trim().eq_ignore_ascii_case("none") {
+                style.background_gradient = None;
+                style.background_image_url = None;
             }
         }
         "color-scheme" => {
