@@ -32,7 +32,7 @@ pub(crate) fn layout_inline_children(
     // We move children out so atomic boxes can be re-emitted into the new child list.
     let original_children = std::mem::take(&mut boxx.children);
     let mut items: Vec<InlineItem> = Vec::new();
-    collect_inline_items(original_children, ctx, styles, measurer, &mut items);
+    collect_inline_items(original_children, ctx, avail, styles, measurer, &mut items);
 
     // Greedy line breaking. Each line is a list of (item, x-offset-within-line).
     struct PlacedLine {
@@ -346,6 +346,7 @@ pub(crate) enum TextAlignLocal {
 pub(crate) fn collect_inline_items(
     children: Vec<LayoutBox>,
     ctx: Ctx,
+    cb_width: f32,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
     out: &mut Vec<InlineItem>,
@@ -362,16 +363,20 @@ pub(crate) fn collect_inline_items(
         }) == Some(true);
 
         if is_atomic {
-            // Lay the atomic box out as a block at a tentative origin (0,0). Its intrinsic width
-            // (max content line, or explicit width) becomes its size; it'll be repositioned on
-            // its line. We use the box's intrinsic width as the containing width so shrink-to-fit
-            // applies.
+            // Lay the atomic box out as a block at a tentative origin (0,0); it'll be repositioned on
+            // its line. An atomic box with an EXPLICIT width (px or %) resolves it against the inline
+            // formatting context's width (`cb_width`) — so e.g. `width:73%` works. An AUTO-width
+            // atomic shrink-to-fits to its intrinsic (max-content) width.
             let m = child.dimensions.margin;
-            let iw = intrinsic_width(&child, styles, measurer) + m.left + m.right;
+            let width = if resolved_width(&child, styles, cb_width).is_some() {
+                cb_width
+            } else {
+                intrinsic_width(&child, styles, measurer) + m.left + m.right
+            };
             let containing = Rect {
                 x: 0.0,
                 y: 0.0,
-                width: iw,
+                width,
                 height: 0.0,
             };
             layout_block(&mut child, containing, ctx, styles, measurer);
@@ -418,7 +423,7 @@ pub(crate) fn collect_inline_items(
                 });
             }
             BoxContent::Inline => {
-                collect_inline_items(child.children, ctx, styles, measurer, out);
+                collect_inline_items(child.children, ctx, cb_width, styles, measurer, out);
             }
             BoxContent::Image(_) => {
                 // An atomic inline image: position its (pre-sized) content box at a tentative
