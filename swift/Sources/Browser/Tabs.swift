@@ -122,8 +122,14 @@ final class TabButton: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let closeButton = HoverButton()
     private let faviconView = NSImageView()
+    /// Title's left inset: wide enough to clear the favicon when there is one, tight when there
+    /// isn't (so a faviconless tab has no empty placeholder gap).
+    private var titleLeading: NSLayoutConstraint!
     private var trackingArea: NSTrackingArea?
     private var hovering = false { didSet { updateAppearance() } }
+
+    private static let titleInsetWithFavicon: CGFloat = 32
+    private static let titleInsetNoFavicon: CGFloat = 10
 
     init(tab: Tab) {
         self.tab = tab
@@ -155,11 +161,14 @@ final class TabButton: NSView {
         addSubview(closeButton)
 
         // Layout (Chrome/Firefox order): favicon on the left, title in the middle, close "×" on the
-        // right (the close button only appears on hover/active; its slot is reserved either way so
-        // the title doesn't shift).
+        // right. The close button only appears on hover/active (its slot is reserved either way so
+        // the title doesn't shift); the title's left inset collapses when there's no favicon.
         faviconView.imageScaling = .scaleProportionallyDown
         faviconView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(faviconView)
+
+        titleLeading = titleLabel.leadingAnchor.constraint(
+            equalTo: leadingAnchor, constant: Self.titleInsetNoFavicon)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 28),
@@ -176,7 +185,7 @@ final class TabButton: NSView {
             closeButton.widthAnchor.constraint(equalToConstant: 18),
             closeButton.heightAnchor.constraint(equalToConstant: 18),
 
-            titleLabel.leadingAnchor.constraint(equalTo: faviconView.trailingAnchor, constant: 7),
+            titleLeading,
             titleLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -4),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
@@ -212,9 +221,12 @@ final class TabButton: NSView {
             layer?.backgroundColor = NSColor.clear.cgColor
             titleLabel.textColor = NSColor.secondaryLabelColor
         }
-        // Close "×" (right) shows only on active/hover; favicon (left) shows whenever there is one.
+        // Close "×" (right) shows only on active/hover; favicon (left) shows whenever there is one,
+        // and its slot collapses when there isn't (no empty placeholder).
         closeButton.isHidden = !(isActive || hovering)
-        faviconView.isHidden = tab.favicon == nil
+        let hasFavicon = tab.favicon != nil
+        faviconView.isHidden = !hasFavicon
+        titleLeading.constant = hasFavicon ? Self.titleInsetWithFavicon : Self.titleInsetNoFavicon
     }
 
     override func updateTrackingAreas() {
