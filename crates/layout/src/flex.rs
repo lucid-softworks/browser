@@ -80,9 +80,12 @@ pub(crate) fn layout_flex(
                 m.left + m.right + b.left + b.right + p.left + p.right,
             )
         };
-        // Base main size (content-box): flex-basis, else explicit main size, else intrinsic.
+        // Base main size (content-box): flex-basis (px, then percentage of the container main size),
+        // else explicit main size, else intrinsic.
         let base_content = if let Some(fb) = ccs.flex_basis {
             fb
+        } else if let Some(pct) = ccs.flex_basis_pct.filter(|_| main_avail.is_finite()) {
+            (main_avail * pct - main_edges).max(0.0)
         } else if is_row {
             ccs.width.unwrap_or_else(|| {
                 (intrinsic_width(child, styles, measurer) - (p.left + p.right + b.left + b.right))
@@ -176,10 +179,18 @@ pub(crate) fn layout_flex(
                 }
             }
         } else if free < 0.0 {
-            let total_shrink: f32 = line.iter().map(|&mi| metas[mi].shrink).sum();
-            if total_shrink > 0.0 {
+            // Shrink is weighted by each item's *scaled* shrink factor (flex-shrink × base size), per
+            // CSS Flexbox §9.7: a larger item gives up proportionally more space. Distributing the
+            // deficit by raw flex-shrink alone over-shrinks small items to zero and leaves large ones
+            // overflowing (e.g. Wikipedia's 55%/45% columns).
+            let total_scaled: f32 = line
+                .iter()
+                .map(|&mi| metas[mi].shrink * metas[mi].hyp_main)
+                .sum();
+            if total_scaled > 0.0 {
                 for (k, &mi) in line.iter().enumerate() {
-                    sizes[k] += free * (metas[mi].shrink / total_shrink);
+                    let scaled = metas[mi].shrink * metas[mi].hyp_main;
+                    sizes[k] += free * (scaled / total_scaled);
                     if sizes[k] < 0.0 {
                         sizes[k] = 0.0;
                     }
