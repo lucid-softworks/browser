@@ -1204,6 +1204,23 @@
     if (b === "default" || b === "inherit" || b === "initial" || b === "unset" || b === "revert" || b === "revert-layer") return true;
     return false;
   }
+  // Find the matching closing quote for a family component that starts with quote `q`, honouring
+  // backslash escapes. Returns the index of the closing quote, or -1 if unterminated.
+  function closingQuoteIndex(fam, q) {
+    for (var i = 1; i < fam.length; i++) {
+      var c = fam.charAt(i);
+      if (c === "\\") { i++; continue; }
+      if (c === q) return i;
+    }
+    return -1;
+  }
+  // Returns the canonical serialization of a font-family list, or null if the list is invalid per
+  // the `<family-name>` grammar (each comma component must be a single <string> OR a sequence of
+  // <custom-ident>s). A quoted string with trailing content after its closing quote
+  // (e.g. `"times" new roman`), or an unterminated quote, is a syntax error: the whole declaration
+  // is dropped. Slicing such a component naively leaves an unbalanced quote that re-escapes and
+  // grows on every CSSOM round-trip, so rejecting it is what stops repeated set/serialize from
+  // blowing up.
   function normalizeFontFamily(val) {
     var parts = splitTopLevel(String(val), ",");
     var out = [];
@@ -1215,7 +1232,12 @@
         // Quoted: serialize unquoted iff the body is a single-space-separated sequence of valid CSS
         // identifiers, re-joining reproduces the body exactly (no double spaces / leading/trailing
         // space), and the body isn't a reserved word (generic family / CSS-wide keyword / default).
-        var body = fam.slice(1, -1);
+        var ci = closingQuoteIndex(fam, first);
+        if (ci < 0 || fam.slice(ci + 1).trim() !== "") return null;
+        // Decode escapes to the literal string value before re-escaping, so serialization is
+        // idempotent: `'\"x'` -> body `"x` -> `"\"x"` -> body `"x` again. Without this, the raw
+        // backslashes are re-escaped and accumulate on every CSSOM round-trip.
+        var body = unescapeCssIdent(fam.slice(1, ci));
         var words = body.split(" ");
         var allIdent = words.length > 0 && words.every(function (w) { return /^-?[A-Za-z_][A-Za-z0-9_-]*$/.test(w); });
         var roundTrips = allIdent && words.join(" ") === body;

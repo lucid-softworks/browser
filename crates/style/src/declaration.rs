@@ -516,7 +516,11 @@ pub(crate) fn apply_declaration(
                     None
                 };
             } else if !trimmed.is_empty() {
-                style.font_family = Some(serialize_font_family(trimmed));
+                // An invalid list (`serialize_font_family` returns None) is dropped, leaving the
+                // cascaded value in place — never stored as a mangled string.
+                if let Some(ff) = serialize_font_family(trimmed) {
+                    style.font_family = Some(ff);
+                }
             }
         }
         "font-weight" => {
