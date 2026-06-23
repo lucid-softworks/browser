@@ -3005,6 +3005,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inline_block_percentage_width_resolves_against_container() {
+        // An inline-block with width:50% inside a 400px block is 200px (not shrink-to-fit to its
+        // content). Regression: percentage widths used to resolve against the box's intrinsic width.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let ib = doc.append_element(wrap, "span");
+        doc.append_child(ib, dom::NodeData::Text("hi".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut wrap_s = block_style(true);
+        wrap_s.width = Some(400.0);
+        styles.insert(wrap, wrap_s);
+        styles.insert(
+            ib,
+            style::ComputedStyle {
+                display: style::Display::InlineBlock,
+                width_pct: Some(0.5),
+                height: Some(20.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let w = rect_of(&root_box, ib).width;
+        assert!(
+            (w - 200.0).abs() < 1.0,
+            "inline-block width:50% of 400px should be 200px, got {w}"
+        );
+    }
+
     // ---- Floats ----
 
     /// Two `float:left` blocks pack side by side on the same row.
