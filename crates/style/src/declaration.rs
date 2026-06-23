@@ -708,7 +708,8 @@ pub(crate) fn apply_declaration(
             "flex-start" | "start" => style.align_items = AlignItems::FlexStart,
             "flex-end" | "end" => style.align_items = AlignItems::FlexEnd,
             "center" => style.align_items = AlignItems::Center,
-            "baseline" => style.align_items = AlignItems::Baseline,
+            "baseline" | "first baseline" => style.align_items = AlignItems::Baseline,
+            "last baseline" => style.align_items = AlignItems::LastBaseline,
             _ => {}
         },
         "align-content" => {
@@ -745,7 +746,8 @@ pub(crate) fn apply_declaration(
             "flex-start" | "start" => style.align_self = AlignSelf::FlexStart,
             "flex-end" | "end" => style.align_self = AlignSelf::FlexEnd,
             "center" => style.align_self = AlignSelf::Center,
-            "baseline" => style.align_self = AlignSelf::Baseline,
+            "baseline" | "first baseline" => style.align_self = AlignSelf::Baseline,
+            "last baseline" => style.align_self = AlignSelf::LastBaseline,
             _ => {}
         },
         "order" => {
@@ -864,7 +866,7 @@ pub(crate) fn apply_declaration(
 
         // --- Box model: width / height ---
         "width" => {
-            style.width = parse_length(val);
+            style.width = parse_length_fs(val, style.font_size);
             style.width_pct = if style.width.is_none() {
                 parse_percent(val).map(|p| p / 100.0)
             } else {
@@ -872,7 +874,7 @@ pub(crate) fn apply_declaration(
             };
         }
         "height" => {
-            style.height = parse_length(val);
+            style.height = parse_length_fs(val, style.font_size);
             style.height_pct = if style.height.is_none() {
                 parse_percent(val).map(|p| p / 100.0)
             } else {
