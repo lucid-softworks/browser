@@ -3,6 +3,11 @@
   // complete; intervals may spin, bounded by the cap), and the REAL wall clock once the page is
   // live (driven by Engine::tick) so setInterval/setTimeout/rAF fire on actual elapsed time.
   var loop = { timers: [], micro: [], nextId: 1, now: 0, realBase: 0, realtime: false, firedThisDrain: Object.create(null) };
+  // Largest virtual-time jump allowed while fast-forwarding the load-time clock. Generous enough to
+  // run any realistic deferred load work (setTimeout(0) chains, rAF, init delays) but well under the
+  // multi-second testharness timeout, so test timeouts are deferred to the real clock instead of
+  // being fast-forwarded and fired during load.
+  var LOAD_FASTFORWARD_CAP_MS = 5000;
   Object.defineProperty(globalThis, "__eventLoop", { value: loop, enumerable: false, configurable: true, writable: true });
   Object.defineProperty(globalThis, "__timerErrors", { value: [], enumerable: false, configurable: true, writable: true });
   function nowMs() { try { return Date.now(); } catch (e) { return 0; } }
@@ -91,7 +96,14 @@
       else { loop.timers.splice(bestIdx, 1); }
     } else {
       // Load-time: fast-forward virtual time to this timer and fire it (one-shots and rAF chains
-      // run freely; a repeating timer fires once and is parked for the real-time ticks).
+      // run freely; a repeating timer fires once and is parked for the real-time ticks). But do NOT
+      // fast-forward across a far-future timer: long timeouts (notably testharness's multi-second
+      // per-test/harness timeout) must be measured on the REAL clock, not skipped to instantly. If
+      // the page is awaiting external input that only arrives after load — e.g. a testdriver
+      // `test_driver.Actions().send()` — virtual time would otherwise jump straight to the test
+      // timeout and fire it ("Test timed out") before the input is ever delivered. Parking such
+      // timers ends the load drain; they then fire in real time once `__enterRealtime` is active.
+      if (timer.when - loop.now > LOAD_FASTFORWARD_CAP_MS) { return false; }
       if (timer.when > loop.now) { loop.now = timer.when; }
       if (timer.repeat) { timer.when = loop.now + timer.delay; loop.firedThisDrain[timer.id] = true; }
       else { loop.timers.splice(bestIdx, 1); }

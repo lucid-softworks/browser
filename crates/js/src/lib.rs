@@ -1843,6 +1843,33 @@ mod tests {
     }
 
     #[test]
+    fn load_clock_does_not_fast_forward_long_timeouts() {
+        // The load-time virtual clock fast-forwards to fire pending short timers, but must NOT skip
+        // across a far-future timer. Regression for testdriver tests: a page awaiting external input
+        // (e.g. test_driver.Actions().send()) leaves only a multi-second testharness timeout pending;
+        // fast-forwarding to it would fire "Test timed out" during load. A short (0ms) timer still
+        // runs; a long (10s) timer is deferred (fires later on the real clock, not during load).
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"setTimeout(() => console.log("short"), 0);
+                    setTimeout(() => console.log("LONG-fired"), 10000);"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
+        assert!(
+            all.iter().any(|l| l == "short"),
+            "short timer should run: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|l| l == "LONG-fired"),
+            "10s timer must NOT be fast-forwarded during load: {all:?}"
+        );
+    }
+
+    #[test]
     fn window_post_message_dispatches_message_event() {
         // `window.postMessage` delivers a `message` MessageEvent to the window asynchronously, with
         // data structured-cloned, the window's own origin, and source === window. WPT's

@@ -355,9 +355,9 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &Mutex<Sessions>) ->
         ("GET", ["session", id, "timeouts"]) => get_timeouts(id, sessions),
 
         // Actions: `release` (DELETE) runs before every test even when it uses no testdriver input,
-        // so it must succeed. `perform` (POST) is a no-op until the Actions API is implemented;
-        // tests that depend on real input will fail rather than 404.
-        ("POST", ["session", id, "actions"]) => with_session(id, sessions, |_| Ok(Json::Null)),
+        // so it must succeed (and resets the input state — a no-op for us). `perform` (POST) replays
+        // pointer input as synthetic mouse events so testdriver click/hover tests run for real.
+        ("POST", ["session", id, "actions"]) => perform_actions(id, body, sessions),
         ("DELETE", ["session", id, "actions"]) => with_session(id, sessions, |_| Ok(Json::Null)),
 
         // Frame switching is not modeled yet; accept and stay on the top-level context so tests that
@@ -661,6 +661,15 @@ fn execute_sync(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
             "{SERIALIZE_PREAMBLE}\n(function(){{ try {{ var __r = (function(){{ {script} \n}}).apply(null, {args_js}); return window.__wd_serialize(__r); }} catch(e) {{ return '__WD_ERR__' + (e && e.message ? e.message : String(e)); }} }})()"
         );
         let raw = s.engine.console_eval(&wrapped);
+        // A synchronous script's return value is captured above, but it may have queued tasks that a
+        // live event loop would then run — most importantly `window.postMessage`, which delivers on a
+        // task. WPT's testdriver delivers action/test-completion results by having wptrunner
+        // `execute_script("window.postMessage(...)")`; without pumping the loop here that message
+        // never reaches the page's `message` listener and `test_driver` promises hang. Tick a few
+        // times so those tasks settle before we return.
+        for _ in 0..5 {
+            s.engine.tick();
+        }
         decode_eval_result(&raw)
     })
 }
@@ -906,6 +915,82 @@ fn element_rect(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResult {
         "(function(){ var r = __el.getBoundingClientRect(); return {x: r.left, y: r.top, width: r.width, height: r.height}; })()",
         sessions,
     )
+}
+
+/// Perform an Actions sequence (`POST /session/:id/actions`). We model the common case WPT's
+/// testdriver uses: one or more `pointer` input sources whose actions are `pointerMove` /
+/// `pointerDown` / `pointerUp` (plus `pause`, which we treat as instantaneous). Each tick across all
+/// sources is replayed in source order as synthetic mouse events against the live page — move →
+/// `mousemove`/hover, down → `mousedown`, up → `mouseup` + a full `click` (with the engine's focus /
+/// checkbox / submit side effects). Key/wheel sources and non-default coordinate origins beyond
+/// `viewport`/`pointer` are ignored (best-effort); the command still succeeds so the test proceeds.
+fn perform_actions(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    let parsed = parse(body).unwrap_or(Json::Null);
+    let sources = match parsed.get("actions").and_then(|a| a.as_array()) {
+        Some(s) => s,
+        None => return Ok(Json::Null),
+    };
+    with_session(id, sessions, |s| {
+        // Build layout so hit-testing in dispatch_* works (mirrors element_click).
+        let _ = s.engine.render();
+        // Current pointer position in CSS px (viewport-relative); shared across pointer sources.
+        let mut px = 0f64;
+        let mut py = 0f64;
+        for source in sources {
+            if source.get("type").and_then(|t| t.as_str()) != Some("pointer") {
+                continue; // key / wheel / none input sources: not modeled
+            }
+            let items = match source.get("actions").and_then(|a| a.as_array()) {
+                Some(items) => items,
+                None => continue,
+            };
+            for item in items {
+                match item.get("type").and_then(|t| t.as_str()) {
+                    Some("pointerMove") => {
+                        let x = item.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let y = item.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        // origin: "viewport" (default) → absolute; "pointer" → relative to current.
+                        // Element origins aren't modeled; treat them as viewport.
+                        match item.get("origin").and_then(|o| o.as_str()) {
+                            Some("pointer") => {
+                                px += x;
+                                py += y;
+                            }
+                            _ => {
+                                px = x;
+                                py = y;
+                            }
+                        }
+                        s.engine
+                            .dispatch_move(px as f32 * s.scale, py as f32 * s.scale);
+                    }
+                    Some("pointerDown") => {
+                        s.engine.dispatch_mouse(
+                            "mousedown",
+                            px as f32 * s.scale,
+                            py as f32 * s.scale,
+                        );
+                    }
+                    Some("pointerUp") => {
+                        // A down→up on a target is a click: fire mouseup, then a full click.
+                        s.engine.dispatch_mouse(
+                            "mouseup",
+                            px as f32 * s.scale,
+                            py as f32 * s.scale,
+                        );
+                        s.engine
+                            .dispatch_click(px as f32 * s.scale, py as f32 * s.scale);
+                    }
+                    _ => {} // pause / pointerCancel / unknown: nothing to dispatch
+                }
+            }
+        }
+        // Let event handlers' microtasks/timers settle so the test observes the result.
+        for _ in 0..5 {
+            s.engine.tick();
+        }
+        Ok(Json::Null)
+    })
 }
 
 fn element_click(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResult {
