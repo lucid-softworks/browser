@@ -100,6 +100,17 @@ impl Engine {
     ///    (`finish` → base_url → `start_session` (V8) → full `collect_stylesheets` (external CSS) →
     ///    `collect_images` → `prune_invalid` → `deliver_observations`), so the FINAL state and frame
     ///    are byte-for-byte what the engine produced before — streaming only ADDS earlier frames.
+    /// The URL currently committed in this engine — the *resolved* final URL after fixup, HSTS
+    /// upgrade, redirects, and any http fallback — or `None` if nothing has loaded. Shells read this
+    /// after a load so the address bar shows the real address (e.g. the http page a defaulted-https
+    /// navigation fell back to, or the https page an HSTS pin forced).
+    pub fn current_url(&self) -> Option<&str> {
+        match &self.state {
+            LoadState::Loaded { url, .. } | LoadState::Failed { url, .. } => Some(url.as_str()),
+            LoadState::Empty => None,
+        }
+    }
+
     pub fn load_url(&mut self, url: &str) -> i32 {
         self.scroll_y = 0.0; // new navigation starts at the top
         self.layout_cache = None; // invalidate cached layout for the previous page
@@ -113,33 +124,55 @@ impl Engine {
         self.inspect_node = None; // and nothing highlighted in the Elements inspector
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
 
+        // URL fixup (shared with every other shell via `net::fixup_url`): a schemeless address-bar
+        // entry becomes `https://…`; authority-less schemes (`about:blank`, `data:…`) pass through.
+        let fixup = net::fixup_url(url);
+        let streaming = self.frame_cb.is_some();
+
         // Stream the body: re-parse on each chunk and paint throttled partial frames. We also
         // accumulate the raw bytes so the non-HTML branch / content sniffing below can inspect the
         // full body without depending on the streaming parser's internal buffer.
-        let mut parser = html::StreamParser::new();
-        let mut last_paint: Option<Instant> = None;
-        let streaming = self.frame_cb.is_some();
-        let result = net::fetch_streaming(url, &mut |chunk| {
-            parser.feed(chunk);
-            // Partial frames are pure cost when nobody is listening — only paint when a frame
-            // callback is installed.
-            if !streaming {
-                return;
+        //
+        // A schemeless address we defaulted to https that can't *connect* falls back to http once
+        // (some sites are http-only), unless HSTS pins the host to https. A real HTTP error status
+        // is NOT a fallback trigger. Each attempt streams into a fresh parser.
+        let mut target = fixup.url;
+        let (parser, result) = loop {
+            let mut parser = html::StreamParser::new();
+            let mut last_paint: Option<Instant> = None;
+            let result = net::fetch_streaming(&target, &mut |chunk| {
+                parser.feed(chunk);
+                // Partial frames are pure cost when nobody is listening — only paint when a frame
+                // callback is installed.
+                if !streaming {
+                    return;
+                }
+                let now = Instant::now();
+                let due = match last_paint {
+                    Some(t) => now.duration_since(t) >= PARTIAL_PAINT_INTERVAL,
+                    None => true, // always emit the first partial frame
+                };
+                if !due {
+                    return;
+                }
+                last_paint = Some(now);
+                // Partial frame: inline-only styles, no images/console, scripts have NOT run yet.
+                let snapshot = parser.snapshot();
+                self.install_partial(snapshot, &target);
+                self.emit_partial_frame();
+            });
+            if let Err(e) = &result {
+                if fixup.https_defaulted
+                    && target.starts_with("https://")
+                    && net::is_connection_error(e)
+                    && !net::hsts_pinned_url(&target)
+                {
+                    target = format!("http://{}", &target["https://".len()..]);
+                    continue;
+                }
             }
-            let now = Instant::now();
-            let due = match last_paint {
-                Some(t) => now.duration_since(t) >= PARTIAL_PAINT_INTERVAL,
-                None => true, // always emit the first partial frame
-            };
-            if !due {
-                return;
-            }
-            last_paint = Some(now);
-            // Partial frame: inline-only styles, no images/console, scripts have NOT run yet.
-            let snapshot = parser.snapshot();
-            self.install_partial(snapshot, url);
-            self.emit_partial_frame();
-        });
+            break (parser, result);
+        };
 
         match result {
             Ok(meta) => {
@@ -243,7 +276,7 @@ impl Engine {
             }
             Err(e) => {
                 self.state = LoadState::Failed {
-                    url: url.to_string(),
+                    url: target,
                     error: e,
                 };
                 self.layout_cache = None;

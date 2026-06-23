@@ -149,6 +149,20 @@ uint64_t browser_engine_cpu_ns(struct Engine *engine);
 const char *browser_engine_title(struct Engine *engine);
 
 /**
+ * The URL currently committed in the engine — the resolved final URL after fixup, HSTS upgrade,
+ * redirects, and any http fallback — as a NUL-terminated UTF-8 C string, or null if nothing has
+ * loaded. Shells call this after `browser_engine_load_url` to show the real address (and to record
+ * history), since the loaded URL can differ from the one passed in.
+ *
+ * Lifetime: owned by the engine handle (stored in `last_url`); valid until the next
+ * `browser_engine_current_url` call on this handle or until `browser_engine_free`. Copy before reusing.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_current_url(struct Engine *engine);
+
+/**
  * Paint the current state and return a borrowed view of the framebuffer.
  * Valid until the next render/free on this handle.
  *

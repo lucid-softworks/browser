@@ -1103,19 +1103,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: Navigation
 
-    private func normalize(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return trimmed }
-        if trimmed.contains("://") { return trimmed }
-        // A bare host like "example.com" -> "https://example.com".
-        return "https://" + trimmed
-    }
-
     @objc private func navigate(_ sender: Any?) {
-        let url = normalize(urlField.stringValue)
-        guard !url.isEmpty else { return }
-        urlField.stringValue = url
-        load(urlString: url, recordHistory: true)
+        // URL fixup (schemeless → https, `about:`/`data:` passthrough), the https→http fallback for
+        // http-only sites, and HSTS all live in the Rust engine so every shell behaves identically.
+        // We pass the raw text through and reconcile the address bar with the engine's committed URL
+        // once the load finishes (see `load`).
+        let raw = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
+        load(urlString: raw, recordHistory: true)
     }
 
     @objc private func goBack() {
@@ -1141,7 +1136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if tab.historyIndex >= 0, tab.historyIndex < tab.history.count {
             load(urlString: tab.history[tab.historyIndex], recordHistory: false)
         } else {
-            let url = normalize(urlField.stringValue)
+            let url = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if !url.isEmpty { load(urlString: url, recordHistory: true) }
         }
     }
@@ -1172,9 +1167,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // A REPL session is per page: navigating starts a fresh one.
         devTools?.clearREPL()
 
-        if shouldRecord {
-            tab.recordHistory(urlString)
-        }
+        // Show the requested text optimistically; the engine may resolve it to a different committed
+        // URL (fixup, HSTS upgrade, redirect, http fallback), which we reconcile after the load.
         tab.urlString = urlString
         tab.title = hostTitle(from: urlString)
         refreshActiveTabButton()
@@ -1198,6 +1192,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             _ = urlCopy.withCString { cstr in
                 browser_engine_load_url(engine, cstr)
             }
+            // The engine's committed URL after fixup/HSTS/redirect/http-fallback — what the address
+            // bar and history should actually reflect (falls back to the requested text if absent).
+            let committed = browser_engine_current_url(engine).map { String(cString: $0) } ?? urlString
             DispatchQueue.main.async {
                 tab.isLoading = false
                 tab.pendingLoads -= 1
@@ -1213,6 +1210,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 // A newer navigation has superseded this one: don't clobber its title/render.
                 if tab.loadGeneration != generation { return }
+                // Reconcile to the engine's committed URL, then record it in history (so a defaulted
+                // https that fell back to http, or an HSTS upgrade, lands correctly in both).
+                tab.urlString = committed
+                if shouldRecord { tab.recordHistory(committed) }
+                if self.activeTab === tab { self.urlField.stringValue = committed }
                 // Use the page's <title> for the tab label (fall back to the host title).
                 if let cstr = browser_engine_title(engine) {
                     let pageTitle = String(cString: cstr)

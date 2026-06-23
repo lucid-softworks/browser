@@ -146,6 +146,246 @@ pub struct ResponseMeta {
     pub final_url: String,
 }
 
+/// Result of [`fixup_url`]: the normalized URL plus whether we supplied a default `https://` scheme
+/// (so the caller may fall back to `http://` if the https attempt can't connect).
+pub struct Fixup {
+    pub url: String,
+    pub https_defaulted: bool,
+}
+
+/// Turn user-typed address-bar text into a URL, the way a browser's "URL fixup" does — shared by
+/// every shell (Swift app, WebDriver, …) so address handling is identical across platforms:
+///   * schemeless input ("example.com", "localhost:8080/x") becomes `https://…`, recorded in
+///     `https_defaulted` so the caller can fall back to http on a *connection* failure;
+///   * input that already carries a scheme passes through untouched — including the authority-less
+///     schemes (`about:blank`, `data:…`, `mailto:…`, …) that have no `://` and must NOT be treated
+///     as a bare host.
+pub fn fixup_url(input: &str) -> Fixup {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Fixup {
+            url: String::new(),
+            https_defaulted: false,
+        };
+    }
+    // `scheme://authority…` (http, https, file, ws, …): already a full URL.
+    if trimmed.contains("://") {
+        return Fixup {
+            url: trimmed.to_string(),
+            https_defaulted: false,
+        };
+    }
+    // Schemes with no `://` authority are real URLs, not bare hosts.
+    const SCHEMELESS: [&str; 7] = [
+        "about:",
+        "data:",
+        "javascript:",
+        "mailto:",
+        "tel:",
+        "blob:",
+        "view-source:",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    if SCHEMELESS.iter().any(|s| lower.starts_with(s)) {
+        return Fixup {
+            url: trimmed.to_string(),
+            https_defaulted: false,
+        };
+    }
+    // A bare host defaults to https (with the caller free to fall back to http on connect failure).
+    Fixup {
+        url: format!("https://{trimmed}"),
+        https_defaulted: true,
+    }
+}
+
+/// Whether an `Err` from the fetch functions is a connection-level failure (DNS/connect/TLS/reset/
+/// timeout) rather than an HTTP error *status*. Lets a defaulted-https navigation decide to retry
+/// over http: an unreachable/refused https port falls back, a real 4xx/5xx page does not.
+pub fn is_connection_error(err: &str) -> bool {
+    err.starts_with("request failed:")
+}
+
+/// Whether HSTS currently forces https for `url`'s host (so a defaulted-https navigation must NOT
+/// fall back to http for it).
+pub fn hsts_pinned_url(url: &str) -> bool {
+    host_of(url).map(|h| hsts::is_pinned(&h)).unwrap_or(false)
+}
+
+/// The lowercased registrable host of an `http(s)` URL (no port, no userinfo), or `None` for IP
+/// literals / malformed authorities (which never carry HSTS).
+fn host_of(url: &str) -> Option<String> {
+    let after = url.split_once("://")?.1;
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // IPv6 literal (`[::1]`) or empty authority: not an HSTS host.
+    if authority.is_empty() || authority.starts_with('[') {
+        return None;
+    }
+    let host = authority.split(':').next().unwrap_or(authority);
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.trim_end_matches('.').to_ascii_lowercase())
+}
+
+/// Rewrite an `http://` URL to `https://` when its host is HSTS-pinned; otherwise return it
+/// unchanged. Applied to every request (documents AND subresources) so a pinned host is never
+/// contacted over plaintext.
+fn hsts_upgrade(url: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = url.strip_prefix("http://") {
+        if let Some(host) = host_of(url) {
+            if hsts::is_pinned(&host) {
+                return std::borrow::Cow::Owned(format!("https://{rest}"));
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(url)
+}
+
+/// HTTP Strict Transport Security: remember hosts that sent a `Strict-Transport-Security` header
+/// over https and force https for them thereafter (persisted across runs). A security control, so
+/// it lives in the network layer and applies to every fetch.
+mod hsts {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Entry {
+        expiry: u64, // unix seconds
+        include_subdomains: bool,
+    }
+
+    fn store() -> &'static Mutex<HashMap<String, Entry>> {
+        static STORE: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(load()))
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Whether `host` (exact, or covered by an ancestor's `includeSubDomains`) is pinned to https.
+    pub fn is_pinned(host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let Ok(guard) = store().lock() else {
+            return false;
+        };
+        let t = now();
+        if let Some(e) = guard.get(&host) {
+            if e.expiry > t {
+                return true;
+            }
+        }
+        // includeSubDomains: any unexpired ancestor entry that set the flag covers this host.
+        let mut rest = host.as_str();
+        while let Some(idx) = rest.find('.') {
+            rest = &rest[idx + 1..];
+            if let Some(e) = guard.get(rest) {
+                if e.expiry > t && e.include_subdomains {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Record a `Strict-Transport-Security` header value for `host` (max-age=0 clears the pin).
+    pub fn record(host: &str, header: &str) {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        let mut max_age: Option<u64> = None;
+        let mut include_sub = false;
+        for part in header.split(';') {
+            let p = part.trim().to_ascii_lowercase();
+            if let Some(v) = p.strip_prefix("max-age=") {
+                max_age = v.trim().trim_matches('"').parse::<u64>().ok();
+            } else if p == "includesubdomains" {
+                include_sub = true;
+            }
+        }
+        let Some(age) = max_age else {
+            return; // a directive-less / max-age-less header is ignored
+        };
+        let Ok(mut guard) = store().lock() else {
+            return;
+        };
+        if age == 0 {
+            guard.remove(&host);
+        } else {
+            guard.insert(
+                host,
+                Entry {
+                    expiry: now().saturating_add(age),
+                    include_subdomains: include_sub,
+                },
+            );
+        }
+        save(&guard);
+    }
+
+    /// On-disk store path (one `host\texpiry\tincludeSubDomains` line per entry), under the same
+    /// cache root as the disk cache; `None` (in-memory only) when caching is disabled.
+    fn path() -> Option<std::path::PathBuf> {
+        match std::env::var("NET_CACHE_DIR") {
+            Ok(v) if v.is_empty() || v == "off" || v == "0" => return None,
+            Ok(v) => return Some(std::path::PathBuf::from(v).join("hsts.txt")),
+            Err(_) => {}
+        }
+        let home = std::env::var_os("HOME")?;
+        Some(std::path::Path::new(&home).join("Library/Caches/dev.imlunahey.browser/hsts.txt"))
+    }
+
+    fn load() -> HashMap<String, Entry> {
+        let mut map = HashMap::new();
+        let Some(p) = path() else {
+            return map;
+        };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return map;
+        };
+        let t = now();
+        for line in text.lines() {
+            let mut it = line.split('\t');
+            if let (Some(h), Some(exp), Some(flag)) = (it.next(), it.next(), it.next()) {
+                if let Ok(expiry) = exp.parse::<u64>() {
+                    if expiry > t {
+                        map.insert(
+                            h.to_string(),
+                            Entry {
+                                expiry,
+                                include_subdomains: flag == "1",
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    fn save(map: &HashMap<String, Entry>) {
+        let Some(p) = path() else {
+            return;
+        };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut out = String::new();
+        for (h, e) in map {
+            out.push_str(h);
+            out.push('\t');
+            out.push_str(&e.expiry.to_string());
+            out.push('\t');
+            out.push(if e.include_subdomains { '1' } else { '0' });
+            out.push('\n');
+        }
+        let _ = std::fs::write(&p, out);
+    }
+}
+
 /// One entry in the network activity log (for the devtools Network tab).
 #[derive(Clone)]
 pub struct NetEntry {
@@ -282,6 +522,11 @@ fn request_streaming_inner(
 ) -> Result<ResponseMeta, String> {
     let method_uc = method.to_ascii_uppercase();
 
+    // HSTS: force https for any http URL whose host is pinned (documents AND subresources), so a
+    // pinned host is never contacted over plaintext. No-op for non-http(s) URLs.
+    let upgraded = hsts_upgrade(url);
+    let url: &str = &upgraded;
+
     // `about:blank` (and bare `about:`) is the empty initial document every browsing context starts
     // on. There's no network involved — serve a minimal empty HTML document so the engine has a real
     // scriptable `about:blank` (used by new windows / WebDriver sessions before the first navigation).
@@ -394,6 +639,16 @@ fn request_streaming_inner(
         .header("Content-Type")
         .unwrap_or("application/octet-stream")
         .to_string();
+
+    // Record HSTS pins, but only from an https response (a header sent over plain http is ignored
+    // per the spec, since it could be injected by a network attacker).
+    if url.starts_with("https://") {
+        if let Some(sts) = resp.header("Strict-Transport-Security") {
+            if let Some(host) = host_of(url) {
+                hsts::record(&host, sts);
+            }
+        }
+    }
 
     // Stream the body: read into a fixed buffer and hand each block to `on_chunk` as it arrives,
     // never buffering the whole body here. On a cache MISS we accumulate a copy locally so the
@@ -749,6 +1004,75 @@ mod tests {
     fn invalid_url_is_err() {
         assert!(fetch("not a url").is_err());
         assert!(fetch("http://").is_err());
+    }
+
+    #[test]
+    fn fixup_defaults_bare_host_to_https() {
+        let f = fixup_url("example.com");
+        assert_eq!(f.url, "https://example.com");
+        assert!(f.https_defaulted);
+
+        let f = fixup_url("  localhost:8080/x  "); // trims, keeps port + path
+        assert_eq!(f.url, "https://localhost:8080/x");
+        assert!(f.https_defaulted);
+    }
+
+    #[test]
+    fn fixup_preserves_explicit_and_authorityless_schemes() {
+        for s in [
+            "http://httpforever.com",
+            "https://example.com",
+            "file:///tmp/x.html",
+            "about:blank",
+            "About:Blank", // scheme match is case-insensitive
+            "data:text/html,hi",
+            "mailto:a@b.com",
+            "view-source:https://example.com",
+        ] {
+            let f = fixup_url(s);
+            assert_eq!(f.url, s.trim());
+            assert!(!f.https_defaulted, "{s} must not be marked https-defaulted");
+        }
+        assert_eq!(fixup_url("   ").url, "");
+    }
+
+    #[test]
+    fn connection_errors_are_distinguished_from_statuses() {
+        assert!(is_connection_error("request failed: connection refused"));
+        assert!(!is_connection_error("HTTP error status 404 for https://x"));
+        assert!(!is_connection_error("failed to read body: reset"));
+    }
+
+    #[test]
+    fn host_of_extracts_host_without_port_or_userinfo() {
+        assert_eq!(host_of("https://Example.COM/path").as_deref(), Some("example.com"));
+        assert_eq!(host_of("http://user:pw@example.com:8080/x").as_deref(), Some("example.com"));
+        assert_eq!(host_of("https://example.com.").as_deref(), Some("example.com")); // trailing dot
+        assert_eq!(host_of("https://[::1]:443/x"), None); // IPv6 literal: no HSTS
+        assert_eq!(host_of("about:blank"), None);
+    }
+
+    #[test]
+    fn hsts_records_pins_and_covers_subdomains() {
+        // Use an isolated in-memory store (no persistence) for the test.
+        std::env::set_var("NET_CACHE_DIR", "off");
+        let host = "hsts-test-example.invalid";
+        let sub = "deep.sub.hsts-test-example.invalid";
+        assert!(!hsts::is_pinned(host));
+
+        hsts::record(host, "max-age=31536000; includeSubDomains");
+        assert!(hsts::is_pinned(host));
+        assert!(hsts::is_pinned(sub)); // includeSubDomains covers descendants
+        assert!(hsts_pinned_url(&format!("http://{host}/x")));
+
+        // hsts_upgrade rewrites http→https for a pinned host, leaves https/others alone.
+        assert_eq!(hsts_upgrade(&format!("http://{host}/x")), format!("https://{host}/x"));
+        assert_eq!(hsts_upgrade("http://not-pinned.invalid/x"), "http://not-pinned.invalid/x");
+
+        // max-age=0 clears the pin.
+        hsts::record(host, "max-age=0");
+        assert!(!hsts::is_pinned(host));
+        assert!(!hsts::is_pinned(sub));
     }
 
     #[test]

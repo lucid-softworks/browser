@@ -19,6 +19,7 @@ pub struct Engine {
     inner: engine::Engine,
     last_link: Option<CString>,
     last_title: Option<CString>,
+    last_url: Option<CString>,
     last_eval: Option<CString>,
     last_console: Option<CString>,
     last_netlog: Option<CString>,
@@ -55,6 +56,7 @@ pub extern "C" fn browser_engine_new() -> *mut Engine {
         inner: engine::Engine::new(),
         last_link: None,
         last_title: None,
+        last_url: None,
         last_eval: None,
         last_console: None,
         last_netlog: None,
@@ -200,6 +202,34 @@ pub unsafe extern "C" fn browser_engine_title(engine: *mut Engine) -> *const c_c
         }
         None => {
             e.last_title = None;
+            std::ptr::null()
+        }
+    }
+}
+
+/// The URL currently committed in the engine — the resolved final URL after fixup, HSTS upgrade,
+/// redirects, and any http fallback — as a NUL-terminated UTF-8 C string, or null if nothing has
+/// loaded. Shells call this after `browser_engine_load_url` to show the real address (and to record
+/// history), since the loaded URL can differ from the one passed in.
+///
+/// Lifetime: owned by the engine handle (stored in `last_url`); valid until the next
+/// `browser_engine_current_url` call on this handle or until `browser_engine_free`. Copy before reusing.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_current_url(engine: *mut Engine) -> *const c_char {
+    let Some(e) = engine.as_mut() else {
+        return std::ptr::null();
+    };
+    match e.inner.current_url().and_then(|s| CString::new(s).ok()) {
+        Some(cstr) => {
+            let ptr = cstr.as_ptr();
+            e.last_url = Some(cstr);
+            ptr
+        }
+        None => {
+            e.last_url = None;
             std::ptr::null()
         }
     }
