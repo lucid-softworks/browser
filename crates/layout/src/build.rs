@@ -304,6 +304,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
             || cs.transform.is_some()
             || cs.border_radius != 0.0
             || cs.mask_image.is_some()
+            || cs.background_image_url.is_some()
         {
             Some(Box::new(PaintExtras {
                 background_gradient: cs.background_gradient.clone(),
@@ -312,6 +313,12 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
                 transform_origin: cs.transform_origin,
                 border_radius: cs.border_radius,
                 mask_image: cs.mask_image.clone(),
+                background_image: cs.background_image_url.as_ref().map(|url| style::BgImage {
+                    url: url.clone(),
+                    size: cs.background_size,
+                    repeat: cs.background_repeat,
+                    position: cs.background_position,
+                }),
             }))
         } else {
             None

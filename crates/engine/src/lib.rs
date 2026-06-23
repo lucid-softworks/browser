@@ -190,6 +190,12 @@ pub struct Engine {
     /// origin's `/favicon.ico`) during `load_url`. `None` until one loads. Read by the shell to show
     /// the site icon in the tab and address bar. Cleared at the start of each navigation.
     favicon: Option<DecodedImage>,
+    /// Decoded `background-image` sources at natural size, keyed by resolved url (fetched once,
+    /// shared across boxes that use the same image). Rebuilt per navigation.
+    bg_sources: HashMap<String, DecodedImage>,
+    /// Per-box composed `background-image` bitmaps (border-box device size, image placed per
+    /// size/repeat/position), keyed by node id. Rebuilt each layout (`update_bg_image_bitmaps`).
+    bg_bitmaps: HashMap<dom::NodeId, DecodedImage>,
 }
 
 /// A fetched/decoded `mask-image` source, ready to rasterize to a per-box coverage bitmap.
@@ -1712,6 +1718,7 @@ mod tests {
             &no_canvas,
             &no_canvas,
             &no_canvas,
+            &no_canvas,
             &[],
             &mut 0,
         );
@@ -1768,6 +1775,7 @@ mod tests {
                 0.0,
                 200.0,
                 &imgs,
+                &no_canvas,
                 &no_canvas,
                 &no_canvas,
                 &no_canvas,
@@ -1845,6 +1853,7 @@ mod tests {
             0.0,
             h as f32,
             &imgs,
+            &no_canvas,
             &no_canvas,
             &no_canvas,
             &no_canvas,

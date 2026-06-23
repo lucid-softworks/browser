@@ -430,6 +430,12 @@ pub struct ComputedStyle {
     /// (the stylesheet base for a rule, the document base for an inline style). `None` = no image
     /// url. Reported by `getComputedStyle` as the CSSOM resolved value. Not inherited.
     pub background_image_url: Option<String>,
+    /// `background-size` for the image url (gradients ignore it). Not inherited.
+    pub background_size: BgSize,
+    /// `background-repeat` for the image url. Not inherited.
+    pub background_repeat: BgRepeat,
+    /// `background-position` as (x, y) fractions in 0..1 (default top-left `0% 0%`). Not inherited.
+    pub background_position: (f32, f32),
     /// `box-shadow` layers (outer + inset), painted back-to-front. Empty = none. Not inherited.
     pub box_shadows: Vec<BoxShadow>,
     /// A composed 2D affine `transform` `[a b c d e f]` (maps (x,y)→(a*x+c*y+e, b*x+d*y+f)),
@@ -619,6 +625,46 @@ pub struct MaskImage {
     pub url: String,
     /// How the mask is scaled to the box.
     pub size: MaskSize,
+}
+
+/// `background-size`. `Exact` carries width/height as fractions of the box (percentages) or `None`
+/// for the `auto` component (which derives from aspect ratio or the image's natural size).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum BgSize {
+    /// Natural image size (`auto` / unset).
+    #[default]
+    Auto,
+    /// Scale to cover the box, preserving aspect ratio (cropped).
+    Cover,
+    /// Scale to fit inside the box, preserving aspect ratio (letterboxed).
+    Contain,
+    /// Explicit size as fractions of the box (from percentages); `None` = `auto` on that axis.
+    Exact(Option<f32>, Option<f32>),
+}
+
+/// `background-repeat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BgRepeat {
+    #[default]
+    Repeat,
+    RepeatX,
+    RepeatY,
+    NoRepeat,
+}
+
+/// A resolved `background-image: url(...)` layer for painting. Gradients use `background_gradient`;
+/// this is only for raster/SVG image sources. Multiple comma-separated layers collapse to the first.
+/// `position` is each axis as a fraction 0..1 (the CSS percentage convention: the image's f-point
+/// aligns to the box's f-point). Out of scope: explicit length positions/sizes, multiple layers,
+/// `background-attachment`, `background-origin`/`-clip` (painted in the border box).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BgImage {
+    /// The image source url (quotes stripped, `var()` resolved): a `data:` URL or a URL to fetch.
+    pub url: String,
+    pub size: BgSize,
+    pub repeat: BgRepeat,
+    /// Position as (x, y) fractions in 0..1.
+    pub position: (f32, f32),
 }
 
 /// A single `box-shadow` layer.

@@ -18,6 +18,7 @@ pub(crate) fn paint_box(
     canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     svg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     mask_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
+    bg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
 ) {
@@ -35,6 +36,7 @@ pub(crate) fn paint_box(
         canvas_bitmaps,
         svg_bitmaps,
         mask_bitmaps,
+        bg_bitmaps,
         1.0,
         sel_ranges,
         run_idx,
@@ -130,6 +132,7 @@ pub(crate) fn paint_box_opacity(
     canvas_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     svg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     mask_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
+    bg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     parent_opacity: f32,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
@@ -258,6 +261,26 @@ pub(crate) fn paint_box_opacity(
                 c,
                 axis,
             );
+        }
+
+        // (a2) `background-image: url(...)`: composed per-box into a border-box-sized bitmap (image
+        // placed/tiled per size/repeat/position; transparent elsewhere), blitted source-over atop the
+        // background color. Axis-aligned only (rotated boxes skip the image — rare).
+        if axis {
+            if let Some(img) = b.node.and_then(|n| bg_bitmaps.get(&n)) {
+                let dst = xf_rect(xf, border.x, border.y, border.width, border.height);
+                if dst.w > 0 && dst.h > 0 && dst.y < clip_bottom as i32 {
+                    if opacity >= 0.999 {
+                        fb.blit_rgba(dst, &img.rgba, img.w, img.h);
+                    } else {
+                        let mut scaled = img.rgba.clone();
+                        for px in scaled.chunks_exact_mut(4) {
+                            px[3] = scale_alpha(px[3], opacity);
+                        }
+                        fb.blit_rgba(dst, &scaled, img.w, img.h);
+                    }
+                }
+            }
         }
 
         // (b) Borders. For a collapsed table CELL, draw single shared 1px lines: left/top at the
@@ -660,6 +683,7 @@ pub(crate) fn paint_box_opacity(
             canvas_bitmaps,
             svg_bitmaps,
             mask_bitmaps,
+            bg_bitmaps,
             opacity,
             sel_ranges,
             run_idx,

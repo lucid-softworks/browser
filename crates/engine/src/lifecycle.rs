@@ -27,6 +27,8 @@ impl Engine {
             mask_sources: HashMap::new(),
             mask_bitmaps: HashMap::new(),
             favicon: None,
+            bg_sources: HashMap::new(),
+            bg_bitmaps: HashMap::new(),
         }
     }
 
@@ -284,6 +286,9 @@ impl Engine {
                     if self.ensure_layout(dw, dh, 0.0) {
                         self.push_layout_rects();
                     }
+                    // Compose background-image bitmaps now so the first paint shows them (render's
+                    // own ensure_layout sees a valid cache and won't recompose them).
+                    self.update_bg_image_bitmaps();
                 }
                 // Fire the initial IntersectionObserver/ResizeObserver observations.
                 self.deliver_observations();
@@ -674,6 +679,57 @@ impl Engine {
         self.mask_bitmaps = next;
     }
 
+    /// Build a per-box `background-image` bitmap for every box with `extras.background_image`: fetch
+    /// + decode each distinct source once (cached in `self.bg_sources` keyed by url), then compose it
+    /// into the box's border-box device size honoring `background-size`/`-repeat`/`-position`. The
+    /// painter blits the result (source-over) atop the box's background color. Background-free pages
+    /// clear the caches and pay nothing. Call AFTER `ensure_layout`.
+    pub(crate) fn update_bg_image_bitmaps(&mut self) {
+        let mut targets: Vec<(dom::NodeId, layout::Rect, style::BgImage)> = Vec::new();
+        if let Some(cache) = &self.layout_cache {
+            collect_bg_targets(&cache.root, &mut targets);
+        }
+        if targets.is_empty() {
+            if !self.bg_bitmaps.is_empty() {
+                self.bg_bitmaps.clear();
+            }
+            if !self.bg_sources.is_empty() {
+                self.bg_sources.clear();
+            }
+            return;
+        }
+
+        // url()s are resolved against their stylesheet base during the cascade, so they're normally
+        // absolute; the page URL is a FALLBACK for inline styles / base-less sheets.
+        let base = match &self.state {
+            LoadState::Loaded { url, .. } => url.clone(),
+            _ => String::new(),
+        };
+        for (_, _, bg) in &targets {
+            if self.bg_sources.contains_key(&bg.url) {
+                continue;
+            }
+            if let Some(src) = load_bg_source(&bg.url, &base) {
+                self.bg_sources.insert(bg.url.clone(), src);
+            }
+        }
+        let live: std::collections::HashSet<&String> =
+            targets.iter().map(|(_, _, b)| &b.url).collect();
+        self.bg_sources.retain(|k, _| live.contains(k));
+
+        let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        for (id, rect, bg) in targets {
+            let src = match self.bg_sources.get(&bg.url) {
+                Some(s) => s,
+                None => continue, // fetch/decode failed
+            };
+            let w = rect.width.round().clamp(1.0, 8192.0) as u32;
+            let h = rect.height.round().clamp(1.0, 8192.0) as u32;
+            next.insert(id, compose_background(src, w, h, &bg));
+        }
+        self.bg_bitmaps = next;
+    }
+
     /// Push the freshly-built layout to the JS Session so `getBoundingClientRect()` /
     /// `offsetWidth` / `scrollHeight` etc. return real values. Converts the engine's
     /// document-absolute, top-origin **device-px** border-box rects to **CSS px** (÷ scale) and
@@ -746,7 +802,8 @@ impl Engine {
         // When the layout was actually (re)built (first paint, viewport resize, or a DOM mutation
         // invalidated the cache), push the fresh rects to the JS Session so element-geometry reads
         // stay current. Gated on the rebuild so scroll-only repaints don't re-ship the rect table.
-        if self.ensure_layout(dw, dh, header_h) {
+        let layout_changed = self.ensure_layout(dw, dh, header_h);
+        if layout_changed {
             self.push_layout_rects();
         }
 
@@ -759,6 +816,11 @@ impl Engine {
         // Build per-box mask coverage bitmaps (the `mask-image` icon technique). After ensure_layout
         // so each masked box's border-box device size is known for the contain/cover fit.
         self.update_mask_bitmaps();
+        // Compose per-box `background-image` bitmaps. Only when layout was (re)built — these can be
+        // large (full-page backgrounds), so we don't recompose on every scroll repaint.
+        if layout_changed {
+            self.update_bg_image_bitmaps();
+        }
 
         let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;
@@ -830,6 +892,7 @@ impl Engine {
                             &self.canvas_bitmaps,
                             &self.svg_bitmaps,
                             &self.mask_bitmaps,
+                            &self.bg_bitmaps,
                             &sel_ranges,
                             &mut run_idx,
                         );

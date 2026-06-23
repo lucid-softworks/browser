@@ -362,6 +362,149 @@ pub(crate) fn parse_mask(val: &str) -> Option<MaskImage> {
     Some(MaskImage { url, size })
 }
 
+/// The image-related parts pulled from a `background` shorthand value.
+pub(crate) struct BgShorthand {
+    pub url: Option<String>,
+    pub repeat: BgRepeat,
+    pub size: BgSize,
+    pub position: (f32, f32),
+}
+
+/// Parse the image layer out of a `background` shorthand: `url(...)`, `repeat`, the `/ <size>` part,
+/// and a `<position>`. Color and `attachment`/`origin`/`clip` tokens are ignored here (color is
+/// handled separately by the caller). Best-effort — the shorthand grammar is loose.
+pub(crate) fn parse_background_shorthand(val: &str) -> BgShorthand {
+    let url = extract_css_url(val);
+    // Drop the `url(...)` token so its contents don't pollute position/repeat scanning.
+    let without_url = match (val.to_ascii_lowercase().find("url("), val.find(')')) {
+        (Some(s), Some(e)) if e > s => format!("{}{}", &val[..s], &val[e + 1..]),
+        _ => val.to_string(),
+    };
+    // `position / size`.
+    let (pos_part, size_part) = match without_url.split_once('/') {
+        Some((a, b)) => (a.to_string(), b.to_string()),
+        None => (without_url.clone(), String::new()),
+    };
+    let lower = pos_part.to_ascii_lowercase();
+    let repeat = if lower.contains("no-repeat") {
+        BgRepeat::NoRepeat
+    } else if lower.contains("repeat-x") {
+        BgRepeat::RepeatX
+    } else if lower.contains("repeat-y") {
+        BgRepeat::RepeatY
+    } else {
+        BgRepeat::Repeat
+    };
+    let size = if size_part.trim().is_empty() {
+        BgSize::Auto
+    } else {
+        parse_bg_size(&size_part)
+    };
+    // Position: keep only position-ish tokens (keywords / percentages).
+    let pos_str: String = pos_part
+        .split_whitespace()
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| {
+            matches!(t.as_str(), "left" | "right" | "top" | "bottom" | "center")
+                || parse_percent(t).is_some()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let position = parse_bg_position(&pos_str);
+    BgShorthand {
+        url,
+        repeat,
+        size,
+        position,
+    }
+}
+
+/// Parse `background-size`: `cover` / `contain` / `auto`, or one–two components as percentages
+/// (kept as box fractions); lengths (px/em) fall back to `auto` on that axis.
+pub(crate) fn parse_bg_size(val: &str) -> BgSize {
+    let v = val.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "cover" => return BgSize::Cover,
+        "contain" => return BgSize::Contain,
+        "" | "auto" | "auto auto" | "initial" | "unset" | "normal" => return BgSize::Auto,
+        _ => {}
+    }
+    let comp = |t: &str| -> Option<f32> { parse_percent(t).map(|p| p / 100.0) };
+    let mut it = v.split_whitespace();
+    let x = it.next().and_then(comp);
+    let y = it.next().and_then(comp);
+    if x.is_none() && y.is_none() {
+        BgSize::Auto
+    } else {
+        BgSize::Exact(x, y)
+    }
+}
+
+/// Parse `background-repeat` (single keyword or two-value `<x> <y>`).
+pub(crate) fn parse_bg_repeat(val: &str) -> BgRepeat {
+    let v = val.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "no-repeat" => return BgRepeat::NoRepeat,
+        "repeat-x" => return BgRepeat::RepeatX,
+        "repeat-y" => return BgRepeat::RepeatY,
+        "repeat" | "" | "repeat repeat" => return BgRepeat::Repeat,
+        _ => {}
+    }
+    let mut it = v.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some("repeat"), Some("no-repeat")) => BgRepeat::RepeatX,
+        (Some("no-repeat"), Some("repeat")) => BgRepeat::RepeatY,
+        (Some("no-repeat"), Some("no-repeat")) => BgRepeat::NoRepeat,
+        _ => BgRepeat::Repeat,
+    }
+}
+
+/// Parse `background-position` into (x, y) fractions in 0..1. Supports keywords (left/center/right,
+/// top/center/bottom) and percentages; lengths default to 0. A single value sets that axis and
+/// centers the other.
+pub(crate) fn parse_bg_position(val: &str) -> (f32, f32) {
+    let v = val.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    let frac_x = |t: &str| -> Option<f32> {
+        match t {
+            "left" => Some(0.0),
+            "center" => Some(0.5),
+            "right" => Some(1.0),
+            _ => parse_percent(t).map(|p| p / 100.0),
+        }
+    };
+    let frac_y = |t: &str| -> Option<f32> {
+        match t {
+            "top" => Some(0.0),
+            "center" => Some(0.5),
+            "bottom" => Some(1.0),
+            _ => parse_percent(t).map(|p| p / 100.0),
+        }
+    };
+    let toks: Vec<&str> = v.split_whitespace().collect();
+    match toks.as_slice() {
+        [a] => {
+            // A vertical keyword alone centers x; anything else sets x and centers y.
+            if *a == "top" || *a == "bottom" {
+                (0.5, frac_y(a).unwrap_or(0.0))
+            } else {
+                (frac_x(a).unwrap_or(0.0), 0.5)
+            }
+        }
+        [a, b, ..] => {
+            // Allow keyword order swap (`top left`); otherwise treat as x then y.
+            if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") {
+                (frac_x(b).unwrap_or(0.5), frac_y(a).unwrap_or(0.5))
+            } else {
+                (frac_x(a).unwrap_or(0.0), frac_y(b).unwrap_or(0.0))
+            }
+        }
+        _ => (0.0, 0.0),
+    }
+}
+
 /// Parse a `linear-gradient(...)` / `radial-gradient(...)` (incl. `repeating-*`) value into a
 /// [`Gradient`], or `None` if the value isn't a recognized gradient. Color stops without an
 /// explicit position are distributed evenly between their neighbors (0..1). Stop positions

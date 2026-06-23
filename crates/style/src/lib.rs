@@ -259,6 +259,32 @@ mod tests {
     }
 
     #[test]
+    fn background_shorthand_with_image_url() {
+        let doc = html::parse(
+            r#"<html><body><div style="background: url(bg.png) no-repeat center / cover">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let div = elem(&doc, |e| e.tag == "div");
+        let cs = &map[&div];
+        assert_eq!(cs.background_image_url.as_deref(), Some("bg.png"));
+        assert_eq!(cs.background_repeat, BgRepeat::NoRepeat);
+        assert_eq!(cs.background_size, BgSize::Cover);
+        assert_eq!(cs.background_position, (0.5, 0.5));
+    }
+
+    #[test]
+    fn background_longhand_image_props() {
+        let doc = html::parse(
+            r#"<html><body><div style="background-image: url('a.svg'); background-repeat: repeat-x; background-position: right top">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let cs = &map[&elem(&doc, |e| e.tag == "div")];
+        assert_eq!(cs.background_image_url.as_deref(), Some("a.svg"));
+        assert_eq!(cs.background_repeat, BgRepeat::RepeatX);
+        assert_eq!(cs.background_position, (1.0, 0.0));
+    }
+
+    #[test]
     fn box_shadow_and_transform_via_cascade() {
         let doc = html::parse(
             r#"<html><body><div style="box-shadow: 2px 4px 8px black; transform: translate(10px,20px) scale(2); transform-origin: top left">x</div></body></html>"#,

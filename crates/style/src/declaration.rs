@@ -398,11 +398,28 @@ pub(crate) fn apply_declaration(
             // First try a gradient (works for the `background` shorthand and `background-image`).
             if let Some(g) = parse_gradient(val, current_color, inherited_color) {
                 style.background_gradient = Some(g);
-            } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
-                // Solid color interpretation; `transparent`/`none` leave it unchanged.
-                style.background_color = Some(c);
+            } else {
+                // The `background` shorthand can carry an image url + position/size/repeat alongside a
+                // color. Pull the image layer out first, then interpret the rest as a solid color.
+                if prop == "background" {
+                    let bg = parse_background_shorthand(val);
+                    if let Some(u) = bg.url {
+                        style.background_image_url = Some(resolve_css_url(&u, base));
+                        style.background_gradient = None;
+                        style.background_repeat = bg.repeat;
+                        style.background_size = bg.size;
+                        style.background_position = bg.position;
+                    }
+                }
+                if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
+                    // Solid color interpretation; `transparent`/`none` leave it unchanged.
+                    style.background_color = Some(c);
+                }
             }
         }
+        "background-size" => style.background_size = parse_bg_size(val),
+        "background-repeat" => style.background_repeat = parse_bg_repeat(val),
+        "background-position" => style.background_position = parse_bg_position(val),
         "background-image" => {
             if let Some(g) = parse_gradient(val, current_color, inherited_color) {
                 style.background_gradient = Some(g);

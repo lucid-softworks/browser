@@ -578,6 +578,135 @@ pub(crate) fn collect_mask_targets(
     }
 }
 
+/// Collect (node, border-box rect, BgImage) for every box carrying a `background-image: url(...)`.
+pub(crate) fn collect_bg_targets(
+    b: &layout::LayoutBox,
+    out: &mut Vec<(dom::NodeId, layout::Rect, style::BgImage)>,
+) {
+    if let Some(node) = b.node {
+        if let Some(bg) = b
+            .style
+            .extras
+            .as_deref()
+            .and_then(|e| e.background_image.clone())
+        {
+            out.push((node, b.dimensions.border_box(), bg));
+        }
+    }
+    for c in &b.children {
+        collect_bg_targets(c, out);
+    }
+}
+
+/// Fetch + decode a `background-image` source `url` (resolved against `base`) into a decoded RGBA
+/// image at natural size. Handles `data:` URLs and http(s); SVG is rasterized at its intrinsic size
+/// (via [`decode_any_image`]). Returns `None` on fetch/decode failure.
+pub(crate) fn load_bg_source(url: &str, base: &str) -> Option<DecodedImage> {
+    let url = url.trim();
+    if url.starts_with("data:") {
+        let bytes = decode_data_url(url)?;
+        return decode_any_image(&bytes, "", url);
+    }
+    let abs = resolve_url(base, url)?;
+    let resp = net::fetch(&abs).ok()?;
+    decode_any_image(&resp.body, &resp.content_type, &abs)
+}
+
+/// The rendered tile size (px) for a background image in a `box_w`×`box_h` box, per `background-size`.
+fn bg_tile_size(src: &DecodedImage, box_w: u32, box_h: u32, size: style::BgSize) -> (f32, f32) {
+    let (sw, sh) = (src.w.max(1) as f32, src.h.max(1) as f32);
+    let (bw, bh) = (box_w as f32, box_h as f32);
+    match size {
+        style::BgSize::Auto => (sw, sh),
+        style::BgSize::Cover => {
+            let s = (bw / sw).max(bh / sh);
+            (sw * s, sh * s)
+        }
+        style::BgSize::Contain => {
+            let s = (bw / sw).min(bh / sh);
+            (sw * s, sh * s)
+        }
+        style::BgSize::Exact(x, y) => match (x, y) {
+            (Some(fx), Some(fy)) => (bw * fx, bh * fy),
+            (Some(fx), None) => {
+                let w = bw * fx;
+                (w, sh * (w / sw))
+            }
+            (None, Some(fy)) => {
+                let h = bh * fy;
+                (sw * (h / sh), h)
+            }
+            (None, None) => (sw, sh),
+        },
+    }
+}
+
+/// Compose a `box_w`×`box_h` RGBA bitmap with `src` placed per `background-size`/`-repeat`/
+/// `-position`. Pixels outside the placed/tiled image stay transparent (so the box's background
+/// color shows through when the painter blits this source-over). Nearest-neighbour sampling.
+pub(crate) fn compose_background(
+    src: &DecodedImage,
+    box_w: u32,
+    box_h: u32,
+    bg: &style::BgImage,
+) -> DecodedImage {
+    let box_w = box_w.clamp(1, 8192);
+    let box_h = box_h.clamp(1, 8192);
+    let mut out = vec![0u8; (box_w as usize) * (box_h as usize) * 4];
+    if src.w == 0 || src.h == 0 {
+        return DecodedImage {
+            rgba: out,
+            w: box_w,
+            h: box_h,
+        };
+    }
+    let (tw, th) = bg_tile_size(src, box_w, box_h, bg.size);
+    if tw < 1.0 || th < 1.0 {
+        return DecodedImage {
+            rgba: out,
+            w: box_w,
+            h: box_h,
+        };
+    }
+    let (off_x, off_y) = (
+        (box_w as f32 - tw) * bg.position.0,
+        (box_h as f32 - th) * bg.position.1,
+    );
+    let (rep_x, rep_y) = match bg.repeat {
+        style::BgRepeat::Repeat => (true, true),
+        style::BgRepeat::RepeatX => (true, false),
+        style::BgRepeat::RepeatY => (false, true),
+        style::BgRepeat::NoRepeat => (false, false),
+    };
+    for oy in 0..box_h {
+        // Tile-local y for this row (wrapped when repeating; skipped when outside a non-repeated tile).
+        let mut ty = oy as f32 - off_y;
+        if rep_y {
+            ty = ty.rem_euclid(th);
+        } else if ty < 0.0 || ty >= th {
+            continue;
+        }
+        let sy = (((ty / th) * src.h as f32) as u32).min(src.h - 1);
+        for ox in 0..box_w {
+            let mut tx = ox as f32 - off_x;
+            if rep_x {
+                tx = tx.rem_euclid(tw);
+            } else if tx < 0.0 || tx >= tw {
+                continue;
+            }
+            let sx = (((tx / tw) * src.w as f32) as u32).min(src.w - 1);
+            let si = ((sy * src.w + sx) * 4) as usize;
+            let di = ((oy * box_w + ox) * 4) as usize;
+            out[di..di + 4].copy_from_slice(&src.rgba[si..si + 4]);
+        }
+    }
+    DecodedImage {
+        rgba: out,
+        w: box_w,
+        h: box_h,
+    }
+}
+
 /// Fetch + decode a `mask-image` source `url` (resolved against `base`) into a [`MaskSource`].
 /// Handles `data:` URLs (percent-encoded or base64; SVG kept as text, raster decoded) and
 /// same-origin/absolute http(s) urls (fetched like an `<img>`). SVG payloads are recognized by a

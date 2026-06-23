@@ -116,6 +116,9 @@ pub struct PaintExtras {
     /// A `mask-image` source (the icon technique), if any. When set, the painter composites the
     /// box's background through the mask's opaque (alpha) pixels. `None` = unmasked.
     pub mask_image: Option<style::MaskImage>,
+    /// A `background-image: url(...)` layer, if any. The engine fetches/decodes it and composes a
+    /// per-box bitmap (honoring size/repeat/position) the painter blits as the background.
+    pub background_image: Option<style::BgImage>,
 }
 
 impl Default for PaintStyle {
