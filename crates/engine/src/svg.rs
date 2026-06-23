@@ -516,10 +516,22 @@ impl<'a> PathParser<'a> {
         if self.i < self.b.len() && (self.b[self.i] == b'-' || self.b[self.i] == b'+') {
             self.i += 1;
         }
+        // Consume digits and at most ONE decimal point: in SVG path data numbers may be packed
+        // without separators, where a second `.` begins a new number (e.g. `.78.16` = 0.78, 0.16).
         let mut seen = false;
-        while self.i < self.b.len() && (self.b[self.i].is_ascii_digit() || self.b[self.i] == b'.') {
-            self.i += 1;
-            seen = true;
+        let mut seen_dot = false;
+        while self.i < self.b.len() {
+            let c = self.b[self.i];
+            if c.is_ascii_digit() {
+                self.i += 1;
+                seen = true;
+            } else if c == b'.' && !seen_dot {
+                seen_dot = true;
+                self.i += 1;
+                seen = true;
+            } else {
+                break;
+            }
         }
         if seen && self.i < self.b.len() && (self.b[self.i] == b'e' || self.b[self.i] == b'E') {
             self.i += 1;
@@ -1940,6 +1952,23 @@ mod tests {
         );
         // Somewhere inside the half-disc + base should be red.
         assert_eq!(px(&img, 25, 35).0, 255, "arc-bounded shape filled");
+    }
+
+    #[test]
+    fn path_packed_decimals_parse_as_separate_numbers() {
+        // SVG path data may omit separators where a second `.` starts a new number: `.5.5` = 0.5,0.5.
+        // Square corners (0.5,0.5),(19.5,0.5),(19.5,19.5),(0.5,19.5). Before the fix the tokenizer
+        // swallowed both dots into one unparseable token and the path produced nothing.
+        let img = render(
+            r#"<svg width="20" height="20"><path d="M.5.5 19.5.5 19.5 19.5.5 19.5Z" fill="red"/></svg>"#,
+            20,
+            20,
+        );
+        assert_eq!(
+            px(&img, 10, 10).0,
+            255,
+            "packed-decimal path coords should produce a filled square"
+        );
     }
 
     #[test]
