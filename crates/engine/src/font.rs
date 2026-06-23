@@ -50,6 +50,57 @@ const FONT_CANDIDATES: &[&str] = &[
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const FONT_CANDIDATES: &[&str] = &[];
 
+/// Broad-coverage fonts consulted, in order, for glyphs the primary font lacks (CJK, Cyrillic,
+/// Greek, Arabic, Hebrew, symbols, …). Without this, non-Latin text on e.g. wikipedia.org renders
+/// as blanks/`.notdef`, since the primary monospace/Latin face has no glyphs for those scripts.
+/// `.ttc` collections load face 0, which is the regular weight for these families.
+#[cfg(target_os = "macos")]
+const FALLBACK_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf", // huge coverage (Latin/Greek/Cyrillic/CJK/Arabic/Hebrew…)
+    "/System/Library/Fonts/PingFang.ttc",                   // CJK (Simplified/Traditional Chinese)
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",           // CJK fallback
+    "/System/Library/Fonts/Apple Symbols.ttf",              // math/misc symbols
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+];
+
+#[cfg(target_os = "linux")]
+const FALLBACK_CANDIDATES: &[&str] = &[
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+];
+
+#[cfg(target_os = "windows")]
+const FALLBACK_CANDIDATES: &[&str] = &[
+    r"C:\Windows\Fonts\arialuni.ttf", // Arial Unicode MS (broad), if installed
+    r"C:\Windows\Fonts\msyh.ttc",     // Microsoft YaHei (CJK)
+    r"C:\Windows\Fonts\msgothic.ttc", // MS Gothic (CJK)
+    r"C:\Windows\Fonts\seguisym.ttf", // Segoe UI Symbol
+    r"C:\Windows\Fonts\arial.ttf",
+];
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+const FALLBACK_CANDIDATES: &[&str] = &[];
+
+/// The shared, lazily-loaded fallback font chain (parsed once for the whole process). Web-font
+/// faces and the system font both consult it for glyphs they lack.
+fn fallback_fonts() -> &'static [fontdue::Font] {
+    use std::sync::OnceLock;
+    static FONTS: OnceLock<Vec<fontdue::Font>> = OnceLock::new();
+    FONTS.get_or_init(|| {
+        FALLBACK_CANDIDATES
+            .iter()
+            .filter_map(|path| std::fs::read(path).ok())
+            .filter_map(|bytes| {
+                fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()
+            })
+            .collect()
+    })
+}
+
 pub struct SystemFont {
     font: fontdue::Font,
 }
@@ -76,11 +127,26 @@ impl SystemFont {
             .ok()
             .map(|font| Self { font })
     }
+
+    /// Pick the font to draw `ch` with: this face if it has the glyph, otherwise the first fallback
+    /// font that does (so non-Latin text falls back to a broad-coverage face). Falls back to this
+    /// face when nothing has the glyph (it then renders `.notdef`).
+    fn font_for(&self, ch: char) -> &fontdue::Font {
+        if self.font.lookup_glyph_index(ch) != 0 {
+            return &self.font;
+        }
+        for f in fallback_fonts() {
+            if f.lookup_glyph_index(ch) != 0 {
+                return f;
+            }
+        }
+        &self.font
+    }
 }
 
 impl GlyphRasterizer for SystemFont {
     fn rasterize(&self, ch: char, px: f32) -> Option<GlyphBitmap> {
-        let (m, coverage) = self.font.rasterize(ch, px);
+        let (m, coverage) = self.font_for(ch).rasterize(ch, px);
         if m.width == 0 || m.height == 0 {
             return None;
         }
@@ -97,6 +163,6 @@ impl GlyphRasterizer for SystemFont {
     }
 
     fn advance(&self, ch: char, px: f32) -> f32 {
-        self.font.metrics(ch, px).advance_width
+        self.font_for(ch).metrics(ch, px).advance_width
     }
 }
