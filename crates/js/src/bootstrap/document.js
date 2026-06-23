@@ -1284,7 +1284,8 @@
       var cur = id;
       while (cur >= 0) {
         var w = wrap(cur);
-        if (w && w.matches(sel)) { return w; }
+        // Only element ancestors have `matches`; skip text/document nodes (walking past them).
+        if (w && typeof w.matches === "function" && w.matches(sel)) { return w; }
         cur = __parent(cur);
       }
       return null;
