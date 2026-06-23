@@ -128,6 +128,46 @@ mod tests {
         None
     }
 
+    /// A floated block of explicit content size.
+    fn floated(width: f32, height: f32, side: style::Float) -> style::ComputedStyle {
+        style::ComputedStyle {
+            display_block: true,
+            float: side,
+            width: Some(width),
+            height: Some(height),
+            ..Default::default()
+        }
+    }
+
+    /// A floated block whose width is a percentage of its containing block.
+    fn floated_pct(pct: f32, height: f32, side: style::Float) -> style::ComputedStyle {
+        style::ComputedStyle {
+            display_block: true,
+            float: side,
+            width_pct: Some(pct),
+            height: Some(height),
+            ..Default::default()
+        }
+    }
+
+    /// An inline-block of explicit content size.
+    fn inline_block(width: f32, height: f32) -> style::ComputedStyle {
+        style::ComputedStyle {
+            display: style::Display::InlineBlock,
+            width: Some(width),
+            height: Some(height),
+            ..Default::default()
+        }
+    }
+
+    /// The border-box rect of the box whose node id is `n`.
+    fn rect_of(root: &LayoutBox, n: dom::NodeId) -> Rect {
+        find_box(root, &|b| b.node == Some(n))
+            .unwrap_or_else(|| panic!("box for node {n:?} not found"))
+            .dimensions
+            .border_box()
+    }
+
     fn count_boxes(b: &LayoutBox, pred: &dyn Fn(&LayoutBox) -> bool) -> usize {
         let mut n = if pred(b) { 1 } else { 0 };
         for c in &b.children {
@@ -2927,5 +2967,187 @@ mod tests {
             "col0 width should be 150, got {w0}"
         );
         assert!((w1 - 50.0).abs() < 1.5, "col1 width should be 50, got {w1}");
+    }
+
+    // ---- Floats ----
+
+    /// Two `float:left` blocks pack side by side on the same row.
+    #[test]
+    fn two_left_floats_pack_side_by_side() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let a = doc.append_element(wrap, "div");
+        let b = doc.append_element(wrap, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut wrap_s = block_style(true);
+        wrap_s.width = Some(900.0);
+        styles.insert(wrap, wrap_s);
+        styles.insert(a, floated(300.0, 100.0, style::Float::Left));
+        styles.insert(b, floated(300.0, 100.0, style::Float::Left));
+
+        let root_box = layout_document(&doc, &styles, 900.0, 600.0, &Stub, &HashMap::new(), None);
+        let ra = rect_of(&root_box, a);
+        let rb = rect_of(&root_box, b);
+        assert!(
+            (ra.x - 0.0).abs() < 0.5,
+            "first float at left edge, x={}",
+            ra.x
+        );
+        assert!(
+            (rb.x - 300.0).abs() < 0.5,
+            "second float packs beside the first, x={} (want 300)",
+            rb.x
+        );
+        assert!((ra.y - rb.y).abs() < 0.5, "both on the same row");
+    }
+
+    /// A left float + a right float sit on the same row at opposite edges.
+    #[test]
+    fn left_and_right_floats_oppose() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let l = doc.append_element(wrap, "div");
+        let r = doc.append_element(wrap, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut wrap_s = block_style(true);
+        wrap_s.width = Some(900.0);
+        styles.insert(wrap, wrap_s);
+        styles.insert(l, floated(200.0, 80.0, style::Float::Left));
+        styles.insert(r, floated(200.0, 80.0, style::Float::Right));
+
+        let root_box = layout_document(&doc, &styles, 900.0, 600.0, &Stub, &HashMap::new(), None);
+        let rl = rect_of(&root_box, l);
+        let rr = rect_of(&root_box, r);
+        assert!((rl.x - 0.0).abs() < 0.5, "left float at x=0, got {}", rl.x);
+        assert!(
+            (rr.x - 700.0).abs() < 0.5,
+            "right float flush right (900-200), got {}",
+            rr.x
+        );
+    }
+
+    /// Three 33%-wide left floats fit on one row; the fourth wraps to a second row.
+    #[test]
+    fn percent_floats_wrap_after_three() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let cols: Vec<_> = (0..4).map(|_| doc.append_element(wrap, "div")).collect();
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut wrap_s = block_style(true);
+        wrap_s.width = Some(900.0);
+        styles.insert(wrap, wrap_s);
+        for &c in &cols {
+            styles.insert(c, floated_pct(0.33, 60.0, style::Float::Left));
+        }
+
+        let root_box = layout_document(&doc, &styles, 900.0, 600.0, &Stub, &HashMap::new(), None);
+        let r: Vec<Rect> = cols.iter().map(|&c| rect_of(&root_box, c)).collect();
+        // 0.33 * 900 = 297; three fit (891 <= 900), the fourth wraps.
+        assert!(
+            (r[0].width - 297.0).abs() < 1.0,
+            "33% width, got {}",
+            r[0].width
+        );
+        assert!(
+            (r[0].y - r[1].y).abs() < 0.5 && (r[1].y - r[2].y).abs() < 0.5,
+            "first three on row 1"
+        );
+        assert!(
+            r[3].y > r[0].y + 0.5,
+            "fourth wraps to a new row, y={}",
+            r[3].y
+        );
+        assert!(
+            (r[3].x - 0.0).abs() < 0.5,
+            "wrapped float returns to the left edge"
+        );
+    }
+
+    /// Floats inside an `inline-block` are contained within it (positioned relative to its content
+    /// box), not escaping to an ancestor formatting context.
+    #[test]
+    fn floats_are_contained_by_inline_block() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        // A left float sidebar, then an inline-block "main" beside it containing its own floats.
+        let wrap = doc.append_element(body, "div");
+        let main = doc.append_element(wrap, "div");
+        let c1 = doc.append_element(main, "div");
+        let c2 = doc.append_element(main, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut wrap_s = block_style(true);
+        wrap_s.width = Some(900.0);
+        styles.insert(wrap, wrap_s);
+        styles.insert(main, inline_block(600.0, 200.0));
+        styles.insert(c1, floated(200.0, 60.0, style::Float::Left));
+        styles.insert(c2, floated(200.0, 60.0, style::Float::Left));
+
+        let root_box = layout_document(&doc, &styles, 900.0, 600.0, &Stub, &HashMap::new(), None);
+        let rm = rect_of(&root_box, main);
+        let r1 = rect_of(&root_box, c1);
+        let r2 = rect_of(&root_box, c2);
+        // The inline-block's own floats live inside its content box, side by side.
+        assert!(
+            r1.x >= rm.x - 0.5 && r1.x < rm.x + rm.width,
+            "float c1 (x={}) should sit inside main [{}, {})",
+            r1.x,
+            rm.x,
+            rm.x + rm.width
+        );
+        assert!(
+            (r2.x - (r1.x + 200.0)).abs() < 0.5,
+            "float c2 packs beside c1 inside main, x={} (want {})",
+            r2.x,
+            r1.x + 200.0
+        );
+    }
+
+    /// A `float:left` sidebar with an `inline-block` main beside it: the main starts after the
+    /// sidebar's right edge (the classic two-column footer pattern).
+    #[test]
+    fn float_sidebar_then_inline_block_main() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let side = doc.append_element(wrap, "div");
+        let main = doc.append_element(wrap, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mut wrap_s = block_style(true);
+        wrap_s.width = Some(900.0);
+        styles.insert(wrap, wrap_s);
+        styles.insert(side, floated(300.0, 160.0, style::Float::Left));
+        styles.insert(main, inline_block(500.0, 160.0));
+
+        let root_box = layout_document(&doc, &styles, 900.0, 600.0, &Stub, &HashMap::new(), None);
+        let rs = rect_of(&root_box, side);
+        let rm = rect_of(&root_box, main);
+        assert!(
+            (rs.x - 0.0).abs() < 0.5,
+            "sidebar floats to x=0, got {}",
+            rs.x
+        );
+        assert!(
+            rm.x >= 300.0 - 0.5,
+            "inline-block main starts after the float (x={} want >=300)",
+            rm.x
+        );
     }
 }

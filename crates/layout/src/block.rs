@@ -287,19 +287,32 @@ pub(crate) fn layout_block_children(
             continue;
         }
 
-        // In-flow block: it stacks below previous siblings at the container's full content width.
-        // (Per CSS a block box keeps its full width beside floats — only its *line boxes* shorten,
-        // which inline layout handles separately; narrowing the box here would wrongly re-resolve a
-        // percentage `width` against the reduced band.)
+        // In-flow content stacks below previous siblings. A block-level box keeps the container's
+        // FULL content width beside floats (per CSS, only its line boxes shorten — narrowing the box
+        // would wrongly re-resolve a percentage `width` against the reduced band). But inline-level
+        // content (inline-block/-flex/-grid, or an anonymous box holding inline content) flows
+        // *beside* earlier floats, so we narrow its containing rect to the float band at this y.
         cursor_y = start_y;
-        // Each child's containing block is this box's content rect, but positioned so the
-        // child stacks below previous siblings. We thread the running y via the containing
-        // rect's y, and the child adds its own top margin/border/padding inside layout_block.
-        let containing = Rect {
-            x: content.x,
-            y: cursor_y,
-            width: content.width,
-            height: 0.0,
+        let containing = if !floats.is_empty() && child_is_inline_level(child, styles) {
+            // Query the band over a nominal 1px height at the top so a float starting exactly at this
+            // y is detected; the inline content then begins at the band's left edge.
+            let (l, r) = floats.band(cursor_y, 1.0);
+            Rect {
+                x: l,
+                y: cursor_y,
+                width: (r - l).max(0.0),
+                height: 0.0,
+            }
+        } else {
+            // Each child's containing block is this box's content rect, positioned so the child
+            // stacks below previous siblings (the running y); the child adds its own top
+            // margin/border/padding inside layout_block.
+            Rect {
+                x: content.x,
+                y: cursor_y,
+                width: content.width,
+                height: 0.0,
+            }
         };
         match &child.content {
             BoxContent::Block => {
@@ -347,6 +360,22 @@ pub(crate) fn layout_block_children(
     }
     // The container must be tall enough to contain its floats (it owns their formatting context).
     floats.max_bottom(cursor_y) - content.y
+}
+
+/// Whether an in-flow child is inline-level — so it flows beside floats (within the float band)
+/// rather than spanning the container's full content width. Anonymous boxes hold inline content;
+/// `inline-block`/`inline-flex`/`inline-grid` are inline-level atomic boxes.
+fn child_is_inline_level(
+    child: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> bool {
+    if matches!(child.content, BoxContent::Anonymous) {
+        return true;
+    }
+    matches!(
+        display_of(child, styles),
+        style::Display::InlineBlock | style::Display::InlineFlex | style::Display::InlineGrid
+    )
 }
 
 /// Lay out and place one floated child within `content` (the container's content rect), no higher

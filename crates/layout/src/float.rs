@@ -44,7 +44,7 @@ impl FloatCtx {
 
     /// The available horizontal band `[left, right]` for content occupying the vertical range
     /// `[y, y + height)`, after subtracting every float that overlaps that range.
-    fn band(&self, y: f32, height: f32) -> (f32, f32) {
+    pub(crate) fn band(&self, y: f32, height: f32) -> (f32, f32) {
         let y0 = y;
         let y1 = y + height.max(0.0);
         let overlaps = |f: &FloatRect| f.top < y1 && f.bottom > y0;
