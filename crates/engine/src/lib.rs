@@ -1349,12 +1349,10 @@ mod tests {
         // Layout-space center of the text box.
         let lx = r.x + r.width / 2.0;
         let ly = r.y + r.height / 2.0;
-        // Convert to device pixels (inverse of the layout->device mapping in render): with
-        // scale 1.0 and scroll 0, device = layout + (left=16, header_h=8).
-        let left = 16.0 * e.scale;
-        let header_h = 8.0 * e.scale;
-        let dx = lx + left;
-        let dy = ly + (header_h - e.scroll_y);
+        // Convert to device pixels (inverse of the layout->device mapping in render/link_at): the
+        // page paints flush at (0,0) (no engine inset), so device = layout - scroll.
+        let dx = lx;
+        let dy = ly - e.scroll_y;
 
         assert_eq!(
             e.link_at(dx, dy).as_deref(),

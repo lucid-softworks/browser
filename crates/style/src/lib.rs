@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(cs.background_image_url.as_deref(), Some("bg.png"));
         assert_eq!(cs.background_repeat, BgRepeat::NoRepeat);
         assert_eq!(cs.background_size, BgSize::Cover);
-        assert_eq!(cs.background_position, (0.5, 0.5));
+        assert_eq!(cs.background_position, (BgLen::Pct(0.5), BgLen::Pct(0.5)));
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
         let cs = &map[&elem(&doc, |e| e.tag == "div")];
         assert_eq!(cs.background_image_url.as_deref(), Some("a.svg"));
         assert_eq!(cs.background_repeat, BgRepeat::RepeatX);
-        assert_eq!(cs.background_position, (1.0, 0.0));
+        assert_eq!(cs.background_position, (BgLen::Pct(1.0), BgLen::Pct(0.0)));
     }
 
     #[test]

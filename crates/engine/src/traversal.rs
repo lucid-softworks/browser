@@ -612,6 +612,16 @@ pub(crate) fn load_bg_source(url: &str, base: &str) -> Option<DecodedImage> {
     decode_any_image(&resp.body, &resp.content_type, &abs)
 }
 
+/// Resolve a [`style::BgLen`] against a box extent (px) and the image's natural extent. `auto`
+/// returns `None` (the caller derives it from the other axis / natural size).
+fn resolve_bg_len(l: style::BgLen, box_extent: f32) -> Option<f32> {
+    match l {
+        style::BgLen::Auto => None,
+        style::BgLen::Px(v) => Some(v),
+        style::BgLen::Pct(f) => Some(box_extent * f),
+    }
+}
+
 /// The rendered tile size (px) for a background image in a `box_w`×`box_h` box, per `background-size`.
 fn bg_tile_size(src: &DecodedImage, box_w: u32, box_h: u32, size: style::BgSize) -> (f32, f32) {
     let (sw, sh) = (src.w.max(1) as f32, src.h.max(1) as f32);
@@ -626,18 +636,23 @@ fn bg_tile_size(src: &DecodedImage, box_w: u32, box_h: u32, size: style::BgSize)
             let s = (bw / sw).min(bh / sh);
             (sw * s, sh * s)
         }
-        style::BgSize::Exact(x, y) => match (x, y) {
-            (Some(fx), Some(fy)) => (bw * fx, bh * fy),
-            (Some(fx), None) => {
-                let w = bw * fx;
-                (w, sh * (w / sw))
-            }
-            (None, Some(fy)) => {
-                let h = bh * fy;
-                (sw * (h / sh), h)
-            }
+        style::BgSize::Exact(x, y) => match (resolve_bg_len(x, bw), resolve_bg_len(y, bh)) {
+            (Some(w), Some(h)) => (w, h),
+            (Some(w), None) => (w, sh * (w / sw)), // height auto: keep aspect
+            (None, Some(h)) => (sw * (h / sh), h), // width auto: keep aspect
             (None, None) => (sw, sh),
         },
+    }
+}
+
+/// The placement offset (px) of the image's top-left within the box for one axis: a percentage
+/// aligns the image's f-point to the box's f-point (`(box - tile) * f`); a length is a direct offset
+/// (negative shifts up/left — how CSS sprites reveal a cell).
+fn bg_offset(pos: style::BgLen, box_extent: f32, tile: f32) -> f32 {
+    match pos {
+        style::BgLen::Pct(f) => (box_extent - tile) * f,
+        style::BgLen::Px(v) => v,
+        style::BgLen::Auto => 0.0,
     }
 }
 
@@ -669,8 +684,8 @@ pub(crate) fn compose_background(
         };
     }
     let (off_x, off_y) = (
-        (box_w as f32 - tw) * bg.position.0,
-        (box_h as f32 - th) * bg.position.1,
+        bg_offset(bg.position.0, box_w as f32, tw),
+        bg_offset(bg.position.1, box_h as f32, th),
     );
     let (rep_x, rep_y) = match bg.repeat {
         style::BgRepeat::Repeat => (true, true),

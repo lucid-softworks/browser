@@ -367,7 +367,29 @@ pub(crate) struct BgShorthand {
     pub url: Option<String>,
     pub repeat: BgRepeat,
     pub size: BgSize,
-    pub position: (f32, f32),
+    pub position: (BgLen, BgLen),
+}
+
+/// Parse one `background-size`/`-position` component: `auto`, a percentage, or a `px`/`em`/`rem`
+/// length (em/rem approximated at 16px). Returns `None` for anything else.
+fn parse_bg_len(tok: &str) -> Option<BgLen> {
+    let t = tok.trim().to_ascii_lowercase();
+    if t == "auto" {
+        return Some(BgLen::Auto);
+    }
+    if t == "0" {
+        return Some(BgLen::Px(0.0));
+    }
+    if let Some(p) = t.strip_suffix('%') {
+        return p.trim().parse::<f32>().ok().map(|v| BgLen::Pct(v / 100.0));
+    }
+    if let Some(n) = t.strip_suffix("px") {
+        return n.trim().parse::<f32>().ok().map(BgLen::Px);
+    }
+    if let Some(n) = t.strip_suffix("rem").or_else(|| t.strip_suffix("em")) {
+        return n.trim().parse::<f32>().ok().map(|v| BgLen::Px(v * 16.0));
+    }
+    None
 }
 
 /// Parse the image layer out of a `background` shorthand: `url(...)`, `repeat`, the `/ <size>` part,
@@ -400,13 +422,13 @@ pub(crate) fn parse_background_shorthand(val: &str) -> BgShorthand {
     } else {
         parse_bg_size(&size_part)
     };
-    // Position: keep only position-ish tokens (keywords / percentages).
+    // Position: keep only position-ish tokens (keywords / percentages / lengths).
     let pos_str: String = pos_part
         .split_whitespace()
         .map(|t| t.to_ascii_lowercase())
         .filter(|t| {
             matches!(t.as_str(), "left" | "right" | "top" | "bottom" | "center")
-                || parse_percent(t).is_some()
+                || parse_bg_len(t).is_some()
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -419,8 +441,8 @@ pub(crate) fn parse_background_shorthand(val: &str) -> BgShorthand {
     }
 }
 
-/// Parse `background-size`: `cover` / `contain` / `auto`, or one–two components as percentages
-/// (kept as box fractions); lengths (px/em) fall back to `auto` on that axis.
+/// Parse `background-size`: `cover` / `contain` / `auto`, or one–two components (px / percentage /
+/// `auto`). A single component sets the width; the height defaults to `auto`.
 pub(crate) fn parse_bg_size(val: &str) -> BgSize {
     let v = val.trim().to_ascii_lowercase();
     match v.as_str() {
@@ -429,14 +451,13 @@ pub(crate) fn parse_bg_size(val: &str) -> BgSize {
         "" | "auto" | "auto auto" | "initial" | "unset" | "normal" => return BgSize::Auto,
         _ => {}
     }
-    let comp = |t: &str| -> Option<f32> { parse_percent(t).map(|p| p / 100.0) };
     let mut it = v.split_whitespace();
-    let x = it.next().and_then(comp);
-    let y = it.next().and_then(comp);
-    if x.is_none() && y.is_none() {
-        BgSize::Auto
-    } else {
-        BgSize::Exact(x, y)
+    let x = it.next().and_then(parse_bg_len);
+    let y = it.next().and_then(parse_bg_len);
+    match (x, y) {
+        (None, _) => BgSize::Auto,
+        (Some(w), Some(h)) => BgSize::Exact(w, h),
+        (Some(w), None) => BgSize::Exact(w, BgLen::Auto),
     }
 }
 
@@ -459,28 +480,30 @@ pub(crate) fn parse_bg_repeat(val: &str) -> BgRepeat {
     }
 }
 
-/// Parse `background-position` into (x, y) fractions in 0..1. Supports keywords (left/center/right,
-/// top/center/bottom) and percentages; lengths default to 0. A single value sets that axis and
-/// centers the other.
-pub(crate) fn parse_bg_position(val: &str) -> (f32, f32) {
+/// Parse `background-position` into (x, y) components. Supports keywords (left/center/right,
+/// top/center/bottom), percentages, and px/em lengths (incl. negative — used by CSS sprites). A
+/// single value sets that axis and centers the other.
+pub(crate) fn parse_bg_position(val: &str) -> (BgLen, BgLen) {
     let v = val.trim().to_ascii_lowercase();
+    let center = BgLen::Pct(0.5);
+    let zero = BgLen::Pct(0.0);
     if v.is_empty() {
-        return (0.0, 0.0);
+        return (zero, zero);
     }
-    let frac_x = |t: &str| -> Option<f32> {
+    let comp_x = |t: &str| -> Option<BgLen> {
         match t {
-            "left" => Some(0.0),
-            "center" => Some(0.5),
-            "right" => Some(1.0),
-            _ => parse_percent(t).map(|p| p / 100.0),
+            "left" => Some(BgLen::Pct(0.0)),
+            "center" => Some(BgLen::Pct(0.5)),
+            "right" => Some(BgLen::Pct(1.0)),
+            _ => parse_bg_len(t),
         }
     };
-    let frac_y = |t: &str| -> Option<f32> {
+    let comp_y = |t: &str| -> Option<BgLen> {
         match t {
-            "top" => Some(0.0),
-            "center" => Some(0.5),
-            "bottom" => Some(1.0),
-            _ => parse_percent(t).map(|p| p / 100.0),
+            "top" => Some(BgLen::Pct(0.0)),
+            "center" => Some(BgLen::Pct(0.5)),
+            "bottom" => Some(BgLen::Pct(1.0)),
+            _ => parse_bg_len(t),
         }
     };
     let toks: Vec<&str> = v.split_whitespace().collect();
@@ -488,20 +511,20 @@ pub(crate) fn parse_bg_position(val: &str) -> (f32, f32) {
         [a] => {
             // A vertical keyword alone centers x; anything else sets x and centers y.
             if *a == "top" || *a == "bottom" {
-                (0.5, frac_y(a).unwrap_or(0.0))
+                (center, comp_y(a).unwrap_or(zero))
             } else {
-                (frac_x(a).unwrap_or(0.0), 0.5)
+                (comp_x(a).unwrap_or(zero), center)
             }
         }
         [a, b, ..] => {
             // Allow keyword order swap (`top left`); otherwise treat as x then y.
             if matches!(*a, "top" | "bottom") || matches!(*b, "left" | "right") {
-                (frac_x(b).unwrap_or(0.5), frac_y(a).unwrap_or(0.5))
+                (comp_x(b).unwrap_or(center), comp_y(a).unwrap_or(center))
             } else {
-                (frac_x(a).unwrap_or(0.0), frac_y(b).unwrap_or(0.0))
+                (comp_x(a).unwrap_or(zero), comp_y(b).unwrap_or(zero))
             }
         }
-        _ => (0.0, 0.0),
+        _ => (zero, zero),
     }
 }
 

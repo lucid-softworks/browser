@@ -434,8 +434,9 @@ pub struct ComputedStyle {
     pub background_size: BgSize,
     /// `background-repeat` for the image url. Not inherited.
     pub background_repeat: BgRepeat,
-    /// `background-position` as (x, y) fractions in 0..1 (default top-left `0% 0%`). Not inherited.
-    pub background_position: (f32, f32),
+    /// `background-position` as (x, y) components (px/percentage; default top-left `0% 0%`). Not
+    /// inherited.
+    pub background_position: (BgLen, BgLen),
     /// `box-shadow` layers (outer + inset), painted back-to-front. Empty = none. Not inherited.
     pub box_shadows: Vec<BoxShadow>,
     /// A composed 2D affine `transform` `[a b c d e f]` (maps (x,y)→(a*x+c*y+e, b*x+d*y+f)),
@@ -627,8 +628,17 @@ pub struct MaskImage {
     pub size: MaskSize,
 }
 
-/// `background-size`. `Exact` carries width/height as fractions of the box (percentages) or `None`
-/// for the `auto` component (which derives from aspect ratio or the image's natural size).
+/// A `background-size`/`background-position` component: a pixel length, a percentage (stored as a
+/// 0..1 fraction), or `auto`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BgLen {
+    Auto,
+    Px(f32),
+    /// Percentage as a fraction (0.5 = 50%).
+    Pct(f32),
+}
+
+/// `background-size`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum BgSize {
     /// Natural image size (`auto` / unset).
@@ -638,8 +648,8 @@ pub enum BgSize {
     Cover,
     /// Scale to fit inside the box, preserving aspect ratio (letterboxed).
     Contain,
-    /// Explicit size as fractions of the box (from percentages); `None` = `auto` on that axis.
-    Exact(Option<f32>, Option<f32>),
+    /// Explicit per-axis size (px / percentage / `auto`).
+    Exact(BgLen, BgLen),
 }
 
 /// `background-repeat`.
@@ -663,8 +673,9 @@ pub struct BgImage {
     pub url: String,
     pub size: BgSize,
     pub repeat: BgRepeat,
-    /// Position as (x, y) fractions in 0..1.
-    pub position: (f32, f32),
+    /// Position as (x, y) components (px / percentage). Default `0% 0%` (top-left). Pixel offsets are
+    /// what CSS sprites use (e.g. `background-position: 0 -260px`).
+    pub position: (BgLen, BgLen),
 }
 
 /// A single `box-shadow` layer.

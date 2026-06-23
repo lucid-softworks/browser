@@ -692,7 +692,7 @@ pub(crate) fn compute_element_style<'a>(
         background_image_url: None,
         background_size: BgSize::Auto,
         background_repeat: BgRepeat::Repeat,
-        background_position: (0.0, 0.0),
+        background_position: (BgLen::Pct(0.0), BgLen::Pct(0.0)),
         box_shadows: Vec::new(),
         transform: None,
         transform_origin: (0.5, 0.5),
