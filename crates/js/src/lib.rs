@@ -1870,6 +1870,34 @@ mod tests {
     }
 
     #[test]
+    fn element_animate_returns_animation_with_settling_finished() {
+        // Minimal Web Animations: Element.animate() returns an Animation whose `finished` promise
+        // resolves after the effect duration. Unblocks WPT's `waitForCompositorReady`
+        // (`body.animate({opacity:[0,1]},{duration:1}).finished`) and any test awaiting an animation
+        // to sync a frame, which otherwise error with "animate is not a function".
+        let (doc, body) = doc_with_body("");
+        let _ = body;
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "var a = document.body.animate({opacity:[0,1]}, {duration:1}); \
+                 a.finished.then(function(){ console.log('finished:' + a.playState); }); \
+                 [typeof document.body.animate, a.finished instanceof Promise, \
+                  document.body.getAnimations().length].join(',')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("function,true,0"));
+        let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
+        assert!(
+            all.iter().any(|l| l == "finished:finished"),
+            "animation finished promise did not resolve: {all:?}"
+        );
+    }
+
+    #[test]
     fn window_post_message_dispatches_message_event() {
         // `window.postMessage` delivers a `message` MessageEvent to the window asynchronously, with
         // data structured-cloned, the window's own origin, and source === window. WPT's
