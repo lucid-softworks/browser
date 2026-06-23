@@ -31,6 +31,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var tabStack: NSStackView!
     private var newTabButton: HoverButton!
     private var tabButtons: [TabButton] = []
+    // Views + constraints whose arrangement depends on the configurable tab-strip position.
+    private var toolbar: NSView!
+    private var tabBar: NSView!
+    private var separator: NSView!
+    private var tabLayoutConstraints: [NSLayoutConstraint] = []
+    private let tabColumnWidth: CGFloat = 200
 
     // MARK: Tab state
     private var tabs: [Tab] = []
@@ -73,20 +79,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.contentView = content
 
         // MARK: Toolbar (translucent visual effect background)
-        let toolbar = NSVisualEffectView()
-        toolbar.material = .titlebar
-        toolbar.blendingMode = .withinWindow
-        toolbar.state = .followsWindowActiveState
-        toolbar.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(toolbar)
+        let toolbarView = NSVisualEffectView()
+        toolbarView.material = .titlebar
+        toolbarView.blendingMode = .withinWindow
+        toolbarView.state = .followsWindowActiveState
+        toolbarView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(toolbarView)
+        toolbar = toolbarView
 
-        // MARK: Tab bar (slim translucent strip under the toolbar)
-        let tabBar = NSVisualEffectView()
-        tabBar.material = .headerView
-        tabBar.blendingMode = .withinWindow
-        tabBar.state = .followsWindowActiveState
-        tabBar.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(tabBar)
+        // MARK: Tab bar (slim translucent strip; placed at the configured edge of the page)
+        let tabBarView = NSVisualEffectView()
+        tabBarView.material = .headerView
+        tabBarView.blendingMode = .withinWindow
+        tabBarView.state = .followsWindowActiveState
+        tabBarView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(tabBarView)
+        tabBar = tabBarView
 
         tabStack = NSStackView()
         tabStack.orientation = .horizontal
@@ -108,13 +116,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         newTabButton.translatesAutoresizingMaskIntoConstraints = false
         tabBar.addSubview(newTabButton)
 
-        // A subtle hairline separator under the tab bar.
-        let separator = NSBox()
-        separator.boxType = .custom
-        separator.borderWidth = 0
-        separator.fillColor = NSColor.separatorColor
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(separator)
+        // A subtle hairline separator between the tab bar and the page area.
+        let separatorBox = NSBox()
+        separatorBox.boxType = .custom
+        separatorBox.borderWidth = 0
+        separatorBox.fillColor = NSColor.separatorColor
+        separatorBox.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(separatorBox)
+        separator = separatorBox
 
         // MARK: Navigation buttons
         backButton = makeNavButton(symbol: "chevron.backward", description: "Back", action: #selector(goBack))
@@ -239,29 +248,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             toolbar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             toolbar.heightAnchor.constraint(equalToConstant: toolbarHeight),
 
-            tabBar.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
-            tabBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            tabBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            tabBar.heightAnchor.constraint(equalToConstant: tabBarHeight),
-
-            tabStack.leadingAnchor.constraint(equalTo: tabBar.leadingAnchor, constant: 8),
-            tabStack.centerYAnchor.constraint(equalTo: tabBar.centerYAnchor),
-            tabStack.trailingAnchor.constraint(lessThanOrEqualTo: newTabButton.leadingAnchor, constant: -6),
-
-            newTabButton.leadingAnchor.constraint(equalTo: tabStack.trailingAnchor, constant: 6),
-            newTabButton.centerYAnchor.constraint(equalTo: tabBar.centerYAnchor),
-            newTabButton.widthAnchor.constraint(equalToConstant: 26),
-            newTabButton.heightAnchor.constraint(equalToConstant: 24),
-
-            separator.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
-            separator.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            separator.heightAnchor.constraint(equalToConstant: 1),
-
-            bitmapView.topAnchor.constraint(equalTo: separator.bottomAnchor),
-            bitmapView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            bitmapView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-
             // Nav buttons pinned to the leading edge, clear of the traffic lights.
             navStack.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 80),
             navStack.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
@@ -315,19 +301,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         pillFillTrailing.priority = .defaultLow
         NSLayoutConstraint.activate([pillMaxWidth, pillLeadingGap, pillTrailingGap, pillCenterX, pillFillLeading, pillFillTrailing])
 
-        // DevTools sits below the bitmap, splitting the content area vertically. We toggle which
-        // of two bitmap-bottom constraints is active: when hidden the bitmap fills to the content
-        // bottom; when shown it stops at the devtools top and devtools takes a fixed height.
-        bitmapBottomToContent = bitmapView.bottomAnchor.constraint(equalTo: content.bottomAnchor)
-        bitmapBottomToDevTools = bitmapView.bottomAnchor.constraint(equalTo: devTools.topAnchor)
+        // DevTools sits below the bitmap, splitting the page area vertically. Its constant height
+        // lives here; the bitmap-bottom toggle and DevTools edges are positional (rebuilt by
+        // applyTabLayout for the current tab-strip position; toggleDevTools flips which bitmap-bottom
+        // constraint is active).
         devToolsHeightConstraint = devTools.heightAnchor.constraint(equalToConstant: devToolsHeight)
-        NSLayoutConstraint.activate([
-            devTools.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            devTools.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            devTools.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            devToolsHeightConstraint,
-            bitmapBottomToContent,
-        ])
+        devToolsHeightConstraint.isActive = true
 
         // Status overlay: bottom-left of the bitmap, label inset by a few px, width-capped so a long
         // URL truncates instead of spanning the window.
@@ -340,6 +319,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             statusBarLabel.topAnchor.constraint(equalTo: statusBar.topAnchor, constant: 3),
             statusBarLabel.bottomAnchor.constraint(equalTo: statusBar.bottomAnchor, constant: -3),
         ])
+
+        // Place the tab strip at the configured edge (top/bottom/left/right) and lay out the page
+        // region; re-applied live when the setting changes.
+        applyTabLayout(Config.shared.tabPosition)
+        Config.shared.onTabPositionChange = { [weak self] pos in self?.applyTabLayout(pos) }
 
         // Only listen for resize/backing callbacks once all views exist, so an early
         // notification can't reach updateViewport() before bitmapView is set.
@@ -1015,6 +999,137 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: DevTools
+
+    /// Arrange the tab strip at the configured edge and lay out the page region (bitmap + DevTools)
+    /// in the remaining space. Idempotent + live: deactivates the previous positional constraints and
+    /// rebuilds them, so it can be called again when the setting changes. The toolbar (URL bar) stays
+    /// at the top in every layout.
+    private func applyTabLayout(_ pos: TabPosition) {
+        guard let content = window?.contentView else { return }
+        NSLayoutConstraint.deactivate(tabLayoutConstraints)
+        tabLayoutConstraints.removeAll()
+        bitmapBottomToContent?.isActive = false
+        bitmapBottomToDevTools?.isActive = false
+
+        let vertical = (pos == .left || pos == .right)
+        tabStack.orientation = vertical ? .vertical : .horizontal
+        tabStack.alignment = vertical ? .leading : .centerY
+
+        var cs: [NSLayoutConstraint] = []
+        // Anchors bounding the page region (bitmap + DevTools), set per position below.
+        let pageTop: NSLayoutYAxisAnchor
+        let pageBottom: NSLayoutYAxisAnchor
+        let pageLeading: NSLayoutXAxisAnchor
+        let pageTrailing: NSLayoutXAxisAnchor
+
+        switch pos {
+        case .top:
+            cs += [
+                tabBar.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+                tabBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                tabBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                tabBar.heightAnchor.constraint(equalToConstant: tabBarHeight),
+                separator.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+                separator.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                separator.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                separator.heightAnchor.constraint(equalToConstant: 1),
+            ]
+            pageTop = separator.bottomAnchor
+            pageBottom = content.bottomAnchor
+            pageLeading = content.leadingAnchor
+            pageTrailing = content.trailingAnchor
+        case .bottom:
+            cs += [
+                tabBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                tabBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                tabBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                tabBar.heightAnchor.constraint(equalToConstant: tabBarHeight),
+                separator.bottomAnchor.constraint(equalTo: tabBar.topAnchor),
+                separator.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                separator.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                separator.heightAnchor.constraint(equalToConstant: 1),
+            ]
+            pageTop = toolbar.bottomAnchor
+            pageBottom = separator.topAnchor
+            pageLeading = content.leadingAnchor
+            pageTrailing = content.trailingAnchor
+        case .left:
+            cs += [
+                tabBar.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+                tabBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+                tabBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                tabBar.widthAnchor.constraint(equalToConstant: tabColumnWidth),
+                separator.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+                separator.leadingAnchor.constraint(equalTo: tabBar.trailingAnchor),
+                separator.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                separator.widthAnchor.constraint(equalToConstant: 1),
+            ]
+            pageTop = toolbar.bottomAnchor
+            pageBottom = content.bottomAnchor
+            pageLeading = separator.trailingAnchor
+            pageTrailing = content.trailingAnchor
+        case .right:
+            cs += [
+                tabBar.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+                tabBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+                tabBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                tabBar.widthAnchor.constraint(equalToConstant: tabColumnWidth),
+                separator.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
+                separator.trailingAnchor.constraint(equalTo: tabBar.leadingAnchor),
+                separator.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+                separator.widthAnchor.constraint(equalToConstant: 1),
+            ]
+            pageTop = toolbar.bottomAnchor
+            pageBottom = content.bottomAnchor
+            pageLeading = content.leadingAnchor
+            pageTrailing = separator.leadingAnchor
+        }
+
+        // Tab list + "new tab" button inside the strip (row for top/bottom, column for left/right).
+        if vertical {
+            cs += [
+                tabStack.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 8),
+                tabStack.leadingAnchor.constraint(equalTo: tabBar.leadingAnchor, constant: 6),
+                tabStack.trailingAnchor.constraint(equalTo: tabBar.trailingAnchor, constant: -6),
+                tabStack.bottomAnchor.constraint(lessThanOrEqualTo: newTabButton.topAnchor, constant: -6),
+                newTabButton.topAnchor.constraint(equalTo: tabStack.bottomAnchor, constant: 6),
+                newTabButton.centerXAnchor.constraint(equalTo: tabBar.centerXAnchor),
+                newTabButton.widthAnchor.constraint(equalToConstant: 26),
+                newTabButton.heightAnchor.constraint(equalToConstant: 24),
+            ]
+        } else {
+            cs += [
+                tabStack.leadingAnchor.constraint(equalTo: tabBar.leadingAnchor, constant: 8),
+                tabStack.centerYAnchor.constraint(equalTo: tabBar.centerYAnchor),
+                tabStack.trailingAnchor.constraint(lessThanOrEqualTo: newTabButton.leadingAnchor, constant: -6),
+                newTabButton.leadingAnchor.constraint(equalTo: tabStack.trailingAnchor, constant: 6),
+                newTabButton.centerYAnchor.constraint(equalTo: tabBar.centerYAnchor),
+                newTabButton.widthAnchor.constraint(equalToConstant: 26),
+                newTabButton.heightAnchor.constraint(equalToConstant: 24),
+            ]
+        }
+
+        // Page region: the bitmap fills it; DevTools occupies its bottom.
+        cs += [
+            bitmapView.topAnchor.constraint(equalTo: pageTop),
+            bitmapView.leadingAnchor.constraint(equalTo: pageLeading),
+            bitmapView.trailingAnchor.constraint(equalTo: pageTrailing),
+            devTools.leadingAnchor.constraint(equalTo: pageLeading),
+            devTools.trailingAnchor.constraint(equalTo: pageTrailing),
+            devTools.bottomAnchor.constraint(equalTo: pageBottom),
+        ]
+        NSLayoutConstraint.activate(cs)
+        tabLayoutConstraints = cs
+
+        // Bitmap-bottom toggle rebuilt against this layout's page bottom (DevTools hidden) / panel top.
+        bitmapBottomToContent = bitmapView.bottomAnchor.constraint(equalTo: pageBottom)
+        bitmapBottomToDevTools = bitmapView.bottomAnchor.constraint(equalTo: devTools.topAnchor)
+        (devToolsVisible ? bitmapBottomToDevTools : bitmapBottomToContent)?.isActive = true
+
+        content.layoutSubtreeIfNeeded()
+        updateViewport()
+        refresh()
+    }
 
     @objc private func toggleDevTools() {
         devToolsVisible.toggle()
