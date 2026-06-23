@@ -187,7 +187,11 @@ pub(crate) fn parse_line_height(val: &str, font_size: f32) -> Option<f32> {
         return p.trim().parse::<f32>().ok().map(|x| x / 100.0 * font_size);
     }
     if let Some(e) = v.strip_suffix("rem") {
-        return e.trim().parse::<f32>().ok().map(|x| x * 16.0);
+        return e
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|x| x * crate::cascade::root_em());
     }
     if let Some(e) = v.strip_suffix("em") {
         return e.trim().parse::<f32>().ok().map(|x| x * font_size);
@@ -386,7 +390,14 @@ fn parse_bg_len(tok: &str) -> Option<BgLen> {
     if let Some(n) = t.strip_suffix("px") {
         return n.trim().parse::<f32>().ok().map(BgLen::Px);
     }
-    if let Some(n) = t.strip_suffix("rem").or_else(|| t.strip_suffix("em")) {
+    if let Some(n) = t.strip_suffix("rem") {
+        return n
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|v| BgLen::Px(v * crate::cascade::root_em()));
+    }
+    if let Some(n) = t.strip_suffix("em") {
         return n.trim().parse::<f32>().ok().map(|v| BgLen::Px(v * 16.0));
     }
     None

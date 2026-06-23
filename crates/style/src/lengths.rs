@@ -220,7 +220,7 @@ impl<'a> MathParser<'a> {
         match unit.as_str() {
             "" => Some(num), // unitless number (multiplier / line-height factor)
             "px" => Some(num),
-            "rem" => Some(num * 16.0),
+            "rem" => Some(num * crate::cascade::root_em()),
             "em" => Some(num * self.font_size),
             "pt" => Some(num * 4.0 / 3.0),
             "vw" => Some(num * assumed_viewport_width() / 100.0),
@@ -286,8 +286,8 @@ pub(crate) fn parse_length_fs(val: &str, font_size: f32) -> Option<f32> {
         Some(px)
     } else if let Some(pt) = num("pt") {
         Some(pt * 4.0 / 3.0)
-    } else if let Some(em) = num("rem") {
-        Some(em * 16.0)
+    } else if let Some(rem) = num("rem") {
+        Some(rem * crate::cascade::root_em())
     } else if let Some(em) = num("em") {
         // em resolves against the element's own font size.
         Some(em * font_size)
@@ -582,7 +582,7 @@ pub(crate) fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
     } else if let Some(em) = num("em") {
         Some(em * parent_px)
     } else if let Some(rem) = num("rem") {
-        Some(rem * 16.0)
+        Some(rem * crate::cascade::root_em())
     } else if let Some(pct) = num("%") {
         // Percentage font-size is relative to the PARENT's computed font size (e.g. `500%` on the
         // big browserscore.dev score number → 5× its parent).

@@ -79,6 +79,8 @@ pub(crate) fn cascade_locked(
     // mapped like the property. See `resolve_root_color_scheme` (it runs with light defaults so its
     // own read can't depend on the result).
     set_root_used_scheme_dark(resolve_root_color_scheme(doc, sheets));
+    // Resolve the root font-size so descendants' `rem` units use it (e.g. `html{font-size:62.5%}`).
+    set_root_em(resolve_root_font_size(doc, sheets));
     // Now build the (themed) UA sheet and the selector index ONCE over UA + author sheets, so every
     // node shares it instead of re-scanning (and re-parsing) all rules per element.
     let ua = user_agent_stylesheet();
@@ -176,6 +178,25 @@ pub fn viewport_metrics() -> (f32, f32, f32) {
 ///
 /// Runs the pre-pass with the dark UA defaults *disabled* (`set_root_used_scheme_dark(false)`) so
 /// the property read doesn't depend on its own result. The caller stores the returned value.
+/// Resolve the root element's used `font-size` (px) — the `rem` basis. Computed with `rem` = the
+/// 16px initial (per spec, `rem` on the root refers to the initial value), so the result can't
+/// depend on itself. Falls back to 16 when there's no `<html>` element.
+pub(crate) fn resolve_root_font_size(doc: &dom::Document, sheets: &[css::Stylesheet]) -> f32 {
+    set_root_em(16.0);
+    let ua = user_agent_stylesheet();
+    let index = SelectorIndex::build(&ua, sheets);
+    let initial = ComputedStyle::default();
+    let initial_vars: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
+    if let Some(html) = find_element(doc, "html") {
+        if let dom::NodeData::Element(el) = &doc.get(html).data {
+            let (s, _) =
+                compute_element_style(doc, html, el, &initial, &initial_vars, false, &index);
+            return s.font_size;
+        }
+    }
+    16.0
+}
+
 pub(crate) fn resolve_root_color_scheme(doc: &dom::Document, sheets: &[css::Stylesheet]) -> bool {
     // Read the property with light defaults so the pre-pass result can't depend on itself.
     set_root_used_scheme_dark(false);
@@ -371,6 +392,25 @@ pub(crate) static VIEWPORT_DPR_BITS: std::sync::atomic::AtomicU32 =
 /// rules take effect. Mirrors the same flag in the `js` crate (which drives the JS `matchMedia`).
 pub(crate) static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// The root element's used `font-size` in CSS px — the basis for `rem` units. Set per cascade by a
+/// pre-pass that resolves `<html>`'s font-size (so `html { font-size: 62.5% }` makes `1rem` = 10px).
+/// Stored as f32 bits; 0 = unset → callers fall back to the 16px initial.
+pub(crate) static ROOT_EM_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The root font-size (px) for resolving `rem`, or the 16px initial when unset.
+pub(crate) fn root_em() -> f32 {
+    let bits = ROOT_EM_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 {
+        16.0
+    } else {
+        f32::from_bits(bits)
+    }
+}
+
+fn set_root_em(px: f32) {
+    ROOT_EM_BITS.store(px.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Set the logical viewport size (CSS px) and device pixel ratio used by the cascade for media
 /// queries and viewport units. Call before [`cascade`] whenever the viewport changes.

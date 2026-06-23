@@ -259,6 +259,21 @@ mod tests {
     }
 
     #[test]
+    fn rem_resolves_against_root_font_size() {
+        // html{font-size:62.5%} → root font-size = 10px, so a child's 1.6rem = 16px (not 25.6).
+        let doc = html::parse(
+            r#"<html style="font-size:62.5%"><body><div style="font-size:1.6rem">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let div = elem(&doc, |e| e.tag == "div");
+        assert!(
+            (map[&div].font_size - 16.0).abs() < 0.5,
+            "1.6rem against a 10px root should be 16px, got {}",
+            map[&div].font_size
+        );
+    }
+
+    #[test]
     fn background_shorthand_with_image_url() {
         let doc = html::parse(
             r#"<html><body><div style="background: url(bg.png) no-repeat center / cover">x</div></body></html>"#,
