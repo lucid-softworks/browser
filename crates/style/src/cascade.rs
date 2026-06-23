@@ -665,6 +665,7 @@ pub(crate) fn compute_element_style<'a>(
         display_none: false, // not inherited
         display_block: false,
         display: Display::Inline,
+        box_sizing: BoxSizing::ContentBox,
         position: Position::Static,
         float: Float::None,
         clear: Clear::None,

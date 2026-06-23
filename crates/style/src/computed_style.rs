@@ -18,6 +18,7 @@ impl Default for ComputedStyle {
             display_none: false,
             display_block: false,
             display: Display::Inline,
+            box_sizing: BoxSizing::ContentBox,
             position: Position::Static,
             float: Float::None,
             clear: Clear::None,

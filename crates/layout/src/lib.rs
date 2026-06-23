@@ -2969,6 +2969,42 @@ mod tests {
         assert!((w1 - 50.0).abs() < 1.5, "col1 width should be 50, got {w1}");
     }
 
+    #[test]
+    fn box_sizing_border_box_subtracts_padding_border() {
+        // A 200px-wide div with 20px padding + 5px border: border-box keeps the border-box at 200;
+        // content-box would make the border-box 250 (200 + 2*20 + 2*5).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let bb = doc.append_element(body, "div");
+        let cb = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        let mk = |sizing| {
+            let mut s = block_style(true);
+            s.width = Some(200.0);
+            s.padding = style::Edges::all(20.0);
+            s.border = style::Edges::all(5.0);
+            s.box_sizing = sizing;
+            s
+        };
+        styles.insert(bb, mk(style::BoxSizing::BorderBox));
+        styles.insert(cb, mk(style::BoxSizing::ContentBox));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        assert!(
+            (rect_of(&root_box, bb).width - 200.0).abs() < 0.5,
+            "border-box width stays 200, got {}",
+            rect_of(&root_box, bb).width
+        );
+        assert!(
+            (rect_of(&root_box, cb).width - 250.0).abs() < 0.5,
+            "content-box border-box = 250, got {}",
+            rect_of(&root_box, cb).width
+        );
+    }
+
     // ---- Floats ----
 
     /// Two `float:left` blocks pack side by side on the same row.
