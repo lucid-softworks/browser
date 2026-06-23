@@ -919,6 +919,31 @@
   installEvents(globalThis);
   installEvents(document);
 
+  // `window.postMessage(message, targetOrigin[, transfer])` / `window.postMessage(message, options)`.
+  // Single browsing context: there are no cross-origin frames to route to, so this is same-window
+  // delivery — structured-clone the message now (per spec, serialization happens at call time) and
+  // queue a task to fire a `message` MessageEvent at the window. `targetOrigin` is accepted and
+  // ignored (we only ever post to ourselves). Used by WPT's testdriver.js to reach the testharness
+  // context (`test_driver.message_test`), and by pages doing same-window messaging.
+  def(globalThis, "postMessage", function (message, targetOriginOrOptions, transfer) {
+    var data;
+    try { data = globalThis.structuredClone(message); } catch (e) { data = message; }
+    // Transfer list: 3-arg `(message, targetOrigin, transfer)` or 2-arg `(message, {transfer})`.
+    var ports = [];
+    if (Array.isArray(transfer)) { ports = transfer.slice(); }
+    else if (targetOriginOrOptions && typeof targetOriginOrOptions === "object" &&
+             Array.isArray(targetOriginOrOptions.transfer)) { ports = targetOriginOrOptions.transfer.slice(); }
+    var origin = "";
+    try { origin = (globalThis.location && globalThis.location.origin) || ""; } catch (e2) {}
+    if (origin === "null") { origin = ""; }
+    setTimeout(function () {
+      var ev = new globalThis.MessageEvent("message", {
+        data: data, origin: origin, source: globalThis, ports: ports
+      });
+      globalThis.__dispatchEventObject(globalThis, ev);
+    }, 0);
+  });
+
   // --- DOMException + AbortController/AbortSignal -------------------------------------------
   // A real DOMException carrying `name`/`message` (AbortError, TimeoutError, …).
   (function () {

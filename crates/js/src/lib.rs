@@ -1819,6 +1819,40 @@ mod tests {
     }
 
     #[test]
+    fn window_post_message_dispatches_message_event() {
+        // `window.postMessage` delivers a `message` MessageEvent to the window asynchronously, with
+        // data structured-cloned, the window's own origin, and source === window. WPT's
+        // testdriver.js (`test_driver.message_test`) relies on this to reach the testharness context;
+        // without it, testdriver tests error out at setup with "window.postMessage is not a function".
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![concat!(
+                "console.log('typeof=' + typeof window.postMessage);",
+                "window.addEventListener('message', function (e) {",
+                "  console.log('msg:' + e.data + '|origin=' + e.origin + '|self=' + (e.source === window));",
+                "});",
+                "window.onmessage = function (e) { console.log('on:' + e.data); };",
+                "window.postMessage('hello', '*');"
+            )
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
+        assert!(all.iter().any(|l| l == "typeof=function"), "{all:?}");
+        assert!(
+            all.iter()
+                .any(|l| l == "msg:hello|origin=https://example.com|self=true"),
+            "addEventListener('message') did not fire correctly: {all:?}"
+        );
+        assert!(
+            all.iter().any(|l| l == "on:hello"),
+            "onmessage did not fire: {all:?}"
+        );
+    }
+
+    #[test]
     fn timers_run_in_delay_order() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(
