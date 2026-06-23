@@ -23,6 +23,16 @@ pub(crate) fn intrinsic_width(
     let b = boxx.dimensions.border;
     let edges = p.left + p.right + b.left + b.right;
 
+    // Vertical writing mode: the physical width is the BLOCK size — the sum of the (unwrapped) line
+    // heights — not the inline text width. Mirror the vertical branch of `layout_inline_children` so
+    // the flex cross size and the laid-out box agree.
+    if matches!(
+        style_of(boxx, styles).map(|cs| cs.writing_mode),
+        Some(style::WritingMode::VerticalRl | style::WritingMode::VerticalLr)
+    ) {
+        return edges + vertical_block_size(boxx, measurer);
+    }
+
     // Gather all words in the subtree; the intrinsic (max-content) inline width is the sum of
     // word widths on a single unwrapped line for the longest text run. We approximate with the
     // widest single contiguous run of text.
@@ -68,4 +78,36 @@ pub(crate) fn intrinsic_width(
     }
 
     edges + max_inline.max(max_block)
+}
+
+/// The block size (sum of per-line line-heights) of a vertical-writing-mode element's inline content,
+/// lines split only by forced breaks (max-content, no wrapping). Mirrors the per-line `line.height`
+/// summed by the vertical branch of [`inline::layout_inline_children`], so intrinsic sizing and the
+/// laid-out box agree on a vertical box's physical width.
+fn vertical_block_size(boxx: &LayoutBox, measurer: &dyn TextMeasurer) -> f32 {
+    fn lh_of(b: &LayoutBox, measurer: &dyn TextMeasurer) -> f32 {
+        b.style
+            .line_height
+            .unwrap_or_else(|| measurer.line_height(b.style.font_size, b.style.font_family.as_deref()))
+    }
+    fn walk(children: &[LayoutBox], lines: &mut Vec<f32>, measurer: &dyn TextMeasurer) {
+        for c in children {
+            match &c.content {
+                BoxContent::LineBreak => {
+                    let cur = lines.last_mut().expect("at least one line");
+                    *cur = cur.max(lh_of(c, measurer));
+                    lines.push(0.0);
+                }
+                BoxContent::Text(_) | BoxContent::Marker(_) => {
+                    let cur = lines.last_mut().expect("at least one line");
+                    *cur = cur.max(lh_of(c, measurer));
+                }
+                // Recurse through inline wrappers (spans) so their text contributes to the line.
+                _ => walk(&c.children, lines, measurer),
+            }
+        }
+    }
+    let mut lines = vec![0.0f32];
+    walk(&boxx.children, &mut lines, measurer);
+    lines.iter().filter(|&&h| h > 0.0).sum()
 }

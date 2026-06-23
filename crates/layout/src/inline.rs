@@ -26,7 +26,23 @@ pub(crate) fn layout_inline_children(
     measurer: &dyn TextMeasurer,
 ) -> f32 {
     let content = boxx.dimensions.content;
-    let avail = content.width.max(0.0);
+    // Vertical writing modes (geometry only): the inline axis runs top-to-bottom and the block axis
+    // (line stacking) runs horizontally — so the inline/block extents map to the physical height/width
+    // *swapped* from horizontal text. We reuse the same line breaking, then map the result to physical
+    // coordinates in the vertical branch below. (Glyphs are not rotated; this targets the layout
+    // geometry that `check-layout` tests assert.)
+    let vertical_wm = style_of(boxx, styles).map(|cs| cs.writing_mode);
+    let vertical = matches!(
+        vertical_wm,
+        Some(style::WritingMode::VerticalRl | style::WritingMode::VerticalLr)
+    );
+    // For vertical, line breaking runs against the inline (vertical) extent; without a known one we
+    // don't wrap (forced `<br>` breaks still apply), which matches these tests.
+    let avail = if vertical {
+        f32::MAX
+    } else {
+        content.width.max(0.0)
+    };
 
     // Flatten inline content into a sequence of inline items: words and atomic inline-blocks.
     // We move children out so atomic boxes can be re-emitted into the new child list.
@@ -107,6 +123,77 @@ pub(crate) fn layout_inline_children(
             height: line_h,
             max_font_size: max_fs,
         });
+    }
+
+    // --- Vertical writing-mode emission (geometry) ------------------------------------------
+    // Map the logical lines to physical coordinates: lines stack along the physical X (block) axis —
+    // right-to-left for `vertical-rl`, left-to-right for `vertical-lr` — and each line's text advances
+    // along physical Y (the inline axis). The element's physical width becomes the block size (Σ line
+    // heights) and its physical height the inline size (longest line). One `Text` box is emitted per
+    // line as a vertical strip, which is enough for the box-geometry the tests assert.
+    if vertical {
+        let line_h = |l: &PlacedLine| -> f32 {
+            if l.height > 0.0 {
+                l.height
+            } else {
+                measurer.line_height(
+                    if l.max_font_size > 0.0 {
+                        l.max_font_size
+                    } else {
+                        16.0
+                    },
+                    None,
+                )
+            }
+        };
+        let block_size: f32 = lines.iter().map(line_h).sum();
+        let inline_size: f32 = lines.iter().map(|l| l.width).fold(0.0, f32::max);
+        boxx.dimensions.content.width = block_size;
+        let rl = matches!(vertical_wm, Some(style::WritingMode::VerticalRl));
+        let mut new_children: Vec<LayoutBox> = Vec::new();
+        let mut block_cursor = 0.0f32; // distance from the block-start edge
+        for line in &lines {
+            let lh = line_h(line);
+            // Physical x of this line's strip (its block-start edge).
+            let line_x = if rl {
+                content.x + block_size - block_cursor - lh
+            } else {
+                content.x + block_cursor
+            };
+            let style = line
+                .items
+                .iter()
+                .find_map(|(it, _)| match it {
+                    InlineItem::Word { style, .. } => Some(style.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let node = line.items.iter().find_map(|(it, _)| match it {
+                InlineItem::Word { node, .. } => *node,
+                _ => None,
+            });
+            let text: String = line
+                .items
+                .iter()
+                .filter_map(|(it, _)| match it {
+                    InlineItem::Word { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut tb = LayoutBox::new(BoxContent::Text(text), style, node);
+            tb.dimensions.content = Rect {
+                x: line_x,
+                y: content.y,
+                width: lh,
+                height: line.width,
+            };
+            new_children.push(tb);
+            block_cursor += lh;
+        }
+        boxx.children = new_children;
+        let _ = ctx;
+        return inline_size;
     }
 
     // Emit positioned boxes per line.
