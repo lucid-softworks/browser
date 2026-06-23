@@ -50,6 +50,9 @@ struct DecodedImage {
 
 /// Maximum number of images fetched + decoded per page; the rest are skipped.
 const MAX_IMAGES: usize = 24;
+/// Maximum images fetched concurrently. Kept low so a page's image burst doesn't trip a CDN's
+/// per-client rate limit (e.g. Wikimedia 429s aggressive bursts).
+const MAX_CONCURRENT_IMAGE_FETCHES: usize = 5;
 /// Skip decoding images whose decoded pixel area would exceed this (guards memory / time).
 const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024; // ~32 megapixels
 

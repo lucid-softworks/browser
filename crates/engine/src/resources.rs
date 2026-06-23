@@ -542,7 +542,10 @@ pub(crate) fn collect_images(
     }
 
     if !net_targets.is_empty() {
-        let n_threads = net_targets.len().clamp(1, 8);
+        // Cap concurrency so we don't fire a whole page's images at one origin at once — bursts trip
+        // CDN rate limits (e.g. Wikimedia returns 429). At most `MAX_CONCURRENT_IMAGE_FETCHES` are
+        // in flight; each worker drains its chunk sequentially.
+        let n_threads = net_targets.len().clamp(1, MAX_CONCURRENT_IMAGE_FETCHES);
         let chunks: Vec<Vec<(dom::NodeId, String)>> = {
             let mut cs: Vec<Vec<_>> = (0..n_threads).map(|_| Vec::new()).collect();
             for (i, t) in net_targets.into_iter().enumerate() {
