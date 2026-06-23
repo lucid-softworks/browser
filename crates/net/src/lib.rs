@@ -558,13 +558,21 @@ fn request_streaming_inner(
     // body so repeated loads don't re-hit the network. GET only (keyed by URL); non-GET bypasses it.
     let cache = if is_get { cache_path(url) } else { None };
     if let Some(p) = &cache {
-        if let Ok(body) = std::fs::read(p) {
-            // Cache hit: deliver the cached bytes in one chunk.
-            on_chunk(&body);
+        if let Ok(bytes) = std::fs::read(p) {
+            // Cache hit. New-format entries carry the post-redirect final URL and content-type in a
+            // small header (see the write path) so a cached navigation reports the SAME address as a
+            // live one — e.g. en.wikipedia.org/ → /wiki/Main_Page. Legacy (header-less) entries fall
+            // back to deriving both from the requested URL, the old behaviour.
+            let (final_url, content_type, body_off) = match parse_cache_header(&bytes) {
+                Some((u, ct, off)) => (u, ct, off),
+                None => (url.to_string(), content_type_from_url(url), 0),
+            };
+            // Deliver the cached body in one chunk.
+            on_chunk(&bytes[body_off..]);
             return Ok(ResponseMeta {
                 status: 200,
-                content_type: content_type_from_url(url),
-                final_url: url.to_string(),
+                content_type,
+                final_url,
             });
         }
     }
@@ -691,13 +699,25 @@ fn request_streaming_inner(
         on_chunk(&buf[..n]);
     }
 
-    // Populate the opt-in disk cache on success (GET only).
+    // Populate the opt-in disk cache on success (GET only). Persist the post-redirect final URL and
+    // content-type in a header ahead of the body, so a later cache hit reports the same address (and
+    // type) as a live load instead of the requested URL. URLs and content-types never contain a
+    // newline, so the line-delimited header is unambiguous.
     if want_cache {
         if let Some(p) = &cache {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let _ = std::fs::write(p, &cache_buf);
+            let mut entry = Vec::with_capacity(
+                CACHE_MAGIC.len() + final_url.len() + content_type.len() + 2 + cache_buf.len(),
+            );
+            entry.extend_from_slice(CACHE_MAGIC);
+            entry.extend_from_slice(final_url.as_bytes());
+            entry.push(b'\n');
+            entry.extend_from_slice(content_type.as_bytes());
+            entry.push(b'\n');
+            entry.extend_from_slice(&cache_buf);
+            let _ = std::fs::write(p, &entry);
         }
     }
 
@@ -721,6 +741,25 @@ fn cache_dir() -> Option<std::path::PathBuf> {
     Some(std::path::Path::new(&home).join("Library/Caches/dev.imlunahey.browser/net"))
 }
 
+/// Magic prefix marking a cache entry that carries a metadata header (final URL + content-type)
+/// ahead of the body. The trailing digit is the format version; bump it when the header layout
+/// changes so older builds don't misread a newer entry.
+const CACHE_MAGIC: &[u8] = b"BRWC1\n";
+
+/// Parse the header of a metadata-carrying cache entry: [`CACHE_MAGIC`], then `final_url\n`, then
+/// `content_type\n`, then the raw body. Returns `(final_url, content_type, body_offset)`, or `None`
+/// for a legacy (body-only) entry written before the header existed.
+fn parse_cache_header(bytes: &[u8]) -> Option<(String, String, usize)> {
+    let rest = bytes.strip_prefix(CACHE_MAGIC)?;
+    let nl1 = rest.iter().position(|&b| b == b'\n')?;
+    let final_url = std::str::from_utf8(&rest[..nl1]).ok()?.to_string();
+    let after = &rest[nl1 + 1..];
+    let nl2 = after.iter().position(|&b| b == b'\n')?;
+    let content_type = std::str::from_utf8(&after[..nl2]).ok()?.to_string();
+    let body_offset = CACHE_MAGIC.len() + nl1 + 1 + nl2 + 1;
+    Some((final_url, content_type, body_offset))
+}
+
 /// Disk-cache file path for `url` (a stable hash of the URL under [`cache_dir`]), or `None` when the
 /// cache is disabled or the URL shouldn't be cached.
 fn cache_path(url: &str) -> Option<std::path::PathBuf> {
@@ -738,6 +777,10 @@ fn cache_path(url: &str) -> Option<std::path::PathBuf> {
     let dir = cache_dir()?;
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Fold the format version into the key so a layout change (e.g. adding the metadata header)
+    // produces fresh filenames — older body-only entries are simply never looked up again, rather
+    // than read and misinterpreted (which would resurrect the requested-URL-as-final_url bug).
+    CACHE_MAGIC.hash(&mut h);
     url.hash(&mut h);
     Some(dir.join(format!("{:016x}", h.finish())))
 }
@@ -1155,6 +1198,26 @@ mod tests {
         assert_eq!(meta.status, 200);
         assert_eq!(meta.final_url, url);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cache_header_round_trips_and_falls_back() {
+        // A new-format entry: the header carries the post-redirect URL + content-type, the body
+        // follows it byte-for-byte (the redirect target is recovered on a cache hit).
+        let mut entry = Vec::new();
+        entry.extend_from_slice(CACHE_MAGIC);
+        entry.extend_from_slice(b"https://en.wikipedia.org/wiki/Main_Page\n");
+        entry.extend_from_slice(b"text/html; charset=utf-8\n");
+        entry.extend_from_slice(b"<!doctype html>body");
+        let (url, ct, off) = parse_cache_header(&entry).expect("header parses");
+        assert_eq!(url, "https://en.wikipedia.org/wiki/Main_Page");
+        assert_eq!(ct, "text/html; charset=utf-8");
+        assert_eq!(&entry[off..], b"<!doctype html>body");
+
+        // A legacy body-only entry (no magic) → None, so the caller derives both from the requested
+        // URL exactly as before. A body that merely starts like the magic but isn't is also legacy.
+        assert!(parse_cache_header(b"<!doctype html>raw body").is_none());
+        assert!(parse_cache_header(b"BRWC1").is_none());
     }
 
     #[test]
