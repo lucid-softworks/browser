@@ -21,6 +21,8 @@ final class BitmapView: NSView {
     var onKeyDown: ((NSEvent) -> Bool)?
     /// Called with a view-local point as the pointer moves, so the page's hover events can fire.
     var onMove: ((CGPoint) -> Void)?
+    /// Called when the pointer leaves the content view (e.g. to hide the hovered-link status bar).
+    var onMouseExit: (() -> Void)?
     /// Called with a raw mouse event kind ("mousedown"/"mouseup"/"dblclick"/"contextmenu") + point.
     var onMouseEvent: ((String, CGPoint) -> Void)?
     /// Called on mouse-down with the view-local point to begin a text selection anchor.
@@ -133,6 +135,7 @@ final class BitmapView: NSView {
 
     override func mouseExited(with event: NSEvent) {
         NSCursor.arrow.set()
+        onMouseExit?()
     }
 }
 

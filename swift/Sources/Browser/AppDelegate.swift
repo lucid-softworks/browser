@@ -8,6 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var urlField: URLTextField!
     var bitmapView: BitmapView!
 
+    // Hovered-link status overlay (bottom-left of the content, like Chrome/Firefox).
+    private var statusBar: NSView!
+    private var statusBarLabel: NSTextField!
+
     // DevTools bottom panel (hidden by default; ⌘⌥I toggles).
     private var devTools: DevToolsView!
     private var devToolsVisible = false
@@ -187,6 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.isLinkAt = { [weak self] point in self?.linkURL(at: point) != nil }
         bitmapView.onKeyDown = { [weak self] event in self?.handleKeyDown(event) ?? false }
         bitmapView.onMove = { [weak self] point in self?.handleContentMove(point) }
+        bitmapView.onMouseExit = { [weak self] in self?.updateStatusBar(link: nil) }
         bitmapView.onMouseEvent = { [weak self] kind, point in self?.handleMouseEvent(kind, point) }
         bitmapView.onSelectStart = { [weak self] point in self?.handleSelectStart(point) }
         bitmapView.onSelectExtend = { [weak self] point in self?.handleSelectExtend(point) }
@@ -194,6 +199,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.onSelectCancel = { [weak self] in self?.handleSelectCancel() }
         bitmapView.contextMenuProvider = { [weak self] point in self?.buildContextMenu(at: point) }
         content.addSubview(bitmapView)
+
+        // MARK: Hovered-link status overlay (bottom-left, shown only while hovering a link)
+        statusBar = NSView()
+        statusBar.translatesAutoresizingMaskIntoConstraints = false
+        statusBar.wantsLayer = true
+        statusBar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        statusBar.layer?.cornerRadius = 4
+        statusBar.layer?.cornerCurve = .continuous
+        statusBar.layer?.borderWidth = 1
+        statusBar.layer?.borderColor = NSColor.separatorColor.cgColor
+        statusBar.isHidden = true
+        statusBarLabel = NSTextField(labelWithString: "")
+        statusBarLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusBarLabel.font = NSFont.systemFont(ofSize: 11)
+        statusBarLabel.textColor = NSColor.secondaryLabelColor
+        statusBarLabel.lineBreakMode = .byTruncatingMiddle
+        statusBarLabel.maximumNumberOfLines = 1
+        statusBar.addSubview(statusBarLabel)
+        content.addSubview(statusBar, positioned: .above, relativeTo: bitmapView)
 
         // MARK: DevTools panel (hidden by default; ⌘⌥I toggles)
         devTools = DevToolsView()
@@ -303,6 +327,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             devTools.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             devToolsHeightConstraint,
             bitmapBottomToContent,
+        ])
+
+        // Status overlay: bottom-left of the bitmap, label inset by a few px, width-capped so a long
+        // URL truncates instead of spanning the window.
+        NSLayoutConstraint.activate([
+            statusBar.leadingAnchor.constraint(equalTo: bitmapView.leadingAnchor),
+            statusBar.bottomAnchor.constraint(equalTo: bitmapView.bottomAnchor),
+            statusBar.widthAnchor.constraint(lessThanOrEqualTo: bitmapView.widthAnchor, multiplier: 0.8),
+            statusBarLabel.leadingAnchor.constraint(equalTo: statusBar.leadingAnchor, constant: 8),
+            statusBarLabel.trailingAnchor.constraint(equalTo: statusBar.trailingAnchor, constant: -8),
+            statusBarLabel.topAnchor.constraint(equalTo: statusBar.topAnchor, constant: 3),
+            statusBarLabel.bottomAnchor.constraint(equalTo: statusBar.bottomAnchor, constant: -3),
         ])
 
         // Only listen for resize/backing callbacks once all views exist, so an early
@@ -762,6 +798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // 3. If it landed on a link, navigate (supersedes a re-render).
         if let url = linkTarget {
+            updateStatusBar(link: nil)
             urlField.stringValue = url
             load(urlString: url, recordHistory: true)
             return
@@ -842,11 +879,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func handleContentMove(_ localPoint: CGPoint) {
         guard let tab = activeTab, let engine = tab.engine, let bitmapView = bitmapView,
               tab.pendingLoads == 0 else { return }
+        // Resolve the hovered link BEFORE dispatch_move (which can invalidate the layout cache that
+        // link hit-testing relies on), and show it in the status overlay.
+        updateStatusBar(link: linkURL(at: localPoint))
         let scale = CGFloat(window?.backingScaleFactor ?? 1)
         let fyTop = bitmapView.bounds.height - localPoint.y
         let fxDevice = Float(localPoint.x * scale)
         let fyDevice = Float(fyTop * scale)
         if browser_engine_dispatch_move(engine, fxDevice, fyDevice) != 0 { refresh() }
+    }
+
+    /// Show `link` in the bottom-left status overlay, or hide it when there's no hovered link.
+    private func updateStatusBar(link: String?) {
+        if let link = link, !link.isEmpty {
+            statusBarLabel.stringValue = link
+            statusBar.isHidden = false
+        } else {
+            statusBar.isHidden = true
+            statusBarLabel.stringValue = ""
+        }
     }
 
     // MARK: Text selection
@@ -968,6 +1019,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc private func toggleDevTools() {
         devToolsVisible.toggle()
         devTools.isHidden = !devToolsVisible
+        // Closing DevTools clears any Elements-inspector highlight so it doesn't linger on the page
+        // (done before the refresh below so the repaint drops the overlay).
+        if !devToolsVisible, let engine = activeTab?.engine {
+            browser_engine_set_inspect_node(engine, -1)
+        }
         // Swap which bitmap-bottom constraint is active so the bitmap shrinks/grows.
         bitmapBottomToContent.isActive = !devToolsVisible
         bitmapBottomToDevTools.isActive = devToolsVisible
