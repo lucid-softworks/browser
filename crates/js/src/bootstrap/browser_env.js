@@ -6502,12 +6502,171 @@
       if (roReg) { try { roReg.cb.call(roReg.observer, roBatches[oid2], roReg.observer); } catch (e) { try { (globalThis.__timerErrors || (globalThis.__timerErrors = [])).push("ResizeObserver: " + (e && e.message || e)); } catch (e2) {} } }
     }
   });
-  if (typeof globalThis.PerformanceObserver !== "function") {
+  // --- Resource Timing + PerformanceObserver("resource") -----------------------------------
+  // A page that watches `PerformanceObserver({type:"resource"})` (e.g. to learn when a CSS
+  // subresource has been fetched) needs three things that aren't wired by default: a resource-
+  // timing buffer, an observer that delivers buffered + live `resource` entries, and the CSS
+  // subresources to actually BE fetched (setting `el.style.background = url(...)` triggers no
+  // JS-visible request; the Rust render pass fetches bitmaps separately and records no timing).
+  // We activate all of it LAZILY — only once something observes "resource" timing — so pages that
+  // don't use Resource Timing are completely unaffected.
+  globalThis.__resourceEntries = globalThis.__resourceEntries || [];
+  globalThis.__perfObservers = globalThis.__perfObservers || [];
+  globalThis.__fetchedResources = globalThis.__fetchedResources || {};
+
+  function __perfDeliver(observer, entries) {
+    if (!entries.length) { return; }
+    var list = {
+      getEntries: function () { return entries.slice(); },
+      getEntriesByType: function (t) { return entries.filter(function (e) { return e.entryType === t; }); },
+      getEntriesByName: function (n, t) { return entries.filter(function (e) { return e.name === n && (!t || e.entryType === t); }); }
+    };
+    try { observer.__cb.call(observer, list, observer); } catch (e) {}
+  }
+
+  // Append a PerformanceResourceTiming-shaped entry and deliver it (async) to every observer
+  // watching "resource".
+  function __recordResourceTiming(name, initiatorType) {
+    var now = 0;
+    try { now = globalThis.performance ? globalThis.performance.now() : (globalThis.__eventLoop ? globalThis.__eventLoop.now : 0); } catch (e) {}
+    var entry = {
+      name: String(name), entryType: "resource", initiatorType: initiatorType || "other",
+      startTime: now, duration: 0, fetchStart: now, responseEnd: now,
+      domainLookupStart: now, domainLookupEnd: now, connectStart: now, connectEnd: now,
+      requestStart: now, responseStart: now, secureConnectionStart: 0,
+      redirectStart: 0, redirectEnd: 0, workerStart: 0, nextHopProtocol: "http/1.1",
+      transferSize: 0, encodedBodySize: 0, decodedBodySize: 0, responseStatus: 200, serverTiming: []
+    };
+    entry.toJSON = function () { var o = {}; for (var k in this) { if (typeof this[k] !== "function") { o[k] = this[k]; } } return o; };
+    globalThis.__resourceEntries.push(entry);
+    var obs = globalThis.__perfObservers.slice();
+    for (var i = 0; i < obs.length; i++) {
+      (function (o) {
+        if (o.__types.indexOf("resource") < 0) { return; }
+        try { Promise.resolve().then(function () { __perfDeliver(o, [entry]); }); } catch (e) { __perfDeliver(o, [entry]); }
+      })(obs[i]);
+    }
+  }
+
+  // Resolve a possibly-relative resource URL against the document base.
+  function __resolveResUrl(u) {
+    try { return new URL(u, (typeof document !== "undefined" && document.baseURI) || (typeof location !== "undefined" && location.href) || "").href; }
+    catch (e) { return u; }
+  }
+  // Fetch a CSS subresource once, sending an `Origin` header iff the resource is fetched in CORS
+  // mode (shape-outside images, web fonts) and omitting it for no-cors resources (background/mask/
+  // border images, `@import`). Records a resource-timing entry when the request settles — by which
+  // point the server has seen the request, so a follow-up header read is race-free. Best-effort.
+  function __fetchSubresource(rawUrl, cors, initiatorType) {
+    if (!rawUrl) { return; }
+    var url = __resolveResUrl(rawUrl);
+    if (globalThis.__fetchedResources[url]) { return; }
+    globalThis.__fetchedResources[url] = true;
+    if (typeof __startFetch !== "function") { __recordResourceTiming(url, initiatorType); return; }
+    var headers = {};
+    if (cors) { try { headers["Origin"] = globalThis.origin || (typeof location !== "undefined" && location.origin) || ""; } catch (e) {} }
+    var id;
+    try { id = __startFetch("GET", url, "", JSON.stringify(headers)); }
+    catch (e) { __recordResourceTiming(url, initiatorType); return; }
+    var done = function () { __recordResourceTiming(url, initiatorType); };
+    globalThis.__pendingFetches[id] = { url: url, resolve: done, reject: done };
+  }
+  function __extractCssUrls(value) {
+    var out = [], re = /url\(\s*(["']?)([^"')]+)\1\s*\)/gi, m;
+    while ((m = re.exec(value))) { out.push(m[2]); }
+    return out;
+  }
+  // Background/mask/border/cursor/list/content images are fetched no-cors; shape-outside is cors.
+  var __noCorsImageProp = /^(background|background-image|border-image|border-image-source|mask|mask-image|-webkit-mask|-webkit-mask-image|list-style-image|cursor|content)$/;
+  function __scanInlineStyle(styleText) {
+    var decls = String(styleText).split(";");
+    for (var i = 0; i < decls.length; i++) {
+      var c = decls[i].indexOf(":");
+      if (c < 0) { continue; }
+      var prop = decls[i].slice(0, c).trim().toLowerCase();
+      var cors = prop === "shape-outside";
+      if (!cors && !__noCorsImageProp.test(prop)) { continue; }
+      var urls = __extractCssUrls(decls[i].slice(c + 1));
+      for (var u = 0; u < urls.length; u++) { __fetchSubresource(urls[u], cors, prop === "shape-outside" ? "css" : "css"); }
+    }
+  }
+  function __scanStylesheetText(text) {
+    text = String(text);
+    var im = /@import\s+(?:url\(\s*)?["']?([^"')\s;]+)/gi, m;
+    while ((m = im.exec(text))) { __fetchSubresource(m[1], false, "css"); }
+    var ff = /@font-face\s*\{([^}]*)\}/gi, fm;
+    while ((fm = ff.exec(text))) {
+      var sr = /src\s*:[^;}]*?url\(\s*["']?([^"')\s]+)/gi, sm;
+      while ((sm = sr.exec(fm[1]))) { __fetchSubresource(sm[1], true, "css"); }
+    }
+  }
+  function __scanElementResources(el) {
+    try {
+      if (!el || el.nodeType !== 1) { return; }
+      if ((el.tagName || "").toUpperCase() === "STYLE") { __scanStylesheetText(el.textContent || ""); return; }
+      var st = el.getAttribute ? el.getAttribute("style") : null;
+      if (st) { __scanInlineStyle(st); }
+    } catch (e) {}
+  }
+  function __scanSubtree(node) {
+    if (!node || node.nodeType !== 1) { return; }
+    __scanElementResources(node);
+    var kids = node.children;
+    if (kids) { for (var i = 0; i < kids.length; i++) { __scanSubtree(kids[i]); } }
+  }
+  // Scan the whole connected tree for CSS subresources and fetch any not-yet-fetched ones (the
+  // `__fetchSubresource` dedupe makes repeat scans cheap). Run on every `observe("resource")`: the
+  // test pattern connects the element BEFORE calling `wait_for_resource` (→ observe), so a fresh
+  // scan at observe time reliably catches it without depending on live MutationObserver delivery.
+  function __scanDocumentNow() {
+    try { if (typeof document !== "undefined" && document.documentElement) { __scanSubtree(document.documentElement); } } catch (e) {}
+  }
+  // Also watch for elements / `<style>` connected AFTER an observer exists, via one internal
+  // MutationObserver (registered once). Belt-and-suspenders alongside the per-observe scan.
+  function __ensureResourceMO() {
+    if (globalThis.__resourceMOStarted) { return; }
+    globalThis.__resourceMOStarted = true;
+    try {
+      var mo = new MutationObserver(function (records) {
+        for (var i = 0; i < records.length; i++) {
+          var rec = records[i];
+          if (rec.addedNodes) { for (var j = 0; j < rec.addedNodes.length; j++) { __scanSubtree(rec.addedNodes[j]); } }
+          if (rec.type === "attributes" && rec.target) { __scanElementResources(rec.target); }
+          if (rec.type === "characterData" && rec.target && rec.target.parentNode) { __scanElementResources(rec.target.parentNode); }
+        }
+      });
+      mo.observe(document, { childList: true, subtree: true, attributes: true, attributeFilter: ["style"], characterData: true });
+    } catch (e) {}
+  }
+  globalThis.__recordResourceTiming = __recordResourceTiming;
+
+  if (typeof globalThis.PerformanceObserver !== "function" || !globalThis.PerformanceObserver.__real) {
     def(globalThis, "PerformanceObserver", function (cb) {
-      this.callback = typeof cb === "function" ? cb : fn;
-      this.observe = fn; this.disconnect = fn; this.takeRecords = function () { return []; };
+      this.__cb = typeof cb === "function" ? cb : fn;
+      this.__types = [];
     });
-    globalThis.PerformanceObserver.supportedEntryTypes = [];
+    globalThis.PerformanceObserver.__real = true;
+    globalThis.PerformanceObserver.supportedEntryTypes = ["resource", "mark", "measure", "navigation", "paint"];
+    def(globalThis.PerformanceObserver.prototype, "observe", function (opts) {
+      opts = opts || {};
+      var types = opts.entryTypes ? [].concat(opts.entryTypes) : (opts.type ? [opts.type] : []);
+      for (var i = 0; i < types.length; i++) { if (this.__types.indexOf(types[i]) < 0) { this.__types.push(types[i]); } }
+      if (globalThis.__perfObservers.indexOf(this) < 0) { globalThis.__perfObservers.push(this); }
+      if (this.__types.indexOf("resource") >= 0) {
+        __ensureResourceMO();
+        __scanDocumentNow();
+        if (opts.buffered) {
+          var self = this, buffered = globalThis.__resourceEntries.slice();
+          try { Promise.resolve().then(function () { __perfDeliver(self, buffered); }); } catch (e) { __perfDeliver(self, buffered); }
+        }
+      }
+    });
+    def(globalThis.PerformanceObserver.prototype, "disconnect", function () {
+      var i = globalThis.__perfObservers.indexOf(this);
+      if (i >= 0) { globalThis.__perfObservers.splice(i, 1); }
+      this.__types = [];
+    });
+    def(globalThis.PerformanceObserver.prototype, "takeRecords", function () { return []; });
   }
 
   // --- performance -------------------------------------------------------------------------
@@ -6519,13 +6678,19 @@
       timing: { navigationStart: 0, fetchStart: 0, domLoading: 0, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: 0, responseEnd: 0, requestStart: 0, connectStart: 0, connectEnd: 0, secureConnectionStart: 0, domainLookupStart: 0, domainLookupEnd: 0, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0 },
       navigation: { type: 0, redirectCount: 0 },
       memory: { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 },
-      getEntries: function () { return []; },
-      getEntriesByType: function () { return []; },
-      getEntriesByName: function () { return []; },
-      mark: fn, measure: fn, clearMarks: fn, clearMeasures: fn, clearResourceTimings: fn,
+      getEntries: function () { return (globalThis.__resourceEntries || []).slice(); },
+      getEntriesByType: function (t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.entryType === t; }); },
+      getEntriesByName: function (n, t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.name === n && (!t || e.entryType === t); }); },
+      mark: fn, measure: fn, clearMarks: fn, clearMeasures: fn,
+      clearResourceTimings: function () { globalThis.__resourceEntries = []; },
       setResourceTimingBufferSize: fn,
       toJSON: function () { return {}; }
     };
+  } else {
+    // A native/earlier-installed `performance` is present: route its resource-timing readers at our
+    // buffer too (best-effort; ignored if the methods are non-configurable).
+    try { globalThis.performance.getEntriesByType = function (t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.entryType === t; }); }; } catch (e) {}
+    try { globalThis.performance.getEntriesByName = function (n, t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.name === n && (!t || e.entryType === t); }); }; } catch (e) {}
   }
 
   // --- IdleDeadline-style object is already provided via requestIdleCallback above. ---------

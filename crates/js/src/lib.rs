@@ -3373,6 +3373,28 @@ mod tests {
     }
 
     #[test]
+    fn resource_timing_buffer_and_observer() {
+        // Observing PerformanceObserver({type:"resource"}) must expose recorded resource-timing
+        // entries via performance.getEntriesByType, and "resource" must be a supported entry type.
+        // (The end-to-end CSS-subresource fetch + CORS-mode behaviour is covered by the
+        // css/fetching/fetch-resources WPT reftest; here we assert the synchronous API surface.)
+        let out = env_eval(
+            "https://example.com/",
+            "var po = new PerformanceObserver(function(){}); \
+             po.observe({type:'resource', buffered:true}); \
+             globalThis.__recordResourceTiming('https://example.com/r.png', 'css'); \
+             var e = performance.getEntriesByType('resource'); \
+             [e.length, e[0] && e[0].name, e[0] && e[0].entryType, \
+              PerformanceObserver.supportedEntryTypes.indexOf('resource') >= 0].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("1|https://example.com/r.png|resource|true")
+        );
+    }
+
+    #[test]
     fn url_and_search_params_work() {
         let out = env_eval(
             "https://example.com/",
