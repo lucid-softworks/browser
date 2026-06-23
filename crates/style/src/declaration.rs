@@ -41,9 +41,10 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
 
     let toks: Vec<&str> = val.split_whitespace().collect();
     // Classify tokens: unitless numbers (no %/px/unit) are grow then shrink; anything that
-    // parses as a length (or `auto`/0px) is the basis.
+    // parses as a length / percentage (or `auto`) is the basis.
     let mut nums: Vec<f32> = Vec::new();
     let mut basis: Option<Option<f32>> = None; // Some(None)=auto, Some(Some(x))=px
+    let mut basis_pct: Option<f32> = None; // percentage basis (fraction), resolved in layout
     for t in &toks {
         let tl = t.to_ascii_lowercase();
         if tl == "auto" {
@@ -64,8 +65,15 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
                 }
             }
         }
-        // Otherwise treat as a length basis.
-        basis = Some(parse_length(t));
+        // A percentage basis (e.g. `55%`) is kept symbolically; other lengths resolve to px.
+        if let Some(p) = tl.strip_suffix('%') {
+            if let Ok(pv) = p.trim().parse::<f32>() {
+                basis_pct = Some(pv / 100.0);
+                basis = Some(None);
+            }
+        } else {
+            basis = Some(parse_length(t));
+        }
     }
     match nums.len() {
         0 => {}
@@ -88,6 +96,7 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
     if let Some(b) = basis {
         style.flex_basis = b;
     }
+    style.flex_basis_pct = basis_pct;
 }
 
 /// Parse a `gap` value: 1 value → both row & column; 2 values → row column.
@@ -704,7 +713,13 @@ pub(crate) fn apply_declaration(
         }
         "flex-basis" => {
             let v = val.trim().to_ascii_lowercase();
-            style.flex_basis = if v == "auto" { None } else { parse_length(val) };
+            if let Some(p) = v.strip_suffix('%') {
+                style.flex_basis = None;
+                style.flex_basis_pct = p.trim().parse::<f32>().ok().map(|x| x / 100.0);
+            } else {
+                style.flex_basis = if v == "auto" { None } else { parse_length(val) };
+                style.flex_basis_pct = None;
+            }
         }
         "align-self" => match val.trim().to_ascii_lowercase().as_str() {
             "auto" => style.align_self = AlignSelf::Auto,

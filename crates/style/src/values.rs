@@ -392,6 +392,10 @@ pub struct ComputedStyle {
     pub flex_shrink: f32,
     /// Flex basis in px (`None` = auto).
     pub flex_basis: Option<f32>,
+    /// Flex basis as a fraction of the container's main size (from a percentage `flex-basis`/`flex`),
+    /// resolved in layout. `None` unless a percentage was given. Takes effect when `flex_basis` (px)
+    /// is `None`.
+    pub flex_basis_pct: Option<f32>,
     pub align_self: AlignSelf,
     pub order: i32,
 

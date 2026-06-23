@@ -705,6 +705,7 @@ pub(crate) fn compute_element_style<'a>(
         flex_grow: 0.0,
         flex_shrink: 1.0,
         flex_basis: None,
+        flex_basis_pct: None,
         align_self: AlignSelf::Auto,
         order: 0,
         row_gap: 0.0,

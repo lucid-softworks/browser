@@ -3006,6 +3006,87 @@ mod tests {
     }
 
     #[test]
+    fn flex_shrink_is_weighted_by_base_size() {
+        // Items 300 + 100 (shrink 1 each) in a 200px flex row: the deficit (-200) is split by scaled
+        // shrink (flex-shrink × base), so the larger item gives up more → 150 and 50, not 100 and 0.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let row = doc.append_element(body, "div");
+        let a = doc.append_element(row, "div");
+        let b = doc.append_element(row, "div");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            row,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                width: Some(200.0),
+                ..Default::default()
+            },
+        );
+        let item = |w: f32| style::ComputedStyle {
+            width: Some(w),
+            height: Some(20.0),
+            ..Default::default()
+        };
+        styles.insert(a, item(300.0));
+        styles.insert(b, item(100.0));
+        let rb = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        assert!(
+            (rect_of(&rb, a).width - 150.0).abs() < 1.0,
+            "a={}",
+            rect_of(&rb, a).width
+        );
+        assert!(
+            (rect_of(&rb, b).width - 50.0).abs() < 1.0,
+            "b={}",
+            rect_of(&rb, b).width
+        );
+    }
+
+    #[test]
+    fn flex_basis_percentage_resolves_against_container() {
+        // `flex: 1 1 50%` items in a 400px flex row each get 200px (basis = 50% of the container).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let row = doc.append_element(body, "div");
+        let a = doc.append_element(row, "div");
+        let b = doc.append_element(row, "div");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            row,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                width: Some(400.0),
+                ..Default::default()
+            },
+        );
+        let item = || style::ComputedStyle {
+            flex_grow: 1.0,
+            flex_shrink: 1.0,
+            flex_basis_pct: Some(0.5),
+            height: Some(20.0),
+            ..Default::default()
+        };
+        styles.insert(a, item());
+        styles.insert(b, item());
+        let rb = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        assert!(
+            (rect_of(&rb, a).width - 200.0).abs() < 1.0,
+            "a={}",
+            rect_of(&rb, a).width
+        );
+        assert!(
+            (rect_of(&rb, b).width - 200.0).abs() < 1.0,
+            "b={}",
+            rect_of(&rb, b).width
+        );
+    }
+
+    #[test]
     fn inline_block_percentage_width_resolves_against_container() {
         // An inline-block with width:50% inside a 400px block is 200px (not shrink-to-fit to its
         // content). Regression: percentage widths used to resolve against the box's intrinsic width.
