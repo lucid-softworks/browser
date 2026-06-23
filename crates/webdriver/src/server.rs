@@ -489,12 +489,18 @@ fn navigate(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
         s.url = url.clone();
         // Tick the event loop until document.readyState === "complete" or a timeout.
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(20) {
+        while start.elapsed() < Duration::from_secs(8) {
             for _ in 0..5 {
                 s.engine.tick();
             }
             let ready = s.engine.console_eval("document.readyState");
             if ready == "complete" {
+                break;
+            }
+            // A failed / non-HTML / error-status navigation has no live document, so readyState can
+            // never reach "complete" — polling would just burn the whole timeout (a major drag on the
+            // suite, since every erroring test paid ~the full wait). Stop as soon as there's no page.
+            if ready == "(no live page)" {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
