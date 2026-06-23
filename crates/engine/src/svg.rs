@@ -121,6 +121,9 @@ impl Affine {
 struct PaintState {
     fill: Option<Color>,   // None => fill:none
     stroke: Option<Color>, // None => stroke:none
+    /// `fill="url(#id)"` reference (gradient). Takes precedence over `fill` when the id resolves to
+    /// a gradient; otherwise `fill` is the solid fallback.
+    fill_url: Option<String>,
     stroke_width: f32,
     fill_opacity: f32,
     stroke_opacity: f32,
@@ -139,6 +142,7 @@ impl Default for PaintState {
                 a: 255,
             }),
             stroke: None,
+            fill_url: None,
             stroke_width: 1.0,
             fill_opacity: 1.0,
             stroke_opacity: 1.0,
@@ -981,7 +985,20 @@ fn resolve_paint(val: &str, inherited: Option<Color>) -> Option<Color> {
 fn apply_paint(el: &dom::ElementData, mut st: PaintState) -> PaintState {
     let style = attr(el, "style").map(|s| s.to_string());
     if let Some(v) = prop(el, "fill", &style) {
-        st.fill = resolve_paint(&v, st.fill);
+        if let Some(id) = paint_url_id(&v) {
+            // A `url(#id)` paint (gradient/pattern): remember the ref; keep a gray solid fallback in
+            // case it doesn't resolve to a gradient we support.
+            st.fill_url = Some(id);
+            st.fill = Some(Color {
+                r: 128,
+                g: 128,
+                b: 128,
+                a: 255,
+            });
+        } else {
+            st.fill_url = None;
+            st.fill = resolve_paint(&v, st.fill);
+        }
     }
     if let Some(v) = prop(el, "stroke", &style) {
         st.stroke = resolve_paint(&v, st.stroke);
@@ -1217,7 +1234,7 @@ fn render_element(
                     ry = rx;
                 }
                 let pts = flatten_rect(x, y, w, h, rx.unwrap_or(0.0), ry.unwrap_or(0.0), &child_m);
-                paint_shape(surf, &[pts], &[true], &child_state, &child_m);
+                paint_shape(doc, surf, &[pts], &[true], &child_state, &child_m);
             }
             "circle" => {
                 let cx = num_attr(el, "cx", 0.0);
@@ -1227,7 +1244,7 @@ fn render_element(
                     return;
                 }
                 let pts = flatten_ellipse(cx, cy, r, r, &child_m);
-                paint_shape(surf, &[pts], &[true], &child_state, &child_m);
+                paint_shape(doc, surf, &[pts], &[true], &child_state, &child_m);
             }
             "ellipse" => {
                 let cx = num_attr(el, "cx", 0.0);
@@ -1238,7 +1255,7 @@ fn render_element(
                     return;
                 }
                 let pts = flatten_ellipse(cx, cy, rx, ry, &child_m);
-                paint_shape(surf, &[pts], &[true], &child_state, &child_m);
+                paint_shape(doc, surf, &[pts], &[true], &child_state, &child_m);
             }
             "line" => {
                 let x1 = num_attr(el, "x1", 0.0);
@@ -1269,12 +1286,12 @@ fn render_element(
                     return;
                 }
                 let closed = tag == "polygon";
-                paint_shape(surf, &[pts], &[closed], &child_state, &child_m);
+                paint_shape(doc, surf, &[pts], &[closed], &child_state, &child_m);
             }
             "path" => {
                 if let Some(d) = attr(el, "d") {
                     let (subpaths, closed) = flatten_path(d, &child_m);
-                    paint_shape(surf, &subpaths, &closed, &child_state, &child_m);
+                    paint_shape(doc, surf, &subpaths, &closed, &child_state, &child_m);
                 }
             }
             "text" | "tspan" => {
@@ -1292,15 +1309,356 @@ fn render_element(
     }
 }
 
+/// Extract the `#id` from a `url(#id)` paint value (quotes/whitespace stripped), or `None`.
+fn paint_url_id(v: &str) -> Option<String> {
+    let t = v.trim();
+    let inner = t.strip_prefix("url(")?;
+    let inner = inner.split(')').next()?.trim();
+    let inner = inner.trim_matches(|c| c == '"' || c == '\'').trim();
+    let id = inner.strip_prefix('#').unwrap_or(inner).trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
+/// A parsed gradient color stop.
+#[derive(Clone, Copy)]
+struct GradStop {
+    offset: f32, // 0..1
+    color: Color,
+}
+
+enum GradKind {
+    Linear { x1: f32, y1: f32, x2: f32, y2: f32 },
+    Radial { cx: f32, cy: f32, r: f32 },
+}
+
+/// A resolved SVG gradient (linear/radial). Coordinates are in either userSpace or the shape's
+/// objectBoundingBox (0..1) per `user_space`.
+struct Gradient {
+    kind: GradKind,
+    stops: Vec<GradStop>,
+    user_space: bool,
+    transform: Affine,
+}
+
+impl Affine {
+    /// Inverse of this affine, or `None` if singular (degenerate scale).
+    fn invert(&self) -> Option<Affine> {
+        let det = self.a * self.d - self.b * self.c;
+        if det.abs() < 1e-9 {
+            return None;
+        }
+        let inv = 1.0 / det;
+        Some(Affine {
+            a: self.d * inv,
+            b: -self.b * inv,
+            c: -self.c * inv,
+            d: self.a * inv,
+            e: (self.c * self.f - self.d * self.e) * inv,
+            f: (self.b * self.e - self.a * self.f) * inv,
+        })
+    }
+}
+
+/// A gradient coordinate attribute: a raw number, or a percentage (→ fraction).
+fn grad_coord(el: &dom::ElementData, name: &str, default: f32) -> f32 {
+    match attr(el, name) {
+        Some(s) => {
+            let s = s.trim();
+            if let Some(p) = s.strip_suffix('%') {
+                p.trim()
+                    .parse::<f32>()
+                    .map(|v| v / 100.0)
+                    .unwrap_or(default)
+            } else {
+                s.parse::<f32>().unwrap_or(default)
+            }
+        }
+        None => default,
+    }
+}
+
+/// Resolve a gradient element (by id) into a [`Gradient`]: its stops (following one level of
+/// `xlink:href` stop inheritance), geometry, units, and `gradientTransform`. `None` if the id isn't a
+/// gradient or has no stops.
+fn resolve_gradient(doc: &Document, id: &str) -> Option<Gradient> {
+    let node = find_by_id(doc, id)?;
+    let el = match &doc.get(node).data {
+        NodeData::Element(e) => e,
+        _ => return None,
+    };
+    let tag = el.tag.to_ascii_lowercase();
+    let is_linear = tag == "lineargradient";
+    let is_radial = tag == "radialgradient";
+    if !is_linear && !is_radial {
+        return None;
+    }
+    let user_space = attr(el, "gradientunits")
+        .map(|u| u.trim().eq_ignore_ascii_case("userSpaceOnUse"))
+        .unwrap_or(false);
+    let transform = attr(el, "gradienttransform")
+        .map(parse_transform)
+        .unwrap_or_else(Affine::identity);
+
+    // Stops: this element's <stop> children, else inherited via xlink:href (one hop).
+    let mut stops = collect_stops(doc, node);
+    if stops.is_empty() {
+        if let Some(href) = attr(el, "href").or_else(|| attr(el, "xlink:href")) {
+            if let Some(rid) = href.trim().strip_prefix('#') {
+                if let Some(rnode) = find_by_id(doc, rid) {
+                    stops = collect_stops(doc, rnode);
+                }
+            }
+        }
+    }
+    if stops.is_empty() {
+        return None;
+    }
+
+    let kind = if is_linear {
+        GradKind::Linear {
+            x1: grad_coord(el, "x1", 0.0),
+            y1: grad_coord(el, "y1", 0.0),
+            x2: grad_coord(el, "x2", if user_space { 0.0 } else { 1.0 }),
+            y2: grad_coord(el, "y2", 0.0),
+        }
+    } else {
+        GradKind::Radial {
+            cx: grad_coord(el, "cx", 0.5),
+            cy: grad_coord(el, "cy", 0.5),
+            r: grad_coord(el, "r", 0.5),
+        }
+    };
+    Some(Gradient {
+        kind,
+        stops,
+        user_space,
+        transform,
+    })
+}
+
+/// Collect `<stop>` children (offset + resolved color incl. stop-opacity) of a gradient element.
+fn collect_stops(doc: &Document, grad: NodeId) -> Vec<GradStop> {
+    let mut out = Vec::new();
+    for &c in &doc.get(grad).children {
+        let el = match &doc.get(c).data {
+            NodeData::Element(e) if e.tag.eq_ignore_ascii_case("stop") => e,
+            _ => continue,
+        };
+        let style = attr(el, "style").map(|s| s.to_string());
+        let offset =
+            match prop(el, "offset", &style).or_else(|| attr(el, "offset").map(str::to_string)) {
+                Some(s) => {
+                    let s = s.trim();
+                    s.strip_suffix('%')
+                        .and_then(|p| p.trim().parse::<f32>().ok().map(|v| v / 100.0))
+                        .or_else(|| s.parse::<f32>().ok())
+                        .unwrap_or(0.0)
+                }
+                None => 0.0,
+            };
+        let mut color = prop(el, "stop-color", &style)
+            .and_then(|c| parse_css_color(c.trim()))
+            .unwrap_or(Color {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            });
+        if let Some(o) = prop(el, "stop-opacity", &style).and_then(|o| o.trim().parse::<f32>().ok())
+        {
+            color = apply_alpha(color, o);
+        }
+        out.push(GradStop {
+            offset: offset.clamp(0.0, 1.0),
+            color,
+        });
+    }
+    out
+}
+
+/// The gradient color at parameter `t` (0..1), interpolating between the surrounding stops.
+fn gradient_color_at(stops: &[GradStop], t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    if t <= stops[0].offset {
+        return stops[0].color;
+    }
+    let last = stops[stops.len() - 1];
+    if t >= last.offset {
+        return last.color;
+    }
+    for w in stops.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if t >= a.offset && t <= b.offset {
+            let span = (b.offset - a.offset).max(1e-6);
+            let f = (t - a.offset) / span;
+            return Color {
+                r: lerp_u8(a.color.r, b.color.r, f),
+                g: lerp_u8(a.color.g, b.color.g, f),
+                b: lerp_u8(a.color.b, b.color.b, f),
+                a: lerp_u8(a.color.a, b.color.a, f),
+            };
+        }
+    }
+    last.color
+}
+
+fn lerp_u8(a: u8, b: u8, f: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * f)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+/// Fill the device-space `subpaths` with a gradient. For each covered pixel, the device point is
+/// mapped back to gradient space (via the inverse shape transform `m` and, for objectBoundingBox
+/// units, the shape's user-space bbox), the gradient parameter `t` computed, and the interpolated
+/// stop color blended. `extra_alpha` folds in fill-opacity × element opacity.
+fn fill_subpaths_gradient(
+    surf: &mut Surface,
+    subpaths: &[Vec<(f32, f32)>],
+    grad: &Gradient,
+    m: &Affine,
+    evenodd: bool,
+    extra_alpha: f32,
+) {
+    // Device-space bounds of the shape.
+    let (mut miny, mut maxy) = (f32::MAX, f32::MIN);
+    let (mut minx, mut maxx) = (f32::MAX, f32::MIN);
+    for p in subpaths {
+        for &(x, y) in p {
+            minx = minx.min(x);
+            maxx = maxx.max(x);
+            miny = miny.min(y);
+            maxy = maxy.max(y);
+        }
+    }
+    if !miny.is_finite() || !minx.is_finite() {
+        return;
+    }
+    let inv = match m.invert() {
+        Some(i) => i,
+        None => return,
+    };
+    // For objectBoundingBox units we need the shape's user-space bbox (map device corners back).
+    let (ux0, uy0) = inv.apply(minx, miny);
+    let (ux1, uy1) = inv.apply(maxx, maxy);
+    let (bb_x, bb_y) = (ux0.min(ux1), uy0.min(uy1));
+    let (bb_w, bb_h) = ((ux1 - ux0).abs().max(1e-6), (uy1 - uy0).abs().max(1e-6));
+    // Gradient geometry → user space (objectBoundingBox maps 0..1 across the bbox).
+    let to_user = |gx: f32, gy: f32| -> (f32, f32) {
+        if grad.user_space {
+            grad.transform.apply(gx, gy)
+        } else {
+            let (px, py) = grad.transform.apply(gx, gy);
+            (bb_x + px * bb_w, bb_y + py * bb_h)
+        }
+    };
+
+    let y0 = miny.floor().max(0.0) as i32;
+    let y1 = (maxy.ceil() as i32).min(surf.h as i32);
+    let mut xs: Vec<(f32, i32)> = Vec::new();
+    for y in y0..y1 {
+        let py = y as f32 + 0.5;
+        xs.clear();
+        for poly in subpaths {
+            let n = poly.len();
+            if n < 2 {
+                continue;
+            }
+            for i in 0..n {
+                let (x0, yy0) = poly[i];
+                let (x1p, yy1) = poly[(i + 1) % n];
+                if (yy0 <= py && yy1 > py) || (yy1 <= py && yy0 > py) {
+                    let t = (py - yy0) / (yy1 - yy0);
+                    let x = x0 + t * (x1p - x0);
+                    let dir = if yy1 > yy0 { 1 } else { -1 };
+                    xs.push((x, dir));
+                }
+            }
+        }
+        if xs.is_empty() {
+            continue;
+        }
+        xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        // Walk spans; inside-ness per even-odd or nonzero winding.
+        let mut wind = 0;
+        for i in 0..xs.len() - 1 {
+            if evenodd {
+                wind ^= 1;
+            } else {
+                wind += xs[i].1;
+            }
+            // Inside the shape when the winding (even-odd toggle or nonzero count) is non-zero.
+            if wind == 0 {
+                continue;
+            }
+            let xa = xs[i].0;
+            let xb = xs[i + 1].0;
+            let xstart = xa.ceil().max(0.0) as i32;
+            let xend = (xb.floor() as i32).min(surf.w as i32 - 1);
+            for x in xstart..=xend {
+                let (ux, uy) = inv.apply(x as f32 + 0.5, py);
+                let t = match &grad.kind {
+                    GradKind::Linear { x1, y1, x2, y2 } => {
+                        let (gx1, gy1) = to_user(*x1, *y1);
+                        let (gx2, gy2) = to_user(*x2, *y2);
+                        let (dx, dy) = (gx2 - gx1, gy2 - gy1);
+                        let len2 = dx * dx + dy * dy;
+                        if len2 < 1e-9 {
+                            0.0
+                        } else {
+                            ((ux - gx1) * dx + (uy - gy1) * dy) / len2
+                        }
+                    }
+                    GradKind::Radial { cx, cy, r } => {
+                        let (gcx, gcy) = to_user(*cx, *cy);
+                        // Radius scales with the bbox (OBB) or stays user-space.
+                        let rr = if grad.user_space {
+                            *r
+                        } else {
+                            r * (bb_w + bb_h) * 0.5
+                        };
+                        if rr < 1e-6 {
+                            1.0
+                        } else {
+                            (((ux - gcx).powi(2) + (uy - gcy).powi(2)).sqrt()) / rr
+                        }
+                    }
+                };
+                let col = apply_alpha(gradient_color_at(&grad.stops, t), extra_alpha);
+                surf.blend(x, y, col);
+            }
+        }
+    }
+}
+
 /// Fill (all subpaths together, honoring fill-rule) then stroke (each subpath) a flattened shape.
 fn paint_shape(
+    doc: &Document,
     surf: &mut Surface,
     subpaths: &[Vec<(f32, f32)>],
     closed: &[bool],
     state: &PaintState,
     m: &Affine,
 ) {
-    if let Some(col) = state.fill_color() {
+    // Gradient fill takes precedence over the solid fallback when the ref resolves.
+    let gradient = state
+        .fill_url
+        .as_deref()
+        .and_then(|id| resolve_gradient(doc, id));
+    if let Some(g) = gradient {
+        fill_subpaths_gradient(
+            surf,
+            subpaths,
+            &g,
+            m,
+            state.evenodd,
+            state.fill_opacity * state.opacity,
+        );
+    } else if let Some(col) = state.fill_color() {
         fill_subpaths(surf, subpaths, col, state.evenodd);
     }
     if let Some(col) = state.stroke_color() {
@@ -1636,6 +1994,33 @@ mod tests {
             0,
             "the original defs rect is not drawn in place"
         );
+    }
+
+    #[test]
+    fn linear_gradient_fill_interpolates_left_to_right() {
+        // A 100x100 rect filled with a userSpaceOnUse red→blue horizontal gradient: left edge red,
+        // right edge blue.
+        let img = render(
+            r##"<svg width="100" height="100" viewBox="0 0 100 100">
+                 <defs>
+                   <linearGradient id="g" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="100" y2="0">
+                     <stop offset="0%" stop-color="#ff0000"/>
+                     <stop offset="100%" stop-color="#0000ff"/>
+                   </linearGradient>
+                 </defs>
+                 <rect width="100" height="100" fill="url(#g)"/>
+               </svg>"##,
+            100,
+            100,
+        );
+        let left = px(&img, 3, 50);
+        let right = px(&img, 96, 50);
+        assert!(left.0 > 200 && left.2 < 60, "left edge red, got {left:?}");
+        assert!(
+            right.2 > 200 && right.0 < 60,
+            "right edge blue, got {right:?}"
+        );
+        assert_eq!(left.3, 255);
     }
 
     #[test]
