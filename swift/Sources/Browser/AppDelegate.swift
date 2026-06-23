@@ -752,20 +752,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
-        // 1. Fire the page's JS click handlers (bubbling). Returns 1 if the DOM changed. Skip while
+        // 1. Resolve a link under the point FIRST: dispatching the click invalidates the layout
+        //    cache that link hit-testing relies on, so link_at must read it beforehand.
+        let linkTarget: String? = browser_engine_link_at(engine, fxDevice, fyDevice).map { String(cString: $0) }
+
+        // 2. Fire the page's JS click handlers (bubbling). Returns 1 if the DOM changed. Skip while
         // a load is running on the engine queue (would race the background mutation).
         let changed = tab.pendingLoads == 0 ? browser_engine_dispatch_click(engine, fxDevice, fyDevice) : 0
 
-        // 2. If it landed on a link, navigate (supersedes a re-render).
-        if let cstr = browser_engine_link_at(engine, fxDevice, fyDevice) {
-            let url = String(cString: cstr)
+        // 3. If it landed on a link, navigate (supersedes a re-render).
+        if let url = linkTarget {
             urlField.stringValue = url
             load(urlString: url, recordHistory: true)
-            refresh()
             return
         }
 
-        // 3. If the click focused a text field, take keyboard focus so typing routes to the page.
+        // 4. If the click focused a text field, take keyboard focus so typing routes to the page.
         if browser_engine_has_text_focus(engine) != 0 {
             window?.makeFirstResponder(bitmapView)
         }
