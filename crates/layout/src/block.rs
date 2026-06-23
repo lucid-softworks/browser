@@ -500,6 +500,31 @@ pub(crate) fn resolve_out_of_flow(
     // are `auto`) is its hypothetical in-flow origin — approximated by this parent's content-box
     // top-left. Captured before the loop so each child sees the same parent content rect.
     let parent_content = boxx.dimensions.content;
+    // If this box is a flex container, abspos children take their static position from its
+    // justify-content / align-items (resolved per child's align-self) rather than the top-left.
+    let flex_parent: Option<style::ComputedStyle> = match display_of(boxx, styles) {
+        style::Display::Flex | style::Display::InlineFlex => style_of(boxx, styles).cloned(),
+        _ => None,
+    };
+    let flex_align_for = |child: &LayoutBox| -> Option<(bool, bool, style::JustifyContent, style::AlignSelf)> {
+        let pcs = flex_parent.as_ref()?;
+        let is_row = matches!(
+            pcs.flex_direction,
+            style::FlexDirection::Row | style::FlexDirection::RowReverse
+        );
+        let reverse = matches!(
+            pcs.flex_direction,
+            style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse
+        );
+        let self_align = style_of(child, styles)
+            .map(|c| c.align_self)
+            .unwrap_or(style::AlignSelf::Auto);
+        let align = match self_align {
+            style::AlignSelf::Auto => crate::flex::align_items_to_self(pcs.align_items),
+            other => other,
+        };
+        Some((is_row, reverse, pcs.justify_content, align))
+    };
     // Tracks where in-flow inline content among the siblings ended, so an abspos that follows it
     // gets the static x/y immediately after that content (e.g. `12345<span style=position:absolute>`
     // sits after "12345", not at the container origin). Reset by a real block, which starts a line.
@@ -507,24 +532,28 @@ pub(crate) fn resolve_out_of_flow(
     for i in 0..boxx.children.len() {
         match position_of(&boxx.children[i], styles) {
             style::Position::Absolute => {
+                let fa = flex_align_for(&boxx.children[i]);
                 let child = &mut boxx.children[i];
                 layout_out_of_flow(
                     child,
                     ctx.positioned,
                     parent_content,
                     inline_cursor,
+                    fa,
                     ctx,
                     styles,
                     measurer,
                 );
             }
             style::Position::Fixed => {
+                let fa = flex_align_for(&boxx.children[i]);
                 let child = &mut boxx.children[i];
                 layout_out_of_flow(
                     child,
                     ctx.viewport,
                     parent_content,
                     inline_cursor,
+                    fa,
                     ctx,
                     styles,
                     measurer,
@@ -544,6 +573,33 @@ pub(crate) fn resolve_out_of_flow(
     }
 }
 
+/// Offset of a flex item's margin box within `free` cross-axis space, for the resolved `align`.
+fn flex_align_offset(align: style::AlignSelf, free: f32) -> f32 {
+    match align {
+        style::AlignSelf::FlexEnd => free,
+        style::AlignSelf::Center => free / 2.0,
+        _ => 0.0, // FlexStart / Stretch / Baseline / Auto → start
+    }
+}
+
+/// Offset of a single flex item's margin box within `free` main-axis space, for `justify`. With a
+/// single (abspos) box, the distributed values collapse to start/center/end.
+fn flex_justify_offset(justify: style::JustifyContent, free: f32, reverse: bool) -> f32 {
+    let off = match justify {
+        style::JustifyContent::FlexEnd => free,
+        style::JustifyContent::Center
+        | style::JustifyContent::SpaceAround
+        | style::JustifyContent::SpaceEvenly => free / 2.0,
+        // FlexStart / SpaceBetween → start
+        _ => 0.0,
+    };
+    if reverse {
+        free - off
+    } else {
+        off
+    }
+}
+
 /// Lay out an out-of-flow box against `cb` (its containing block rect = padding box of the
 /// nearest positioned ancestor, or the viewport). Insets resolve the position; size comes from
 /// explicit width/height or content.
@@ -555,6 +611,11 @@ pub(crate) fn layout_out_of_flow(
     // Static-position origin from preceding inline siblings `(x, y)`, when this box follows inline
     // content. Overrides `cb`/`parent_content` for the axis (or axes) whose insets are both `auto`.
     inline_static: Option<(f32, f32)>,
+    // When the containing block is a flex container, its `(is_row, reverse, justify-content,
+    // resolved align-self)` — the abspos box's static position is then aligned within the container
+    // per those properties (CSS Flexbox §4.1 abspos static position), instead of pinned to the top
+    // -left. `None` for a non-flex containing block.
+    flex_align: Option<(bool, bool, style::JustifyContent, style::AlignSelf)>,
     ctx: Ctx,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
@@ -634,10 +695,21 @@ pub(crate) fn layout_out_of_flow(
 
     // Tentative content origin: relative to the containing block's top-left, offset by insets.
     // The insets address the box's *margin* box edge; we then add the box's own left/top edges.
+    // Margin-box width, used to align the box's static position inside a flex containing block.
+    let margin_box_w = content_width + horizontal;
     let border_left_x = if let Some(l) = inset_left {
         cb.x + l + margin.left
     } else if let Some(r) = inset_right {
         cb.x + cb.width - r - (content_width + horizontal) + margin.left
+    } else if let Some((is_row, reverse, justify, align)) = flex_align {
+        // Flex static position (horizontal axis = main for a row container, cross for a column).
+        let free = (cb.width - margin_box_w).max(0.0);
+        let off = if is_row {
+            flex_justify_offset(justify, free, reverse)
+        } else {
+            flex_align_offset(align, free)
+        };
+        cb.x + off
     } else {
         // Both horizontal insets auto → static position: after preceding inline content if any.
         inline_static.map(|(x, _)| x).unwrap_or(cb.x)
@@ -718,6 +790,27 @@ pub(crate) fn layout_out_of_flow(
                     + padding.top
                     + padding.bottom);
             let new_y = new_border_top + margin.top + border.top + padding.top;
+            shift_subtree(boxx, 0.0, new_y - boxx.dimensions.content.y);
+        }
+    }
+    // Flex static position on the vertical axis (cross for a row container, main for a column), now
+    // that the height is known. Only when both vertical insets are `auto`.
+    if inset_top.is_none() && inset_bottom.is_none() {
+        if let Some((is_row, reverse, justify, align)) = flex_align {
+            let margin_box_h = final_height
+                + margin.top
+                + margin.bottom
+                + border.top
+                + border.bottom
+                + padding.top
+                + padding.bottom;
+            let free = (cb.height - margin_box_h).max(0.0);
+            let off = if is_row {
+                flex_align_offset(align, free)
+            } else {
+                flex_justify_offset(justify, free, reverse)
+            };
+            let new_y = cb.y + off + margin.top + border.top + padding.top;
             shift_subtree(boxx, 0.0, new_y - boxx.dimensions.content.y);
         }
     }

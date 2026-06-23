@@ -1193,6 +1193,50 @@ mod tests {
     }
 
     #[test]
+    fn absolute_flex_child_static_position_follows_justify_and_align() {
+        // An abspos child of a flex container with no insets takes its static position from the
+        // container's justify-content (main) + the child's align-self (cross): both `center` → the
+        // child's border box is centered in the container.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let flex = doc.append_element(body, "div");
+        let item = doc.append_element(flex, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            flex,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                position: style::Position::Relative,
+                width: Some(800.0),
+                height: Some(600.0),
+                justify_content: style::JustifyContent::Center,
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            item,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Absolute,
+                width: Some(140.0),
+                height: Some(60.0),
+                align_self: style::AlignSelf::Center,
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox = find_box(&root_box, &|x| x.node == Some(item)).unwrap();
+        let bb = ibox.dimensions.border_box();
+        assert!((bb.x - 330.0).abs() < 0.5, "x={} (want 330)", bb.x); // (800-140)/2
+        assert!((bb.y - 270.0).abs() < 0.5, "y={} (want 270)", bb.y); // (600-60)/2
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();
