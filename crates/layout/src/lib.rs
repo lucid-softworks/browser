@@ -1237,6 +1237,60 @@ mod tests {
     }
 
     #[test]
+    fn fieldset_legend_offsets_content_into_the_border() {
+        // A `<legend>` is laid out in the fieldset's block-start border; the following content is
+        // pushed down by however much the legend exceeds the border (legend 20 over border 10 → +10).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let fs = doc.append_element(body, "fieldset");
+        let legend = doc.append_element(fs, "legend");
+        let content = doc.append_element(fs, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            fs,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                width: Some(200.0),
+                border: style::Edges::all(10.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            legend,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(20.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            content,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(30.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let fbox = find_box(&root_box, &|x| x.node == Some(fs)).unwrap();
+        let cbox = find_box(&root_box, &|x| x.node == Some(content)).unwrap();
+        // Content border-box top = fieldset content-box top (border 10) + (legend 20 − border 10) = +20.
+        let want = fbox.dimensions.content.y + 10.0;
+        assert!(
+            (cbox.dimensions.border_box().y - want).abs() < 0.5,
+            "content y={} (want {want})",
+            cbox.dimensions.border_box().y
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();

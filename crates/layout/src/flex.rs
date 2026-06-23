@@ -481,10 +481,11 @@ fn flex_item_baseline(
             Some(style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse)
         );
         let pick_last = last ^ reverse;
+        // A fieldset `<legend>` is laid out in the border and doesn't contribute to the baseline.
         let next = if pick_last {
-            b.children.last()
+            b.children.iter().rev().find(|c| !c.style.is_legend)
         } else {
-            b.children.first()
+            b.children.iter().find(|c| !c.style.is_legend)
         };
         match next {
             // A childless box is the leaf (atomic / empty), whose synthesized baseline is its bottom

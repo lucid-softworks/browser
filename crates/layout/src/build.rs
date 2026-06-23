@@ -287,6 +287,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         border_color: cs.border_color,
         border_collapse: cs.border_collapse,
         is_table_cell: cs.display == style::Display::TableCell,
+        is_legend: false,
         underline: cs.underline,
         line_through: cs.line_through,
         overline: cs.overline,
@@ -831,7 +832,9 @@ pub(crate) fn build_box(
                 content
             };
             // Assemble this element's box after recursion unwinds.
-            let mut bx = LayoutBox::new(content, paint_style_of(cs), Some(id));
+            let mut ps = paint_style_of(cs);
+            ps.is_legend = el.tag.eq_ignore_ascii_case("legend");
+            let mut bx = LayoutBox::new(content, ps, Some(id));
             bx.dimensions.margin = edges_of(cs.margin);
             bx.dimensions.padding = edges_of(cs.padding);
             bx.dimensions.border = edges_of(cs.border);

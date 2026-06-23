@@ -263,13 +263,36 @@ pub(crate) fn layout_block_children(
     // in-flow inline (anonymous) box. Tracked so later anonymous boxes aren't re-indented.
     let parent_indent = text_indent_of(boxx.node, styles);
     let mut indent_unused = parent_indent != 0.0;
-    let mut cursor_y = content.y;
+    // Fieldset `<legend>`: laid out inside the block-start border region rather than in normal flow.
+    // The remaining content is shifted down by however much the legend's margin box exceeds the
+    // block-start border (CSS rendering of fieldsets), so e.g. a 20px legend over a 10px border pushes
+    // the content down 10px. The legend is skipped in the flow loop below and excluded from baselines.
+    let mut content_offset = 0.0f32;
+    if let Some(li) = boxx
+        .children
+        .iter()
+        .position(|c| c.style.is_legend && !is_out_of_flow(c, styles))
+    {
+        let containing = Rect {
+            x: content.x,
+            y: content.y,
+            width: content.width,
+            height: 0.0,
+        };
+        grow_stack(|| layout_block(&mut boxx.children[li], containing, ctx, styles, measurer));
+        let lh = boxx.children[li].dimensions.margin_box().height;
+        content_offset = (lh - boxx.dimensions.border.top).max(0.0);
+    }
+    let mut cursor_y = content.y + content_offset;
     // Floats placed by this container (its own block formatting context). Empty for the common
     // float-free page, in which case every helper below is a cheap no-op and the flow is unchanged.
     let mut floats = FloatCtx::new(content.x, content.x + content.width);
     for child in &mut boxx.children {
         if is_out_of_flow(child, styles) {
             continue; // resolved separately; takes no space in flow
+        }
+        if child.style.is_legend {
+            continue; // already laid out in the block-start border above
         }
 
         let float = float_of(child, styles);

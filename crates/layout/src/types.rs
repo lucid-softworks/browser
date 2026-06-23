@@ -67,6 +67,9 @@ pub struct PaintStyle {
     /// True for a `display: table-cell` box. Lets the painter apply the collapsed-borders single-line
     /// rule to cells (top+left lines only) while the table box keeps its full outer border frame.
     pub is_table_cell: bool,
+    /// True for a `<legend>` element. Its fieldset parent lays it out inside the block-start border
+    /// (rather than as a normal in-flow child) and offsets the following content by the legend height.
+    pub is_legend: bool,
     /// Draw an underline under text runs (`text-decoration: underline`).
     pub underline: bool,
     /// Draw a strike-through line over text runs (`text-decoration: line-through`).
@@ -135,6 +138,7 @@ impl Default for PaintStyle {
             border_color: (0, 0, 0),
             border_collapse: style::BorderCollapse::Separate,
             is_table_cell: false,
+            is_legend: false,
             underline: false,
             line_through: false,
             overline: false,
