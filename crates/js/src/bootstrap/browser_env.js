@@ -1015,6 +1015,17 @@
   AbortController.prototype.abort = function (reason) { __abortSignal(this.signal, reason); };
   def(globalThis, "AbortController", AbortController);
 
+  // The "Window-reflecting body element event handler set" (HTML §8.1.7.2.1): these `on*` content
+  // attributes on <body>/<frameset> set the handler on the Window, not the element.
+  globalThis.__windowReflectedBodyHandlers = globalThis.__windowReflectedBodyHandlers || (function () {
+    var s = {};
+    ["onafterprint", "onbeforeprint", "onbeforeunload", "onhashchange", "onlanguagechange",
+      "onmessage", "onmessageerror", "onoffline", "ononline", "onpagehide", "onpageshow",
+      "onpopstate", "onrejectionhandled", "onstorage", "onunhandledrejection", "onunload",
+      "onblur", "onerror", "onfocus", "onload", "onresize", "onscroll"].forEach(function (n) { s[n] = true; });
+    return s;
+  })();
+
   // --- DOM lifecycle dispatch (driven from Rust during the drain) --------------------------
   var readyState = "loading";
   Object.defineProperty(document, "readyState", { get: function () { return readyState; }, enumerable: true, configurable: true });
@@ -1092,6 +1103,25 @@
         if (__st.__loadFired) { continue; }
         def(__st, "__loadFired", true);
         try { __st.dispatchEvent(new Event("load")); } catch (e) {}
+      }
+    } catch (e) {}
+    // Pick up the <body>/<frameset> window-reflecting event-handler content attributes (onload,
+    // onunload, onresize, …) and bind them on the Window before firing load. A page may set a
+    // `<body onload="...">` without any script ever touching `document.body` (so the element wrapper
+    // — which normally compiles inline handlers — is never created); compiling them here guarantees
+    // the handler runs. This is what unblocks the many `check-layout-th.js` tests that start from
+    // `<body onload="checkLayout(...)">`.
+    try {
+      var __bodyish = document.body || (document.querySelector && document.querySelector("frameset"));
+      var __wrh = globalThis.__windowReflectedBodyHandlers || {};
+      if (__bodyish && typeof __bodyish.getAttributeNames === "function") {
+        var __bn = __bodyish.getAttributeNames();
+        for (var __bi = 0; __bi < __bn.length; __bi++) {
+          var __bname = __bn[__bi];
+          if (__wrh[__bname] && typeof globalThis[__bname] !== "function") {
+            try { globalThis[__bname] = new Function("event", __bodyish.getAttribute(__bname)); } catch (e) {}
+          }
+        }
       }
     } catch (e) {}
     fireOn(window, "load");
@@ -4948,11 +4978,23 @@
     // and `this` bound to the element (dispatchEvent calls `el.on<type>`).
     try {
       if (el.tagName && typeof el.getAttributeNames === "function") {
+        // The "Window-reflecting body element event handler set" (HTML §8.1.7.2.1): on <body> and
+        // <frameset> these content attributes set the handler on the WINDOW, not the element. The
+        // `load` event in particular is dispatched at the window (see fireLifecycle), so a
+        // `<body onload="...">` must compile to `window.onload` or it would never fire — which is
+        // exactly what stalls the `check-layout-th.js` tests that kick off from `body.onload`.
+        var __ln = (el.localName || el.tagName || "").toLowerCase();
+        var __winReflect = (__ln === "body" || __ln === "frameset")
+          ? globalThis.__windowReflectedBodyHandlers
+          : null;
         var __ons = el.getAttributeNames();
         for (var __oi = 0; __oi < __ons.length; __oi++) {
           var __on = __ons[__oi];
-          if (__on.length > 2 && __on.slice(0, 2) === "on" && typeof el[__on] !== "function") {
-            try { el[__on] = new Function("event", el.getAttribute(__on)); } catch (e) {}
+          if (__on.length > 2 && __on.slice(0, 2) === "on") {
+            var __target = (__winReflect && __winReflect[__on]) ? globalThis : el;
+            if (typeof __target[__on] !== "function") {
+              try { __target[__on] = new Function("event", el.getAttribute(__on)); } catch (e) {}
+            }
           }
         }
       }

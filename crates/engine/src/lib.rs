@@ -1396,6 +1396,23 @@ mod tests {
     }
 
     #[test]
+    fn body_onload_attribute_fires_on_window_load() {
+        // `<body onload="...">` is a Window-reflecting body event handler: it sets window.onload and
+        // must run when the `load` event fires — even if no script ever touches `document.body`. This
+        // is what unblocks the `check-layout-th.js` WPT tests that start from `<body onload=...>`.
+        let doc = html::parse(
+            r#"<html><body onload="console.log('loaded:' + (typeof window.onload))">
+               <script>/* presence of a script starts the JS session + lifecycle */</script>
+               </body></html>"#,
+        );
+        let (_doc, console) = run_scripts(doc, "https://example.com/");
+        assert!(
+            console.iter().any(|l| l == "loaded:function"),
+            "body onload should fire on window load; got {console:?}"
+        );
+    }
+
+    #[test]
     fn inline_scripts_share_state_in_document_order() {
         let doc = html::parse(
             r#"<html><body><script>var x = 5;</script><script>console.log(x * 2)</script></body></html>"#,
