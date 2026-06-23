@@ -37,9 +37,12 @@ fi
 
 # 1. Ensure the serve/runner infrastructure is in the sparse checkout. `css/support` holds shared
 #    CSS test helpers (e.g. interpolation-testcommon.js) that testharness tests under css/ load via
-#    /css/support/*; `fonts` holds the Ahem test font + ahem.css for exact glyph metrics. Without
-#    them those resources 404 (helper scripts report no subtests; Ahem tests use the fallback font).
-( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts >/dev/null 2>&1 || true )
+#    /css/support/*; `fonts` holds the Ahem test font + ahem.css for exact glyph metrics; `quirks`
+#    holds reference pages that quirks-mode css/ reftests link to (e.g.
+#    /quirks/reference/*.html via ../../quirks/...). Without them those resources 404 (helper scripts
+#    report no subtests; Ahem tests use the fallback font; reftest refs fail to load and the
+#    comparison can't run).
+( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks >/dev/null 2>&1 || true )
 
 # 2. Install our product into the checkout's wptrunner.browsers package (the checkout is gitignored,
 #    so the canonical copy lives in tools/wpt/). Register the product name in BUILTIN_PRODUCTS.
