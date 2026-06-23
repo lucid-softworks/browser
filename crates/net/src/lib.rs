@@ -635,6 +635,16 @@ fn request_streaming_inner(
     };
 
     let status = resp.status();
+    // The URL the response actually came from — ureq follows redirects, so this is the post-redirect
+    // location (e.g. en.wikipedia.org/ → /wiki/Main_Page). Falls back to the requested URL.
+    let final_url = {
+        let u = resp.get_url();
+        if u.is_empty() {
+            url.to_string()
+        } else {
+            u.to_string()
+        }
+    };
     let content_type = resp
         .header("Content-Type")
         .unwrap_or("application/octet-stream")
@@ -694,7 +704,7 @@ fn request_streaming_inner(
     Ok(ResponseMeta {
         status,
         content_type,
-        final_url: url.to_string(),
+        final_url,
     })
 }
 
