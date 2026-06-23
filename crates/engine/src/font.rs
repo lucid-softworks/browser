@@ -6,21 +6,20 @@
 
 use paint::{GlyphBitmap, GlyphRasterizer};
 
-/// Candidate single-file TTFs, tried in order, per OS. Prefer modern fonts with a proper UNICODE
-/// cmap: legacy fonts (e.g. macOS Monaco/Geneva) carry a Mac-Roman cmap where byte 0xB7 is `∑`, so
-/// `·` (U+00B7) and most non-ASCII glyphs (é, α, →, €…) map to the WRONG glyph. Monospace first to
-/// keep the look, then broad-coverage fallbacks. (A future upgrade is `font-kit` for true system
-/// font enumeration; this fixed list is dependency-free and covers the common installs.)
+/// Candidate single-file TTFs for the DEFAULT (proportional sans-serif) UA font, tried in order, per
+/// OS. The web overwhelmingly uses proportional sans/serif text, so the default must be proportional
+/// — a monospace default makes every page (e.g. wikipedia.org) render fixed-width. Prefer modern
+/// fonts with a proper UNICODE cmap: legacy fonts (e.g. macOS Monaco/Geneva) carry a Mac-Roman cmap
+/// where byte 0xB7 is `∑`, so `·` (U+00B7) and most non-ASCII glyphs map to the WRONG glyph.
+/// (A future upgrade is `font-kit` for true system font enumeration + per-`font-family` serif/
+/// monospace selection; this fixed list is dependency-free.)
 #[cfg(target_os = "macos")]
 const FONT_CANDIDATES: &[&str] = &[
-    "/System/Library/Fonts/SFNSMono.ttf",
-    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf", // proportional sans (reliable single-file TTF)
+    "/System/Library/Fonts/SFNS.ttf",               // San Francisco (proportional), if parseable
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    "/System/Library/Fonts/Supplemental/Arial.ttf",
-    // Legacy single-file fonts (Mac-Roman cmap) — last resort only.
-    "/System/Library/Fonts/Monaco.ttf",
     "/System/Library/Fonts/Geneva.ttf",
-    "/System/Library/Fonts/NewYork.ttf",
+    "/System/Library/Fonts/SFNSMono.ttf", // monospace — only if no proportional face is available
 ];
 
 #[cfg(target_os = "linux")]
