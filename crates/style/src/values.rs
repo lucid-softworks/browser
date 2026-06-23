@@ -197,7 +197,10 @@ pub enum AlignItems {
     FlexStart,
     FlexEnd,
     Center,
+    /// `baseline` / `first baseline`.
     Baseline,
+    /// `last baseline`.
+    LastBaseline,
 }
 
 /// Per-item cross-axis alignment override.
@@ -208,7 +211,10 @@ pub enum AlignSelf {
     FlexStart,
     FlexEnd,
     Center,
+    /// `baseline` / `first baseline`.
     Baseline,
+    /// `last baseline`.
+    LastBaseline,
 }
 
 /// A grid track size.

@@ -244,6 +244,9 @@ pub(crate) fn layout_flex(
         // top of it (the observed vertical overlap).
         let mut actual_cross: Vec<f32> = vec![0.0; metas.len()]; // per-meta, item margin-box cross
         let mut actual_laid: Vec<f32> = vec![0.0; metas.len()]; // per-meta, content height laid out
+        // For `align-*: [first|last] baseline`: each participating item's baseline as an offset from
+        // its cross-start margin edge. Only well-defined for a (horizontal) row container — see below.
+        let mut item_baseline: Vec<Option<f32>> = vec![None; metas.len()];
         for &mi in line {
             let item_main = size_of(mi);
             let meta = &metas[mi];
@@ -277,7 +280,33 @@ pub(crate) fn layout_flex(
                 meta.cross
             };
             actual_cross[mi] = cross_extent;
+
+            // Record the item's baseline if it participates in baseline alignment. Only meaningful
+            // when the item's baseline is parallel to the cross axis — for a ROW container that's the
+            // usual case; for a COLUMN container the baseline is perpendicular to the cross axis and
+            // the spec falls back to start alignment, so we leave it `None`.
+            let resolved = match metas[mi].align {
+                style::AlignSelf::Auto => align_items_to_self(cs.align_items),
+                other => other,
+            };
+            if is_row
+                && matches!(
+                    resolved,
+                    style::AlignSelf::Baseline | style::AlignSelf::LastBaseline
+                )
+            {
+                let last = matches!(resolved, style::AlignSelf::LastBaseline);
+                item_baseline[mi] =
+                    Some(flex_item_baseline(&boxx.children[metas[mi].idx], last, styles));
+            }
         }
+
+        // The line's reference baseline = the largest item baseline; baseline-aligned items then
+        // shift so their baselines coincide there.
+        let ref_baseline: Option<f32> = item_baseline
+            .iter()
+            .filter_map(|b| *b)
+            .fold(None, |acc, b| Some(acc.map_or(b, |a: f32| a.max(b))));
 
         // Cross size of this line = max actual item cross size, but if the container has an
         // explicit cross size and this is a single line, the line fills the container's cross
@@ -306,12 +335,20 @@ pub(crate) fn layout_flex(
                 _ => this_cross,
             };
             let cross_off = match align {
-                style::AlignSelf::FlexStart
-                | style::AlignSelf::Stretch
-                | style::AlignSelf::Baseline => 0.0,
+                style::AlignSelf::FlexStart | style::AlignSelf::Stretch | style::AlignSelf::Auto => {
+                    0.0
+                }
                 style::AlignSelf::FlexEnd => line_cross - this_cross,
                 style::AlignSelf::Center => (line_cross - this_cross) / 2.0,
-                style::AlignSelf::Auto => 0.0,
+                // Baseline: shift the item down so its baseline meets the line's reference baseline.
+                // Falls back to start when this item has no cross-axis baseline (e.g. a column
+                // container — see Pass A, where `item_baseline` stays `None`).
+                style::AlignSelf::Baseline | style::AlignSelf::LastBaseline => {
+                    match (ref_baseline, item_baseline[mi]) {
+                        (Some(r), Some(b)) => (r - b).max(0.0),
+                        _ => 0.0,
+                    }
+                }
             };
             let cross_off = if matches!(align, style::AlignSelf::Stretch) {
                 0.0
@@ -415,6 +452,51 @@ pub(crate) fn order_of(
     style_of(boxx, styles).map(|cs| cs.order).unwrap_or(0)
 }
 
+/// The first (or `last`) baseline of a laid-out flex item, as an offset DOWN from the item's
+/// margin-box top edge (for a row container). Per CSS Flexbox §8.3 the baseline propagates from the
+/// item's startmost/endmost in-flow descendant: we descend the first (or last) in-flow child until a
+/// leaf, then take a text leaf's alphabetic baseline (≈ 0.8·font-size below its top, matching the
+/// painter) or, for an atomic leaf (inline-block / replaced / empty box), its bottom margin edge —
+/// which is the synthesized baseline of a box with no in-flow line. This yields the exact values the
+/// flex-baseline reftests expect (e.g. an `inline-block; height:1em` span contributes a `1em`
+/// baseline, and a nested flex container contributes its first/last item's baseline).
+fn flex_item_baseline(
+    item: &LayoutBox,
+    last: bool,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> f32 {
+    fn leaf_baseline_abs(
+        b: &LayoutBox,
+        last: bool,
+        styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    ) -> f32 {
+        if let BoxContent::Text(_) | BoxContent::Marker(_) = &b.content {
+            return b.dimensions.content.y + b.style.font_size * 0.8;
+        }
+        // Pick the startmost child for a first baseline (endmost for a last baseline). A
+        // *-reverse flex container lays its items out against source order, so flip the choice
+        // there — that's what makes the `row-reverse`/`column-reverse` baselines come out right.
+        let reverse = matches!(
+            style_of(b, styles).map(|cs| cs.flex_direction),
+            Some(style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse)
+        );
+        let pick_last = last ^ reverse;
+        let next = if pick_last {
+            b.children.last()
+        } else {
+            b.children.first()
+        };
+        match next {
+            // A childless box is the leaf (atomic / empty), whose synthesized baseline is its bottom
+            // margin edge.
+            Some(c) => leaf_baseline_abs(c, last, styles),
+            None => b.dimensions.margin_box().y + b.dimensions.margin_box().height,
+        }
+    }
+    let top = item.dimensions.margin_box().y;
+    leaf_baseline_abs(item, last, styles) - top
+}
+
 /// Map a container's `align-items` to the equivalent per-item `align-self`.
 pub(crate) fn align_items_to_self(a: style::AlignItems) -> style::AlignSelf {
     match a {
@@ -423,6 +505,7 @@ pub(crate) fn align_items_to_self(a: style::AlignItems) -> style::AlignSelf {
         style::AlignItems::FlexEnd => style::AlignSelf::FlexEnd,
         style::AlignItems::Center => style::AlignSelf::Center,
         style::AlignItems::Baseline => style::AlignSelf::Baseline,
+        style::AlignItems::LastBaseline => style::AlignSelf::LastBaseline,
     }
 }
 

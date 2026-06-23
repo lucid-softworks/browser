@@ -455,6 +455,7 @@ impl ComputedStyle {
                 AlignItems::FlexEnd => "flex-end",
                 AlignItems::Center => "center",
                 AlignItems::Baseline => "baseline",
+                AlignItems::LastBaseline => "last baseline",
             }
             .to_string(),
             "align-content" => match self.align_content {
@@ -473,6 +474,7 @@ impl ComputedStyle {
                 AlignSelf::FlexEnd => "flex-end",
                 AlignSelf::Center => "center",
                 AlignSelf::Baseline => "baseline",
+                AlignSelf::LastBaseline => "last baseline",
             }
             .to_string(),
             "order" => self.order.to_string(),
