@@ -634,6 +634,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Show an empty address bar for the blank initial document (a "New Tab"), so the user can
         // just type — rather than displaying the literal "about:blank".
         urlField.stringValue = (tab.urlString == "about:blank" || tab.urlString == "about:") ? "" : tab.urlString
+        updateAddressBarIcon()
         updateNavButtons()
         if tab.isLoading {
             progress.startAnimation(nil)
@@ -1094,6 +1095,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.setNeedsDisplay(bitmapView.bounds)
     }
 
+    /// Set the address-bar leading icon to the active tab's favicon, falling back to the globe
+    /// symbol when there's no icon (e.g. the New Tab page or a page without one).
+    func updateAddressBarIcon() {
+        if let favicon = activeTab?.favicon {
+            lockSymbol.contentTintColor = nil // don't tint a real (non-template) icon
+            lockSymbol.image = favicon
+        } else {
+            lockSymbol.contentTintColor = NSColor.secondaryLabelColor
+            lockSymbol.image = NSImage(systemSymbolName: "globe", accessibilityDescription: nil)
+        }
+    }
+
     /// A progressive frame painted by the engine WHILE a page streams in (pushed from the load
     /// thread via the C callback). Only show it if `tab` is still the visible tab.
     func displayProgressFrame(forTab tab: Tab, data: Data, width: Int, height: Int, stride: Int) {
@@ -1195,6 +1208,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // The engine's committed URL after fixup/HSTS/redirect/http-fallback — what the address
             // bar and history should actually reflect (falls back to the requested text if absent).
             let committed = browser_engine_current_url(engine).map { String(cString: $0) } ?? urlString
+            // Snapshot the favicon on the engine queue (its pixels are valid only until the next load).
+            let favicon = faviconImage(from: engine)
             DispatchQueue.main.async {
                 tab.isLoading = false
                 tab.pendingLoads -= 1
@@ -1215,6 +1230,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 tab.urlString = committed
                 if shouldRecord { tab.recordHistory(committed) }
                 if self.activeTab === tab { self.urlField.stringValue = committed }
+                tab.favicon = favicon
                 // Use the page's <title> for the tab label (fall back to the host title).
                 if let cstr = browser_engine_title(engine) {
                     let pageTitle = String(cString: cstr)
@@ -1225,11 +1241,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
                 // Only repaint if the tab that finished is still the active one.
                 if self.activeTab === tab {
+                    self.updateAddressBarIcon()
                     self.refresh()
                     self.updateNavButtons()
                 }
             }
         }
     }
+}
+
+/// Build an `NSImage` from the engine's current favicon bitmap (straight-alpha RGBA8), or `nil` if
+/// the page has no icon. Copies the pixels, so it's safe to call on the tab's engine queue (where
+/// the borrowed pointer is valid until the next load).
+private func faviconImage(from engine: OpaquePointer) -> NSImage? {
+    let fb = browser_engine_favicon(engine)
+    guard let pixels = fb.pixels, fb.width > 0, fb.height > 0 else { return nil }
+    let w = Int(fb.width), h = Int(fb.height), stride = Int(fb.stride)
+    let data = Data(bytes: pixels, count: stride * h) as CFData
+    guard let provider = CGDataProvider(data: data) else { return nil }
+    // Engine favicons are straight (non-premultiplied) alpha RGBA8.
+    let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue)
+    guard let cg = CGImage(
+        width: w, height: h,
+        bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: stride,
+        space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: bitmapInfo,
+        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent
+    ) else { return nil }
+    return NSImage(cgImage: cg, size: NSSize(width: 16, height: 16))
 }
 

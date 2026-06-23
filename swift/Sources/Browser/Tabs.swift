@@ -25,6 +25,9 @@ final class Tab {
     private(set) var engine: OpaquePointer?
     var urlString: String = ""
     var title: String = "New Tab"
+    /// The page's decoded favicon (from the engine), shown in the tab chip + address bar. `nil`
+    /// until one loads (or for pages without an icon).
+    var favicon: NSImage?
 
     // Per-tab navigation history.
     var history: [String] = []
@@ -118,6 +121,7 @@ final class TabButton: NSView {
 
     private let titleLabel = NSTextField(labelWithString: "")
     private let closeButton = HoverButton()
+    private let faviconView = NSImageView()
     private var trackingArea: NSTrackingArea?
     private var hovering = false { didSet { updateAppearance() } }
 
@@ -150,18 +154,30 @@ final class TabButton: NSView {
         closeButton.toolTip = "Close Tab"
         addSubview(closeButton)
 
+        // Layout (Chrome/Firefox order): favicon on the left, title in the middle, close "×" on the
+        // right (the close button only appears on hover/active; its slot is reserved either way so
+        // the title doesn't shift).
+        faviconView.imageScaling = .scaleProportionallyDown
+        faviconView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(faviconView)
+
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 28),
             widthAnchor.constraint(greaterThanOrEqualToConstant: 90),
             widthAnchor.constraint(lessThanOrEqualToConstant: 200),
 
-            closeButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            faviconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            faviconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            faviconView.widthAnchor.constraint(equalToConstant: 16),
+            faviconView.heightAnchor.constraint(equalToConstant: 16),
+
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.widthAnchor.constraint(equalToConstant: 18),
             closeButton.heightAnchor.constraint(equalToConstant: 18),
 
-            titleLabel.leadingAnchor.constraint(equalTo: closeButton.trailingAnchor, constant: 4),
-            titleLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            titleLabel.leadingAnchor.constraint(equalTo: faviconView.trailingAnchor, constant: 7),
+            titleLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -4),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
 
@@ -173,6 +189,8 @@ final class TabButton: NSView {
 
     func updateTitle() {
         titleLabel.stringValue = tab.title.isEmpty ? "New Tab" : tab.title
+        faviconView.image = tab.favicon
+        updateAppearance() // favicon presence affects the leading-slot visibility
         refreshStatsTooltip()
     }
 
@@ -194,8 +212,9 @@ final class TabButton: NSView {
             layer?.backgroundColor = NSColor.clear.cgColor
             titleLabel.textColor = NSColor.secondaryLabelColor
         }
-        // Close button only visible when active or hovered.
+        // Close "×" (right) shows only on active/hover; favicon (left) shows whenever there is one.
         closeButton.isHidden = !(isActive || hovering)
+        faviconView.isHidden = tab.favicon == nil
     }
 
     override func updateTrackingAreas() {

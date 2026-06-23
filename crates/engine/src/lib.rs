@@ -183,6 +183,10 @@ pub struct Engine {
     /// (after layout) by rasterizing the box's [`MaskSource`] to its border-box device size; the
     /// alpha channel is the coverage the painter multiplies the background by.
     mask_bitmaps: HashMap<dom::NodeId, DecodedImage>,
+    /// The current page's decoded favicon (RGBA8), resolved from `<link rel=icon>` (or the
+    /// origin's `/favicon.ico`) during `load_url`. `None` until one loads. Read by the shell to show
+    /// the site icon in the tab and address bar. Cleared at the start of each navigation.
+    favicon: Option<DecodedImage>,
 }
 
 /// A fetched/decoded `mask-image` source, ready to rasterize to a per-box coverage bitmap.

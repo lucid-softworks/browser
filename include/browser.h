@@ -163,6 +163,17 @@ const char *browser_engine_title(struct Engine *engine);
 const char *browser_engine_current_url(struct Engine *engine);
 
 /**
+ * The current page's favicon as a borrowed RGBA8 (straight-alpha) [`Framebuffer`] (`stride` =
+ * `width * 4`), or an empty framebuffer (null `pixels`) if the page has no loadable icon. The
+ * pixels are owned by the engine and stay valid until the next `browser_engine_load_url` (which
+ * replaces the icon) or `browser_engine_free` — copy them synchronously.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+struct Framebuffer browser_engine_favicon(struct Engine *engine);
+
+/**
  * Paint the current state and return a borrowed view of the framebuffer.
  * Valid until the next render/free on this handle.
  *

@@ -235,6 +235,29 @@ pub unsafe extern "C" fn browser_engine_current_url(engine: *mut Engine) -> *con
     }
 }
 
+/// The current page's favicon as a borrowed RGBA8 (straight-alpha) [`Framebuffer`] (`stride` =
+/// `width * 4`), or an empty framebuffer (null `pixels`) if the page has no loadable icon. The
+/// pixels are owned by the engine and stay valid until the next `browser_engine_load_url` (which
+/// replaces the icon) or `browser_engine_free` — copy them synchronously.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_favicon(engine: *mut Engine) -> Framebuffer {
+    let Some(e) = engine.as_mut() else {
+        return Framebuffer::empty();
+    };
+    match e.inner.favicon() {
+        Some((px, w, h)) => Framebuffer {
+            pixels: px.as_ptr(),
+            width: w,
+            height: h,
+            stride: w.saturating_mul(4),
+        },
+        None => Framebuffer::empty(),
+    }
+}
+
 /// Paint the current state and return a borrowed view of the framebuffer.
 /// Valid until the next render/free on this handle.
 ///

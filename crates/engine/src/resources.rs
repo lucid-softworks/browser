@@ -612,6 +612,123 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
     })
 }
 
+/// Max favicon download size — favicons are tiny; this caps abuse without rejecting real icons.
+const MAX_FAVICON_BYTES: usize = 2 * 1024 * 1024;
+/// Pixel size favicons are decoded/rasterized to for the tab + address-bar slot (covers 2× of the
+/// ~16pt UI icon; the shell downsamples to fit).
+const FAVICON_PX: u32 = 32;
+
+/// Resolve the page's favicon URL: the first `<link rel~="icon">` href (or a `data:` icon),
+/// resolved against `base`; otherwise the origin's `/favicon.ico`. `None` when no http(s) origin can
+/// be derived (e.g. a `file://` page with no explicit icon link).
+pub(crate) fn resolve_favicon_url(doc: &dom::Document, base: &str) -> Option<String> {
+    fn walk(doc: &dom::Document, id: dom::NodeId, base: &str) -> Option<String> {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("link") {
+                let rel = e.attrs.get("rel").map(String::as_str).unwrap_or("");
+                // `rel="icon"` / `rel="shortcut icon"` (token match; excludes `apple-touch-icon`).
+                let is_icon = rel
+                    .split_whitespace()
+                    .any(|t| t.eq_ignore_ascii_case("icon"));
+                if is_icon {
+                    if let Some(href) = e.attrs.get("href") {
+                        let h = href.trim();
+                        if h.starts_with("data:") {
+                            return Some(h.to_string()); // inline icon; decoded directly later
+                        }
+                        if let Some(abs) = resolve_url(base, h) {
+                            return Some(abs);
+                        }
+                    }
+                }
+            }
+        }
+        for &child in &doc.get(id).children {
+            if let Some(u) = walk(doc, child, base) {
+                return Some(u);
+            }
+        }
+        None
+    }
+    if let Some(u) = walk(doc, doc.root(), base) {
+        return Some(u);
+    }
+    // Fallback to <origin>/favicon.ico, but only for http(s) pages.
+    let parsed = url::Url::parse(base).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => parsed.join("/favicon.ico").ok().map(Into::into),
+        _ => None,
+    }
+}
+
+/// Fetch + decode the favicon at `url` into RGBA8. Handles raster formats (ICO/PNG/JPEG/GIF/WebP)
+/// via the image decoder and SVG via the engine's own rasterizer; `data:` icons decode inline.
+/// Best-effort: any failure (network, unsupported format, decode error) returns `None`.
+pub(crate) fn fetch_favicon(url: &str, font: Option<&SystemFont>) -> Option<DecodedImage> {
+    // Bytes + a lowercased content-type/MIME hint.
+    let (bytes, ctype) = if url.starts_with("data:") {
+        let mime = url
+            .get("data:".len()..)?
+            .split([';', ','])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        (decode_data_url(url)?, mime)
+    } else {
+        let resp = net::fetch(url).ok()?;
+        if resp.body.len() > MAX_FAVICON_BYTES {
+            return None;
+        }
+        (resp.body, resp.content_type.to_ascii_lowercase())
+    };
+    if bytes.is_empty() {
+        return None;
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_svg = ctype.contains("svg") || path.ends_with(".svg") || bytes_look_like_svg(&bytes);
+    if is_svg {
+        decode_svg_favicon(&bytes, font)
+    } else {
+        decode_image(&bytes)
+    }
+}
+
+/// Heuristic sniff for SVG markup (covers responses served with a wrong/missing content-type).
+fn bytes_look_like_svg(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(512)];
+    let s = String::from_utf8_lossy(head);
+    let s = s.trim_start();
+    s.starts_with("<svg")
+        || ((s.starts_with("<?xml") || s.starts_with("<!--")) && s.contains("<svg"))
+}
+
+/// Parse standalone SVG markup and rasterize its first `<svg>` element to a square favicon bitmap.
+fn decode_svg_favicon(bytes: &[u8], font: Option<&SystemFont>) -> Option<DecodedImage> {
+    fn find_svg(doc: &dom::Document, id: dom::NodeId) -> Option<dom::NodeId> {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("svg") {
+                return Some(id);
+            }
+        }
+        for &c in &doc.get(id).children {
+            if let Some(s) = find_svg(doc, c) {
+                return Some(s);
+            }
+        }
+        None
+    }
+    let markup = String::from_utf8_lossy(bytes);
+    let doc = html::parse(&markup);
+    let svg_id = find_svg(&doc, doc.root())?;
+    Some(crate::svg::rasterize_svg(
+        &doc, svg_id, FAVICON_PX, FAVICON_PX, font,
+    ))
+}
+
 /// Whether `bytes` look like a JPEG XL stream: either the raw codestream marker (`FF 0A`) or the
 /// ISOBMFF container's signature box (`00000000C 'JXL ' 0D 0A 87 0A`).
 pub(crate) fn is_jxl(bytes: &[u8]) -> bool {

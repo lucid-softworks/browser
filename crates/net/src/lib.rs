@@ -1045,9 +1045,18 @@ mod tests {
 
     #[test]
     fn host_of_extracts_host_without_port_or_userinfo() {
-        assert_eq!(host_of("https://Example.COM/path").as_deref(), Some("example.com"));
-        assert_eq!(host_of("http://user:pw@example.com:8080/x").as_deref(), Some("example.com"));
-        assert_eq!(host_of("https://example.com.").as_deref(), Some("example.com")); // trailing dot
+        assert_eq!(
+            host_of("https://Example.COM/path").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            host_of("http://user:pw@example.com:8080/x").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            host_of("https://example.com.").as_deref(),
+            Some("example.com")
+        ); // trailing dot
         assert_eq!(host_of("https://[::1]:443/x"), None); // IPv6 literal: no HSTS
         assert_eq!(host_of("about:blank"), None);
     }
@@ -1066,8 +1075,14 @@ mod tests {
         assert!(hsts_pinned_url(&format!("http://{host}/x")));
 
         // hsts_upgrade rewrites http→https for a pinned host, leaves https/others alone.
-        assert_eq!(hsts_upgrade(&format!("http://{host}/x")), format!("https://{host}/x"));
-        assert_eq!(hsts_upgrade("http://not-pinned.invalid/x"), "http://not-pinned.invalid/x");
+        assert_eq!(
+            hsts_upgrade(&format!("http://{host}/x")),
+            format!("https://{host}/x")
+        );
+        assert_eq!(
+            hsts_upgrade("http://not-pinned.invalid/x"),
+            "http://not-pinned.invalid/x"
+        );
 
         // max-age=0 clears the pin.
         hsts::record(host, "max-age=0");

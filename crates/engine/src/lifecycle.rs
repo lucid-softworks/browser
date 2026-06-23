@@ -26,6 +26,7 @@ impl Engine {
             svg_bitmaps: HashMap::new(),
             mask_sources: HashMap::new(),
             mask_bitmaps: HashMap::new(),
+            favicon: None,
         }
     }
 
@@ -111,6 +112,12 @@ impl Engine {
         }
     }
 
+    /// The current page's decoded favicon as straight-alpha RGBA8 `(pixels, width, height)`, or
+    /// `None` if the page has no (loadable) icon. The shell renders it in the tab + address bar.
+    pub fn favicon(&self) -> Option<(&[u8], u32, u32)> {
+        self.favicon.as_ref().map(|f| (f.rgba.as_slice(), f.w, f.h))
+    }
+
     pub fn load_url(&mut self, url: &str) -> i32 {
         self.scroll_y = 0.0; // new navigation starts at the top
         self.layout_cache = None; // invalidate cached layout for the previous page
@@ -122,6 +129,7 @@ impl Engine {
         self.session = None; // drop the previous page's runtime (stops its thread)
         self.selection = None; // a new page starts with nothing selected
         self.inspect_node = None; // and nothing highlighted in the Elements inspector
+        self.favicon = None; // and no site icon until this page's loads
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
 
         // URL fixup (shared with every other shell via `net::fixup_url`): a schemeless address-bar
@@ -193,6 +201,14 @@ impl Engine {
                 };
 
                 let mut console: Vec<String> = Vec::new();
+                // Resolve the favicon URL from the parsed document (pre-script `<link rel=icon>` /
+                // origin fallback) before `final_doc` is moved into the JS session; it's fetched +
+                // decoded below once the page has settled.
+                let favicon_url = if looks_html {
+                    resolve_favicon_url(&final_doc, &base)
+                } else {
+                    None
+                };
                 let doc = if looks_html {
                     // Pre-layout the parsed document (inline-CSS only, no network) so the JS session
                     // can seed `layout_rects` BEFORE its scripts run. Synchronous layout-dependent
@@ -249,6 +265,9 @@ impl Engine {
                 // Pick up any @font-face declared in runtime-injected stylesheets (most are already
                 // loaded by `load_web_fonts_early` before scripts; this catches script-added ones).
                 self.load_web_fonts(&styles, &base);
+                // Fetch + decode the site favicon (best-effort; the page is already painted via the
+                // streaming/final frame, so this only gates the shell's icon update).
+                self.favicon = favicon_url.and_then(|u| fetch_favicon(&u, self.font.as_ref()));
                 self.state = LoadState::Loaded {
                     url: meta.final_url,
                     doc,
