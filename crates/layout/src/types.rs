@@ -86,6 +86,9 @@ pub struct PaintStyle {
     /// inherits, descendants are `false` too unless one opts back in with `visibility: visible` —
     /// so the painter still recurses into children rather than culling the subtree.
     pub visible: bool,
+    /// `overflow` is not `visible` (hidden/clip/scroll/auto): the painter clips this box's
+    /// descendants to its padding box. Drives CSS `overflow` clipping (and hides `sr-only` content).
+    pub clips_overflow: bool,
     /// Extra px advance added per character (`letter-spacing`). Painter uses it to space glyphs.
     pub letter_spacing: f32,
     /// Resolved `line-height` in px (`None` = use the font metric). Drives inline line advance.
@@ -139,6 +142,7 @@ impl Default for PaintStyle {
             white_space: style::WhiteSpace::Normal,
             opacity: 1.0,
             visible: true,
+            clips_overflow: false,
             letter_spacing: 0.0,
             line_height: None,
             font_family: None,

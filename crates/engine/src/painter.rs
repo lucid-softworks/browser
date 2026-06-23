@@ -671,6 +671,16 @@ pub(crate) fn paint_box_opacity(
         }
     }
 
+    // CSS `overflow` clipping: clip this box's descendants to its padding box (intersected with any
+    // outer clip), then restore. Axis-aligned only (a rotated clip region is out of scope). This is
+    // what hides `overflow:hidden` content — including the `width:1px;overflow:hidden` "screen
+    // reader only" idiom whose text would otherwise leak and disrupt layout.
+    let saved_clip = fb.clip;
+    if b.style.clips_overflow && xf.is_axis_aligned() {
+        let pb = b.dimensions.padding_box();
+        let r = xf_rect(xf, pb.x, pb.y, pb.width, pb.height);
+        fb.clip = Some(intersect_clip(saved_clip, r));
+    }
     for child in &b.children {
         paint_box_opacity(
             fb,
@@ -688,6 +698,26 @@ pub(crate) fn paint_box_opacity(
             sel_ranges,
             run_idx,
         );
+    }
+    fb.clip = saved_clip;
+}
+
+/// Intersect an optional existing clip rect with `r` (both device px) for nested overflow clipping.
+fn intersect_clip(prev: Option<Rect>, r: Rect) -> Rect {
+    match prev {
+        None => r,
+        Some(p) => {
+            let x0 = p.x.max(r.x);
+            let y0 = p.y.max(r.y);
+            let x1 = (p.x + p.w).min(r.x + r.w);
+            let y1 = (p.y + p.h).min(r.y + r.h);
+            Rect {
+                x: x0,
+                y: y0,
+                w: (x1 - x0).max(0),
+                h: (y1 - y0).max(0),
+            }
+        }
     }
 }
 

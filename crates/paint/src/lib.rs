@@ -11,6 +11,10 @@ pub struct Framebuffer {
     pub height: u32,
     pub stride: u32,
     pub pixels: Vec<u8>,
+    /// Optional clip rectangle (device px): when set, all primitives are additionally clipped to it
+    /// (intersected with the framebuffer bounds). Drives CSS `overflow: hidden`/`clip`/`scroll`. The
+    /// painter saves/restores it around a clipping box's subtree.
+    pub clip: Option<Rect>,
 }
 
 /// An RGBA color, 0..=255 per channel.
@@ -53,7 +57,30 @@ impl Framebuffer {
             height,
             stride,
             pixels,
+            clip: None,
         }
+    }
+
+    /// The effective drawable bounds `(x0, y0, x1, y1)`: the framebuffer rect intersected with the
+    /// current clip rect (if any).
+    #[inline]
+    fn bounds(&self) -> (i32, i32, i32, i32) {
+        let (mut x0, mut y0) = (0i32, 0i32);
+        let (mut x1, mut y1) = (self.width as i32, self.height as i32);
+        if let Some(c) = self.clip {
+            x0 = x0.max(c.x);
+            y0 = y0.max(c.y);
+            x1 = x1.min(c.x + c.w);
+            y1 = y1.min(c.y + c.h);
+        }
+        (x0, y0, x1, y1)
+    }
+
+    /// True if device pixel `(x, y)` is inside the current clip (and the framebuffer).
+    #[inline]
+    fn in_clip(&self, x: i32, y: i32) -> bool {
+        let (x0, y0, x1, y1) = self.bounds();
+        x >= x0 && y >= y0 && x < x1 && y < y1
     }
 
     /// Fill the whole buffer with a solid color.
@@ -66,12 +93,13 @@ impl Framebuffer {
         }
     }
 
-    /// Source-over fill of an axis-aligned rect, clipped to the framebuffer.
+    /// Source-over fill of an axis-aligned rect, clipped to the framebuffer (and any clip rect).
     pub fn fill_rect(&mut self, rect: Rect, c: Color) {
-        let x0 = rect.x.max(0);
-        let y0 = rect.y.max(0);
-        let x1 = (rect.x + rect.w).min(self.width as i32);
-        let y1 = (rect.y + rect.h).min(self.height as i32);
+        let (cx0, cy0, cx1, cy1) = self.bounds();
+        let x0 = rect.x.max(cx0);
+        let y0 = rect.y.max(cy0);
+        let x1 = (rect.x + rect.w).min(cx1);
+        let y1 = (rect.y + rect.h).min(cy1);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -102,10 +130,11 @@ impl Framebuffer {
             self.fill_rect(rect, c);
             return;
         }
-        let x0 = rect.x.max(0);
-        let y0 = rect.y.max(0);
-        let x1 = (rect.x + rect.w).min(self.width as i32);
-        let y1 = (rect.y + rect.h).min(self.height as i32);
+        let (cx0, cy0, cx1, cy1) = self.bounds();
+        let x0 = rect.x.max(cx0);
+        let y0 = rect.y.max(cy0);
+        let x1 = (rect.x + rect.w).min(cx1);
+        let y1 = (rect.y + rect.h).min(cy1);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -174,10 +203,11 @@ impl Framebuffer {
         if src.len() < (src_w as usize) * (src_h as usize) * 4 {
             return;
         }
-        let x0 = dst.x.max(0);
-        let y0 = dst.y.max(0);
-        let x1 = (dst.x + dst.w).min(self.width as i32);
-        let y1 = (dst.y + dst.h).min(self.height as i32);
+        let (cx0, cy0, cx1, cy1) = self.bounds();
+        let x0 = dst.x.max(cx0);
+        let y0 = dst.y.max(cy0);
+        let x1 = (dst.x + dst.w).min(cx1);
+        let y1 = (dst.y + dst.h).min(cy1);
         if x1 <= x0 || y1 <= y0 {
             return;
         }
@@ -206,7 +236,7 @@ impl Framebuffer {
     /// Blend a single coverage value (0..=255) of `c` at one pixel. Used by text painting
     /// once a [`GlyphRasterizer`] hands us coverage bitmaps.
     pub fn blend_coverage(&mut self, x: i32, y: i32, coverage: u8, c: Color) {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+        if !self.in_clip(x, y) {
             return;
         }
         let i = (y as u32 * self.stride) as usize + (x as usize) * 4;
@@ -280,6 +310,37 @@ mod tests {
         // Pixel (2,2) untouched (still opaque black).
         let i = (2 * fb.stride + 2 * 4) as usize;
         assert_eq!(&fb.pixels[i..i + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn clip_rect_limits_fills_and_glyphs() {
+        let mut fb = Framebuffer::new(8, 8);
+        // Clip to a 2x2 region at (2,2). A full-buffer fill only paints inside it.
+        fb.clip = Some(Rect {
+            x: 2,
+            y: 2,
+            w: 2,
+            h: 2,
+        });
+        fb.fill_rect(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            },
+            Color::rgb(9, 9, 9),
+        );
+        // A glyph coverage pixel outside the clip is dropped too.
+        fb.blend_coverage(0, 0, 255, Color::rgb(1, 2, 3));
+        let at = |fb: &Framebuffer, x: u32, y: u32| {
+            let i = (y * fb.stride + x * 4) as usize;
+            [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
+        };
+        assert_eq!(at(&fb, 2, 2), [9, 9, 9], "inside clip painted");
+        assert_eq!(at(&fb, 3, 3), [9, 9, 9], "inside clip painted");
+        assert_eq!(at(&fb, 0, 0), [0, 0, 0], "outside clip + glyph dropped");
+        assert_eq!(at(&fb, 4, 4), [0, 0, 0], "outside clip untouched");
     }
 
     #[test]
