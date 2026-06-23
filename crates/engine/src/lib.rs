@@ -8,11 +8,12 @@
 mod canvas;
 mod font;
 mod svg;
+mod woff2;
 
 pub(crate) use std::collections::HashMap;
 use std::time::Instant;
 
-use font::SystemFont;
+use font::{Fonts, SystemFont};
 use paint::{Color, Framebuffer, GlyphRasterizer, Rect};
 
 /// A borrowed, C-ABI view of the engine's RGBA8 (straight-alpha) framebuffer, handed to the
@@ -1585,6 +1586,57 @@ mod tests {
     }
 
     #[test]
+    fn cdata_wrapped_inline_style_import_is_followed() {
+        // XHTML reftests (WPT `.xht`) wrap inline CSS in `<![CDATA[ … ]]>` so the XML parser leaves
+        // `@import`/`url(...)` alone. Our lenient HTML parser captures `<style>` as raw text, so the
+        // markers land literally in the CSS. The wrapper must be stripped before `@import`
+        // extraction — otherwise the leading `<![CDATA[` makes the scanner read `@import …;` as a
+        // normal rule and skip it, so the imported sheet (which may define the test's @font-face)
+        // is never fetched. Regression for the WOFF2 reftests rendering the fallback letter raw.
+        let dir = std::env::temp_dir().join(format!("engine_cdata_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tokens_path = dir.join("tokens.css");
+        std::fs::write(&tokens_path, ".token { color: #111111 }").unwrap();
+        let base = format!("file://{}/page.xht", dir.display());
+        // Inline <style> whose body is CDATA-wrapped and starts with an @import.
+        let html = format!(
+            "<html><head><style type=\"text/css\"><![CDATA[\n@import url(\"tokens.css\");\n.main {{ color: #222222 }}\n]]></style></head><body></body></html>"
+        );
+        let doc = html::parse(&html);
+
+        // The extracted inline source must have no CDATA markers left.
+        let sources = collect_style_sources(&doc, &base);
+        let inline = sources
+            .iter()
+            .find_map(|s| match s {
+                StyleSource::Inline(t) => Some(t.clone()),
+                StyleSource::External(_) => None,
+            })
+            .expect("an inline <style> source");
+        assert!(
+            !inline.contains("CDATA") && !inline.contains("]]>"),
+            "CDATA wrapper not stripped: {inline:?}"
+        );
+        assert_eq!(
+            css::extract_imports(&inline),
+            vec!["tokens.css".to_string()],
+            "the @import must be visible to the extractor"
+        );
+
+        // End to end: the imported sheet is actually fetched + collected.
+        let (sheets, console) = collect_stylesheets(&doc, &base);
+        assert!(
+            sheets
+                .iter()
+                .flat_map(|s| s.rules.iter())
+                .any(|r| r.selectors.iter().any(|s| s == ".token")),
+            "imported tokens.css should be followed from the CDATA-wrapped inline @import; \
+             sheets={sheets:?} console={console:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn script_errors_are_captured_as_warnings() {
         let doc =
             html::parse(r#"<html><body><script>throw new Error("boom")</script></body></html>"#);
@@ -1704,9 +1756,13 @@ mod tests {
         let mut fb = Framebuffer::new(400, 300);
         let images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        let no_faces: HashMap<String, SystemFont> = HashMap::new();
         paint_box(
             &mut fb,
-            &NoFont,
+            Fonts {
+                system: &NoFont,
+                faces: &no_faces,
+            },
             &root,
             16.0,
             28.0,
@@ -1764,9 +1820,13 @@ mod tests {
             paint_gradient(&mut fb);
             let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
             let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+            let no_faces: HashMap<String, SystemFont> = HashMap::new();
             paint_box(
                 &mut fb,
-                &NoFont,
+                Fonts {
+                    system: &NoFont,
+                    faces: &no_faces,
+                },
                 &root,
                 0.0,
                 0.0,
@@ -1842,9 +1902,13 @@ mod tests {
         fb.clear(Color::BLACK);
         let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         let no_canvas: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        let no_faces: HashMap<String, SystemFont> = HashMap::new();
         paint_box(
             &mut fb,
-            &NF,
+            Fonts {
+                system: &NF,
+                faces: &no_faces,
+            },
             &root,
             0.0,
             0.0,

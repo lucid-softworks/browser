@@ -891,7 +891,10 @@ impl Engine {
                         let mut run_idx = 0usize;
                         paint_box(
                             &mut fb,
-                            font,
+                            Fonts {
+                                system: font,
+                                faces: &self.font_faces,
+                            },
                             &cache.root,
                             left,
                             header_h - scroll_y,

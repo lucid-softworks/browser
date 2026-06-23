@@ -8,19 +8,16 @@ pub(crate) struct FontMeasurer<'a> {
     pub(crate) faces: &'a std::collections::HashMap<String, SystemFont>,
 }
 
-impl FontMeasurer<'_> {
+impl<'a> FontMeasurer<'a> {
     /// Pick the loaded font for a computed `font-family` list: the first comma-separated family that
-    /// names a loaded `@font-face` web font, else the system font.
-    pub(crate) fn pick(&self, family: Option<&str>) -> &SystemFont {
-        if let Some(list) = family {
-            for fam in list.split(',') {
-                let name = fam.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
-                if let Some(face) = self.faces.get(&name) {
-                    return face;
-                }
-            }
+    /// names a loaded `@font-face` web font, else the system font. Delegates to [`Fonts::pick`] so
+    /// layout MEASURES a run with the exact face the painter later DRAWS it with.
+    pub(crate) fn pick(&self, family: Option<&str>) -> &'a dyn paint::GlyphRasterizer {
+        Fonts {
+            system: self.font,
+            faces: self.faces,
         }
-        self.font
+        .pick(family)
     }
 }
 

@@ -8,7 +8,7 @@ use crate::*;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_box(
     fb: &mut Framebuffer,
-    font: &dyn GlyphRasterizer,
+    fonts: Fonts,
     b: &layout::LayoutBox,
     ox: f32,
     oy: f32,
@@ -27,7 +27,7 @@ pub(crate) fn paint_box(
     let xf = Affine::translate(ox, oy);
     paint_box_opacity(
         fb,
-        font,
+        fonts,
         b,
         &xf,
         clip_top,
@@ -123,7 +123,7 @@ pub(crate) fn scale_alpha(a: u8, opacity: f32) -> u8 {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint_box_opacity(
     fb: &mut Framebuffer,
-    font: &dyn GlyphRasterizer,
+    fonts: Fonts,
     b: &layout::LayoutBox,
     xf: &Affine,
     clip_top: f32,
@@ -415,6 +415,10 @@ pub(crate) fn paint_box_opacity(
         // Text is positioned through the affine's mapped origin; glyphs are not rotated (NOTE:
         // rotated/skewed text is positioned but rendered upright — an approximation).
         if let layout::BoxContent::Text(s) = &b.content {
+            // Draw the run in the same face layout measured it with: the first `font-family` that
+            // names a loaded `@font-face`, else the system font. Drawing in the system font instead
+            // would mis-render any web-font text (e.g. a fallback face whose 'F' glyph spells PASS).
+            let font = fonts.pick(b.style.font_family.as_deref());
             let (dx, dy) = xf.apply(content.x, content.y);
             if dy < clip_bottom {
                 // Scale font size by the affine's average linear magnitude so scale() enlarges text.
@@ -548,7 +552,7 @@ pub(crate) fn paint_box_opacity(
                 let baseline = dy + fs * 0.8;
                 draw_run(
                     fb,
-                    font,
+                    fonts.pick(b.style.font_family.as_deref()),
                     s,
                     dx,
                     baseline,
@@ -684,7 +688,7 @@ pub(crate) fn paint_box_opacity(
     for child in &b.children {
         paint_box_opacity(
             fb,
-            font,
+            fonts,
             child,
             xf,
             clip_top,

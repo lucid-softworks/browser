@@ -104,6 +104,33 @@ pub struct SystemFont {
     font: fontdue::Font,
 }
 
+/// The set of fonts available while measuring/painting a page: the system fallback face plus any
+/// loaded `@font-face` web fonts (keyed by lowercased family name). [`pick`](Fonts::pick) resolves a
+/// computed `font-family` list to the face to draw a run with — the same selection layout uses to
+/// MEASURE text, so the painter draws with the very font the run was sized for (without this, a run
+/// in a web font is measured in that font but painted in the system font: wrong glyphs).
+#[derive(Clone, Copy)]
+pub(crate) struct Fonts<'a> {
+    pub(crate) system: &'a dyn GlyphRasterizer,
+    pub(crate) faces: &'a std::collections::HashMap<String, SystemFont>,
+}
+
+impl<'a> Fonts<'a> {
+    /// Pick the loaded font for a computed `font-family` list: the first comma-separated family that
+    /// names a loaded `@font-face` web font, else the system font.
+    pub(crate) fn pick(&self, family: Option<&str>) -> &'a dyn GlyphRasterizer {
+        if let Some(list) = family {
+            for fam in list.split(',') {
+                let name = fam.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+                if let Some(face) = self.faces.get(&name) {
+                    return face;
+                }
+            }
+        }
+        self.system
+    }
+}
+
 impl SystemFont {
     /// Load the first available system font. Returns `None` if none could be read/parsed.
     pub fn load() -> Option<Self> {
@@ -118,10 +145,16 @@ impl SystemFont {
         None
     }
 
-    /// Load a font from in-memory TrueType/OpenType bytes (a fetched `@font-face` `src`). Returns
-    /// `None` if the bytes aren't a font fontdue can parse (e.g. `woff`/`woff2`, which are
-    /// compressed wrappers we don't decode).
+    /// Load a font from in-memory `@font-face` `src` bytes. Bare TrueType/OpenType is parsed
+    /// directly; a WOFF2 (`wOF2`) wrapper is first decoded to SFNT (see [`crate::woff2`]) — a
+    /// MALFORMED WOFF2 fails to decode and yields `None`, so the caller falls back to the next
+    /// source (matching the WOFF2 conformance reftests). Legacy `woff` (1.0) is not decoded.
     pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
+        let bytes = if bytes.starts_with(b"wOF2") {
+            crate::woff2::decode(&bytes)?
+        } else {
+            bytes
+        };
         fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .ok()
             .map(|font| Self { font })

@@ -309,18 +309,35 @@ pub fn base_url(doc: &dom::Document, final_url: &str) -> String {
 /// Walk the DOM in document order, classifying each author style contribution as an inline
 /// `<style>` body or an external `<link rel=stylesheet href>` (resolved against `base`).
 /// Pure: no fetching, so the ordering/classification is unit-testable without network.
+/// Concatenate a `<style>`/`<script>` element's text children, stripping an XHTML `<![CDATA[ … ]]>`
+/// wrapper (and the legacy `<!-- … -->` comment guard). XHTML files (e.g. WPT's `.xht` reftests)
+/// wrap inline CSS/JS in CDATA so the XML parser doesn't treat `&`/`<` as markup; our lenient HTML
+/// parser captures `<style>` as raw text, so those markers land literally in the CSS — where they
+/// break `@import` extraction (the leading `<![CDATA[` makes the scanner read `@import …;` as a
+/// normal rule's prelude and skip it, so the imported sheet is never fetched). Only the surrounding
+/// wrapper is removed (markers never appear mid-CSS in practice), leaving the CSS otherwise intact.
+pub(crate) fn raw_text_content(doc: &dom::Document, id: dom::NodeId) -> String {
+    let mut src = String::new();
+    for &child in &doc.get(id).children {
+        if let dom::NodeData::Text(t) = &doc.get(child).data {
+            src.push_str(t);
+        }
+    }
+    let trimmed = src.trim();
+    for (open, close) in [("<![CDATA[", "]]>"), ("<!--", "-->")] {
+        if let Some(inner) = trimmed.strip_prefix(open) {
+            return inner.strip_suffix(close).unwrap_or(inner).to_string();
+        }
+    }
+    src
+}
+
 pub fn collect_style_sources(doc: &dom::Document, base: &str) -> Vec<StyleSource> {
     fn walk(doc: &dom::Document, id: dom::NodeId, base: &str, out: &mut Vec<StyleSource>) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             match e.tag.as_str() {
                 "style" => {
-                    let mut src = String::new();
-                    for &child in &doc.get(id).children {
-                        if let dom::NodeData::Text(t) = &doc.get(child).data {
-                            src.push_str(t);
-                        }
-                    }
-                    out.push(StyleSource::Inline(src));
+                    out.push(StyleSource::Inline(raw_text_content(doc, id)));
                     return;
                 }
                 "link" => {
@@ -392,14 +409,8 @@ pub(crate) fn collect_inline_stylesheets(doc: &dom::Document, base: &str) -> Vec
     fn walk(doc: &dom::Document, id: dom::NodeId, base: &str, out: &mut Vec<css::Stylesheet>) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag == "style" {
-                let mut src = String::new();
-                for &child in &doc.get(id).children {
-                    if let dom::NodeData::Text(t) = &doc.get(child).data {
-                        src.push_str(t);
-                    }
-                }
                 // Inline `<style>` resolves relative `url(...)` against the document base URL.
-                out.push(css::parse_with_base(&src, base));
+                out.push(css::parse_with_base(&raw_text_content(doc, id), base));
                 return; // a <style>'s text body isn't markup
             }
         }
