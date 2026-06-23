@@ -1060,22 +1060,7 @@ pub fn rasterize_svg(
     };
 
     // viewBox → device: uniform scale-to-fit (xMidYMid meet), centered.
-    let base = if let Some(vb) = attr(el, "viewbox").map(parse_numbers) {
-        if vb.len() == 4 && vb[2] > 0.0 && vb[3] > 0.0 {
-            let (minx, miny, vw, vh) = (vb[0], vb[1], vb[2], vb[3]);
-            let scale = (out_w as f32 / vw).min(out_h as f32 / vh);
-            let tx = (out_w as f32 - vw * scale) / 2.0;
-            let ty = (out_h as f32 - vh * scale) / 2.0;
-            // translate(tx,ty) ∘ scale(s) ∘ translate(-minx,-miny)
-            Affine::translate(tx, ty)
-                .then(Affine::scale(scale, scale))
-                .then(Affine::translate(-minx, -miny))
-        } else {
-            Affine::identity()
-        }
-    } else {
-        Affine::identity()
-    };
+    let base = viewbox_affine(el, out_w as f32, out_h as f32);
 
     let root_state = apply_paint(el, PaintState::default());
     render_children(doc, svg_id, base, &root_state, &mut surf, font, 0);
@@ -1085,6 +1070,32 @@ pub fn rasterize_svg(
         w: out_w,
         h: out_h,
     }
+}
+
+/// The `viewBox` → viewport affine for an `<svg>`/`<symbol>` element: uniform scale-to-fit
+/// (xMidYMid meet) into a `out_w`×`out_h` box, centered. Identity when there's no usable viewBox.
+fn viewbox_affine(el: &dom::ElementData, out_w: f32, out_h: f32) -> Affine {
+    if let Some(vb) = attr(el, "viewbox").map(parse_numbers) {
+        if vb.len() == 4 && vb[2] > 0.0 && vb[3] > 0.0 {
+            let (minx, miny, vw, vh) = (vb[0], vb[1], vb[2], vb[3]);
+            let scale = (out_w / vw).min(out_h / vh);
+            let tx = (out_w - vw * scale) / 2.0;
+            let ty = (out_h - vh * scale) / 2.0;
+            // translate(tx,ty) ∘ scale(s) ∘ translate(-minx,-miny)
+            return Affine::translate(tx, ty)
+                .then(Affine::scale(scale, scale))
+                .then(Affine::translate(-minx, -miny));
+        }
+    }
+    Affine::identity()
+}
+
+/// Find the first element in the document with `id="id"` (for `<use xlink:href="#id">` resolution).
+fn find_by_id(doc: &Document, id: &str) -> Option<NodeId> {
+    (0..doc.len()).map(NodeId).find(|&n| {
+        matches!(&doc.get(n).data,
+            NodeData::Element(e) if e.attrs.get("id").map(|s| s == id).unwrap_or(false))
+    })
 }
 
 /// Recurse over an element's children, rendering each shape / group. `depth` guards runaway nesting.
@@ -1101,16 +1112,34 @@ fn render_children(
         return;
     }
     for &child in &doc.get(parent).children {
+        render_element(doc, child, m, state, surf, font, depth);
+    }
+}
+
+/// Render a single SVG element (and its subtree) at the current transform `m` + inherited paint.
+fn render_element(
+    doc: &Document,
+    child: NodeId,
+    m: Affine,
+    state: &PaintState,
+    surf: &mut Surface,
+    font: Option<&SystemFont>,
+    depth: usize,
+) {
+    if depth > 256 {
+        return;
+    }
+    {
         let el = match &doc.get(child).data {
             NodeData::Element(e) => e,
-            _ => continue,
+            _ => return,
         };
         let tag = el.tag.to_ascii_lowercase();
-        // Skip non-rendered defs/metadata/etc.
+        // Skip non-rendered defs/metadata/etc. (gradients/clipPath are resolved on demand, not drawn
+        // directly here). `<use>`/`<svg>`/`<symbol>` ARE handled below.
         if matches!(
             tag.as_str(),
             "defs"
-                | "symbol"
                 | "clippath"
                 | "mask"
                 | "lineargradient"
@@ -1121,9 +1150,8 @@ fn render_children(
                 | "title"
                 | "desc"
                 | "style"
-                | "use"
         ) {
-            continue;
+            return;
         }
         let child_m = match attr(el, "transform") {
             Some(t) => m.then(parse_transform(t)),
@@ -1132,8 +1160,45 @@ fn render_children(
         let child_state = apply_paint(el, state.clone());
 
         match tag.as_str() {
-            "g" | "a" | "svg" => {
+            "g" | "a" => {
                 render_children(doc, child, child_m, &child_state, surf, font, depth + 1);
+            }
+            // A nested `<svg>` / `<symbol>` establishes its own viewport at (x,y) with its own
+            // viewBox — the structure SVG sprite sheets use (one inner <svg> per icon).
+            "svg" | "symbol" => {
+                let x = num_attr(el, "x", 0.0);
+                let y = num_attr(el, "y", 0.0);
+                let vb = attr(el, "viewbox").map(parse_numbers);
+                let (vw, vh) = vb
+                    .as_ref()
+                    .filter(|v| v.len() == 4)
+                    .map(|v| (v[2], v[3]))
+                    .unwrap_or((0.0, 0.0));
+                let w = attr(el, "width").and_then(parse_len).unwrap_or(vw);
+                let h = attr(el, "height").and_then(parse_len).unwrap_or(vh);
+                let inner = if w > 0.0 && h > 0.0 {
+                    child_m
+                        .then(Affine::translate(x, y))
+                        .then(viewbox_affine(el, w, h))
+                } else {
+                    child_m.then(Affine::translate(x, y))
+                };
+                render_children(doc, child, inner, &child_state, surf, font, depth + 1);
+            }
+            // `<use xlink:href="#id">`: render the referenced element at this use's (x,y).
+            "use" => {
+                let href = attr(el, "href").or_else(|| attr(el, "xlink:href"));
+                if let Some(id) = href.and_then(|h| h.trim().strip_prefix('#').map(str::to_string))
+                {
+                    if let Some(target) = find_by_id(doc, &id) {
+                        if target != child {
+                            let ux = num_attr(el, "x", 0.0);
+                            let uy = num_attr(el, "y", 0.0);
+                            let use_m = child_m.then(Affine::translate(ux, uy));
+                            render_element(doc, target, use_m, &child_state, surf, font, depth + 1);
+                        }
+                    }
+                }
             }
             "rect" => {
                 let x = num_attr(el, "x", 0.0);
@@ -1141,7 +1206,7 @@ fn render_children(
                 let w = num_attr(el, "width", 0.0);
                 let h = num_attr(el, "height", 0.0);
                 if w <= 0.0 || h <= 0.0 {
-                    continue;
+                    return;
                 }
                 let mut rx = attr(el, "rx").and_then(parse_len);
                 let mut ry = attr(el, "ry").and_then(parse_len);
@@ -1159,7 +1224,7 @@ fn render_children(
                 let cy = num_attr(el, "cy", 0.0);
                 let r = num_attr(el, "r", 0.0);
                 if r <= 0.0 {
-                    continue;
+                    return;
                 }
                 let pts = flatten_ellipse(cx, cy, r, r, &child_m);
                 paint_shape(surf, &[pts], &[true], &child_state, &child_m);
@@ -1170,7 +1235,7 @@ fn render_children(
                 let rx = num_attr(el, "rx", 0.0);
                 let ry = num_attr(el, "ry", 0.0);
                 if rx <= 0.0 || ry <= 0.0 {
-                    continue;
+                    return;
                 }
                 let pts = flatten_ellipse(cx, cy, rx, ry, &child_m);
                 paint_shape(surf, &[pts], &[true], &child_state, &child_m);
@@ -1201,7 +1266,7 @@ fn render_children(
                     k += 2;
                 }
                 if pts.len() < 2 {
-                    continue;
+                    return;
                 }
                 let closed = tag == "polygon";
                 paint_shape(surf, &[pts], &[closed], &child_state, &child_m);
@@ -1517,5 +1582,74 @@ mod tests {
         );
         // Somewhere inside the half-disc + base should be red.
         assert_eq!(px(&img, 25, 35).0, 255, "arc-bounded shape filled");
+    }
+
+    #[test]
+    fn nested_svg_positions_and_scales_inner_viewport() {
+        // Outer 100x100; an inner <svg> at (10,10) sized 40x40 with its own 0..10 viewBox holds a
+        // full red rect. The inner content should fill (10,10)..(50,50) and nothing outside it.
+        let img = render(
+            r#"<svg width="100" height="100" viewBox="0 0 100 100">
+                 <svg x="10" y="10" width="40" height="40" viewBox="0 0 10 10">
+                   <rect width="10" height="10" fill="red"/>
+                 </svg>
+               </svg>"#,
+            100,
+            100,
+        );
+        assert_eq!(
+            px(&img, 30, 30).0,
+            255,
+            "inner rect red inside the nested viewport"
+        );
+        assert_eq!(px(&img, 30, 30).3, 255);
+        assert_eq!(
+            px(&img, 5, 5).3,
+            0,
+            "above/left of the nested viewport is empty"
+        );
+        assert_eq!(
+            px(&img, 70, 70).3,
+            0,
+            "below/right of the nested viewport is empty"
+        );
+    }
+
+    #[test]
+    fn use_renders_referenced_element_at_offset() {
+        // A <rect> defined in <defs> is drawn by <use> translated to (60,60).
+        let img = render(
+            r##"<svg width="100" height="100" viewBox="0 0 100 100" xmlns:xlink="http://www.w3.org/1999/xlink">
+                 <defs><rect id="r" width="20" height="20" fill="blue"/></defs>
+                 <use xlink:href="#r" x="60" y="60"/>
+               </svg>"##,
+            100,
+            100,
+        );
+        assert_eq!(
+            px(&img, 70, 70),
+            (0, 0, 255, 255),
+            "use'd rect drawn at its offset"
+        );
+        assert_eq!(
+            px(&img, 10, 10).3,
+            0,
+            "the original defs rect is not drawn in place"
+        );
+    }
+
+    #[test]
+    fn use_references_group_with_transform() {
+        // <use> of a <g> containing a rect, with the use translated — the group's contents appear
+        // at the use offset (covers the Commons-logo pattern of <use> + transformed groups).
+        let img = render(
+            r##"<svg width="100" height="100" viewBox="0 0 100 100" xmlns:xlink="http://www.w3.org/1999/xlink">
+                 <defs><g id="g"><rect width="10" height="10" fill="red"/></g></defs>
+                 <use xlink:href="#g" x="40" y="40"/>
+               </svg>"##,
+            100,
+            100,
+        );
+        assert_eq!(px(&img, 44, 44).0, 255, "group drawn via use at offset");
     }
 }
