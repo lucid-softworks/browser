@@ -623,6 +623,34 @@ const MAX_FAVICON_BYTES: usize = 2 * 1024 * 1024;
 /// ~16pt UI icon; the shell downsamples to fit).
 const FAVICON_PX: u32 = 32;
 
+/// Whether `url`'s path has a known image extension (used to render direct image navigations even
+/// when the server sends a generic content-type).
+pub(crate) fn url_has_image_extension(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    [
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".svg", ".avif", ".jxl", ".tif",
+        ".tiff",
+    ]
+    .iter()
+    .any(|ext| path.ends_with(ext))
+}
+
+/// A minimal generated document that displays `url` as a centered image on a neutral backdrop —
+/// the "image viewer" real browsers show when you navigate straight to an image file.
+pub(crate) fn image_viewer_html(url: &str) -> String {
+    // Escape the few characters that would break the `src="..."` attribute.
+    let safe = url.replace('&', "&amp;").replace('"', "&quot;");
+    format!(
+        "<!DOCTYPE html><html><head><meta name=\"color-scheme\" content=\"light dark\"></head>\
+         <body style=\"margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#2b2b2b\">\
+         <img src=\"{safe}\" style=\"max-width:100%;height:auto\"></body></html>"
+    )
+}
+
 /// Resolve the page's favicon URL: the first `<link rel~="icon">` href (or a `data:` icon),
 /// resolved against `base`; otherwise the origin's `/favicon.ico`. `None` when no http(s) origin can
 /// be derived (e.g. a `file://` page with no explicit icon link).

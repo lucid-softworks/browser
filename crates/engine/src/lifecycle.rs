@@ -190,8 +190,17 @@ impl Engine {
                 // sniffs as HTML (mirrors the old `content_type.contains("html")` gate, extended
                 // with a structural sniff for type-less responses).
                 let ct = meta.content_type.to_ascii_lowercase();
-                let final_doc = parser.finish();
-                let looks_html = ct.contains("html")
+                // Navigating directly to an image: wrap it in a tiny generated document so it renders
+                // as a picture (like real browsers) instead of showing raw bytes.
+                let is_image = ct.starts_with("image/")
+                    || (!ct.contains("html") && url_has_image_extension(&meta.final_url));
+                let final_doc = if is_image {
+                    html::parse(&image_viewer_html(&meta.final_url))
+                } else {
+                    parser.finish()
+                };
+                let looks_html = is_image
+                    || ct.contains("html")
                     || (ct.is_empty() || ct == "application/octet-stream")
                         && document_looks_like_html(&final_doc);
 
