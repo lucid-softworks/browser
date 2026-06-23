@@ -11,7 +11,8 @@
 .DS_Store
 .claude/worktrees/
 
-# Generated WPT results report (the default homepage) + its raw wptreport log
+# Generated WPT coverage report + per-test result store (all under one dir) and raw run logs.
+/wpt-report/
 /wpt-report.html
 /_wpt_*.json
 # Local checkout of the web-platform-tests suite (cloned for conformance runs)
