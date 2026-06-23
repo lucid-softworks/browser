@@ -1512,6 +1512,30 @@ mod tests {
     }
 
     #[test]
+    fn huge_css_value_setter_is_linear_not_quadratic() {
+        // Regression for grid-template-columns-crash.html: setting a very long property value must
+        // not be O(n²). normalizeCssValue previously indexed the growing result rope per number
+        // token (`out[out.length-1]`), forcing repeated flattening, so a ~1.8MB value hung the
+        // engine (V8 GC thrash -> WebDriver "not responding" -> CRASH). Build a large value and
+        // assert the round-trip completes well under the worker budget.
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var v=''; for (var i=0;i<40000;i++){ v+=' repeat(1000, '+i+'px)'; } \
+                 var t0=Date.now(); document.body.style.gridTemplateColumns=v; \
+                 var ok = document.body.style.gridTemplateColumns.length > 0; \
+                 [ok, (Date.now()-t0) < 4000].join(',')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // Both flags true: the value was stored, and the setter finished fast (linear).
+        assert_eq!(out[0].value.as_deref(), Some("true,true"));
+    }
+
+    #[test]
     fn inline_style_overflow_collapses_to_shorthand() {
         let (doc, _) = doc_with_body("");
         let (_d, out) = run_with_dom(

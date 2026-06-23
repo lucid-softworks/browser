@@ -820,6 +820,18 @@ mod tests {
             parse_track_list("repeat(3, 1fr)"),
             vec![TrackSize::Fr(1.0), TrackSize::Fr(1.0), TrackSize::Fr(1.0)]
         );
+        // Pathological input (grid-template-columns-crash.html builds 100k chained repeats) must not
+        // expand without bound: the total track count is capped instead of exhausting memory.
+        let mut huge = String::new();
+        for i in 0..2000 {
+            huge.push_str(&format!(" repeat(1000, {i}px)"));
+        }
+        let tracks = parse_track_list(&huge);
+        assert!(
+            tracks.len() <= 10_000,
+            "track count not capped: {}",
+            tracks.len()
+        );
     }
 
     #[test]

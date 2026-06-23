@@ -109,14 +109,25 @@ pub(crate) fn parse_gap(val: &str) -> Option<(f32, f32)> {
     }
 }
 
+/// Hard cap on the number of expanded grid tracks. A single `repeat()` is already bounded, but a
+/// list can chain arbitrarily many of them — e.g. `grid-template-columns-crash.html` builds 100,000
+/// × `repeat(1000, …)`, which would expand to 100M tracks and exhaust memory. Real engines cap the
+/// track count (Blink's limit is ~1e6); 10,000 is far more than any real layout needs and keeps the
+/// expanded Vec (and downstream grid sizing) bounded. Once reached, remaining tokens are ignored.
+const MAX_GRID_TRACKS: usize = 10_000;
+
 /// Parse a space-separated grid track list. Supports `Npx`, `Nfr`, `N%`, `auto`, and
-/// `repeat(n, <track>)` (expanded). Unrecognized tokens are skipped.
+/// `repeat(n, <track>)` (expanded). Unrecognized tokens are skipped. The total expanded track count
+/// is capped at [`MAX_GRID_TRACKS`] to bound memory against pathological inputs.
 pub(crate) fn parse_track_list(val: &str) -> Vec<TrackSize> {
     let mut out = Vec::new();
     let lower = val.trim().to_ascii_lowercase();
     let chars: Vec<char> = lower.chars().collect();
     let mut i = 0;
     while i < chars.len() {
+        if out.len() >= MAX_GRID_TRACKS {
+            break;
+        }
         while i < chars.len() && chars[i].is_whitespace() {
             i += 1;
         }
@@ -147,6 +158,9 @@ pub(crate) fn parse_track_list(val: &str) -> Vec<TrackSize> {
                 if let Ok(count) = count_s.trim().parse::<usize>() {
                     let inner_tracks = parse_track_list(rest);
                     for _ in 0..count.min(1000) {
+                        if out.len() >= MAX_GRID_TRACKS {
+                            break;
+                        }
                         out.extend(inner_tracks.iter().copied());
                     }
                 }

@@ -1165,6 +1165,9 @@
     val = val.replace(/counter\(\s*([^,)]+?)\s*,\s*decimal\s*\)/gi, function (_m, nm) { return "counter(" + nm.trim() + ")"; });
     var out = "";
     var i = 0, n = val.length;
+    // Sticky number matcher: anchored at `lastIndex`, so we never slice the tail of `val` (which
+    // would make this loop O(n²) — a 1.8MB value, e.g. grid-template-columns-crash.html, then hangs).
+    var numRe = /[-+]?(?:\d+\.?\d*|\.\d+)/y;
     while (i < n) {
       var ch = val[i];
       // Skip quoted strings verbatim (property-specific quote canonicalization happens in pushDecl).
@@ -1175,11 +1178,15 @@
         continue;
       }
       // A number token: optional sign, digits with optional single decimal point.
-      var rest = val.slice(i);
-      var m = /^[-+]?(?:\d+\.?\d*|\.\d+)/.exec(rest);
+      numRe.lastIndex = i;
+      var m = numRe.exec(val);
       if (m && m[0].length > 0) {
-        // Only treat as a number if not part of an identifier (preceding char isn't a letter/_/-).
-        var prev = out.length ? out[out.length - 1] : "";
+        // Only treat as a number if not part of an identifier (preceding char isn't a letter/_).
+        // Read the preceding char from `val` (O(1)), NOT `out[out.length-1]` — indexing the growing
+        // result rope per number token forces repeated flattening, making this O(n²) (a 1.8MB
+        // grid-template-columns value then hangs). `val` is fixed for the loop and number
+        // normalization never adds/removes letters, so `val[i-1]` is an equivalent predecessor.
+        var prev = i > 0 ? val[i - 1] : "";
         var startsAlpha = /[A-Za-z_]/.test(prev);
         if (!startsAlpha) {
           out += normalizeNumberToken(m[0]);
