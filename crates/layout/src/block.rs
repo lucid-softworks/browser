@@ -131,10 +131,14 @@ pub(crate) fn layout_block(
     let explicit_h = explicit_height(boxx, styles);
 
     // Content width: containing content width minus this box's horizontal margin+border+padding,
-    // unless an explicit width is set.
+    // unless an explicit width is set. With `box-sizing: border-box`, an explicit width INCLUDES
+    // padding+border, so subtract them to get the content width.
     let horizontal =
         margin.left + margin.right + border.left + border.right + padding.left + padding.right;
+    let border_box = box_sizing_of(boxx, styles) == style::BoxSizing::BorderBox;
+    let pb_h = padding.left + padding.right + border.left + border.right;
     let content_width = match explicit_w {
+        Some(w) if border_box => (w - pb_h).max(0.0),
         Some(w) => w,
         None => (containing.width - horizontal).max(0.0),
     };
@@ -209,7 +213,14 @@ pub(crate) fn layout_block(
         }
     };
 
-    let final_height = explicit_h.unwrap_or(content_height);
+    // With `box-sizing: border-box`, an explicit height includes padding+border too.
+    let final_height = match explicit_h {
+        Some(h) if border_box => {
+            (h - (padding.top + padding.bottom + border.top + border.bottom)).max(0.0)
+        }
+        Some(h) => h,
+        None => content_height,
+    };
     // Clamp the used height to min-height / max-height (% against the containing block height).
     let final_height = clamp_height(boxx, final_height, containing.height, styles);
     boxx.dimensions.content.height = final_height;

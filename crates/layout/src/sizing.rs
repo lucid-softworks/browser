@@ -44,6 +44,17 @@ pub(crate) fn explicit_height(
         .and_then(|cs| cs.height)
 }
 
+/// The box's `box-sizing` (content-box for anonymous / style-less boxes).
+pub(crate) fn box_sizing_of(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> style::BoxSizing {
+    boxx.node
+        .and_then(|n| styles.get(&n))
+        .map(|cs| cs.box_sizing)
+        .unwrap_or_default()
+}
+
 /// The computed style for a box's node, if any.
 pub(crate) fn style_of<'a>(
     boxx: &LayoutBox,

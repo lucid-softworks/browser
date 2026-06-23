@@ -66,6 +66,15 @@ pub enum Display {
     TableColumnGroup,
 }
 
+/// CSS `box-sizing`: whether a specified `width`/`height` includes padding+border (`border-box`)
+/// or just the content (`content-box`, the initial value). Not inherited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BoxSizing {
+    #[default]
+    ContentBox,
+    BorderBox,
+}
+
 /// CSS `visibility`. Inherits. `hidden`/`collapse` keep the box in layout but hide its own content
 /// (a descendant can opt back in with `visibility: visible`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -302,6 +311,8 @@ pub struct ComputedStyle {
     pub display_block: bool,
     /// The full display mode. Drives layout dispatch.
     pub display: Display,
+    /// CSS `box-sizing`: whether `width`/`height` include padding+border. Not inherited.
+    pub box_sizing: BoxSizing,
     /// CSS `visibility`. Inherited.
     pub visibility: Visibility,
     /// CSS `position`. Not inherited.

@@ -417,6 +417,12 @@ pub(crate) fn apply_declaration(
                 }
             }
         }
+        "box-sizing" => {
+            style.box_sizing = match val.trim().to_ascii_lowercase().as_str() {
+                "border-box" => BoxSizing::BorderBox,
+                _ => BoxSizing::ContentBox,
+            }
+        }
         "background-size" => style.background_size = parse_bg_size(val),
         "background-repeat" => style.background_repeat = parse_bg_repeat(val),
         "background-position" => style.background_position = parse_bg_position(val),
