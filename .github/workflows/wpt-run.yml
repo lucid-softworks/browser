@@ -79,7 +79,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-deps
-      - uses: mozilla-actions/sccache-action@v0.0.6
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Build WebDriver server
         run: cargo build --release -p webdriver
       - name: Upload WebDriver binary
