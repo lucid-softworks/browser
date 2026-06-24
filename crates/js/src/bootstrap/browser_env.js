@@ -8325,23 +8325,44 @@
 
   // --- Custom Elements (minimal) ---------------------------------------------------------------
   // `customElements.define(name, ctor)` registers a class, then upgrades matching elements already
-  // in the tree (re-pointing their prototype at the ctor's) and fires `connectedCallback` on the
-  // connected ones. Elements inserted later are upgraded/connected via the insertNode hook. We skip
-  // the spec's constructor-run-with-`this`-as-the-element machinery (we can't replicate it without
-  // engine support) — connectedCallback covers the overwhelming majority of components.
+  // in the tree (re-pointing their prototype at the ctor's) and runs the lifecycle reactions:
+  // `connectedCallback` on connect (also for elements inserted later, via the insertNode hook),
+  // `disconnectedCallback` on removal (via a wrapper around the native subtree-removal primitive),
+  // and `attributeChangedCallback` for the attributes named in the ctor's static `observedAttributes`
+  // (via the setAttribute/removeAttribute hook). We still skip the spec's
+  // constructor-run-with-`this`-as-the-element machinery (no engine support) and `adoptedCallback`
+  // (cross-document adoption is rare); these three reactions cover the overwhelming majority of
+  // reactive components. Direct id/class/dataset setters and toggleAttribute are not yet hooked for
+  // attributeChangedCallback — only setAttribute/removeAttribute.
   try {
     var __ceReg = {};      // name -> ctor
+    var __ceObs = {};      // name -> { attrName: true, … } observed-attribute set (read once at define)
     var __ceWhen = {};     // name -> { promise, resolve }
+    var __ceAny = false;   // fast-path guard: stay a no-op until the first element is defined
     function __ceConnected(el) {
       try { return !!(document.documentElement && document.documentElement.contains(el)); } catch (e) { return false; }
     }
+    function __ceName(el) { return ((el && el.tagName) || "").toLowerCase(); }
+    function __ceFireAttr(el, name, oldV, newV) {
+      try { el.attributeChangedCallback(name, oldV == null ? null : oldV, newV == null ? null : newV, null); }
+      catch (e) { try { console.error(e); } catch (e2) {} }
+    }
     function __ceUpgrade(el) {
       if (!el || el.__ceUpgraded) { return; }
-      var name = (el.tagName || "").toLowerCase();
-      var ctor = __ceReg[name];
+      var ctor = __ceReg[__ceName(el)];
       if (!ctor) { return; }
       def(el, "__ceUpgraded", true);
       try { if (ctor.prototype) { Object.setPrototypeOf(el, ctor.prototype); } } catch (e) {}
+      // Spec: enqueue attributeChangedCallback (oldValue null) for each observed attribute present.
+      var obs = __ceObs[__ceName(el)];
+      if (obs && typeof el.attributeChangedCallback === "function" && el.getAttributeNames) {
+        try {
+          var names = el.getAttributeNames();
+          for (var i = 0; i < names.length; i++) {
+            if (obs[names[i]]) { __ceFireAttr(el, names[i], null, el.getAttribute(names[i])); }
+          }
+        } catch (e) {}
+      }
     }
     function __ceConnect(el) {
       __ceUpgrade(el);
@@ -8350,6 +8371,14 @@
       def(el, "__ceConnectedFired", true);
       if (typeof el.connectedCallback === "function") {
         try { el.connectedCallback(); }
+        catch (e) { try { console.error(e); } catch (e2) {} }
+      }
+    }
+    function __ceDisconnect(el) {
+      if (!el || !el.__ceUpgraded || !el.__ceConnectedFired) { return; }
+      def(el, "__ceConnectedFired", false);
+      if (typeof el.disconnectedCallback === "function") {
+        try { el.disconnectedCallback(); }
         catch (e) { try { console.error(e); } catch (e2) {} }
       }
     }
@@ -8363,10 +8392,44 @@
         for (var i = 0; i < kids.length; i++) { __ceWalk(kids[i]); }
       } catch (e) {}
     }
+    function __ceCollect(nodeId, acc) {        // node ids of a subtree, parent-first (capture pre-removal)
+      if (nodeId == null || nodeId < 0) { return; }
+      acc.push(nodeId);
+      try { var kids = __children(nodeId); for (var i = 0; i < kids.length; i++) { __ceCollect(kids[i], acc); } } catch (e) {}
+    }
     // Called from insertNode. Cheap no-op until at least one custom element is defined.
-    def(globalThis, "__ceOnInsert", function (nodeId) {
-      for (var k in __ceReg) { __ceWalk(nodeId); return; }
+    def(globalThis, "__ceOnInsert", function (nodeId) { if (__ceAny) { __ceWalk(nodeId); } });
+    // Called from setAttribute/removeAttribute. Fires attributeChangedCallback for observed attrs.
+    def(globalThis, "__ceNoteAttrChange", function (el, attrName, oldV, newV) {
+      if (!__ceAny || !el || !el.__ceUpgraded) { return; }
+      var obs = __ceObs[__ceName(el)];
+      if (obs && obs[attrName] && typeof el.attributeChangedCallback === "function") {
+        __ceFireAttr(el, attrName, oldV, newV);
+      }
     });
+    // Wrap the native subtree-removal primitive once so removing a connected custom element (or a
+    // subtree containing one) runs disconnectedCallback. Bare `__removeChild(...)` call sites resolve
+    // the global at call time, so re-pointing it reroutes them all. Capture the subtree ids BEFORE
+    // removal (the node's child links are torn down by it), then fire after.
+    if (typeof globalThis.__removeChild === "function" && !globalThis.__removeChild.__ceWrapped) {
+      var __nativeRemoveChild = globalThis.__removeChild;
+      var __wrappedRemoveChild = function (parent, child) {
+        var victims = null;
+        if (__ceAny) { victims = []; __ceCollect(child, victims); }
+        var r = __nativeRemoveChild(parent, child);
+        if (victims) {
+          for (var i = 0; i < victims.length; i++) {
+            try {
+              var w = globalThis.__nodeById ? globalThis.__nodeById(victims[i]) : null;
+              if (w && w.tagName) { __ceDisconnect(w); }
+            } catch (e) {}
+          }
+        }
+        return r;
+      };
+      def(__wrappedRemoveChild, "__ceWrapped", true);
+      globalThis.__removeChild = __wrappedRemoveChild;
+    }
     def(globalThis, "customElements", {
       define: function (name, ctor) {
         if (typeof name !== "string" || !/^[a-z][a-z0-9._]*-[a-z0-9._-]*$/.test(name)) {
@@ -8379,6 +8442,16 @@
           throw new globalThis.DOMException("the name '" + name + "' has already been used with this registry", "NotSupportedError");
         }
         __ceReg[name] = ctor;
+        __ceAny = true;
+        // Read observedAttributes once (static getter), as the spec requires.
+        try {
+          var o = ctor.observedAttributes;
+          if (o && o.length) {
+            var set = {};
+            for (var oi = 0; oi < o.length; oi++) { set[String(o[oi])] = true; }
+            __ceObs[name] = set;
+          }
+        } catch (e) {}
         // Upgrade + connect elements already in the document (snapshot first — connectedCallback may mutate).
         try {
           var live = document.getElementsByTagName(name);

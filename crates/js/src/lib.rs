@@ -443,6 +443,39 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("true|true|true|true"));
     }
 
+    #[test]
+    fn custom_element_lifecycle_callbacks_fire_in_order() {
+        // connectedCallback already worked; this also exercises the new attributeChangedCallback
+        // (only for observedAttributes) and disconnectedCallback (via the removeChild wrapper).
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"globalThis.__log = [];
+                    class XEl {
+                      static get observedAttributes() { return ["data-x"]; }
+                      connectedCallback() { __log.push("connected"); }
+                      disconnectedCallback() { __log.push("disconnected"); }
+                      attributeChangedCallback(n, o, v) { __log.push("attr:" + n + ":" + o + ":" + v); }
+                    }
+                    customElements.define("x-el", XEl);
+                    var e = document.createElement("x-el");
+                    document.body.appendChild(e);
+                    e.setAttribute("data-x", "1");
+                    e.setAttribute("data-x", "2");
+                    e.setAttribute("data-y", "z");   // not observed -> no callback
+                    e.removeAttribute("data-x");
+                    e.remove();
+                    __log.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("connected|attr:data-x:null:1|attr:data-x:1:2|attr:data-x:2:null|disconnected")
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]

@@ -868,18 +868,25 @@
       }
       // HTML elements ASCII-lowercase the attribute's qualified name.
       if (elIsHtml()) { nm = asciiLower(nm); }
+      // Capture the old value before mutating, for a custom element's attributeChangedCallback.
+      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function") ? __getAttr(id, nm) : null;
       // `value` is a non-nullable DOMString in WebIDL: undefined -> "undefined", null -> "null".
-      __setAttr(id, nm, String(value));
+      var newVal = String(value);
+      __setAttr(id, nm, newVal);
       // Mutating an aria element-reflection content attribute directly clears any explicitly set
       // attr-element slot, so the IDL getter falls back to ID lookup (see __aomNoteAttrChange).
       if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
+      if (typeof globalThis.__ceNoteAttrChange === "function") { globalThis.__ceNoteAttrChange(el, nm, ceOld, newVal); }
     });
     def(el, "removeAttribute", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
+      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function") ? __getAttr(id, nm) : null;
       __detachCachedAttr(nm);
       __removeAttr(id, nm); delete __attrNs[nm]; delete __attrNodeCache[nm];
       if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
+      // Only a real removal is a mutation; removing an absent attribute is a no-op (oldValue null).
+      if (ceOld != null && typeof globalThis.__ceNoteAttrChange === "function") { globalThis.__ceNoteAttrChange(el, nm, ceOld, null); }
     });
     def(el, "hasAttribute", function (name) {
       var nm = String(name);
