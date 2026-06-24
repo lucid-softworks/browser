@@ -631,6 +631,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn web_crypto_aes_ctr_vector_and_cbc_roundtrip() {
+        // AES-CTR against NIST SP800-38A F.5.1 (AES-128): validates the cipher core + counter mode.
+        // AES-CBC: encrypt-then-decrypt must round-trip back to the plaintext (validates dec path).
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var L = function (s) { console.log(s); };
+                    var hex = function (buf) { return Array.prototype.map.call(new Uint8Array(buf), function (b) { return (b + 0x100).toString(16).slice(1); }).join(""); };
+                    var fromHex = function (h) { var a = new Uint8Array(h.length / 2); for (var i = 0; i < a.length; i++) { a[i] = parseInt(h.substr(i * 2, 2), 16); } return a; };
+                    var key = fromHex("2b7e151628aed2a6abf7158809cf4f3c");
+                    var ctr = fromHex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
+                    var pt = fromHex("6bc1bee22e409f96e93d7e117393172a");
+                    crypto.subtle.importKey("raw", key, { name: "AES-CTR" }, false, ["encrypt", "decrypt"]).then(function (k) {
+                      return crypto.subtle.encrypt({ name: "AES-CTR", counter: ctr, length: 128 }, k, pt).then(function (ct) { L("ctr:" + hex(ct)); });
+                    });
+                    crypto.subtle.importKey("raw", key, { name: "AES-CBC" }, false, ["encrypt", "decrypt"]).then(function (k) {
+                      var msg = new TextEncoder().encode("hello AES-CBC world!");
+                      var iv = fromHex("000102030405060708090a0b0c0d0e0f");
+                      return crypto.subtle.encrypt({ name: "AES-CBC", iv: iv }, k, msg).then(function (ct) {
+                        return crypto.subtle.decrypt({ name: "AES-CBC", iv: iv }, k, ct).then(function (back) { L("cbc:" + new TextDecoder().decode(back)); });
+                      });
+                    });
+                    "ok""#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].console,
+            vec![
+                "ctr:874d6191b620e3261bef6864990db6ce".to_string(),
+                "cbc:hello AES-CBC world!".to_string(),
+            ]
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]
