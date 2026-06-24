@@ -277,15 +277,15 @@ pub(crate) fn layout_flex(
             } else {
                 explicit_width(child, styles).is_some()
             };
-            let cross_extent = if main_horizontal {
-                if has_explicit_cross {
-                    meta.cross
-                } else {
-                    (laid + meta.cross_edges).max(meta.cross)
-                }
-            } else {
-                // column: cross is width — content layout doesn't change width, keep estimate.
+            let cross_extent = if has_explicit_cross {
                 meta.cross
+            } else if main_horizontal {
+                (laid + meta.cross_edges).max(meta.cross)
+            } else {
+                // Vertical container: cross is the width. The intrinsic estimate (`meta.cross`) misses
+                // inline-block / atomic content (`intrinsic_width` only counts text + block children),
+                // so fall back to the actually laid-out margin-box width.
+                child.dimensions.margin_box().width.max(meta.cross)
             };
             actual_cross[mi] = cross_extent;
 
