@@ -709,6 +709,40 @@ mod tests {
     }
 
     #[test]
+    fn form_parentnode_media_storage_stubs() {
+        // sweep4 batch: ParentNode insertion (prepend/append), <input> stepUp/stepDown/select/
+        // setSelectionRange, <video> play/addTextTrack, and StorageEvent.initStorageEvent.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var p = document.createElement("div"); document.body.appendChild(p);
+                    var a = document.createElement("span"); a.textContent = "A";
+                    var b = document.createElement("span"); b.textContent = "B";
+                    p.append(a); p.prepend(b);
+                    r.push("pre:" + p.firstChild.textContent + ":" + p.lastChild.textContent);
+                    var inp = document.createElement("input"); inp.setAttribute("step", "2"); inp.value = "5";
+                    inp.stepUp(); r.push("up:" + inp.value);
+                    inp.stepDown(3); r.push("down:" + inp.value);
+                    inp.value = "hello"; inp.select(); r.push("sel:" + inp.selectionStart + ":" + inp.selectionEnd);
+                    inp.setSelectionRange(1, 3); r.push("ssr:" + inp.selectionStart + ":" + inp.selectionEnd);
+                    var v = document.createElement("video");
+                    r.push("play:" + (typeof v.play().then) + ":" + v.addTextTrack("subtitles").kind);
+                    var se = new StorageEvent("storage");
+                    se.initStorageEvent("storage", false, false, "k", "o", "n", "http://x/", null);
+                    r.push("se:" + se.key + ":" + se.oldValue + ":" + se.newValue);
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("pre:B:A|up:7|down:1|sel:0:5|ssr:1:3|play:function:subtitles|se:k:o:n")
+        );
+    }
+
+    #[test]
     fn range_extract_and_delete_contents() {
         // Range.extractContents moves the selected content into a fragment (trimming char-data
         // boundaries); deleteContents leaves the same tree state without returning it.

@@ -5443,6 +5443,36 @@
         };
       });
     }
+    // ParentNode/ChildNode insertion (node-taking variants; the *HTML helpers are added below). A
+    // string argument becomes a Text node.
+    var __toNode = function (x) { return (x && typeof x.nodeType === "number") ? x : document.createTextNode(x == null ? "" : String(x)); };
+    if (typeof el.prepend !== "function") { def(el, "prepend", function () { var ref = this.firstChild; for (var i = 0; i < arguments.length; i++) { this.insertBefore(__toNode(arguments[i]), ref); } }); }
+    if (typeof el.append !== "function") { def(el, "append", function () { for (var i = 0; i < arguments.length; i++) { this.appendChild(__toNode(arguments[i])); } }); }
+    if (typeof el.before !== "function") { def(el, "before", function () { var p = this.parentNode; if (!p) { return; } for (var i = 0; i < arguments.length; i++) { p.insertBefore(__toNode(arguments[i]), this); } }); }
+    if (typeof el.after !== "function") { def(el, "after", function () { var p = this.parentNode; if (!p) { return; } var ref = this.nextSibling; for (var i = 0; i < arguments.length; i++) { p.insertBefore(__toNode(arguments[i]), ref); } }); }
+    if (typeof el.replaceWith !== "function") { def(el, "replaceWith", function () { var p = this.parentNode; if (!p) { return; } var ref = this.nextSibling; for (var i = 0; i < arguments.length; i++) { p.insertBefore(__toNode(arguments[i]), ref); } p.removeChild(this); }); }
+    // Form-control methods. stepUp/stepDown adjust a numeric <input> by its step; setSelectionRange/
+    // select track a text field's selection; submit/requestSubmit/requestClose are accepted (no real
+    // navigation/dialog top-layer). These exist on every element here but are only called on the
+    // right ones in practice.
+    if (typeof el.stepUp !== "function") { def(el, "stepUp", function (n) { var s = parseFloat(this.getAttribute("step")) || 1, v = parseFloat(this.value) || 0; this.value = String(v + s * (n == null ? 1 : n)); }); }
+    if (typeof el.stepDown !== "function") { def(el, "stepDown", function (n) { var s = parseFloat(this.getAttribute("step")) || 1, v = parseFloat(this.value) || 0; this.value = String(v - s * (n == null ? 1 : n)); }); }
+    if (typeof el.setSelectionRange !== "function") { def(el, "setSelectionRange", function (start, end, dir) { def(this, "selectionStart", start | 0); def(this, "selectionEnd", end | 0); def(this, "selectionDirection", dir || "none"); }); }
+    if (typeof el.select !== "function") { def(el, "select", function () { var v = this.value == null ? "" : String(this.value); def(this, "selectionStart", 0); def(this, "selectionEnd", v.length); }); }
+    if (typeof el.submit !== "function") { def(el, "submit", fn); }
+    if (typeof el.requestSubmit !== "function") { def(el, "requestSubmit", fn); }
+    if (typeof el.requestClose !== "function") { def(el, "requestClose", function () { try { this.open = false; this.removeAttribute("open"); } catch (e) {} }); }
+    // <audio>/<video>: no media pipeline, so playback methods are accepted (play resolves immediately).
+    if (typeof el.play !== "function") { def(el, "play", function () { return Promise.resolve(); }); }
+    if (typeof el.pause !== "function") { def(el, "pause", fn); }
+    if (typeof el.load !== "function") { def(el, "load", fn); }
+    if (typeof el.canPlayType !== "function") { def(el, "canPlayType", function () { return ""; }); }
+    if (typeof el.addTextTrack !== "function") { def(el, "addTextTrack", function (kind) { return { kind: kind || "", mode: "disabled", cues: [], activeCues: [], addCue: fn, removeCue: fn, addEventListener: fn, removeEventListener: fn }; }); }
+    // SVGSVGElement animation controls (no SMIL): accept and ignore.
+    if (typeof el.pauseAnimations !== "function") { def(el, "pauseAnimations", fn); }
+    if (typeof el.unpauseAnimations !== "function") { def(el, "unpauseAnimations", fn); }
+    if (typeof el.setCurrentTime !== "function") { def(el, "setCurrentTime", fn); }
+    if (typeof el.getCurrentTime !== "function") { def(el, "getCurrentTime", function () { return 0; }); }
     // Declarative partial-update methods (WICG): {append,prepend,before,after,replaceWith}HTML[Unsafe].
     globalThis.__addPartialMethods(el);
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
@@ -8101,6 +8131,7 @@
   def(__selectionProto, "deleteFromDocument", function () { var r = this._ranges[0]; if (r && typeof r.deleteContents === "function") { r.deleteContents(); } });
   def(__selectionProto, "modify", function () {});   // direction/granularity movement not modelled
   def(__selectionProto, "selectAll", function () {});
+  def(__selectionProto, "getComposedRanges", function () { return this._ranges.slice(); });
   def(__selectionProto, "toString", function () { var r = __selStart(this); return r ? r.toString() : ""; });
 
   var __selection = null;
@@ -10945,6 +10976,14 @@
     defSubclass("ErrorEvent", Event, { message: "", filename: "", lineno: 0, colno: 0, error: null });
     defSubclass("PromiseRejectionEvent", Event, { promise: null, reason: undefined });
     defSubclass("StorageEvent", Event, { key: null, oldValue: null, newValue: null, url: "", storageArea: null }, null, { url: toUSVString });
+    globalThis.StorageEvent.prototype.initStorageEvent = function (type, bubbles, cancelable, key, oldValue, newValue, url, storageArea) {
+      this.initEvent(type, bubbles, cancelable);
+      def(this, "key", key == null ? null : String(key));
+      def(this, "oldValue", oldValue == null ? null : String(oldValue));
+      def(this, "newValue", newValue == null ? null : String(newValue));
+      def(this, "url", url == null ? "" : String(url));
+      def(this, "storageArea", storageArea == null ? null : storageArea);
+    };
     defSubclass("AnimationEvent", Event, { animationName: "", elapsedTime: 0, pseudoElement: "" });
     defSubclass("TransitionEvent", Event, { propertyName: "", elapsedTime: 0, pseudoElement: "" });
     defSubclass("CloseEvent", Event, { code: 0, reason: "", wasClean: false });
