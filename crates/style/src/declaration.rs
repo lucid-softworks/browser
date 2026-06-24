@@ -803,6 +803,20 @@ pub(crate) fn apply_declaration(
         "caption-side" => style.caption_side_bottom = val.trim().eq_ignore_ascii_case("bottom"),
 
         // --- Grid ---
+        "grid-template" | "grid" => {
+            // `grid-template: <rows> / <columns>` (the `grid` shorthand reduces to this for the
+            // simple track-list form used here). We don't model the `[line-names]`/areas syntax.
+            if let Some((rows, cols)) = val.split_once('/') {
+                let r = parse_track_list(rows);
+                let c = parse_track_list(cols);
+                if !r.is_empty() {
+                    style.grid_template_rows = r;
+                }
+                if !c.is_empty() {
+                    style.grid_template_columns = c;
+                }
+            }
+        }
         "grid-template-columns" => {
             let tracks = parse_track_list(val);
             if !tracks.is_empty() {

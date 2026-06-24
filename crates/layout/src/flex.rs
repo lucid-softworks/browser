@@ -535,6 +535,16 @@ fn flex_item_baseline(
             return b - top;
         }
     }
+    // A grid's baseline is its first (or last) grid row's shared baseline: among the items in that row
+    // that participate in baseline alignment, the deepest first-line baseline.
+    if matches!(
+        style_of(item, styles).map(|cs| cs.display),
+        Some(style::Display::Grid | style::Display::InlineGrid)
+    ) {
+        if let Some(b) = grid_baseline(item, last, styles) {
+            return b - top;
+        }
+    }
     // `-webkit-line-clamp: N` truncates the box to N lines, so its *last* baseline is the Nth line's
     // baseline, not its true final line's.
     if last {
@@ -575,6 +585,51 @@ fn flex_item_baseline(
 /// The absolute baseline of a table's first (or `last`) row: the cells are grouped into rows by their
 /// top edge, and the chosen row's baseline is the deepest first-line baseline among its cells (cells
 /// with `vertical-align: baseline` share that line). Captions are excluded. `None` if no cells.
+/// The absolute baseline of a grid's first (or `last`) row: among the in-flow items in that row
+/// (grouped by border-box top) that participate in baseline alignment — i.e. whose resolved
+/// `align-self` is `[first|last] baseline`, not start/center/end/stretch — the deepest first-line
+/// baseline. `None` if no such item.
+fn grid_baseline(
+    item: &LayoutBox,
+    last: bool,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> Option<f32> {
+    let parent_align = style_of(item, styles)
+        .map(|cs| cs.align_items)
+        .unwrap_or(style::AlignItems::Stretch);
+    let mut rows: Vec<(f32, f32)> = Vec::new();
+    for c in &item.children {
+        if is_out_of_flow(c, styles) {
+            continue;
+        }
+        let self_align = style_of(c, styles)
+            .map(|cs| cs.align_self)
+            .unwrap_or(style::AlignSelf::Auto);
+        let resolved = match self_align {
+            style::AlignSelf::Auto => align_items_to_self(parent_align),
+            other => other,
+        };
+        if !matches!(
+            resolved,
+            style::AlignSelf::Baseline | style::AlignSelf::LastBaseline
+        ) {
+            continue;
+        }
+        if let Some(bl) = nth_line_baseline(c, 1, styles) {
+            rows.push((c.dimensions.border_box().y, bl));
+        }
+    }
+    let row_top = if last {
+        rows.iter().map(|r| r.0).fold(f32::MIN, f32::max)
+    } else {
+        rows.iter().map(|r| r.0).fold(f32::MAX, f32::min)
+    };
+    rows.iter()
+        .filter(|r| (r.0 - row_top).abs() < 0.5)
+        .map(|r| r.1)
+        .fold(None, |acc, b| Some(acc.map_or(b, |a: f32| a.max(b))))
+}
+
 fn table_baseline(
     item: &LayoutBox,
     last: bool,
