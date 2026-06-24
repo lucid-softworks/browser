@@ -709,6 +709,31 @@ mod tests {
     }
 
     #[test]
+    fn selection_caret_api() {
+        // Selection.collapse/extend/selectAllChildren/collapseToStart over the Range model — the
+        // editing tests lean heavily on these (collapse alone was ~531 "is not a function" hits).
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var p = document.createElement("p"); p.textContent = "hello world"; document.body.appendChild(p);
+                    var t = p.firstChild, sel = getSelection();
+                    sel.collapse(t, 3); r.push("c:" + sel.anchorOffset + ":" + sel.type);
+                    sel.extend(t, 8); r.push("e:" + sel.toString());
+                    sel.selectAllChildren(p); r.push("a:" + sel.type + ":" + (sel.anchorNode === p));
+                    sel.collapseToStart(); r.push("s:" + sel.type);
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("c:3:Caret|e:lo wo|a:Range:true|s:Caret")
+        );
+    }
+
+    #[test]
     fn more_stubbed_apis_respond() {
         // Tail of the "is not a function" sweep: TextEvent.initTextEvent, Element.attachInternals
         // (minimal ElementInternals), and Animation.commitStyles.

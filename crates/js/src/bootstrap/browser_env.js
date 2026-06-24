@@ -7994,6 +7994,39 @@
     catch (e) { try { range.setStart(focusNode, focusOffset); range.setEnd(anchorNode, anchorOffset); } catch (e2) { return; } }
     this._ranges = [range];
   });
+  // Caret/selection movement built on the Range model (one range per selection). collapse places a
+  // caret; extend moves the focus keeping the anchor; selectAllChildren selects a node's contents.
+  def(__selectionProto, "collapse", function (node, offset) {
+    if (node == null) { this._ranges = []; return; }
+    var range = globalThis.document.createRange();
+    range.setStart(node, offset || 0); range.collapse(true);
+    this._ranges = [range];
+  });
+  def(__selectionProto, "setPosition", __selectionProto.collapse);
+  def(__selectionProto, "collapseToStart", function () {
+    var r = this._ranges[0];
+    if (!r) { throw new globalThis.DOMException("There is no selection to collapse.", "InvalidStateError"); }
+    var nr = globalThis.document.createRange(); nr.setStart(r._sc, r._so); nr.collapse(true); this._ranges = [nr];
+  });
+  def(__selectionProto, "collapseToEnd", function () {
+    var r = this._ranges[0];
+    if (!r) { throw new globalThis.DOMException("There is no selection to collapse.", "InvalidStateError"); }
+    var nr = globalThis.document.createRange(); nr.setStart(r._ec, r._eo); nr.collapse(true); this._ranges = [nr];
+  });
+  def(__selectionProto, "extend", function (node, offset) {
+    var r = this._ranges[0];
+    this.setBaseAndExtent(r ? r._sc : node, r ? r._so : 0, node, offset || 0);
+  });
+  def(__selectionProto, "selectAllChildren", function (node) {
+    var range = globalThis.document.createRange(); range.selectNodeContents(node); this._ranges = [range];
+  });
+  def(__selectionProto, "containsNode", function (node) {
+    var r = this._ranges[0];
+    try { return !!(r && node && r.intersectsNode(node)); } catch (e) { return false; }
+  });
+  def(__selectionProto, "deleteFromDocument", function () { var r = this._ranges[0]; if (r && typeof r.deleteContents === "function") { r.deleteContents(); } });
+  def(__selectionProto, "modify", function () {});   // direction/granularity movement not modelled
+  def(__selectionProto, "selectAll", function () {});
   def(__selectionProto, "toString", function () { var r = __selStart(this); return r ? r.toString() : ""; });
 
   var __selection = null;
