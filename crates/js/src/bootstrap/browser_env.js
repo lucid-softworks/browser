@@ -9582,7 +9582,69 @@
   def(globalThis, "cancelIdleCallback", function (id) { return clearTimeout(id); });
 
   if (typeof globalThis.structuredClone !== "function") {
-    def(globalThis, "structuredClone", function (v) { try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; } });
+    // A real structured-clone: deep-copies the common cloneable types (Date, RegExp, ArrayBuffer +
+    // views, Map, Set, Array, plain objects, Error, Blob), preserves shared references and cycles
+    // via a memory map, and throws DataCloneError for non-cloneable values (functions, symbols, DOM
+    // nodes, exotic objects) the way the spec requires — instead of the old JSON round-trip that
+    // silently dropped Maps/Sets/cycles and returned the original on failure. We don't implement
+    // `transfer` (no ArrayBuffer detach primitive in pure JS); the option is accepted and ignored.
+    def(globalThis, "structuredClone", function (value, _options) {
+      var seen = new Map();
+      function dce(msg) { return new globalThis.DOMException(msg, "DataCloneError"); }
+      function clone(v) {
+        if (v === null) { return v; }
+        var t = typeof v;
+        if (t === "symbol") { throw dce("Symbols cannot be cloned."); }
+        if (t === "function") { throw dce("Functions cannot be cloned."); }
+        if (t !== "object") { return v; }                 // string/number/boolean/bigint/undefined
+        if (seen.has(v)) { return seen.get(v); }           // shared reference / cycle
+        if (typeof v.nodeType === "number") { throw dce("DOM nodes cannot be cloned."); }
+        var tag = Object.prototype.toString.call(v);
+        var out;
+        switch (tag) {
+          case "[object Date]": return new Date(v.getTime());
+          case "[object RegExp]": return new RegExp(v.source, v.flags);
+          case "[object Boolean]": return new Boolean(v.valueOf());
+          case "[object Number]": return new Number(v.valueOf());
+          case "[object String]": return new String(v.valueOf());
+          case "[object ArrayBuffer]": out = v.slice(0); seen.set(v, out); return out;
+          case "[object DataView]": return new DataView(clone(v.buffer), v.byteOffset, v.byteLength);
+          case "[object Map]":
+            out = new Map(); seen.set(v, out);
+            v.forEach(function (val, key) { out.set(clone(key), clone(val)); });
+            return out;
+          case "[object Set]":
+            out = new Set(); seen.set(v, out);
+            v.forEach(function (val) { out.add(clone(val)); });
+            return out;
+          case "[object Error]": {
+            var EC = (typeof globalThis[v.name] === "function") ? globalThis[v.name] : Error;
+            out = new EC(v.message); seen.set(v, out);
+            try { if (v.stack !== undefined) { out.stack = v.stack; } } catch (e) {}
+            return out;
+          }
+          case "[object Array]":
+            out = new Array(v.length); seen.set(v, out);
+            for (var i = 0; i < v.length; i++) { if (i in v) { out[i] = clone(v[i]); } }
+            Object.keys(v).forEach(function (k) { if (!/^\d+$/.test(k)) { out[k] = clone(v[k]); } });
+            return out;
+        }
+        if (ArrayBuffer.isView(v)) {                       // typed arrays (Int8Array … BigUint64Array)
+          return new v.constructor(clone(v.buffer), v.byteOffset, v.length);
+        }
+        if (typeof globalThis.Blob === "function" && v instanceof globalThis.Blob) {
+          return v.slice(0, v.size, v.type);
+        }
+        var proto = Object.getPrototypeOf(v);
+        if (proto === Object.prototype || proto === null) { // plain object: own enumerable string keys
+          out = {}; seen.set(v, out);
+          Object.keys(v).forEach(function (k) { out[k] = clone(v[k]); });
+          return out;
+        }
+        throw dce("An object could not be cloned.");        // exotic / non-[Serializable]
+      }
+      return clone(value);
+    });
   }
 
   // Minimal Web Animations `Animation` for `Element.animate()`. We don't run/composite animations,

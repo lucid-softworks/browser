@@ -418,6 +418,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn structured_clone_deep_copies_cycles_and_throws_on_uncloneable() {
+        // Replaces the old JSON-roundtrip stub: must deep-copy Maps, preserve cycles and shared
+        // ArrayBuffer aliasing, and raise DataCloneError on a function — none of which the stub did.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var m = new Map([["a", 1]]); var mc = structuredClone(m);
+                    r.push(mc instanceof Map && mc.get("a") === 1 && mc !== m);
+                    var c = {}; c.self = c; var cc = structuredClone(c);
+                    r.push(cc.self === cc && cc !== c);
+                    var buf = new ArrayBuffer(4); var v = { a: new Uint8Array(buf), b: new Uint8Array(buf) };
+                    var vc = structuredClone(v); vc.a[0] = 9;
+                    r.push(vc.b[0] === 9 && vc.a.buffer === vc.b.buffer && vc.a.buffer !== buf);
+                    var threw = false; try { structuredClone(function () {}); } catch (e) { threw = e.name === "DataCloneError"; }
+                    r.push(threw);
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|true|true|true"));
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]
