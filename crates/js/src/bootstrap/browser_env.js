@@ -8493,7 +8493,15 @@
               // The frame window's getComputedStyle: the global one already cascades frame-document
               // subtrees with the iframe's own viewport, so just delegate.
               getComputedStyle: function (el, pseudo) { return getComputedStyle(el, pseudo); },
+              // The facade has no nested browsing context, so window-level events/messaging are
+              // accepted and ignored rather than throwing. location is a minimal about:blank.
+              addEventListener: function () {}, removeEventListener: function () {}, dispatchEvent: function () { return false; },
+              postMessage: function () {}, focus: function () {}, blur: function () {}, close: function () {},
+              location: { href: "about:blank", toString: function () { return "about:blank"; } },
+              name: "",
             };
+            this.__cwin.self = this.__cwin; this.__cwin.window = this.__cwin; this.__cwin.frameElement = this;
+            try { this.__cwin.parent = globalThis; this.__cwin.top = globalThis; } catch (e) {}
             d.defaultView = this.__cwin;
           }
           return this.__cwin;
