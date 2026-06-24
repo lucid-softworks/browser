@@ -305,7 +305,7 @@ pub(crate) fn layout_flex(
             {
                 let last = matches!(resolved, style::AlignSelf::LastBaseline);
                 item_baseline[mi] =
-                    Some(flex_item_baseline(&boxx.children[metas[mi].idx], last, styles));
+                    Some(flex_item_baseline(&boxx.children[metas[mi].idx], last, vertical_wm, styles));
             }
         }
 
@@ -471,6 +471,7 @@ pub(crate) fn order_of(
 fn flex_item_baseline(
     item: &LayoutBox,
     last: bool,
+    container_vertical: bool,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) -> f32 {
     fn leaf_baseline_abs(
@@ -502,14 +503,18 @@ fn flex_item_baseline(
             None => b.dimensions.margin_box().y + b.dimensions.margin_box().height,
         }
     }
-    // An item whose writing mode is orthogonal to the (row) container's cross axis has no baseline
-    // parallel to that axis, so the spec synthesizes one from its margin box — the alphabetic
-    // baseline sits at the margin-box end (bottom) edge.
+    // A vertical-writing-mode item's alphabetic baseline runs horizontally (perpendicular to a
+    // vertical cross axis), so it can't be propagated as-is. Two cases:
+    //   * orthogonal to the container (horizontal-tb container): synthesize from the margin box — the
+    //     alphabetic baseline sits at the margin-box end (bottom) edge.
+    //   * parallel to the container (vertical container, so the cross axis is the item's own inline
+    //     axis): use the central baseline — the middle of the margin box.
     if matches!(
         style_of(item, styles).map(|cs| cs.writing_mode),
         Some(style::WritingMode::VerticalRl | style::WritingMode::VerticalLr)
     ) {
-        return item.dimensions.margin_box().height;
+        let h = item.dimensions.margin_box().height;
+        return if container_vertical { h / 2.0 } else { h };
     }
     let top = item.dimensions.margin_box().y;
     let mut abs = leaf_baseline_abs(item, last, styles);
