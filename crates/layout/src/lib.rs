@@ -1415,6 +1415,52 @@ mod tests {
     }
 
     #[test]
+    fn vertical_writing_mode_flex_row_main_axis_is_vertical() {
+        // A `flex-direction: row` container in a vertical writing mode has its main axis VERTICAL
+        // (the inline axis follows the writing mode), so its items stack top-to-bottom, not side by
+        // side. Two 40x20 items therefore occupy distinct y bands.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let flex = doc.append_element(body, "div");
+        let a = doc.append_element(flex, "div");
+        let b = doc.append_element(flex, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            flex,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                writing_mode: style::WritingMode::VerticalRl,
+                width: Some(300.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+        );
+        let item = style::ComputedStyle {
+            display: style::Display::Block,
+            display_block: true,
+            width: Some(40.0),
+            height: Some(20.0),
+            ..Default::default()
+        };
+        styles.insert(a, item.clone());
+        styles.insert(b, item);
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
+        // Main axis is vertical → b stacks below a (distinct y), not to its side.
+        assert!(
+            bbox.dimensions.content.y >= abox.dimensions.content.y + 20.0,
+            "items should stack vertically: a.y={} b.y={}",
+            abox.dimensions.content.y,
+            bbox.dimensions.content.y
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();

@@ -24,17 +24,25 @@ pub(crate) fn layout_flex(
         cs.flex_direction,
         style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse
     );
-    let main_gap = if is_row { cs.column_gap } else { cs.row_gap };
-    let cross_gap = if is_row { cs.row_gap } else { cs.column_gap };
+    // The flex main axis is physically horizontal only when the container's writing mode agrees with
+    // the flex-direction: a `row` in horizontal-tb, or a `column` in a vertical writing mode. So in a
+    // vertical writing mode the axes swap. (`^` since exactly one of the two flips the axis.)
+    let vertical_wm = matches!(
+        cs.writing_mode,
+        style::WritingMode::VerticalRl | style::WritingMode::VerticalLr
+    );
+    let main_horizontal = is_row ^ vertical_wm;
+    let main_gap = if main_horizontal { cs.column_gap } else { cs.row_gap };
+    let cross_gap = if main_horizontal { cs.row_gap } else { cs.column_gap };
 
     // The main-axis available size. For row this is content width; for column we use explicit
     // height if set, else a large value (single line) — content drives the height.
-    let main_avail = if is_row {
+    let main_avail = if main_horizontal {
         content.width
     } else {
         explicit_height(boxx, styles).unwrap_or(f32::INFINITY)
     };
-    let cross_container = if is_row {
+    let cross_container = if main_horizontal {
         explicit_height(boxx, styles) // None → derived from lines
     } else {
         Some(content.width)
@@ -69,7 +77,7 @@ pub(crate) fn layout_flex(
         let m = child.dimensions.margin;
         let b = child.dimensions.border;
         let p = child.dimensions.padding;
-        let (main_edges, cross_edges) = if is_row {
+        let (main_edges, cross_edges) = if main_horizontal {
             (
                 m.left + m.right + b.left + b.right + p.left + p.right,
                 m.top + m.bottom + b.top + b.bottom + p.top + p.bottom,
@@ -86,7 +94,7 @@ pub(crate) fn layout_flex(
             fb
         } else if let Some(pct) = ccs.flex_basis_pct.filter(|_| main_avail.is_finite()) {
             (main_avail * pct - main_edges).max(0.0)
-        } else if is_row {
+        } else if main_horizontal {
             ccs.width.unwrap_or_else(|| {
                 (intrinsic_width(child, styles, measurer) - (p.left + p.right + b.left + b.right))
                     .max(0.0)
@@ -97,7 +105,7 @@ pub(crate) fn layout_flex(
         };
         let base_main = base_content + main_edges;
         // Cross base size (content-box) for the item.
-        let cross_content = if is_row {
+        let cross_content = if main_horizontal {
             ccs.height
                 .unwrap_or_else(|| intrinsic_cross_height(child, styles, measurer))
         } else {
@@ -147,10 +155,10 @@ pub(crate) fn layout_flex(
     }
 
     // Resolve each line: distribute free space, position along main & cross axes.
-    let mut cross_cursor = if is_row { content.y } else { content.x };
+    let mut cross_cursor = if main_horizontal { content.y } else { content.x };
     let mut line_cross_sizes: Vec<f32> = Vec::new();
     // First pass to know total cross used (for container sizing); we position as we go.
-    let main_start = if is_row { content.x } else { content.y };
+    let main_start = if main_horizontal { content.x } else { content.y };
 
     // Determine final main container size for positioning.
     let main_box = if main_avail.is_finite() {
@@ -253,7 +261,7 @@ pub(crate) fn layout_flex(
             let child = &mut boxx.children[meta.idx];
             // Tentatively size the content box so contents lay out at the right main extent.
             let content_main = (item_main - meta.main_edges).max(0.0);
-            if is_row {
+            if main_horizontal {
                 child.dimensions.content.width = content_main;
                 child.dimensions.content.height = (meta.cross - meta.cross_edges).max(0.0);
             } else {
@@ -264,12 +272,12 @@ pub(crate) fn layout_flex(
             actual_laid[mi] = laid;
             // The item's cross-axis margin-box extent: explicit cross size if set, else the
             // greater of the single-line estimate and what the contents actually needed.
-            let has_explicit_cross = if is_row {
+            let has_explicit_cross = if main_horizontal {
                 explicit_height(child, styles).is_some()
             } else {
                 explicit_width(child, styles).is_some()
             };
-            let cross_extent = if is_row {
+            let cross_extent = if main_horizontal {
                 if has_explicit_cross {
                     meta.cross
                 } else {
@@ -289,7 +297,7 @@ pub(crate) fn layout_flex(
                 style::AlignSelf::Auto => align_items_to_self(cs.align_items),
                 other => other,
             };
-            if is_row
+            if main_horizontal
                 && matches!(
                     resolved,
                     style::AlignSelf::Baseline | style::AlignSelf::LastBaseline
@@ -357,7 +365,7 @@ pub(crate) fn layout_flex(
             };
 
             // For column flex the main extent is the laid-out height (so the next item clears it).
-            let main_extent = if is_row {
+            let main_extent = if main_horizontal {
                 item_main
             } else {
                 let has_explicit_main = explicit_height(&boxx.children[meta.idx], styles).is_some();
@@ -370,7 +378,7 @@ pub(crate) fn layout_flex(
             };
 
             // Compute the child's margin-box origin in (main, cross) then map to (x, y).
-            let cur_main = if is_row { pos } else { col_pos };
+            let cur_main = if main_horizontal { pos } else { col_pos };
             let main_origin = main_start + cur_main;
             let cross_origin = cross_cursor + cross_off;
 
@@ -383,7 +391,7 @@ pub(crate) fn layout_flex(
             let content_main = (item_main - meta.main_edges).max(0.0);
             let content_cross = (item_cross_outer - meta.cross_edges).max(0.0);
 
-            let (cx, cy, cw, ch) = if is_row {
+            let (cx, cy, cw, ch) = if main_horizontal {
                 (
                     main_origin + m.left + b.left + p.left,
                     cross_origin + m.top + b.top + p.top,
@@ -408,13 +416,13 @@ pub(crate) fn layout_flex(
             // Re-lay out contents at the final position so descendant boxes are correctly placed.
             layout_flex_item_contents(child, ctx, styles, measurer);
 
-            if is_row {
+            if main_horizontal {
                 pos += item_main + main_gap + between_extra;
             } else {
                 col_pos += main_extent + main_gap + between_extra;
             }
         }
-        if !is_row {
+        if !main_horizontal {
             pos = col_pos;
         }
         let _ = pos;
@@ -426,7 +434,7 @@ pub(crate) fn layout_flex(
     // Container cross size = explicit, else sum of line cross sizes + gaps.
     let total_cross: f32 = line_cross_sizes.iter().sum::<f32>()
         + cross_gap * (line_cross_sizes.len().saturating_sub(1) as f32);
-    if is_row {
+    if main_horizontal {
         explicit_height(boxx, styles).unwrap_or(total_cross)
     } else {
         // column: height is the main size used.
