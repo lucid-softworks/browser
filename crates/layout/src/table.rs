@@ -385,6 +385,9 @@ pub(crate) fn layout_table(
     let mut col_w = col_pref.clone();
     let target = match table_cs.width {
         Some(w) => (w - h_spacing_total).max(sum_min).min(avail.max(sum_min)),
+        // A percentage width (e.g. `width: 100%`) is already resolved into `content.width`, so the
+        // table fills the available width rather than shrinking to its preferred width.
+        None if table_cs.width_pct.is_some() => avail.max(sum_min),
         None => sum_pref.min(avail),
     };
     if target > sum_pref && sum_pref > 0.0 {
@@ -488,6 +491,18 @@ pub(crate) fn layout_table(
                     row_h[last] += total - have;
                 }
             }
+        }
+    }
+
+    // Grow the rows to fill a definite table height. `content.height` carries the table's definite
+    // content height (set by `layout_block` for a `height`-constrained table; 0 when auto), so the
+    // extra space above what the content needs is shared evenly across the rows — letting cells fill
+    // a `height: 100px` table instead of shrinking to their content.
+    let rows_total = row_h.iter().sum::<f32>() + spacing * (num_rows as f32 + 1.0);
+    if num_rows > 0 && content.height > rows_total + 0.5 {
+        let per = (content.height - rows_total) / num_rows as f32;
+        for h in row_h.iter_mut() {
+            *h += per;
         }
     }
 

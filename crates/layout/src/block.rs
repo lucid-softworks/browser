@@ -128,7 +128,16 @@ pub(crate) fn layout_block(
     // Explicit sizing comes from the box's DOM node's computed style (percentage width resolves
     // against the containing block's content width).
     let explicit_w = resolved_width(boxx, styles, containing.width);
-    let explicit_h = explicit_height(boxx, styles);
+    // A definite height: an explicit px height, or a percentage height resolved against the
+    // containing block's content height — but only when THAT is definite (a parent with an explicit/
+    // percentage height threads its content height in via `containing.height`; an auto-height parent
+    // passes 0, so the percentage stays auto). This is what lets `height: 100%` fill a sized parent.
+    let explicit_h = explicit_height(boxx, styles).or_else(|| {
+        style_of(boxx, styles)
+            .and_then(|cs| cs.height_pct)
+            .filter(|_| containing.height > 0.0)
+            .map(|p| p * containing.height)
+    });
 
     // Content width: containing content width minus this box's horizontal margin+border+padding,
     // unless an explicit width is set. With `box-sizing: border-box`, an explicit width INCLUDES
@@ -160,11 +169,21 @@ pub(crate) fn layout_block(
     let x = containing.x + margin.left + border.left + padding.left;
     let y = containing.y + margin.top + border.top + padding.top;
 
+    // Definite content height (box-sizing aware): `border-box` heights include padding+border, so
+    // strip them. Set on the content rect now — BEFORE laying out children — so a percentage-height
+    // child resolves against this box's definite height (threaded as the child's `containing.height`).
+    let definite_content_h = explicit_h.map(|h| {
+        if border_box {
+            (h - (padding.top + padding.bottom + border.top + border.bottom)).max(0.0)
+        } else {
+            h
+        }
+    });
     boxx.dimensions.content = Rect {
         x,
         y,
         width: content_width,
-        height: 0.0,
+        height: definite_content_h.unwrap_or(0.0),
     };
 
     // List-item marker: pull a leading `Marker` child out of normal flow so it doesn't flow into the
@@ -216,14 +235,9 @@ pub(crate) fn layout_block(
         }
     };
 
-    // With `box-sizing: border-box`, an explicit height includes padding+border too.
-    let final_height = match explicit_h {
-        Some(h) if border_box => {
-            (h - (padding.top + padding.bottom + border.top + border.bottom)).max(0.0)
-        }
-        Some(h) => h,
-        None => content_height,
-    };
+    // A definite height (explicit px or resolved percentage, box-sizing already applied) wins over the
+    // content-derived height.
+    let final_height = definite_content_h.unwrap_or(content_height);
     // Clamp the used height to min-height / max-height (% against the containing block height).
     let final_height = clamp_height(boxx, final_height, containing.height, styles);
     boxx.dimensions.content.height = final_height;
@@ -343,12 +357,13 @@ pub(crate) fn layout_block_children(
         } else {
             // Each child's containing block is this box's content rect, positioned so the child
             // stacks below previous siblings (the running y); the child adds its own top
-            // margin/border/padding inside layout_block.
+            // margin/border/padding inside layout_block. `content.height` carries this box's definite
+            // height (0 when auto) so a percentage-height child can resolve against it.
             Rect {
                 x: content.x,
                 y: cursor_y,
                 width: content.width,
-                height: 0.0,
+                height: content.height,
             }
         };
         match &child.content {

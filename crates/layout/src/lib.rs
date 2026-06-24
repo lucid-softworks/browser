@@ -1704,6 +1704,86 @@ mod tests {
     }
 
     #[test]
+    fn percentage_height_resolves_against_definite_parent() {
+        // A `height: 100%` block fills a parent with a definite (explicit) height — the report's
+        // progress-bar fill.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let track = doc.append_element(body, "div");
+        let fill = doc.append_element(track, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            track,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                width: Some(200.0),
+                height: Some(9.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            fill,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                width_pct: Some(0.5),
+                height_pct: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let f = find_box(&root_box, &|x| x.node == Some(fill)).unwrap();
+        assert!(
+            (f.dimensions.content.height - 9.0).abs() < 0.5,
+            "fill height {} (want 9 = 100% of the 9px track)",
+            f.dimensions.content.height
+        );
+    }
+
+    #[test]
+    fn percentage_width_table_fills_container() {
+        // A `width: 100%` table fills its container rather than shrinking to its content width.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let table = doc.append_element(wrap, "table");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            wrap,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                width: Some(400.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            table,
+            style::ComputedStyle {
+                display: style::Display::Table,
+                width_pct: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let _ = build_row(&mut doc, &mut styles, table, "td", &["a", "b"]);
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let t = find_box(&root_box, &|x| x.node == Some(table)).unwrap();
+        assert!(
+            t.dimensions.content.width >= 400.0 - 1.0,
+            "table width {} should fill the 400px container",
+            t.dimensions.content.width
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();
