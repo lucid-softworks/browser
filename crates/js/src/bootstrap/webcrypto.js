@@ -257,6 +257,20 @@
   // ---- SubtleCrypto ------------------------------------------------------------------------
   function SubtleCrypto() {}
   var subtle = Object.create(SubtleCrypto.prototype);
+  // SubtleCrypto.supports(operation, algorithm) — feature-detection (newer spec addition). Report
+  // true only for the operation/algorithm pairs we actually implement, so callers neither hit a
+  // TypeError nor skip our working algorithms.
+  function supports(operation, algorithm) {
+    var op = String(operation || "").toLowerCase();
+    var name = (algorithm && (algorithm.name || algorithm) || "").toUpperCase();
+    if (op === "digest") { return !!digestBytes(name, []); }
+    if (op === "sign" || op === "verify") { return name === "HMAC"; }
+    if (op === "encrypt" || op === "decrypt") { return name === "AES-CBC" || name === "AES-CTR"; }
+    if (op === "importkey" || op === "exportkey" || op === "generatekey") { return name === "HMAC" || name === "AES-CBC" || name === "AES-CTR"; }
+    return false;
+  }
+  def(SubtleCrypto, "supports", supports);
+  def(subtle, "supports", supports);
   def(subtle, "digest", function (algorithm, data) {
     return new Promise(function (resolve, reject) {
       try {

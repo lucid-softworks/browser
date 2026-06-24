@@ -5416,6 +5416,21 @@
     if (typeof el.animate !== "function") { def(el, "animate", function (_keyframes, options) { return globalThis.__makeAnimation(options); }); }
     if (typeof el.getAnimations !== "function") { def(el, "getAnimations", function () { return []; }); }
     if (typeof el.isEqualNode !== "function") { def(el, "isEqualNode", function (other) { return globalThis.__nodesEqual(this, other); }); }
+    // getRootNode walks to the topmost ancestor (the document for a connected node; no shadow trees,
+    // so the `composed` option is a no-op). isSameNode is identity (compare by node id, since one node
+    // can have several wrappers). moveBefore is an atomic move — we model it as insertBefore.
+    if (typeof el.getRootNode !== "function") { def(el, "getRootNode", function () { var n = this; while (n && n.parentNode) { n = n.parentNode; } return n; }); }
+    if (typeof el.isSameNode !== "function") { def(el, "isSameNode", function (other) { if (this === other) { return true; } try { return other != null && this.__node != null && this.__node === other.__node; } catch (e) { return false; } }); }
+    if (typeof el.moveBefore !== "function") { def(el, "moveBefore", function (node, ref) { return this.insertBefore(node, ref); }); }
+    // Scrolling an element does nothing here (no scroll containers in layout); accept and ignore.
+    if (typeof el.scroll !== "function") { def(el, "scroll", fn); }
+    if (typeof el.scrollTo !== "function") { def(el, "scrollTo", fn); }
+    if (typeof el.scrollBy !== "function") { def(el, "scrollBy", fn); }
+    if (typeof el.checkVisibility !== "function") { def(el, "checkVisibility", function () { return true; }); }
+    // Popover API: accept the calls (we don't render the top layer), togglePopover reports "hidden".
+    if (typeof el.showPopover !== "function") { def(el, "showPopover", fn); }
+    if (typeof el.hidePopover !== "function") { def(el, "hidePopover", fn); }
+    if (typeof el.togglePopover !== "function") { def(el, "togglePopover", function () { return false; }); }
     // Declarative partial-update methods (WICG): {append,prepend,before,after,replaceWith}HTML[Unsafe].
     globalThis.__addPartialMethods(el);
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
@@ -7955,12 +7970,41 @@
   });
   def(__selectionProto, "removeAllRanges", function () { this._ranges = []; });
   def(__selectionProto, "empty", function () { this._ranges = []; });
+  // setBaseAndExtent: select from (anchorNode, anchorOffset) to (focusNode, focusOffset). We don't
+  // track selection direction, so a backward selection's anchor/focus getters may read swapped; the
+  // selected range itself is correct.
+  def(__selectionProto, "setBaseAndExtent", function (anchorNode, anchorOffset, focusNode, focusOffset) {
+    var range = globalThis.document.createRange();
+    try { range.setStart(anchorNode, anchorOffset); range.setEnd(focusNode, focusOffset); }
+    catch (e) { try { range.setStart(focusNode, focusOffset); range.setEnd(anchorNode, anchorOffset); } catch (e2) { return; } }
+    this._ranges = [range];
+  });
   def(__selectionProto, "toString", function () { var r = __selStart(this); return r ? r.toString() : ""; });
 
   var __selection = null;
   function getSelection() { if (!__selection) { __selection = __makeSelection(); } return __selection; }
   globalThis.getSelection = getSelection;
   try { def(globalThis.document, "getSelection", getSelection); } catch (e) {}
+
+  // Document-level method stubs for APIs we don't implement, so calls don't throw a TypeError:
+  // execCommand/queryCommand* (legacy editing — we report unsupported), getAnimations (none running),
+  // and startViewTransition (run the update callback immediately; no visual transition).
+  try {
+    var d = globalThis.document;
+    if (typeof d.execCommand !== "function") { def(d, "execCommand", function () { return false; }); }
+    if (typeof d.queryCommandSupported !== "function") { def(d, "queryCommandSupported", function () { return false; }); }
+    if (typeof d.queryCommandEnabled !== "function") { def(d, "queryCommandEnabled", function () { return false; }); }
+    if (typeof d.queryCommandState !== "function") { def(d, "queryCommandState", function () { return false; }); }
+    if (typeof d.queryCommandValue !== "function") { def(d, "queryCommandValue", function () { return ""; }); }
+    if (typeof d.getAnimations !== "function") { def(d, "getAnimations", function () { return []; }); }
+    if (typeof d.startViewTransition !== "function") {
+      def(d, "startViewTransition", function (cb) {
+        var done = Promise.resolve();
+        try { if (typeof cb === "function") { var r = cb(); if (r && typeof r.then === "function") { done = r.then(function () {}, function () {}); } } } catch (e) {}
+        return { ready: Promise.resolve(), finished: Promise.resolve(), updateCallbackDone: done, skipTransition: function () {} };
+      });
+    }
+  } catch (e) {}
 
   // CaretPosition: { offsetNode, offset, getClientRect() }. getClientRect() returns a FRESH DOMRect
   // each call (the WPT test asserts identity differs between calls).

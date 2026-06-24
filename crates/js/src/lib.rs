@@ -668,6 +668,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stubbed_apis_no_longer_throw() {
+        // Previously-missing APIs surfaced by the WPT sweep now respond instead of throwing
+        // "X is not a function": Node.getRootNode/isSameNode/moveBefore, element scroll/visibility/
+        // popover, document.execCommand/getAnimations/startViewTransition, Selection.setBaseAndExtent,
+        // and SubtleCrypto.supports.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var div = document.createElement("div"); document.body.appendChild(div);
+                    r.push("root:" + (div.getRootNode() === document));
+                    r.push("same:" + div.isSameNode(div) + ":" + div.isSameNode(document.body));
+                    var a = document.createElement("span"), b = document.createElement("span");
+                    div.appendChild(b); div.moveBefore(a, b);
+                    r.push("move:" + (div.firstChild === a));
+                    div.scrollTo(0, 0); div.scroll(); div.scrollBy(1, 1);
+                    r.push("vis:" + div.checkVisibility());
+                    div.showPopover(); div.hidePopover();
+                    r.push("toggle:" + div.togglePopover());
+                    r.push("exec:" + document.execCommand("bold"));
+                    r.push("anims:" + document.getAnimations().length);
+                    r.push("svt:" + (typeof document.startViewTransition(function () {}).finished.then));
+                    r.push("sup256:" + crypto.subtle.supports("digest", "SHA-256"));
+                    r.push("supMd5:" + crypto.subtle.supports("digest", "MD5"));
+                    r.push("supAes:" + SubtleCrypto.supports("encrypt", "AES-CBC"));
+                    var t = document.createTextNode("hello"); div.appendChild(t);
+                    var sel = getSelection(); sel.setBaseAndExtent(t, 0, t, 3);
+                    r.push("sel:" + sel.toString());
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("root:true|same:true:false|move:true|vis:true|toggle:false|exec:false|anims:0|svt:function|sup256:true|supMd5:false|supAes:true|sel:hel")
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]
