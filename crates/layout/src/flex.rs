@@ -482,14 +482,6 @@ fn flex_item_baseline(
         if let BoxContent::Text(_) | BoxContent::Marker(_) = &b.content {
             return b.dimensions.content.y + b.style.font_size * 0.8;
         }
-        // Pick the startmost child for a first baseline (endmost for a last baseline). A
-        // *-reverse flex container lays its items out against source order, so flip the choice
-        // there — that's what makes the `row-reverse`/`column-reverse` baselines come out right.
-        let reverse = matches!(
-            style_of(b, styles).map(|cs| cs.flex_direction),
-            Some(style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse)
-        );
-        let pick_last = last ^ reverse;
         // A fieldset `<legend>` is laid out in the border, and a table `<caption>` is outside the
         // table grid — neither contributes to the box's baseline (a table's baseline is its rows').
         let skip = |c: &&LayoutBox| -> bool {
@@ -499,10 +491,60 @@ fn flex_item_baseline(
                     Some(style::Display::TableCaption)
                 )
         };
-        let next = if pick_last {
-            b.children.iter().rev().find(|c| !skip(c))
+        let bcs = style_of(b, styles);
+        let dir = bcs.map(|cs| cs.flex_direction);
+        let is_flex = matches!(
+            bcs.map(|cs| cs.display),
+            Some(style::Display::Flex | style::Display::InlineFlex)
+        );
+        let main_rev = matches!(
+            dir,
+            Some(style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse)
+        );
+        let kids: Vec<&LayoutBox> = b.children.iter().filter(|c| !skip(c)).collect();
+        let next: Option<&LayoutBox> = if is_flex && !kids.is_empty() {
+            // The first (last) baseline comes from the item in the cross-start (cross-end) flex line,
+            // main-start (main-end) within it. Items are in main order per line in source order, so we
+            // split into lines at each main-position reset, then pick the right line/item — making
+            // wrap, wrap-reverse and *-reverse fall out from the laid-out positions.
+            let is_row = matches!(
+                dir,
+                Some(style::FlexDirection::Row | style::FlexDirection::RowReverse)
+            );
+            let main_key = |c: &LayoutBox| -> f32 {
+                let m = if is_row {
+                    c.dimensions.content.x
+                } else {
+                    c.dimensions.content.y
+                };
+                if main_rev { -m } else { m }
+            };
+            let mut lines: Vec<Vec<&LayoutBox>> = vec![Vec::new()];
+            let mut prev = f32::MIN;
+            for &c in &kids {
+                let k = main_key(c);
+                if k < prev - 0.01 {
+                    lines.push(Vec::new());
+                }
+                lines.last_mut().expect("a line").push(c);
+                prev = k;
+            }
+            let wrap_rev = matches!(bcs.map(|cs| cs.flex_wrap), Some(style::FlexWrap::WrapReverse));
+            // Cross-start line for first baseline (cross-end for last); `wrap-reverse` stacks lines in
+            // reverse cross order, so the cross-start line is then the last source line.
+            let li = if last ^ wrap_rev { lines.len() - 1 } else { 0 };
+            let line = &lines[li];
+            // Within the line, the main-start (main-end) item — `*-reverse` lays items against source
+            // order, so flip there, exactly as the single-line baseline did.
+            if last ^ main_rev {
+                line.last().copied()
+            } else {
+                line.first().copied()
+            }
+        } else if last {
+            kids.into_iter().next_back()
         } else {
-            b.children.iter().find(|c| !skip(c))
+            kids.into_iter().next()
         };
         match next {
             // A childless box is the leaf (atomic / empty), whose synthesized baseline is its bottom
@@ -768,17 +810,33 @@ pub(crate) fn intrinsic_cross_height(
     ) {
         return vertical_inline_extent(boxx, styles);
     }
-    // One line of text at the box's font size, or 0.
+    // One line of text at the box's font size (0 if it has none) …
     let fs = boxx.style.font_size;
-    let has_text = has_any_text(boxx);
-    if has_text {
+    let line_h = if has_any_text(boxx) {
         measurer.line_height(
             if fs > 0.0 { fs } else { 16.0 },
             boxx.style.font_family.as_deref(),
         )
     } else {
         0.0
+    };
+    // … but an inline-block / atomic child still establishes a line box as tall as the tallest of
+    // them, so a box whose only content is an inline-block (no text) isn't measured as 0 tall.
+    let mut atomic_h = 0.0f32;
+    for c in &boxx.children {
+        if matches!(
+            style_of(c, styles).map(|s| s.display),
+            Some(style::Display::InlineBlock | style::Display::InlineFlex | style::Display::InlineGrid)
+        ) {
+            let ch = explicit_height(c, styles)
+                .unwrap_or_else(|| intrinsic_cross_height(c, styles, measurer));
+            let m = c.dimensions.margin;
+            let b = c.dimensions.border;
+            let p = c.dimensions.padding;
+            atomic_h = atomic_h.max(ch + m.top + m.bottom + b.top + b.bottom + p.top + p.bottom);
+        }
     }
+    line_h.max(atomic_h)
 }
 
 /// The inline size (physical height) of a vertical-writing-mode box: the longest line's inline

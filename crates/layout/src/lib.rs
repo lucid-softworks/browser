@@ -1656,6 +1656,54 @@ mod tests {
     }
 
     #[test]
+    fn flex_item_with_only_inline_block_gets_inline_block_cross_height() {
+        // A row flex item whose only content is an inline-block (height 20, no text) takes that as its
+        // cross size, not 0 — so a column flex of such items can actually wrap on its block-size.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let flex = doc.append_element(body, "div");
+        let item = doc.append_element(flex, "div");
+        let span = doc.append_element(item, "span");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            flex,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                width: Some(200.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            item,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            span,
+            style::ComputedStyle {
+                display: style::Display::InlineBlock,
+                width: Some(20.0),
+                height: Some(20.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox = find_box(&root_box, &|x| x.node == Some(item)).unwrap();
+        assert!(
+            ibox.dimensions.content.height >= 20.0 - 0.5,
+            "flex item cross height {} should be >= the inline-block's 20",
+            ibox.dimensions.content.height
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();
