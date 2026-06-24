@@ -1461,6 +1461,62 @@ mod tests {
     }
 
     #[test]
+    fn parallel_vertical_flex_items_align_by_central_baseline() {
+        // In a vertical-writing-mode flex container, a vertical item is parallel to the container, so
+        // baseline alignment uses its CENTRAL baseline (middle of the margin box). Two vertical items
+        // of height 20 (central 10) and 40 (central 20) align centers → the shorter shifts +10 along
+        // the (vertical) cross axis.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let flex = doc.append_element(body, "div");
+        let a = doc.append_element(flex, "div");
+        let b = doc.append_element(flex, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            flex,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                flex_direction: style::FlexDirection::Column,
+                writing_mode: style::WritingMode::VerticalRl,
+                align_items: style::AlignItems::Baseline,
+                width: Some(300.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+        );
+        let mut item = |h: f32| style::ComputedStyle {
+            display: style::Display::Block,
+            display_block: true,
+            writing_mode: style::WritingMode::VerticalRl,
+            width: Some(10.0),
+            height: Some(h),
+            ..Default::default()
+        };
+        styles.insert(a, item(20.0));
+        styles.insert(b, item(40.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ay = find_box(&root_box, &|x| x.node == Some(a))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
+        let by = find_box(&root_box, &|x| x.node == Some(b))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
+        // a's center (10) meets b's center (20): a shifts +10 down relative to b.
+        assert!(
+            (ay - (by + 10.0)).abs() < 0.5,
+            "a.y={ay} b.y={by} (expected a = b + 10)"
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();
