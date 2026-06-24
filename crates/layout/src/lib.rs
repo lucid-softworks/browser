@@ -1517,6 +1517,79 @@ mod tests {
     }
 
     #[test]
+    fn line_clamp_last_baseline_uses_nth_line() {
+        // A `-webkit-line-clamp: 3` flex item's LAST baseline is its 3rd line's baseline, not its
+        // true final line. Five stacked 20px lines → 3rd line bottom = 60 (not the 5th's 100), so a
+        // baseline-aligned reference item (baseline 30) sits 30px below the clamp box's line top.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let flex = doc.append_element(body, "div");
+        let refd = doc.append_element(flex, "div");
+        let clamp = doc.append_element(flex, "div");
+        let lines: Vec<_> = (0..5).map(|_| doc.append_element(clamp, "div")).collect();
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            flex,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                align_items: style::AlignItems::LastBaseline,
+                width: Some(300.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            refd,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(30.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            clamp,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                line_clamp: Some(3),
+                ..Default::default()
+            },
+        );
+        for &l in &lines {
+            styles.insert(
+                l,
+                style::ComputedStyle {
+                    display: style::Display::Block,
+                    display_block: true,
+                    height: Some(20.0),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ry = find_box(&root_box, &|x| x.node == Some(refd))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
+        let cy = find_box(&root_box, &|x| x.node == Some(clamp))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
+        // ref baseline (30) aligns to clamp's 3rd-line baseline (60): ref.y = clamp.y + 30.
+        assert!(
+            (ry - (cy + 30.0)).abs() < 0.5,
+            "ref.y={ry} clamp.y={cy} (expected ref = clamp + 30 from 3rd-line clamp)"
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();

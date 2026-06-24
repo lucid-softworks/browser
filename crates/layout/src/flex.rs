@@ -517,6 +517,15 @@ fn flex_item_baseline(
         return if container_vertical { h / 2.0 } else { h };
     }
     let top = item.dimensions.margin_box().y;
+    // `-webkit-line-clamp: N` truncates the box to N lines, so its *last* baseline is the Nth line's
+    // baseline, not its true final line's.
+    if last {
+        if let Some(n) = style_of(item, styles).and_then(|cs| cs.line_clamp) {
+            if let Some(b) = nth_line_baseline(item, n) {
+                return b - top;
+            }
+        }
+    }
     let mut abs = leaf_baseline_abs(item, last, styles);
     // A scroll container (overflow != visible) clamps its propagated baseline to its own border box:
     // content scrolled or pushed (e.g. a negative margin) out of the scrollport doesn't drag the
@@ -532,6 +541,57 @@ fn flex_item_baseline(
         abs = abs.clamp(bb.y, bb.y + bb.height);
     }
     abs - top
+}
+
+/// The absolute (document-space) baseline of the Nth line of `item` (1-indexed, clamped to the line
+/// count) — used for a `-webkit-line-clamp` box's last baseline. Lines are split by forced breaks;
+/// each line's baseline is the lowest of its leaves' baselines (text alphabetic, else the leaf's
+/// bottom margin edge). `None` if the box has no leaves.
+fn nth_line_baseline(item: &LayoutBox, n: u32) -> Option<f32> {
+    // Collect each leaf as `(top, baseline)`. A `-webkit-box` line-clamp box stacks its lines as flex
+    // items / block children (distinct `y`), while a plain block stacks them as inline lines — both
+    // give one leaf-group per visual line when grouped by top edge, so we don't rely on line breaks.
+    fn walk(b: &LayoutBox, out: &mut Vec<(f32, f32)>) {
+        match &b.content {
+            BoxContent::LineBreak => {}
+            BoxContent::Text(_) | BoxContent::Marker(_) => {
+                out.push((
+                    b.dimensions.content.y,
+                    b.dimensions.content.y + b.style.font_size * 0.8,
+                ));
+            }
+            _ if b.children.is_empty() => {
+                let mb = b.dimensions.margin_box();
+                out.push((mb.y, mb.y + mb.height));
+            }
+            _ => {
+                for c in &b.children {
+                    walk(c, out);
+                }
+            }
+        }
+    }
+    let mut leaves: Vec<(f32, f32)> = Vec::new();
+    walk(item, &mut leaves);
+    if leaves.is_empty() {
+        return None;
+    }
+    // Group leaves into visual lines by top edge (sorted top-to-bottom); each line's baseline is the
+    // lowest of its leaves'.
+    leaves.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut lines: Vec<f32> = Vec::new();
+    let mut cur_top = f32::MIN;
+    for (top, bl) in leaves {
+        if lines.is_empty() || (top - cur_top).abs() > 0.5 {
+            lines.push(bl);
+            cur_top = top;
+        } else {
+            let last = lines.last_mut().expect("a line");
+            *last = last.max(bl);
+        }
+    }
+    let idx = (n as usize).min(lines.len()).saturating_sub(1);
+    Some(lines[idx])
 }
 
 /// Map a container's `align-items` to the equivalent per-item `align-self`.

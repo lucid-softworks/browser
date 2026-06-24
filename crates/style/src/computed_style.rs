@@ -66,6 +66,7 @@ impl Default for ComputedStyle {
             grid_column: None,
             grid_row: None,
             line_height: None,
+            line_clamp: None,
             text_transform: TextTransform::None,
             letter_spacing: 0.0,
             text_indent: 0.0,

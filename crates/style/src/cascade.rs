@@ -716,6 +716,7 @@ pub(crate) fn compute_element_style<'a>(
         grid_row: None,
         // Typography extras inherit.
         line_height: parent.line_height,
+        line_clamp: None, // not inherited
         text_transform: parent.text_transform,
         letter_spacing: parent.letter_spacing,
         text_indent: parent.text_indent,

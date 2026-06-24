@@ -420,6 +420,9 @@ pub struct ComputedStyle {
     // --- Text / typography extras ---
     /// Resolved `line-height` in px (`None` = use the font metric default). Inherits.
     pub line_height: Option<f32>,
+    /// `-webkit-line-clamp` line count (`None` = unset). Truncates the box to N lines; here used so a
+    /// clamped box's *last* baseline comes from its Nth line rather than its true final line.
+    pub line_clamp: Option<u32>,
     /// `text-transform`. Inherits.
     pub text_transform: TextTransform,
     /// `letter-spacing` in px added per character (0 = normal). Inherits.

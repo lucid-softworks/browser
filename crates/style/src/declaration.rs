@@ -970,6 +970,10 @@ pub(crate) fn apply_declaration(
                 style.line_height = Some(px);
             }
         }
+        "-webkit-line-clamp" | "line-clamp" => {
+            // `<integer>` (≥1) clamps to that many lines; `none` (or anything else) clears it.
+            style.line_clamp = val.trim().parse::<u32>().ok().filter(|&n| n > 0);
+        }
         "text-transform" => match val.trim().to_ascii_lowercase().as_str() {
             "none" => style.text_transform = TextTransform::None,
             "uppercase" => style.text_transform = TextTransform::Uppercase,
