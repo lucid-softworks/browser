@@ -32,8 +32,16 @@ pub(crate) fn layout_flex(
         style::WritingMode::VerticalRl | style::WritingMode::VerticalLr
     );
     let main_horizontal = is_row ^ vertical_wm;
-    let main_gap = if main_horizontal { cs.column_gap } else { cs.row_gap };
-    let cross_gap = if main_horizontal { cs.row_gap } else { cs.column_gap };
+    let main_gap = if main_horizontal {
+        cs.column_gap
+    } else {
+        cs.row_gap
+    };
+    let cross_gap = if main_horizontal {
+        cs.row_gap
+    } else {
+        cs.column_gap
+    };
 
     // The main-axis available size. For row this is content width; for column we use explicit
     // height if set, else a large value (single line) — content drives the height.
@@ -155,10 +163,18 @@ pub(crate) fn layout_flex(
     }
 
     // Resolve each line: distribute free space, position along main & cross axes.
-    let mut cross_cursor = if main_horizontal { content.y } else { content.x };
+    let mut cross_cursor = if main_horizontal {
+        content.y
+    } else {
+        content.x
+    };
     let mut line_cross_sizes: Vec<f32> = Vec::new();
     // First pass to know total cross used (for container sizing); we position as we go.
-    let main_start = if main_horizontal { content.x } else { content.y };
+    let main_start = if main_horizontal {
+        content.x
+    } else {
+        content.y
+    };
 
     // Determine final main container size for positioning.
     let main_box = if main_avail.is_finite() {
@@ -252,8 +268,8 @@ pub(crate) fn layout_flex(
         // top of it (the observed vertical overlap).
         let mut actual_cross: Vec<f32> = vec![0.0; metas.len()]; // per-meta, item margin-box cross
         let mut actual_laid: Vec<f32> = vec![0.0; metas.len()]; // per-meta, content height laid out
-        // For `align-*: [first|last] baseline`: each participating item's baseline as an offset from
-        // its cross-start margin edge. Only well-defined for a (horizontal) row container — see below.
+                                                                // For `align-*: [first|last] baseline`: each participating item's baseline as an offset from
+                                                                // its cross-start margin edge. Only well-defined for a (horizontal) row container — see below.
         let mut item_baseline: Vec<Option<f32>> = vec![None; metas.len()];
         for &mi in line {
             let item_main = size_of(mi);
@@ -304,8 +320,12 @@ pub(crate) fn layout_flex(
                 )
             {
                 let last = matches!(resolved, style::AlignSelf::LastBaseline);
-                item_baseline[mi] =
-                    Some(flex_item_baseline(&boxx.children[metas[mi].idx], last, vertical_wm, styles));
+                item_baseline[mi] = Some(flex_item_baseline(
+                    &boxx.children[metas[mi].idx],
+                    last,
+                    vertical_wm,
+                    styles,
+                ));
             }
         }
 
@@ -343,9 +363,9 @@ pub(crate) fn layout_flex(
                 _ => this_cross,
             };
             let cross_off = match align {
-                style::AlignSelf::FlexStart | style::AlignSelf::Stretch | style::AlignSelf::Auto => {
-                    0.0
-                }
+                style::AlignSelf::FlexStart
+                | style::AlignSelf::Stretch
+                | style::AlignSelf::Auto => 0.0,
                 style::AlignSelf::FlexEnd => line_cross - this_cross,
                 style::AlignSelf::Center => (line_cross - this_cross) / 2.0,
                 // Baseline: shift the item down so its baseline meets the line's reference baseline.
@@ -517,7 +537,11 @@ fn flex_item_baseline(
                 } else {
                     c.dimensions.content.y
                 };
-                if main_rev { -m } else { m }
+                if main_rev {
+                    -m
+                } else {
+                    m
+                }
             };
             let mut lines: Vec<Vec<&LayoutBox>> = vec![Vec::new()];
             let mut prev = f32::MIN;
@@ -529,7 +553,10 @@ fn flex_item_baseline(
                 lines.last_mut().expect("a line").push(c);
                 prev = k;
             }
-            let wrap_rev = matches!(bcs.map(|cs| cs.flex_wrap), Some(style::FlexWrap::WrapReverse));
+            let wrap_rev = matches!(
+                bcs.map(|cs| cs.flex_wrap),
+                Some(style::FlexWrap::WrapReverse)
+            );
             // Cross-start line for first baseline (cross-end for last); `wrap-reverse` stacks lines in
             // reverse cross order, so the cross-start line is then the last source line.
             let li = if last ^ wrap_rev { lines.len() - 1 } else { 0 };
@@ -611,9 +638,7 @@ fn flex_item_baseline(
     // Only when the height is constrained (explicit height/block-size) — otherwise the box grows to
     // fit its content, so the baseline is already inside it and the border box can't be trusted (e.g.
     // a `-webkit-line-clamp` box, whose used height the engine doesn't compute).
-    if item.style.clips_overflow
-        && style_of(item, styles).is_some_and(|cs| cs.height.is_some())
-    {
+    if item.style.clips_overflow && style_of(item, styles).is_some_and(|cs| cs.height.is_some()) {
         let bb = item.dimensions.border_box();
         abs = abs.clamp(bb.y, bb.y + bb.height);
     }
@@ -826,7 +851,11 @@ pub(crate) fn intrinsic_cross_height(
     for c in &boxx.children {
         if matches!(
             style_of(c, styles).map(|s| s.display),
-            Some(style::Display::InlineBlock | style::Display::InlineFlex | style::Display::InlineGrid)
+            Some(
+                style::Display::InlineBlock
+                    | style::Display::InlineFlex
+                    | style::Display::InlineGrid
+            )
         ) {
             let ch = explicit_height(c, styles)
                 .unwrap_or_else(|| intrinsic_cross_height(c, styles, measurer));
@@ -912,7 +941,10 @@ pub(crate) fn layout_flex_item_contents(
             layout_grid(boxx, child_ctx, styles, measurer)
         }
         style::Display::Table => crate::table::layout_table(boxx, child_ctx, styles, measurer),
-        _ if style_of(boxx, styles).and_then(|cs| cs.column_count).is_some() => {
+        _ if style_of(boxx, styles)
+            .and_then(|cs| cs.column_count)
+            .is_some() =>
+        {
             crate::block::layout_multicol(boxx, child_ctx, styles, measurer)
         }
         _ => {

@@ -441,7 +441,7 @@ impl GlyfBuilder<'_> {
             };
             glyf.extend_from_slice(&glyph);
             // Pad each glyph to an even length so short-format loca (offset/2) stays exact.
-            if glyf.len() % 2 != 0 {
+            if !glyf.len().is_multiple_of(2) {
                 glyf.push(0);
             }
             offsets.push(glyf.len() as u32);

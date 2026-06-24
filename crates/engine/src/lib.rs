@@ -1616,10 +1616,8 @@ mod tests {
         std::fs::write(&tokens_path, ".token { color: #111111 }").unwrap();
         let base = format!("file://{}/page.xht", dir.display());
         // Inline <style> whose body is CDATA-wrapped and starts with an @import.
-        let html = format!(
-            "<html><head><style type=\"text/css\"><![CDATA[\n@import url(\"tokens.css\");\n.main {{ color: #222222 }}\n]]></style></head><body></body></html>"
-        );
-        let doc = html::parse(&html);
+        let html = "<html><head><style type=\"text/css\"><![CDATA[\n@import url(\"tokens.css\");\n.main { color: #222222 }\n]]></style></head><body></body></html>";
+        let doc = html::parse(html);
 
         // The extracted inline source must have no CDATA markers left.
         let sources = collect_style_sources(&doc, &base);

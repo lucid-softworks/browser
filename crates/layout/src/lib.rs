@@ -1487,7 +1487,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut item = |h: f32| style::ComputedStyle {
+        let item = |h: f32| style::ComputedStyle {
             display: style::Display::Block,
             display_block: true,
             writing_mode: style::WritingMode::VerticalRl,

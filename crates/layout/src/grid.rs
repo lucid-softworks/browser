@@ -208,12 +208,14 @@ pub(crate) fn layout_grid(
     let resolved_align: Vec<style::AlignSelf> = boxx
         .children
         .iter()
-        .map(|c| match style_of(c, styles)
-            .map(|s| s.align_self)
-            .unwrap_or(style::AlignSelf::Auto)
-        {
-            style::AlignSelf::Auto => crate::flex::align_items_to_self(cs.align_items),
-            other => other,
+        .map(|c| {
+            match style_of(c, styles)
+                .map(|s| s.align_self)
+                .unwrap_or(style::AlignSelf::Auto)
+            {
+                style::AlignSelf::Auto => crate::flex::align_items_to_self(cs.align_items),
+                other => other,
+            }
         })
         .collect();
     let mut row_ascent = vec![f32::MIN; used_rows + 1];

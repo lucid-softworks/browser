@@ -992,7 +992,9 @@ pub(crate) fn apply_declaration(
         "margin-inline-end" => set_margin_side(style, EdgeSide::Right, 1, val),
         "padding-block-start" => set_edge(&mut style.padding, EdgeSide::Top, val, style.font_size),
         "padding-block-end" => set_edge(&mut style.padding, EdgeSide::Bottom, val, style.font_size),
-        "padding-inline-start" => set_edge(&mut style.padding, EdgeSide::Left, val, style.font_size),
+        "padding-inline-start" => {
+            set_edge(&mut style.padding, EdgeSide::Left, val, style.font_size)
+        }
         "padding-inline-end" => set_edge(&mut style.padding, EdgeSide::Right, val, style.font_size),
 
         // --- Typography extras ---
