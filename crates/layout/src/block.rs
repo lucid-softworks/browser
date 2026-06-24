@@ -194,6 +194,9 @@ pub(crate) fn layout_block(
             layout_grid(boxx, child_ctx, styles, measurer)
         }
         style::Display::Table => layout_table(boxx, child_ctx, styles, measurer),
+        _ if style_of(boxx, styles).and_then(|cs| cs.column_count).is_some() => {
+            layout_multicol(boxx, child_ctx, styles, measurer)
+        }
         _ => {
             // Block / inline-block / (anonymous, root): normal block-or-inline formatting.
             let any_block = boxx.children.iter().any(|c| {
@@ -394,6 +397,67 @@ pub(crate) fn layout_block_children(
     }
     // The container must be tall enough to contain its floats (it owns their formatting context).
     floats.max_bottom(cursor_y) - content.y
+}
+
+/// Lay out a multi-column container (`column-count` set): distribute its in-flow block children
+/// into N side-by-side columns and stack each column's children vertically. A child with
+/// `break-before: column` (or a preceding `break-after: column`) starts the next column. The
+/// container's height is the tallest column. (Mid-content fragmentation and column balancing aren't
+/// modeled — content is placed column-by-column following explicit breaks, which covers the common
+/// "one block per column" case.)
+pub(crate) fn layout_multicol(
+    boxx: &mut LayoutBox,
+    ctx: Ctx,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    measurer: &dyn TextMeasurer,
+) -> f32 {
+    let content = boxx.dimensions.content;
+    let cs = style_of(boxx, styles).cloned().unwrap_or_default();
+    let n = cs.column_count.unwrap_or(1).max(1) as usize;
+    let gap = cs.column_gap;
+    let col_width = ((content.width - gap * n.saturating_sub(1) as f32) / n as f32).max(0.0);
+    let mut col_y: Vec<f32> = vec![content.y; n];
+    let mut col_top = content.y; // top of the current column row (resets after a column-spanning box)
+    let mut col = 0usize;
+    let mut prev_break_after = false;
+    for child in &mut boxx.children {
+        if is_out_of_flow(child, styles) {
+            continue;
+        }
+        let ccs = style_of(child, styles).cloned().unwrap_or_default();
+        if ccs.column_span_all {
+            // Full-width box below the current column row; content after it begins a fresh row.
+            let row_bottom = col_y.iter().cloned().fold(col_top, f32::max);
+            let containing = Rect {
+                x: content.x,
+                y: row_bottom,
+                width: content.width,
+                height: 0.0,
+            };
+            grow_stack(|| layout_block(child, containing, ctx, styles, measurer));
+            let span_bottom = row_bottom + child.dimensions.margin_box().height;
+            col_y = vec![span_bottom; n];
+            col_top = span_bottom;
+            col = 0;
+            prev_break_after = false;
+            continue;
+        }
+        if prev_break_after || (ccs.break_before_column && col_y[col] > col_top) {
+            col = (col + 1).min(n - 1);
+        }
+        let cx = content.x + col as f32 * (col_width + gap);
+        let containing = Rect {
+            x: cx,
+            y: col_y[col],
+            width: col_width,
+            height: 0.0,
+        };
+        grow_stack(|| layout_block(child, containing, ctx, styles, measurer));
+        col_y[col] += child.dimensions.margin_box().height;
+        prev_break_after = ccs.break_after_column;
+    }
+    resolve_out_of_flow(boxx, ctx, styles, measurer);
+    (col_y.iter().cloned().fold(content.y, f32::max) - content.y).max(0.0)
 }
 
 /// Whether an in-flow child is inline-level — so it flows beside floats (within the float band)

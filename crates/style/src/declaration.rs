@@ -785,6 +785,22 @@ pub(crate) fn apply_declaration(
             }
         }
 
+        // --- Multi-column ---
+        "column-count" => {
+            style.column_count = val.trim().parse::<u32>().ok().filter(|&n| n > 0);
+        }
+        "columns" => {
+            // `columns: <count> || <width>`. Take the bare integer as the column count (the length,
+            // if any, is the column-width, which we don't size against yet).
+            style.column_count = val
+                .split_whitespace()
+                .find_map(|t| t.parse::<u32>().ok())
+                .filter(|&n| n > 0);
+        }
+        "break-before" => style.break_before_column = val.trim().eq_ignore_ascii_case("column"),
+        "break-after" => style.break_after_column = val.trim().eq_ignore_ascii_case("column"),
+        "column-span" => style.column_span_all = val.trim().eq_ignore_ascii_case("all"),
+
         // --- Grid ---
         "grid-template-columns" => {
             let tracks = parse_track_list(val);

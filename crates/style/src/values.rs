@@ -409,6 +409,16 @@ pub struct ComputedStyle {
     pub row_gap: f32,
     pub column_gap: f32,
 
+    // --- Multi-column layout ---
+    /// `column-count` (from `column-count` or the `columns` shorthand). `None` = `auto`.
+    pub column_count: Option<u32>,
+    /// `break-before: column` — this box starts a new column.
+    pub break_before_column: bool,
+    /// `break-after: column` — the next sibling starts a new column.
+    pub break_after_column: bool,
+    /// `column-span: all` — this box spans all columns (full width) and resets the column flow.
+    pub column_span_all: bool,
+
     // --- Grid container properties ---
     pub grid_template_columns: Vec<TrackSize>,
     pub grid_template_rows: Vec<TrackSize>,

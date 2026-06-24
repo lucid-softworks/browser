@@ -1590,6 +1590,72 @@ mod tests {
     }
 
     #[test]
+    fn multicol_places_children_in_side_by_side_columns() {
+        // A `column-count: 2` box with two children separated by a column break lays them out side by
+        // side (distinct x, same top), and its height is the tallest column (50), not the stacked sum.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let mc = doc.append_element(body, "div");
+        let a = doc.append_element(mc, "div");
+        let b = doc.append_element(mc, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            mc,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                width: Some(200.0),
+                column_count: Some(2),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(30.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(50.0),
+                break_before_column: true, // forces the second column
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let mcb = find_box(&root_box, &|x| x.node == Some(mc)).unwrap();
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
+        assert!(
+            bbox.dimensions.content.x > abox.dimensions.content.x + 50.0,
+            "b should be in the next column: a.x={} b.x={}",
+            abox.dimensions.content.x,
+            bbox.dimensions.content.x
+        );
+        assert!(
+            (abox.dimensions.content.y - bbox.dimensions.content.y).abs() < 0.5,
+            "columns share a top: a.y={} b.y={}",
+            abox.dimensions.content.y,
+            bbox.dimensions.content.y
+        );
+        assert!(
+            (mcb.dimensions.content.height - 50.0).abs() < 0.5,
+            "multicol height = tallest column (50), got {}",
+            mcb.dimensions.content.height
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();

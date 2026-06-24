@@ -525,6 +525,13 @@ fn flex_item_baseline(
                 return b - top;
             }
         }
+        // A multi-column box's last baseline is its lowest line across all columns (the bottom of the
+        // tallest column), not its source-last child — `nth_line_baseline` with a huge N returns that.
+        if style_of(item, styles).is_some_and(|cs| cs.column_count.is_some()) {
+            if let Some(b) = nth_line_baseline(item, u32::MAX) {
+                return b - top;
+            }
+        }
     }
     let mut abs = leaf_baseline_abs(item, last, styles);
     // A scroll container (overflow != visible) clamps its propagated baseline to its own border box:
@@ -708,6 +715,9 @@ pub(crate) fn layout_flex_item_contents(
         }
         style::Display::Grid | style::Display::InlineGrid => {
             layout_grid(boxx, child_ctx, styles, measurer)
+        }
+        _ if style_of(boxx, styles).and_then(|cs| cs.column_count).is_some() => {
+            crate::block::layout_multicol(boxx, child_ctx, styles, measurer)
         }
         _ => {
             let any_block = boxx.children.iter().any(|c| {

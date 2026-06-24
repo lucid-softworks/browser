@@ -710,6 +710,10 @@ pub(crate) fn compute_element_style<'a>(
         order: 0,
         row_gap: 0.0,
         column_gap: 0.0,
+        column_count: None,           // not inherited
+        break_before_column: false,   // not inherited
+        break_after_column: false,    // not inherited
+        column_span_all: false,       // not inherited
         grid_template_columns: Vec::new(),
         grid_template_rows: Vec::new(),
         grid_column: None,
