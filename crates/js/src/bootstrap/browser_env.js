@@ -6042,6 +6042,9 @@
   if (typeof document.contains !== "function") {
     def(document, "contains", function (node) { return nodeContains(document, node); });
   }
+  // The document is itself the root of its tree; getRootNode returns it, isSameNode is identity.
+  if (typeof document.getRootNode !== "function") { def(document, "getRootNode", function () { return document; }); }
+  if (typeof document.isSameNode !== "function") { def(document, "isSameNode", function (other) { return other === document; }); }
   if (typeof document.compareDocumentPosition !== "function") {
     def(document, "compareDocumentPosition", function (other) {
       if (!other || typeof other.__node !== "number") {
@@ -10778,6 +10781,25 @@
       charCode: 0, keyCode: 0, which: 0
     });
     KeyboardEvent.prototype.getModifierState = MouseEvent.prototype.getModifierState;
+    // Legacy init methods (deprecated, but still exercised by tests). Each calls initEvent then sets
+    // the subclass members from positional args (re-defining the read-only properties).
+    UIEvent.prototype.initUIEvent = function (type, bubbles, cancelable, view, detail) {
+      this.initEvent(type, bubbles, cancelable);
+      def(this, "view", view === undefined ? null : view);
+      def(this, "detail", detail === undefined ? 0 : detail);
+    };
+    MouseEvent.prototype.initMouseEvent = function (type, bubbles, cancelable, view, detail, screenX, screenY, clientX, clientY, ctrlKey, altKey, shiftKey, metaKey, button, relatedTarget) {
+      this.initUIEvent(type, bubbles, cancelable, view, detail);
+      def(this, "screenX", screenX || 0); def(this, "screenY", screenY || 0);
+      def(this, "clientX", clientX || 0); def(this, "clientY", clientY || 0);
+      def(this, "ctrlKey", !!ctrlKey); def(this, "altKey", !!altKey); def(this, "shiftKey", !!shiftKey); def(this, "metaKey", !!metaKey);
+      def(this, "button", button || 0); def(this, "relatedTarget", relatedTarget === undefined ? null : relatedTarget);
+    };
+    KeyboardEvent.prototype.initKeyboardEvent = function (type, bubbles, cancelable, view, key, location, ctrlKey, altKey, shiftKey, metaKey) {
+      this.initUIEvent(type, bubbles, cancelable, view, 0);
+      def(this, "key", key == null ? "" : String(key)); def(this, "location", location || 0);
+      def(this, "ctrlKey", !!ctrlKey); def(this, "altKey", !!altKey); def(this, "shiftKey", !!shiftKey); def(this, "metaKey", !!metaKey);
+    };
     var CompositionEvent = defSubclass("CompositionEvent", UIEvent, { data: "" });
     var InputEvent = defSubclass("InputEvent", UIEvent, { data: null, inputType: "", isComposing: false });
     var TouchEvent = defSubclass("TouchEvent", UIEvent, {
