@@ -1291,6 +1291,76 @@ mod tests {
     }
 
     #[test]
+    fn scroll_container_flex_baseline_clamps_to_border_box() {
+        // A baseline-aligned scroll-container flex item (explicit height) whose content is pushed far
+        // out of view by a negative margin must not drag its baseline outside its border box: the
+        // clamp keeps it bounded, so the item's own offset stays small instead of ~220px down.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let flex = doc.append_element(body, "div");
+        let a = doc.append_element(flex, "div");
+        let b = doc.append_element(flex, "div");
+        let bchild = doc.append_element(b, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            flex,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                align_items: style::AlignItems::Baseline,
+                width: Some(300.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(30.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(50.0),
+                overflow_scrollport: true, // overflow: hidden → scroll container
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            bchild,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(10.0),
+                margin: style::Edges {
+                    top: -200.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                },
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
+        // Without the clamp B's baseline would be ~ -190, dragging B's box ~220px down to align.
+        assert!(
+            bbox.dimensions.border_box().y < 100.0,
+            "B offset {} should be clamped near the top",
+            bbox.dimensions.border_box().y
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();

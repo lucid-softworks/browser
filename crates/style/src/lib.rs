@@ -278,6 +278,21 @@ mod tests {
     }
 
     #[test]
+    fn logical_size_longhands_map_to_physical_width_height() {
+        // inline-size/block-size (and their min/max) resolve to physical width/height under the
+        // engine's LTR horizontal-tb assumption — incl. percentages routed through the width arm.
+        let doc = html::parse(
+            r#"<html><body><div style="inline-size:300px;block-size:80px;min-block-size:20px;max-inline-size:50%">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let s = &map[&elem(&doc, |e| e.tag == "div")];
+        assert_eq!(s.width, Some(300.0));
+        assert_eq!(s.height, Some(80.0));
+        assert!(s.min_height.is_some(), "min-block-size → min-height");
+        assert!(s.max_width.is_some(), "max-inline-size → max-width");
+    }
+
+    #[test]
     fn rem_resolves_against_root_font_size() {
         // html{font-size:62.5%} → root font-size = 10px, so a child's 1.6rem = 16px (not 25.6).
         let doc = html::parse(

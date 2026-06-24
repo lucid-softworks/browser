@@ -406,6 +406,17 @@ pub(crate) fn apply_declaration(
     inherited_color: (u8, u8, u8),
     base: Option<&str>,
 ) {
+    // Logical sizing longhands resolve to physical width/height (the engine's LTR horizontal-tb
+    // assumption), so the existing physical arms below handle them (incl. percentage / min-max).
+    let prop = match prop {
+        "inline-size" => "width",
+        "block-size" => "height",
+        "min-inline-size" => "min-width",
+        "max-inline-size" => "max-width",
+        "min-block-size" => "min-height",
+        "max-block-size" => "max-height",
+        other => other,
+    };
     match prop {
         "color" => {
             let trimmed = val.trim().to_ascii_lowercase();

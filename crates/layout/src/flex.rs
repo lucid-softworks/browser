@@ -495,7 +495,21 @@ fn flex_item_baseline(
         }
     }
     let top = item.dimensions.margin_box().y;
-    leaf_baseline_abs(item, last, styles) - top
+    let mut abs = leaf_baseline_abs(item, last, styles);
+    // A scroll container (overflow != visible) clamps its propagated baseline to its own border box:
+    // content scrolled or pushed (e.g. a negative margin) out of the scrollport doesn't drag the
+    // baseline outside the box — it pins to the near border edge instead (CSS scroll-container
+    // baselines).
+    // Only when the height is constrained (explicit height/block-size) — otherwise the box grows to
+    // fit its content, so the baseline is already inside it and the border box can't be trusted (e.g.
+    // a `-webkit-line-clamp` box, whose used height the engine doesn't compute).
+    if item.style.clips_overflow
+        && style_of(item, styles).is_some_and(|cs| cs.height.is_some())
+    {
+        let bb = item.dimensions.border_box();
+        abs = abs.clamp(bb.y, bb.y + bb.height);
+    }
+    abs - top
 }
 
 /// Map a container's `align-items` to the equivalent per-item `align-self`.
