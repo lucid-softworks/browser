@@ -709,6 +709,37 @@ mod tests {
     }
 
     #[test]
+    fn range_extract_and_delete_contents() {
+        // Range.extractContents moves the selected content into a fragment (trimming char-data
+        // boundaries); deleteContents leaves the same tree state without returning it.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var p = document.createElement("p"); p.textContent = "hello world"; document.body.appendChild(p);
+                    var rng = document.createRange(); rng.setStart(p.firstChild, 3); rng.setEnd(p.firstChild, 8);
+                    var frag = rng.extractContents();
+                    r.push("ex:" + frag.textContent + ":" + p.textContent);
+                    var div = document.createElement("div"); div.innerHTML = "<b>aa</b><i>bb</i><u>cc</u>"; document.body.appendChild(div);
+                    var rng2 = document.createRange(); rng2.setStartBefore(div.children[1]); rng2.setEndAfter(div.children[1]);
+                    rng2.deleteContents();
+                    r.push("del:" + div.innerHTML);
+                    var div2 = document.createElement("div"); div2.innerHTML = "<span>x</span><span>y</span>"; document.body.appendChild(div2);
+                    var rng3 = document.createRange(); rng3.selectNode(div2.children[0]);
+                    var frag3 = rng3.extractContents();
+                    r.push("ext2:" + frag3.childNodes.length + ":" + div2.innerHTML);
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("ex:lo wo:helrld|del:<b>aa</b><u>cc</u>|ext2:1:<span>y</span>")
+        );
+    }
+
+    #[test]
     fn selection_caret_api() {
         // Selection.collapse/extend/selectAllChildren/collapseToStart over the Range model — the
         // editing tests lean heavily on these (collapse alone was ~531 "is not a function" hits).

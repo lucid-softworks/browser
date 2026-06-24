@@ -7766,6 +7766,80 @@
     }
     return frag;
   }
+  // Like __cloneRangeContents, but MOVES the contained nodes into the fragment (removing them from
+  // the tree) and trims the partially-contained CharData boundaries — i.e. the spec "extract"
+  // algorithm. __appendChild reparents an already-attached node, so appending = moving.
+  function __extractRangeContents(rec) {
+    var frag = document.createDocumentFragment();
+    var fragId = frag.__node;
+    var scId = __idOf(rec._sc), so = rec._so, ecId = __idOf(rec._ec), eo = rec._eo;
+    if (scId === ecId && so === eo) { return frag; }
+    if (scId === ecId && __isCharData(__nodeType(scId))) {
+      var t = __textContent(scId) || "";
+      var clone = globalThis.__cloneNode(scId, false);
+      globalThis.__setTextContent(clone, t.slice(so, eo));
+      globalThis.__appendChild(fragId, clone);
+      globalThis.__setTextContent(scId, t.slice(0, so) + t.slice(eo));
+      return frag;
+    }
+    var caId = scId;
+    while (!__isInclAncestor(caId, ecId)) { caId = __parent(caId); }
+    var kids = __children(caId);
+    var firstPC = -1, lastPC = -1;
+    if (!__isInclAncestor(scId, ecId)) { for (var i = 0; i < kids.length; i++) { if (__nodePartiallyContained(kids[i], scId, ecId)) { firstPC = kids[i]; break; } } }
+    if (!__isInclAncestor(ecId, scId)) { for (var j = kids.length - 1; j >= 0; j--) { if (__nodePartiallyContained(kids[j], scId, ecId)) { lastPC = kids[j]; break; } } }
+    var contained = [];
+    for (var k = 0; k < kids.length; k++) { if (__nodeContainedIn(kids[k], scId, so, ecId, eo)) { contained.push(kids[k]); } }
+    // Leading partial boundary.
+    if (firstPC >= 0 && __isCharData(__nodeType(firstPC))) {
+      var df = __textContent(scId) || "";
+      var cf = globalThis.__cloneNode(scId, false);
+      globalThis.__setTextContent(cf, df.slice(so));
+      globalThis.__appendChild(fragId, cf);
+      globalThis.__setTextContent(scId, df.slice(0, so));
+    } else if (firstPC >= 0) {
+      var cfe = globalThis.__cloneNode(firstPC, false);
+      globalThis.__appendChild(fragId, cfe);
+      var sub1 = __extractRangeContents({ _sc: __nodeFor(scId), _so: so, _ec: __nodeFor(firstPC), _eo: __rangeLength(__nodeFor(firstPC)) });
+      var sk1 = __children(sub1.__node).slice();
+      for (var a = 0; a < sk1.length; a++) { globalThis.__appendChild(cfe, sk1[a]); }
+    }
+    // Fully contained children: move (not clone).
+    for (var c = 0; c < contained.length; c++) { globalThis.__appendChild(fragId, contained[c]); }
+    // Trailing partial boundary.
+    if (lastPC >= 0 && __isCharData(__nodeType(lastPC))) {
+      var dl = __textContent(ecId) || "";
+      var cl = globalThis.__cloneNode(ecId, false);
+      globalThis.__setTextContent(cl, dl.slice(0, eo));
+      globalThis.__appendChild(fragId, cl);
+      globalThis.__setTextContent(ecId, dl.slice(eo));
+    } else if (lastPC >= 0) {
+      var cle = globalThis.__cloneNode(lastPC, false);
+      globalThis.__appendChild(fragId, cle);
+      var sub2 = __extractRangeContents({ _sc: __nodeFor(lastPC), _so: 0, _ec: __nodeFor(ecId), _eo: eo });
+      var sk2 = __children(sub2.__node).slice();
+      for (var b = 0; b < sk2.length; b++) { globalThis.__appendChild(cle, sk2[b]); }
+    }
+    return frag;
+  }
+  // The collapse point after an extract/delete: the start, or (parent of the start's highest ancestor
+  // not containing the end, index+1).
+  function __rangeCollapseTarget(range) {
+    var scId = __idOf(range._sc), ecId = __idOf(range._ec);
+    if (__isInclAncestor(scId, ecId)) { return { node: range._sc, off: range._so }; }
+    var ref = scId;
+    while (__parent(ref) >= 0 && !__isInclAncestor(__parent(ref), ecId)) { ref = __parent(ref); }
+    var pp = __parent(ref);
+    return { node: __nodeFor(pp), off: __children(pp).indexOf(ref) + 1 };
+  }
+  Range.prototype.extractContents = function () {
+    var target = __rangeCollapseTarget(this);
+    var frag = __extractRangeContents({ _sc: this._sc, _so: this._so, _ec: this._ec, _eo: this._eo });
+    __setRangeStart(this, target.node, target.off); __setRangeEnd(this, target.node, target.off);
+    return frag;
+  };
+  // deleteContents leaves the same tree state as extracting and discarding the result.
+  Range.prototype.deleteContents = function () { this.extractContents(); };
   Range.prototype.cloneContents = function () {
     return __cloneRangeContents(this);
   };
