@@ -6,6 +6,8 @@ Usage: scripts/wpt-report.py <source> [out-dir] [area-label]
              single wptreport JSON file.
   out-dir    container directory (default: wpt-report). Pages are written under <out-dir>/site/ and
              the entry point is <out-dir>/index.html (a redirect into site/).
+  area-label the top-level area to root at (default: css). Pass `all` to render every area in the
+             store under a synthetic `wpt` root (the whole-suite report).
 
 Layout (like an lcov coverage report): one page per directory. Every directory of the test tree gets
 its own `index.html` listing its immediate children — subdirectories (aggregate pass/total + a bar,
@@ -65,13 +67,19 @@ class Node:
 
 
 def build_tree(results, area):
-    root = Node(area)
+    """Build the directory tree. `area` is the single top-level area to root at (its leading path
+    segment is stripped). Pass None to render EVERY area under a synthetic root, keeping each test's
+    full path — used for the whole-suite report spanning css/, dom/, html/, … ."""
+    root = Node(area if area else "wpt")
     for r in results:
         parts = r["test"].lstrip("/").split("/")
-        if not parts or parts[0] != area:
-            # Tolerate results outside the area by bucketing them under the root.
-            parts = [area] + parts
-        path = parts[1:]  # drop the area segment (it's the root)
+        if area:
+            if not parts or parts[0] != area:
+                # Tolerate results outside the area by bucketing them under the root.
+                parts = [area] + parts
+            path = parts[1:]  # drop the area segment (it's the root)
+        else:
+            path = parts  # synthetic root: top-level areas become its child dirs
         node = root
         for seg in path[:-1]:
             node = node.dirs.setdefault(seg, Node(seg))
@@ -271,8 +279,14 @@ def main():
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "wpt-report"
     area = sys.argv[3] if len(sys.argv) > 3 else "css"
 
+    # `all` (or `*`) renders every top-level area under a synthetic `wpt` root, rather than rooting
+    # at a single area. Used by the whole-suite report.
+    multi = area in ("all", "*")
+    if multi:
+        area = "wpt"
+
     results = load_results(src)
-    root = build_tree(results, area)
+    root = build_tree(results, None if multi else area)
     aggregate(root)
 
     # Everything lives under one container dir: pages under `<out_dir>/site/`, a tiny redirect at

@@ -42,7 +42,9 @@ fi
 #    /quirks/reference/*.html via ../../quirks/...). Without them those resources 404 (helper scripts
 #    report no subtests; Ahem tests use the fallback font; reftest refs fail to load and the
 #    comparison can't run).
-( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks >/dev/null 2>&1 || true )
+#    The requested test paths ("${TESTS[@]}") are added too, so running an area that isn't yet in the
+#    sparse checkout pulls it into the working tree instead of silently finding 0 tests.
+( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks "${TESTS[@]}" >/dev/null 2>&1 || true )
 
 # 2. Install our product into the checkout's wptrunner.browsers package (the checkout is gitignored,
 #    so the canonical copy lives in tools/wpt/). Register the product name in BUILTIN_PRODUCTS.
