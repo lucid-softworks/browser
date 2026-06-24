@@ -515,6 +515,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dom_parser_text_html_returns_independent_document() {
+        // Regression: the text/html path used to return the LIVE document and ignore the input
+        // string. It must parse into a fresh document (content distributed to head/body) that does
+        // not leak into the live tree.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var d = new DOMParser().parseFromString(
+                      "<!DOCTYPE html><html><head><title>T</title></head><body><p id=x>hi</p></body></html>",
+                      "text/html");
+                    var r = [];
+                    r.push("notlive:" + (d !== document));
+                    var p = d.body.querySelector("p#x");
+                    r.push("body:" + (p ? p.textContent : "null"));
+                    var ti = d.querySelector("title");
+                    r.push("title:" + (ti ? ti.textContent : "null"));
+                    r.push("leak:" + document.body.querySelector("p#x"));
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("notlive:true|body:hi|title:T|leak:null")
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]
