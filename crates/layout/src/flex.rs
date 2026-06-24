@@ -676,7 +676,7 @@ fn table_baseline(
         .fold(None, |acc, b| Some(acc.map_or(b, |a: f32| a.max(b))))
 }
 
-fn nth_line_baseline(
+pub(crate) fn nth_line_baseline(
     item: &LayoutBox,
     n: u32,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,

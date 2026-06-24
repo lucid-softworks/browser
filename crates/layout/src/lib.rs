@@ -2057,6 +2057,59 @@ mod tests {
     }
 
     #[test]
+    fn grid_align_self_end_positions_item_at_cell_bottom() {
+        // An `align-self: end` grid item (height 20) in a 60px row sits at the cell bottom (offset
+        // 40), content-sized rather than stretched to fill the cell.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let g = doc.append_element(body, "div");
+        let a = doc.append_element(g, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            g,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                width: Some(100.0),
+                grid_template_columns: vec![style::TrackSize::Px(50.0)],
+                grid_template_rows: vec![style::TrackSize::Px(60.0)],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                height: Some(20.0),
+                align_self: style::AlignSelf::FlexEnd,
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let gy = find_box(&root_box, &|x| x.node == Some(g))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        assert!(
+            (abox.dimensions.content.height - 20.0).abs() < 0.5,
+            "item should be content-sized (20), got {}",
+            abox.dimensions.content.height
+        );
+        assert!(
+            (abox.dimensions.content.y - (gy + 40.0)).abs() < 0.5,
+            "item should sit at the cell bottom (gy+40), got {}",
+            abox.dimensions.content.y
+        );
+    }
+
+    #[test]
     fn sibling_after_wrapped_paragraph_clears_its_margin_box() {
         // body > p (multi-line wrapped text) , div (sibling). The sibling's content.y must be
         // >= the paragraph block's margin-box bottom (no vertical overlap). This guards the bug

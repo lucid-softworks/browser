@@ -149,6 +149,11 @@ pub(crate) fn layout_grid(
     // feed it into the auto-row sizing below. (Items are laid out again at their final cell rect
     // after row heights are known, so this is purely a measurement pass.)
     let mut measured_h: Vec<f32> = vec![0.0; boxx.children.len()];
+    // Per-item baseline offsets (first/last line baseline from the item's margin-box top) and
+    // margin-box height — used for cross-axis (`align-items`) baseline alignment within cells.
+    let mut first_bl: Vec<Option<f32>> = vec![None; boxx.children.len()];
+    let mut last_bl: Vec<Option<f32>> = vec![None; boxx.children.len()];
+    let mut mbox_h: Vec<f32> = vec![0.0; boxx.children.len()];
     for p in &placed {
         let end_col = (p.col + p.col_span).min(num_cols);
         let mut w = 0.0;
@@ -163,11 +168,17 @@ pub(crate) fn layout_grid(
         let b = child.dimensions.border;
         let pad = child.dimensions.padding;
         let edges_h = m.left + m.right + b.left + b.right + pad.left + pad.right;
+        let edges_v = m.top + m.bottom + b.top + b.bottom + pad.top + pad.bottom;
         let ccs = style_of(child, styles).cloned().unwrap_or_default();
         let cw = ccs.width.unwrap_or((w - edges_h).max(0.0));
         child.dimensions.content.width = cw;
         let laid = layout_flex_item_contents(child, ctx, styles, measurer);
         measured_h[p.idx] = laid;
+        let mb_top = child.dimensions.margin_box().y;
+        first_bl[p.idx] = crate::flex::nth_line_baseline(child, 1, styles).map(|x| x - mb_top);
+        last_bl[p.idx] =
+            crate::flex::nth_line_baseline(child, u32::MAX, styles).map(|x| x - mb_top);
+        mbox_h[p.idx] = ccs.height.unwrap_or(laid) + edges_v;
     }
 
     // Row heights: resolve. For auto rows, use an equal share of explicit container height if
@@ -189,6 +200,39 @@ pub(crate) fn layout_grid(
     let mut row_y = vec![0.0f32; used_rows + 1];
     for r in 0..used_rows {
         row_y[r + 1] = row_y[r] + row_heights[r] + if r + 1 < used_rows { cs.row_gap } else { 0.0 };
+    }
+
+    // Cross-axis (`align-items`/`align-self`) baseline references per row: the deepest first-line
+    // ascent for `baseline` groups, and the deepest descent (margin box below the last baseline) for
+    // `last baseline` groups. Items in a group then share a baseline line within their cells.
+    let resolved_align: Vec<style::AlignSelf> = boxx
+        .children
+        .iter()
+        .map(|c| match style_of(c, styles)
+            .map(|s| s.align_self)
+            .unwrap_or(style::AlignSelf::Auto)
+        {
+            style::AlignSelf::Auto => crate::flex::align_items_to_self(cs.align_items),
+            other => other,
+        })
+        .collect();
+    let mut row_ascent = vec![f32::MIN; used_rows + 1];
+    let mut row_descent = vec![f32::MIN; used_rows + 1];
+    for p in &placed {
+        let r = p.row.min(used_rows);
+        match resolved_align[p.idx] {
+            style::AlignSelf::Baseline => {
+                if let Some(o) = first_bl[p.idx] {
+                    row_ascent[r] = row_ascent[r].max(o);
+                }
+            }
+            style::AlignSelf::LastBaseline => {
+                if let Some(o) = last_bl[p.idx] {
+                    row_descent[r] = row_descent[r].max(mbox_h[p.idx] - o);
+                }
+            }
+            _ => {}
+        }
     }
 
     for p in &placed {
@@ -221,9 +265,30 @@ pub(crate) fn layout_grid(
         let edges_h = m.left + m.right + b.left + b.right + pad.left + pad.right;
         let edges_v = m.top + m.bottom + b.top + b.bottom + pad.top + pad.bottom;
         let cw = ccs.width.unwrap_or((w - edges_h).max(0.0));
-        let ch = ccs.height.unwrap_or((h - edges_v).max(0.0));
+        let r = p.row.min(used_rows);
+        // Cross-axis size + offset (margin-box top within the cell) per `align-items`/`align-self`.
+        // Stretch fills the row; everything else uses the content height and is positioned.
+        let (ch, cross_off) = match resolved_align[p.idx] {
+            style::AlignSelf::Stretch => (ccs.height.unwrap_or((h - edges_v).max(0.0)), 0.0),
+            align => {
+                let item_ch = ccs.height.unwrap_or(measured_h[p.idx]);
+                let item_mbh = item_ch + edges_v;
+                let off = match align {
+                    style::AlignSelf::FlexEnd => (h - item_mbh).max(0.0),
+                    style::AlignSelf::Center => ((h - item_mbh) / 2.0).max(0.0),
+                    style::AlignSelf::Baseline => first_bl[p.idx]
+                        .filter(|_| row_ascent[r] > f32::MIN)
+                        .map_or(0.0, |o| row_ascent[r] - o),
+                    style::AlignSelf::LastBaseline => last_bl[p.idx]
+                        .filter(|_| row_descent[r] > f32::MIN)
+                        .map_or(0.0, |o| (h - row_descent[r]) - o),
+                    _ => 0.0, // FlexStart / Auto
+                };
+                (item_ch, off)
+            }
+        };
         let cx = cell_x + m.left + b.left + pad.left;
-        let cy = cell_y + m.top + b.top + pad.top;
+        let cy = cell_y + cross_off + m.top + b.top + pad.top;
         child.dimensions.content = Rect {
             x: cx,
             y: cy,
