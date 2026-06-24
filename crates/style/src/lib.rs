@@ -259,6 +259,25 @@ mod tests {
     }
 
     #[test]
+    fn logical_margin_padding_longhands_map_to_physical_sides() {
+        // margin-block-start/-end and margin-inline-start/-end (and the padding equivalents) map to
+        // physical top/bottom/left/right under the engine's LTR horizontal-tb assumption. A negative
+        // value is honored (used by overflow baseline tests that push content out of a scroll box).
+        let doc = html::parse(
+            r#"<html><body><div style="margin-block-start:-200px;margin-block-end:5px;margin-inline-start:7px;margin-inline-end:9px;padding-block-start:11px;padding-inline-end:13px">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        let div = elem(&doc, |e| e.tag == "div");
+        let s = &map[&div];
+        assert_eq!(s.margin.top, -200.0);
+        assert_eq!(s.margin.bottom, 5.0);
+        assert_eq!(s.margin.left, 7.0);
+        assert_eq!(s.margin.right, 9.0);
+        assert_eq!(s.padding.top, 11.0);
+        assert_eq!(s.padding.right, 13.0);
+    }
+
+    #[test]
     fn rem_resolves_against_root_font_size() {
         // html{font-size:62.5%} → root font-size = 10px, so a child's 1.6rem = 16px (not 25.6).
         let doc = html::parse(

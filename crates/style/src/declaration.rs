@@ -941,6 +941,17 @@ pub(crate) fn apply_declaration(
                 style.margin.right = b;
             }
         }
+        // Logical margin/padding longhands → physical sides, assuming LTR horizontal-tb (the same
+        // assumption the engine makes elsewhere, e.g. the `margin-block`/`margin-inline` shorthands
+        // and logical `float`/`clear` above).
+        "margin-block-start" => set_margin_side(style, EdgeSide::Top, 0, val),
+        "margin-block-end" => set_margin_side(style, EdgeSide::Bottom, 2, val),
+        "margin-inline-start" => set_margin_side(style, EdgeSide::Left, 3, val),
+        "margin-inline-end" => set_margin_side(style, EdgeSide::Right, 1, val),
+        "padding-block-start" => set_edge(&mut style.padding, EdgeSide::Top, val, style.font_size),
+        "padding-block-end" => set_edge(&mut style.padding, EdgeSide::Bottom, val, style.font_size),
+        "padding-inline-start" => set_edge(&mut style.padding, EdgeSide::Left, val, style.font_size),
+        "padding-inline-end" => set_edge(&mut style.padding, EdgeSide::Right, val, style.font_size),
 
         // --- Typography extras ---
         "line-height" => {
