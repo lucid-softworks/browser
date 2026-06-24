@@ -418,6 +418,8 @@ pub struct ComputedStyle {
     pub break_after_column: bool,
     /// `column-span: all` — this box spans all columns (full width) and resets the column flow.
     pub column_span_all: bool,
+    /// `caption-side: bottom` — a table caption rendered below the grid instead of above.
+    pub caption_side_bottom: bool,
 
     // --- Grid container properties ---
     pub grid_template_columns: Vec<TrackSize>,

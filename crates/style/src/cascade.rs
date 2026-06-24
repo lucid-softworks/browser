@@ -714,6 +714,7 @@ pub(crate) fn compute_element_style<'a>(
         break_before_column: false,   // not inherited
         break_after_column: false,    // not inherited
         column_span_all: false,       // not inherited
+        caption_side_bottom: parent.caption_side_bottom, // inherited
         grid_template_columns: Vec::new(),
         grid_template_rows: Vec::new(),
         grid_column: None,

@@ -65,6 +65,7 @@ impl Default for ComputedStyle {
             break_before_column: false,
             break_after_column: false,
             column_span_all: false,
+            caption_side_bottom: false,
             grid_template_columns: Vec::new(),
             grid_template_rows: Vec::new(),
             grid_column: None,

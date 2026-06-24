@@ -3227,6 +3227,47 @@ mod tests {
     }
 
     #[test]
+    fn table_caption_side_bottom_sits_below_rows() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let table = doc.append_element(body, "table");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(table, disp(style::Display::Table));
+
+        let r1 = build_row(&mut doc, &mut styles, table, "td", &["a", "b"]);
+        let caption = doc.append_element(table, "caption");
+        styles.insert(
+            caption,
+            style::ComputedStyle {
+                display: style::Display::TableCaption,
+                caption_side_bottom: true,
+                ..Default::default()
+            },
+        );
+        doc.append_child(caption, dom::NodeData::Text("Bottom".into()));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let cap_y = find_box(&root_box, &|x| x.node == Some(caption))
+            .unwrap()
+            .dimensions
+            .content
+            .y;
+        let cell_y = find_box(&root_box, &|x| {
+            x.node == Some(r1[0]) && matches!(x.content, BoxContent::Block)
+        })
+        .unwrap()
+        .dimensions
+        .content
+        .y;
+        assert!(
+            cap_y > cell_y,
+            "caption-side:bottom caption ({cap_y}) should sit below the first cell ({cell_y})"
+        );
+    }
+
+    #[test]
     fn table_cell_content_wraps_within_column_width() {
         // A narrow fixed-width cell forces its long text to wrap onto multiple lines, making the
         // cell (and its row) taller than a single line.

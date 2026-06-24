@@ -430,8 +430,15 @@ pub(crate) fn layout_table(
     let cols_only: f32 = col_w.iter().sum();
     let table_width: f32 = cols_only + h_spacing_total;
 
-    // --- Caption above the grid. ---
-    let caption_h = layout_table_captions(&mut captions, content, ctx, styles, measurer);
+    // --- Captions: `caption-side: bottom` ones go below the grid, the rest above. ---
+    let (mut bottom_captions, mut top_captions): (Vec<LayoutBox>, Vec<LayoutBox>) = captions
+        .drain(..)
+        .partition(|c| {
+            style_of(c, styles)
+                .map(|cs| cs.caption_side_bottom)
+                .unwrap_or(false)
+        });
+    let caption_h = layout_table_captions(&mut top_captions, content, ctx, styles, measurer);
     let grid_top = content.y + caption_h;
 
     // --- 4. Measure each cell's content height at its column width. ---
@@ -540,14 +547,24 @@ pub(crate) fn layout_table(
     // Rebuild the table box's children: captions first (above), then the flattened cells (the row /
     // row-group boxes were structural only — cells carry their own borders/backgrounds, so we drop
     // the wrappers and paint cells directly, mirroring how grid flattens its items).
-    let mut new_children: Vec<LayoutBox> = Vec::with_capacity(captions.len() + cells.len());
-    new_children.append(&mut captions);
+    // `caption-side: bottom` captions sit below the grid.
+    let bottom_origin = Rect {
+        y: grid_top + grid_h,
+        ..content
+    };
+    let bottom_caption_h =
+        layout_table_captions(&mut bottom_captions, bottom_origin, ctx, styles, measurer);
+
+    let mut new_children: Vec<LayoutBox> =
+        Vec::with_capacity(top_captions.len() + cells.len() + bottom_captions.len());
+    new_children.append(&mut top_captions);
     for cell in cells {
         new_children.push(cell.boxx);
     }
+    new_children.append(&mut bottom_captions);
     boxx.children = new_children;
 
-    caption_h + grid_h
+    caption_h + grid_h + bottom_caption_h
 }
 
 /// Lay out a table's `<caption>` boxes full-width above the grid, stacked. Returns their total

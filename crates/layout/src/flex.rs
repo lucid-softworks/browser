@@ -525,18 +525,28 @@ fn flex_item_baseline(
         return if container_vertical { h / 2.0 } else { h };
     }
     let top = item.dimensions.margin_box().y;
+    // A table's baseline is its first (or last) row's baseline: among the cells of that row (grouped
+    // by their top edge), the deepest first-line baseline. Captions are excluded.
+    if matches!(
+        style_of(item, styles).map(|cs| cs.display),
+        Some(style::Display::Table)
+    ) {
+        if let Some(b) = table_baseline(item, last, styles) {
+            return b - top;
+        }
+    }
     // `-webkit-line-clamp: N` truncates the box to N lines, so its *last* baseline is the Nth line's
     // baseline, not its true final line's.
     if last {
         if let Some(n) = style_of(item, styles).and_then(|cs| cs.line_clamp) {
-            if let Some(b) = nth_line_baseline(item, n) {
+            if let Some(b) = nth_line_baseline(item, n, styles) {
                 return b - top;
             }
         }
         // A multi-column box's last baseline is its lowest line across all columns (the bottom of the
         // tallest column), not its source-last child — `nth_line_baseline` with a huge N returns that.
         if style_of(item, styles).is_some_and(|cs| cs.column_count.is_some()) {
-            if let Some(b) = nth_line_baseline(item, u32::MAX) {
+            if let Some(b) = nth_line_baseline(item, u32::MAX, styles) {
                 return b - top;
             }
         }
@@ -562,11 +572,75 @@ fn flex_item_baseline(
 /// count) — used for a `-webkit-line-clamp` box's last baseline. Lines are split by forced breaks;
 /// each line's baseline is the lowest of its leaves' baselines (text alphabetic, else the leaf's
 /// bottom margin edge). `None` if the box has no leaves.
-fn nth_line_baseline(item: &LayoutBox, n: u32) -> Option<f32> {
+/// The absolute baseline of a table's first (or `last`) row: the cells are grouped into rows by their
+/// top edge, and the chosen row's baseline is the deepest first-line baseline among its cells (cells
+/// with `vertical-align: baseline` share that line). Captions are excluded. `None` if no cells.
+fn table_baseline(
+    item: &LayoutBox,
+    last: bool,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> Option<f32> {
+    fn collect(
+        b: &LayoutBox,
+        styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+        out: &mut Vec<(f32, f32)>,
+    ) {
+        match style_of(b, styles).map(|cs| cs.display) {
+            Some(style::Display::TableCaption) => {}
+            Some(style::Display::TableCell) => {
+                // First-line baseline if the cell has content; otherwise the content-box bottom (the
+                // synthesized baseline of an empty cell).
+                let cbottom = b.dimensions.content.y + b.dimensions.content.height;
+                let bl = if b.children.is_empty() {
+                    cbottom
+                } else {
+                    nth_line_baseline(b, 1, styles).unwrap_or(cbottom)
+                };
+                // Key on the cell's border-box top (the row position) — cells in one row share it even
+                // when their differing borders give their content boxes different tops.
+                out.push((b.dimensions.border_box().y, bl));
+            }
+            _ => {
+                for c in &b.children {
+                    collect(c, styles, out);
+                }
+            }
+        }
+    }
+    let mut cells: Vec<(f32, f32)> = Vec::new();
+    collect(item, styles, &mut cells);
+    let row_top = if last {
+        cells.iter().map(|c| c.0).fold(f32::MIN, f32::max)
+    } else {
+        cells.iter().map(|c| c.0).fold(f32::MAX, f32::min)
+    };
+    cells
+        .iter()
+        .filter(|c| (c.0 - row_top).abs() < 0.5)
+        .map(|c| c.1)
+        .fold(None, |acc, b| Some(acc.map_or(b, |a: f32| a.max(b))))
+}
+
+fn nth_line_baseline(
+    item: &LayoutBox,
+    n: u32,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> Option<f32> {
     // Collect each leaf as `(top, baseline)`. A `-webkit-box` line-clamp box stacks its lines as flex
     // items / block children (distinct `y`), while a plain block stacks them as inline lines — both
     // give one leaf-group per visual line when grouped by top edge, so we don't rely on line breaks.
-    fn walk(b: &LayoutBox, out: &mut Vec<(f32, f32)>) {
+    // `<caption>` subtrees are skipped (they're outside a table's grid / baseline).
+    fn walk(
+        b: &LayoutBox,
+        styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+        out: &mut Vec<(f32, f32)>,
+    ) {
+        if matches!(
+            style_of(b, styles).map(|cs| cs.display),
+            Some(style::Display::TableCaption)
+        ) {
+            return;
+        }
         match &b.content {
             BoxContent::LineBreak => {}
             BoxContent::Text(_) | BoxContent::Marker(_) => {
@@ -581,13 +655,13 @@ fn nth_line_baseline(item: &LayoutBox, n: u32) -> Option<f32> {
             }
             _ => {
                 for c in &b.children {
-                    walk(c, out);
+                    walk(c, styles, out);
                 }
             }
         }
     }
     let mut leaves: Vec<(f32, f32)> = Vec::new();
-    walk(item, &mut leaves);
+    walk(item, styles, &mut leaves);
     if leaves.is_empty() {
         return None;
     }
@@ -724,6 +798,7 @@ pub(crate) fn layout_flex_item_contents(
         style::Display::Grid | style::Display::InlineGrid => {
             layout_grid(boxx, child_ctx, styles, measurer)
         }
+        style::Display::Table => crate::table::layout_table(boxx, child_ctx, styles, measurer),
         _ if style_of(boxx, styles).and_then(|cs| cs.column_count).is_some() => {
             crate::block::layout_multicol(boxx, child_ctx, styles, measurer)
         }

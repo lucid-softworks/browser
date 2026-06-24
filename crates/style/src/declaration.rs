@@ -800,6 +800,7 @@ pub(crate) fn apply_declaration(
         "break-before" => style.break_before_column = val.trim().eq_ignore_ascii_case("column"),
         "break-after" => style.break_after_column = val.trim().eq_ignore_ascii_case("column"),
         "column-span" => style.column_span_all = val.trim().eq_ignore_ascii_case("all"),
+        "caption-side" => style.caption_side_bottom = val.trim().eq_ignore_ascii_case("bottom"),
 
         // --- Grid ---
         "grid-template-columns" => {
