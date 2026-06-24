@@ -7008,8 +7008,22 @@
     def(globalThis, "DOMParser", function () {
       this.parseFromString = function (str, type) {
         var t = String(type || "").toLowerCase();
-        // text/html parses as an HTML document (HTML namespace).
-        if (t === "text/html") { return document; }
+        // text/html parses into a FRESH, independent HTML document (not the live one). Build an empty
+        // html/head/body skeleton, then let the engine's HTML parser distribute the string's content
+        // into the new head and body.
+        if (t === "text/html") {
+          var d = document.implementation.createHTMLDocument();
+          try {
+            var hid = d.head && typeof d.head.__node === "number" ? d.head.__node : -1;
+            var bid = d.body && typeof d.body.__node === "number" ? d.body.__node : -1;
+            if (typeof globalThis.__parseHtmlSections === "function" && (hid >= 0 || bid >= 0)) {
+              globalThis.__parseHtmlSections(hid, bid, String(str));
+            } else if (d.body) {
+              d.body.innerHTML = String(str);   // fallback if the parse primitive is unavailable
+            }
+          } catch (e) {}
+          return d;
+        }
         // XML flavours: parse into an independent namespace-aware XML document.
         if (t.indexOf("xml") >= 0) { return __xml.parse(String(str)).doc; }
         return document;

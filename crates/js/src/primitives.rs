@@ -1329,6 +1329,23 @@ pub(crate) fn prim_set_inner_html(
     }
 }
 
+/// `__parseHtmlSections(headId, bodyId, html)` — parse a full HTML document string and copy its
+/// parsed <head>/<body> children under the given (fresh, detached) head/body nodes. Backs
+/// DOMParser.parseFromString(…, "text/html"), which must return an independent document rather than
+/// the live one.
+pub(crate) fn prim_parse_html_sections(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let head = arg_node(scope, &args, 0);
+    let body = arg_node(scope, &args, 1);
+    let html = arg_str(scope, &args, 2);
+    let state = host_state(scope);
+    state.bump_dom_version();
+    parse_html_into_sections(&mut state.doc.borrow_mut(), head, body, &html);
+}
+
 /// `__innerText(id) -> string` — the `innerText`/`outerText` getter (rendered-text algorithm).
 pub(crate) fn prim_inner_text(
     scope: &mut v8::PinScope,
@@ -1957,6 +1974,12 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__setTextContent", prim_set_text_content);
     set_fn(scope, global, "__innerHTML", prim_inner_html);
     set_fn(scope, global, "__setInnerHTML", prim_set_inner_html);
+    set_fn(
+        scope,
+        global,
+        "__parseHtmlSections",
+        prim_parse_html_sections,
+    );
     set_fn(scope, global, "__innerText", prim_inner_text);
     set_fn(scope, global, "__setInnerText", prim_set_inner_text);
     set_fn(scope, global, "__setOuterText", prim_set_outer_text);

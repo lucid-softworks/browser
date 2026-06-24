@@ -179,6 +179,26 @@ pub(crate) fn copy_children_into(
     }
 }
 
+/// Parse a full HTML document string and copy the parsed `<head>`'s children under `head` and the
+/// parsed `<body>`'s children under `body` (either may be `None`). Backs DOMParser's `text/html`
+/// path, which builds a fresh, independent document and fills its head/body from the string — unlike
+/// `set_inner_html`, which flattens the html/head/body wrappers into a single target.
+pub(crate) fn parse_html_into_sections(
+    doc: &mut dom::Document,
+    head: Option<dom::NodeId>,
+    body: Option<dom::NodeId>,
+    html: &str,
+) {
+    let frag = html::parse(html);
+    let frag_root = frag.root();
+    if let (Some(h), Some(fh)) = (head, find_by_tag(&frag, frag_root, "head")) {
+        copy_children_into(doc, h, &frag, fh);
+    }
+    if let (Some(b), Some(fb)) = (body, find_by_tag(&frag, frag_root, "body")) {
+        copy_children_into(doc, b, &frag, fb);
+    }
+}
+
 /// Depth-first search for the first element whose tag equals `tag` (ASCII case-insensitive).
 pub(crate) fn find_by_tag(
     doc: &dom::Document,
