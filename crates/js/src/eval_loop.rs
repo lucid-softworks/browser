@@ -109,6 +109,8 @@ pub(crate) fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
     // IndexedDB (in-memory) — depends on structuredClone + queueMicrotask from the prior bootstraps.
     eval_internal(scope, INDEXEDDB_BOOTSTRAP, "<indexeddb>");
+    // Web Crypto SubtleCrypto (digest + HMAC) — depends on `crypto` from browser-env.
+    eval_internal(scope, WEBCRYPTO_BOOTSTRAP, "<webcrypto>");
     // Expose elements with an `id` as named globals (HTML named-properties-on-window). The DOM is
     // already fully parsed by the time the environment is installed (the engine batches scripts
     // after `parser.finish()`), so every static-markup id is visible to author scripts that follow.
@@ -145,6 +147,11 @@ pub(crate) const BROWSER_ENV_BOOTSTRAP: &str = include_str!("bootstrap/browser_e
 /// implementation backed by per-realm in-memory stores; values are deep-copied with `structuredClone`
 /// and requests/transactions run asynchronously on the microtask queue. Not persisted to disk.
 pub(crate) const INDEXEDDB_BOOTSTRAP: &str = include_str!("bootstrap/indexeddb.js");
+
+/// Web Crypto `crypto.subtle` (digest for SHA-1/256/384/512 and HMAC sign/verify/generate/import/
+/// export), a pure-JS implementation layered onto the `crypto` object from browser-env (whose
+/// getRandomValues already uses the OS CSPRNG via the `__cryptoRandom` native).
+pub(crate) const WEBCRYPTO_BOOTSTRAP: &str = include_str!("bootstrap/webcrypto.js");
 
 // ---------------------------------------------------------------------------------------------
 // Event loop drain + script evaluation against a V8 context.

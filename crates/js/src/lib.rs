@@ -597,6 +597,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn web_crypto_subtle_digest_and_hmac_known_vectors() {
+        // Assert SubtleCrypto against published test vectors — the surest correctness check for a
+        // hand-written hash. SHA-1/256/384/512 of "abc" and HMAC-SHA256(key="key", message=…).
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var L = function (s) { console.log(s); };
+                    var hex = function (buf) { return Array.prototype.map.call(new Uint8Array(buf), function (b) { return (b + 0x100).toString(16).slice(1); }).join(""); };
+                    var enc = new TextEncoder();
+                    crypto.subtle.digest("SHA-256", enc.encode("abc")).then(function (h) { L("sha256:" + hex(h)); });
+                    crypto.subtle.digest("SHA-1", enc.encode("abc")).then(function (h) { L("sha1:" + hex(h)); });
+                    crypto.subtle.digest("SHA-512", enc.encode("abc")).then(function (h) { L("sha512:" + hex(h)); });
+                    crypto.subtle.digest("SHA-384", enc.encode("abc")).then(function (h) { L("sha384:" + hex(h)); });
+                    crypto.subtle.importKey("raw", enc.encode("key"), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]).then(function (k) {
+                      return crypto.subtle.sign("HMAC", k, enc.encode("The quick brown fox jumps over the lazy dog")).then(function (sig) { L("hmac:" + hex(sig)); });
+                    });
+                    "ok""#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].console,
+            vec![
+                "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string(),
+                "sha1:a9993e364706816aba3e25717850c26c9cd0d89d".to_string(),
+                "sha512:ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f".to_string(),
+                "sha384:cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7".to_string(),
+                "hmac:f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8".to_string(),
+            ]
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]
