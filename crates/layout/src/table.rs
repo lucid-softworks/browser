@@ -434,9 +434,8 @@ pub(crate) fn layout_table(
     let table_width: f32 = cols_only + h_spacing_total;
 
     // --- Captions: `caption-side: bottom` ones go below the grid, the rest above. ---
-    let (mut bottom_captions, mut top_captions): (Vec<LayoutBox>, Vec<LayoutBox>) = captions
-        .drain(..)
-        .partition(|c| {
+    let (mut bottom_captions, mut top_captions): (Vec<LayoutBox>, Vec<LayoutBox>) =
+        captions.drain(..).partition(|c| {
             style_of(c, styles)
                 .map(|cs| cs.caption_side_bottom)
                 .unwrap_or(false)

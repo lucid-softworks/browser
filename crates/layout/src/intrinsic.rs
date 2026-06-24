@@ -77,7 +77,11 @@ pub(crate) fn intrinsic_width(
     for c in &boxx.children {
         if matches!(
             style_of(c, styles).map(|s| s.display),
-            Some(style::Display::InlineBlock | style::Display::InlineFlex | style::Display::InlineGrid)
+            Some(
+                style::Display::InlineBlock
+                    | style::Display::InlineFlex
+                    | style::Display::InlineGrid
+            )
         ) {
             inline_atomic += intrinsic_width(c, styles, measurer);
         }
@@ -101,9 +105,9 @@ pub(crate) fn intrinsic_width(
 /// laid-out box agree on a vertical box's physical width.
 fn vertical_block_size(boxx: &LayoutBox, measurer: &dyn TextMeasurer) -> f32 {
     fn lh_of(b: &LayoutBox, measurer: &dyn TextMeasurer) -> f32 {
-        b.style
-            .line_height
-            .unwrap_or_else(|| measurer.line_height(b.style.font_size, b.style.font_family.as_deref()))
+        b.style.line_height.unwrap_or_else(|| {
+            measurer.line_height(b.style.font_size, b.style.font_family.as_deref())
+        })
     }
     fn walk(children: &[LayoutBox], lines: &mut Vec<f32>, measurer: &dyn TextMeasurer) {
         for c in children {

@@ -213,7 +213,10 @@ pub(crate) fn layout_block(
             layout_grid(boxx, child_ctx, styles, measurer)
         }
         style::Display::Table => layout_table(boxx, child_ctx, styles, measurer),
-        _ if style_of(boxx, styles).and_then(|cs| cs.column_count).is_some() => {
+        _ if style_of(boxx, styles)
+            .and_then(|cs| cs.column_count)
+            .is_some() =>
+        {
             layout_multicol(boxx, child_ctx, styles, measurer)
         }
         _ => {
@@ -608,25 +611,26 @@ pub(crate) fn resolve_out_of_flow(
         style::Display::Flex | style::Display::InlineFlex => style_of(boxx, styles).cloned(),
         _ => None,
     };
-    let flex_align_for = |child: &LayoutBox| -> Option<(bool, bool, style::JustifyContent, style::AlignSelf)> {
-        let pcs = flex_parent.as_ref()?;
-        let is_row = matches!(
-            pcs.flex_direction,
-            style::FlexDirection::Row | style::FlexDirection::RowReverse
-        );
-        let reverse = matches!(
-            pcs.flex_direction,
-            style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse
-        );
-        let self_align = style_of(child, styles)
-            .map(|c| c.align_self)
-            .unwrap_or(style::AlignSelf::Auto);
-        let align = match self_align {
-            style::AlignSelf::Auto => crate::flex::align_items_to_self(pcs.align_items),
-            other => other,
+    let flex_align_for =
+        |child: &LayoutBox| -> Option<(bool, bool, style::JustifyContent, style::AlignSelf)> {
+            let pcs = flex_parent.as_ref()?;
+            let is_row = matches!(
+                pcs.flex_direction,
+                style::FlexDirection::Row | style::FlexDirection::RowReverse
+            );
+            let reverse = matches!(
+                pcs.flex_direction,
+                style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse
+            );
+            let self_align = style_of(child, styles)
+                .map(|c| c.align_self)
+                .unwrap_or(style::AlignSelf::Auto);
+            let align = match self_align {
+                style::AlignSelf::Auto => crate::flex::align_items_to_self(pcs.align_items),
+                other => other,
+            };
+            Some((is_row, reverse, pcs.justify_content, align))
         };
-        Some((is_row, reverse, pcs.justify_content, align))
-    };
     // Tracks where in-flow inline content among the siblings ended, so an abspos that follows it
     // gets the static x/y immediately after that content (e.g. `12345<span style=position:absolute>`
     // sits after "12345", not at the container origin). Reset by a real block, which starts a line.
