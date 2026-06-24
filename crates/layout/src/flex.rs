@@ -490,11 +490,19 @@ fn flex_item_baseline(
             Some(style::FlexDirection::RowReverse | style::FlexDirection::ColumnReverse)
         );
         let pick_last = last ^ reverse;
-        // A fieldset `<legend>` is laid out in the border and doesn't contribute to the baseline.
+        // A fieldset `<legend>` is laid out in the border, and a table `<caption>` is outside the
+        // table grid — neither contributes to the box's baseline (a table's baseline is its rows').
+        let skip = |c: &&LayoutBox| -> bool {
+            c.style.is_legend
+                || matches!(
+                    style_of(c, styles).map(|s| s.display),
+                    Some(style::Display::TableCaption)
+                )
+        };
         let next = if pick_last {
-            b.children.iter().rev().find(|c| !c.style.is_legend)
+            b.children.iter().rev().find(|c| !skip(c))
         } else {
-            b.children.iter().find(|c| !c.style.is_legend)
+            b.children.iter().find(|c| !skip(c))
         };
         match next {
             // A childless box is the leaf (atomic / empty), whose synthesized baseline is its bottom
