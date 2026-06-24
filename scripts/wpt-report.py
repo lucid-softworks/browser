@@ -218,10 +218,22 @@ def page_html(node, rel_to_root, area, depth):
             cls, label = "pass", "PASS"
             detail = ""
             failcell = f"<td class=num>{sf}</td>"
+        # Per-file subtest pass-rate bar (matching the directory rows); reftests with no subtests
+        # (0/0) leave the cell empty.
+        ftot = sp + sf
+        if ftot > 0:
+            fpct = pct_of(sp, ftot)
+            ratecell = (
+                f"<td class=num><span class=minibar>"
+                f"<i style='width:{fpct:.0f}%;background:{bar_color(fpct)}'></i></span>"
+                f"<span class=pct>{fpct:.0f}%</span></td>"
+            )
+        else:
+            ratecell = "<td class=num></td>"
         rows.append(
             f"<tr class=file><td class=name>{html.escape(fname)}{detail}</td>"
             f"<td><span class='b {cls}'>{label}</span></td>"
-            f"<td class=num></td>"
+            f"{ratecell}"
             f"<td class=num>{sp}</td>{failcell}</tr>"
         )
 
