@@ -10088,28 +10088,79 @@
       return new Uint8Array(bytes);
     };
     globalThis.TextEncoder.prototype.encodeInto = function (str, dest) {
-      var enc = this.encode(str), n = Math.min(enc.length, dest.length);
-      for (var i = 0; i < n; i++) dest[i] = enc[i];
-      return { read: str.length, written: n };
+      // Encode as much as fits, one code point at a time, never writing a partial UTF-8 sequence.
+      // `read` counts UTF-16 code units consumed (2 for a surrogate pair), `written` counts bytes —
+      // the old version reported str.length / min(len) regardless, which is wrong on a short buffer.
+      str = str === undefined ? "" : String(str);
+      var cap = dest.length, read = 0, written = 0;
+      for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i), seq, units = 1;
+        if (c < 0x80) { seq = [c]; }
+        else if (c < 0x800) { seq = [0xc0 | (c >> 6), 0x80 | (c & 0x3f)]; }
+        else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+          var cp = 0x10000 + ((c & 0x3ff) << 10) + (str.charCodeAt(i + 1) & 0x3ff);
+          seq = [0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f)];
+          units = 2;
+        } else { seq = [0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)]; }
+        if (written + seq.length > cap) { break; }   // no room for the whole code point — stop here
+        for (var k = 0; k < seq.length; k++) { dest[written++] = seq[k]; }
+        read += units;
+        if (units === 2) { i++; }
+      }
+      return { read: read, written: written };
     };
   }
   if (typeof globalThis.TextDecoder !== "function") {
-    def(globalThis, "TextDecoder", function (label) { this.encoding = label || "utf-8"; });
-    globalThis.TextDecoder.prototype.decode = function (buf) {
-      if (!buf) return "";
-      var b = buf.buffer ? new Uint8Array(buf.buffer, buf.byteOffset || 0, buf.byteLength) : new Uint8Array(buf);
-      var out = "", i = 0;
-      while (i < b.length) {
-        var c = b[i++];
-        if (c < 0x80) { out += String.fromCharCode(c); }
-        else if (c < 0xe0) { out += String.fromCharCode(((c & 0x1f) << 6) | (b[i++] & 0x3f)); }
-        else if (c < 0xf0) { out += String.fromCharCode(((c & 0x0f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f)); }
-        else {
-          var cp = ((c & 0x07) << 18) | ((b[i++] & 0x3f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f);
-          cp -= 0x10000;
-          out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
-        }
+    // UTF-8 only (the common case), but a real UTF-8 decoder: validates sequences and emits U+FFFD
+    // for malformed input (or throws when `fatal`), strips a leading BOM unless `ignoreBOM`, and
+    // carries an incomplete trailing sequence across `decode(…, {stream:true})` calls. Non-UTF-8
+    // labels are still treated as UTF-8 (we don't implement legacy encodings).
+    def(globalThis, "TextDecoder", function (label, options) {
+      this.encoding = "utf-8";
+      this.fatal = !!(options && options.fatal);
+      this.ignoreBOM = !!(options && options.ignoreBOM);
+      this.__pending = null;   // incomplete trailing bytes carried between streaming calls
+      this.__bomSeen = false;
+    });
+    globalThis.TextDecoder.prototype.decode = function (input, options) {
+      var stream = !!(options && options.stream);
+      var bytes;
+      if (input == null) { bytes = new Uint8Array(0); }
+      else if (input.buffer) { bytes = new Uint8Array(input.buffer, input.byteOffset || 0, input.byteLength); }
+      else { bytes = new Uint8Array(input); }
+      if (this.__pending && this.__pending.length) {     // prepend bytes held from a prior stream call
+        var merged = new Uint8Array(this.__pending.length + bytes.length);
+        merged.set(this.__pending, 0); merged.set(bytes, this.__pending.length);
+        bytes = merged; this.__pending = null;
       }
+      var out = "", i = 0, n = bytes.length, self = this;
+      function fail() { if (self.fatal) { throw new TypeError("The encoded data was not valid."); } out += "�"; }
+      while (i < n) {
+        var b0 = bytes[i], len, cp, min;
+        if (b0 < 0x80) { out += String.fromCharCode(b0); i++; self.__bomSeen = true; continue; }
+        else if (b0 >= 0xc2 && b0 <= 0xdf) { len = 2; cp = b0 & 0x1f; min = 0x80; }
+        else if (b0 >= 0xe0 && b0 <= 0xef) { len = 3; cp = b0 & 0x0f; min = 0x800; }
+        else if (b0 >= 0xf0 && b0 <= 0xf4) { len = 4; cp = b0 & 0x07; min = 0x10000; }
+        else { fail(); i++; continue; }                  // invalid lead byte (0x80–0xc1, 0xf5–0xff)
+        if (i + len > n) {                               // incomplete sequence at the end of input
+          if (stream) { self.__pending = bytes.slice(i); return out; }
+          fail(); i++; continue;
+        }
+        var ok = true;
+        for (var k = 1; k < len; k++) {
+          var bk = bytes[i + k];
+          if (bk < 0x80 || bk > 0xbf) { ok = false; break; }
+          cp = (cp << 6) | (bk & 0x3f);
+        }
+        if (!ok) { fail(); i++; continue; }              // bad continuation — resync from next byte
+        if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) { fail(); i += len; continue; }
+        if (cp === 0xfeff && !self.__bomSeen && !self.ignoreBOM) { self.__bomSeen = true; i += len; continue; }
+        self.__bomSeen = true;
+        if (cp > 0xffff) { cp -= 0x10000; out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff)); }
+        else { out += String.fromCharCode(cp); }
+        i += len;
+      }
+      if (!stream) { this.__pending = null; this.__bomSeen = false; }   // reset for the next decode
       return out;
     };
   }

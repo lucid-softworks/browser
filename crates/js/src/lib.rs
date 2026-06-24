@@ -476,6 +476,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn text_encoder_decoder_utf8_correctness() {
+        // encodeInto: real read/written counts, never a partial sequence. TextDecoder: U+FFFD on
+        // invalid input, fatal throws, BOM stripped unless ignoreBOM, streaming carries a partial.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var te = new TextEncoder();
+                    var d1 = new Uint8Array(10); var i1 = te.encodeInto("ab€", d1);
+                    r.push("ei_full:" + i1.read + ":" + i1.written);
+                    var d2 = new Uint8Array(2); var i2 = te.encodeInto("a€", d2);
+                    r.push("ei_tight:" + i2.read + ":" + i2.written);
+                    var d3 = new Uint8Array(4); var i3 = te.encodeInto("😀", d3);
+                    r.push("ei_surr:" + i3.read + ":" + i3.written);
+                    var d4 = new Uint8Array(3); var i4 = te.encodeInto("😀", d4);
+                    r.push("ei_nofit:" + i4.read + ":" + i4.written);
+                    r.push("dec:" + new TextDecoder().decode(new Uint8Array([0x68, 0xC3, 0xA9])));
+                    r.push("bad:" + new TextDecoder().decode(new Uint8Array([0xFF])));
+                    r.push("bom:" + new TextDecoder().decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x41])));
+                    r.push("ibom:" + new TextDecoder("utf-8", { ignoreBOM: true }).decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x41])).length);
+                    var threw = false;
+                    try { new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xFF])); } catch (e) { threw = e instanceof TypeError; }
+                    r.push("fatal:" + threw);
+                    var sd = new TextDecoder();
+                    var p1 = sd.decode(new Uint8Array([0xC3]), { stream: true });
+                    var p2 = sd.decode(new Uint8Array([0xA9]));
+                    r.push("stream:" + p1.length + ":" + p2);
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("ei_full:3:5|ei_tight:1:1|ei_surr:2:4|ei_nofit:0:0|dec:hé|bad:\u{fffd}|bom:A|ibom:2|fatal:true|stream:0:é")
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]
