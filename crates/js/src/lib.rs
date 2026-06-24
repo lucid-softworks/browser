@@ -708,6 +708,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_event_init_and_document_node_methods() {
+        // Second "is not a function" batch: legacy Event init* methods set their members, and the
+        // document (not an element) answers getRootNode/isSameNode.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var me = new MouseEvent("x");
+                    me.initMouseEvent("click", true, true, window, 1, 10, 20, 30, 40, false, false, true, false, 0, null);
+                    r.push("me:" + me.type + ":" + me.clientX + ":" + me.clientY + ":" + me.shiftKey + ":" + me.bubbles);
+                    var ue = new UIEvent("y"); ue.initUIEvent("custom", true, false, window, 5);
+                    r.push("ue:" + ue.type + ":" + ue.detail);
+                    var ke = new KeyboardEvent("z"); ke.initKeyboardEvent("keydown", true, true, window, "Enter", 0, true, false, false, false);
+                    r.push("ke:" + ke.type + ":" + ke.key + ":" + ke.ctrlKey);
+                    r.push("doc:" + (document.getRootNode() === document) + ":" + document.isSameNode(document));
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("me:click:30:40:true:true|ue:custom:5|ke:keydown:Enter:true|doc:true:true")
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]
