@@ -709,6 +709,31 @@ mod tests {
     }
 
     #[test]
+    fn more_stubbed_apis_respond() {
+        // Tail of the "is not a function" sweep: TextEvent.initTextEvent, Element.attachInternals
+        // (minimal ElementInternals), and Animation.commitStyles.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var r = [];
+                    var te = new TextEvent("t"); te.initTextEvent("textInput", true, false, window, "hi");
+                    r.push("te:" + te.type + ":" + te.data);
+                    var ai = document.createElement("x-y").attachInternals();
+                    ai.setFormValue("v"); r.push("ai:" + ai.checkValidity() + ":" + (typeof ai.states.add));
+                    var an = document.body.animate({ opacity: [0, 1] }, 1); an.commitStyles(); an.persist();
+                    r.push("an:ok");
+                    r.join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("te:textInput:hi|ai:true:function|an:ok")
+        );
+    }
+
+    #[test]
     fn legacy_event_init_and_document_node_methods() {
         // Second "is not a function" batch: legacy Event init* methods set their members, and the
         // document (not an element) answers getRootNode/isSameNode.

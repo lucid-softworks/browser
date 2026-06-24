@@ -5431,6 +5431,18 @@
     if (typeof el.showPopover !== "function") { def(el, "showPopover", fn); }
     if (typeof el.hidePopover !== "function") { def(el, "hidePopover", fn); }
     if (typeof el.togglePopover !== "function") { def(el, "togglePopover", function () { return false; }); }
+    // attachInternals: form-associated custom elements / ElementInternals are not implemented; return
+    // a minimal internals object whose methods are no-ops so callers don't hit a TypeError. (Tests
+    // that exercise real form association still fail — just not with "not a function".)
+    if (typeof el.attachInternals !== "function") {
+      def(el, "attachInternals", function () {
+        return {
+          shadowRoot: this.shadowRoot || null, form: null, labels: [], states: new Set(),
+          willValidate: true, validity: { valid: true }, validationMessage: "",
+          setFormValue: fn, setValidity: fn, checkValidity: function () { return true; }, reportValidity: function () { return true; }
+        };
+      });
+    }
     // Declarative partial-update methods (WICG): {append,prepend,before,after,replaceWith}HTML[Unsafe].
     globalThis.__addPartialMethods(el);
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
@@ -9825,6 +9837,8 @@
       if (typeof anim.oncancel === "function") { try { anim.oncancel.call(anim, { type: "cancel" }); } catch (e) {} }
     };
     anim.updatePlaybackRate = fn;
+    anim.commitStyles = fn;   // we don't interpolate, so there are no computed values to commit
+    anim.persist = fn;
     anim.addEventListener = fn;
     anim.removeEventListener = fn;
     anim.dispatchEvent = function () { return false; };
@@ -10821,7 +10835,11 @@
     defSubclass("CloseEvent", Event, { code: 0, reason: "", wasClean: false });
     defSubclass("DeviceMotionEvent", Event, { acceleration: null, accelerationIncludingGravity: null, rotationRate: null, interval: 0 });
     defSubclass("DeviceOrientationEvent", Event, { alpha: null, beta: null, gamma: null, absolute: false });
-    defSubclass("TextEvent", UIEvent, { data: "" });
+    var TextEvent = defSubclass("TextEvent", UIEvent, { data: "" });
+    TextEvent.prototype.initTextEvent = function (type, bubbles, cancelable, view, data) {
+      this.initUIEvent(type, bubbles, cancelable, view, 0);
+      def(this, "data", data == null ? "" : String(data));
+    };
     // Service Worker events (see issue #56). ExtendableEvent.waitUntil collects lifetime-extending
     // promises onto the event's internal state; the SW lifecycle awaits them. FetchEvent.respondWith
     // stashes the response promise for the fetch-interception path (stage 3).
