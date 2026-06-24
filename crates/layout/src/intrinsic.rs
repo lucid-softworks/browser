@@ -69,6 +69,21 @@ pub(crate) fn intrinsic_width(
         }
     }
 
+    // Inline-level atomic children (inline-block / inline-flex / inline-grid) sit on the inline line
+    // but carry no text, so `collect_inline_words` misses them — add their own intrinsic widths
+    // (max-content, so a single unwrapped line). Without this a box whose only content is an
+    // inline-block (e.g. a `<span style="display:inline-block">` placeholder) measures as 0 wide.
+    let mut inline_atomic = 0.0f32;
+    for c in &boxx.children {
+        if matches!(
+            style_of(c, styles).map(|s| s.display),
+            Some(style::Display::InlineBlock | style::Display::InlineFlex | style::Display::InlineGrid)
+        ) {
+            inline_atomic += intrinsic_width(c, styles, measurer);
+        }
+    }
+    max_inline += inline_atomic;
+
     // Block children: the box is at least as wide as its widest block child.
     let mut max_block = 0.0f32;
     for c in &boxx.children {
