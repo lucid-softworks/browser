@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the same lint gate CI does (rustfmt + clippy) before any push,
+# so a red `lint` job never surprises you after the fact.
+#
+# Enabled per-clone via the versioned hooks directory:
+#     git config core.hooksPath .githooks
+# (see README "Build & run"). Bypass a single push with `git push --no-verify`.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-push: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-push: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "pre-push: lint OK"

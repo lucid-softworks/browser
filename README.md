@@ -32,6 +32,13 @@ compositor — is ours.
 - **Rust** (stable) — install via [rustup](https://rustup.rs).
 - For App Shell: **Xcode command-line tools** (`xcode-select --install`)
 
+Enable the versioned git hooks (a `pre-push` hook that runs the same `rustfmt` +
+`clippy` gate as CI, so lint never fails the PR after the fact):
+
+```sh
+git config core.hooksPath .githooks   # one-time, per clone
+```
+
 ### Engine / tests only
 
 The engine is plain Rust and builds on **macOS, Linux, and Windows**:
