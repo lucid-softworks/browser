@@ -1361,6 +1361,60 @@ mod tests {
     }
 
     #[test]
+    fn vertical_writing_mode_flex_item_cross_height_is_inline_extent() {
+        // A vertical-lr flex item in a row container: its physical height (the flex cross extent) is
+        // the inline size — the longest line's inline-block extent — not zero. Two 10px inline-block
+        // spans split by <br> are two 1-span lines, so the height is 10 (one span), not 0 or 20.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let flex = doc.append_element(body, "div");
+        let item = doc.append_element(flex, "div");
+        let s1 = doc.append_element(item, "span");
+        let _br = doc.append_element(item, "br");
+        let s2 = doc.append_element(item, "span");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            flex,
+            style::ComputedStyle {
+                display: style::Display::Flex,
+                align_items: style::AlignItems::Baseline,
+                width: Some(200.0),
+                height: Some(100.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            item,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                writing_mode: style::WritingMode::VerticalLr,
+                ..Default::default()
+            },
+        );
+        styles.insert(_br, style::ComputedStyle::default());
+        let span = style::ComputedStyle {
+            display: style::Display::InlineBlock,
+            width: Some(10.0),
+            height: Some(10.0),
+            ..Default::default()
+        };
+        styles.insert(s1, span.clone());
+        styles.insert(s2, span);
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox = find_box(&root_box, &|x| x.node == Some(item)).unwrap();
+        assert!(
+            (ibox.dimensions.border_box().height - 10.0).abs() < 0.5,
+            "vertical item cross height {} (want 10)",
+            ibox.dimensions.border_box().height
+        );
+    }
+
+    #[test]
     fn fixed_child_anchors_to_viewport() {
         let mut doc = dom::Document::new();
         let root = doc.root();

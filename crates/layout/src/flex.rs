@@ -494,6 +494,15 @@ fn flex_item_baseline(
             None => b.dimensions.margin_box().y + b.dimensions.margin_box().height,
         }
     }
+    // An item whose writing mode is orthogonal to the (row) container's cross axis has no baseline
+    // parallel to that axis, so the spec synthesizes one from its margin box — the alphabetic
+    // baseline sits at the margin-box end (bottom) edge.
+    if matches!(
+        style_of(item, styles).map(|cs| cs.writing_mode),
+        Some(style::WritingMode::VerticalRl | style::WritingMode::VerticalLr)
+    ) {
+        return item.dimensions.margin_box().height;
+    }
     let top = item.dimensions.margin_box().y;
     let mut abs = leaf_baseline_abs(item, last, styles);
     // A scroll container (overflow != visible) clamps its propagated baseline to its own border box:
@@ -533,6 +542,15 @@ pub(crate) fn intrinsic_cross_height(
     if let Some(h) = explicit_height(boxx, styles) {
         return h;
     }
+    // Vertical writing mode: the physical height (a row flex item's cross extent) is the INLINE size
+    // — the longest line's inline extent (inline-block / replaced heights summed per line, lines split
+    // by forced breaks) — not a single horizontal line-height.
+    if matches!(
+        style_of(boxx, styles).map(|cs| cs.writing_mode),
+        Some(style::WritingMode::VerticalRl | style::WritingMode::VerticalLr)
+    ) {
+        return vertical_inline_extent(boxx, styles);
+    }
     // One line of text at the box's font size, or 0.
     let fs = boxx.style.font_size;
     let has_text = has_any_text(boxx);
@@ -544,6 +562,44 @@ pub(crate) fn intrinsic_cross_height(
     } else {
         0.0
     }
+}
+
+/// The inline size (physical height) of a vertical-writing-mode box: the longest line's inline
+/// extent, where each line (split by forced break) sums the inline-axis extent of its atomic
+/// inline-level boxes (inline-block / replaced → their margin-box height). Mirror of
+/// `intrinsic::vertical_block_size` for the perpendicular (inline) axis.
+fn vertical_inline_extent(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> f32 {
+    fn walk(
+        children: &[LayoutBox],
+        styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+        lines: &mut Vec<f32>,
+    ) {
+        for c in children {
+            match &c.content {
+                BoxContent::LineBreak => lines.push(0.0),
+                BoxContent::Image(_) | BoxContent::Widget(_) => {
+                    *lines.last_mut().expect("a line") += c.dimensions.margin_box().height;
+                }
+                _ => {
+                    if let Some(h) = explicit_height(c, styles) {
+                        let m = c.dimensions.margin;
+                        let b = c.dimensions.border;
+                        let p = c.dimensions.padding;
+                        *lines.last_mut().expect("a line") +=
+                            h + m.top + m.bottom + b.top + b.bottom + p.top + p.bottom;
+                    } else {
+                        walk(&c.children, styles, lines);
+                    }
+                }
+            }
+        }
+    }
+    let mut lines = vec![0.0f32];
+    walk(&boxx.children, styles, &mut lines);
+    lines.into_iter().fold(0.0, f32::max)
 }
 
 pub(crate) fn has_any_text(boxx: &LayoutBox) -> bool {
