@@ -65,12 +65,21 @@ jobs:
   # ubuntu-latest runners.
   webdriver:
     runs-on: ubuntu-latest
+    # Content-addressed compiler cache so an unchanged tree restores the webdriver build instead of
+    # recompiling the workspace nightly (rust-cache only caches the deps, not the workspace crates).
+    # Scoped to this job: the `wpt` matrix legs run the prebuilt binary and never invoke rustc, so
+    # they need neither the wrapper nor the sccache install.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-deps
+      - uses: mozilla-actions/sccache-action@v0.0.6
       - name: Build WebDriver server
         run: cargo build --release -p webdriver
       - name: Upload WebDriver binary
