@@ -544,6 +544,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn indexeddb_open_store_index_cursor_roundtrip() {
+        // Exercises the in-memory IndexedDB end to end: open + onupgradeneeded creates a keyPath
+        // store and an index, adds rows; then a readwrite txn puts a row, and a readonly txn reads
+        // back via get/count/index.getAll/cursor. Callbacks log to console (captured during drain).
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var L = function (s) { console.log(s); };
+                    var req = indexedDB.open("testdb", 1);
+                    req.onupgradeneeded = function (e) {
+                      var s = req.result.createObjectStore("people", { keyPath: "id" });
+                      s.createIndex("byAge", "age");
+                      s.add({ id: 1, name: "Ann", age: 30 });
+                      s.add({ id: 2, name: "Bob", age: 25 });
+                      s.add({ id: 3, name: "Cy", age: 30 });
+                      L("upgrade:" + e.oldVersion + "->" + e.newVersion);
+                    };
+                    req.onsuccess = function () {
+                      var db = req.result;
+                      var w = db.transaction("people", "readwrite");
+                      w.objectStore("people").put({ id: 4, name: "Di", age: 25 });
+                      w.oncomplete = function () {
+                        var s = db.transaction("people", "readonly").objectStore("people");
+                        s.get(2).onsuccess = function (ev) { L("get2:" + ev.target.result.name); };
+                        s.count().onsuccess = function (ev) { L("count:" + ev.target.result); };
+                        s.index("byAge").getAll(25).onsuccess = function (ev) {
+                          L("age25:" + ev.target.result.map(function (r) { return r.name; }).sort().join(","));
+                        };
+                        var names = [];
+                        s.openCursor().onsuccess = function (ev) {
+                          var c = ev.target.result;
+                          if (c) { names.push(c.value.name); c.continue(); } else { L("cursor:" + names.join(",")); }
+                        };
+                      };
+                    };
+                    "ok""#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].console,
+            vec![
+                "upgrade:0->1".to_string(),
+                "get2:Bob".to_string(),
+                "count:4".to_string(),
+                "age25:Bob,Di".to_string(),
+                "cursor:Ann,Bob,Cy,Di".to_string(),
+            ]
+        );
+    }
+
     // --- createElement / createElementNS / createAttribute / namespaces ------------------
 
     #[test]

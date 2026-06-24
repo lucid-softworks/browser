@@ -107,6 +107,8 @@ pub(crate) fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
         global.set(scope, k.into(), n.into());
     }
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
+    // IndexedDB (in-memory) — depends on structuredClone + queueMicrotask from the prior bootstraps.
+    eval_internal(scope, INDEXEDDB_BOOTSTRAP, "<indexeddb>");
     // Expose elements with an `id` as named globals (HTML named-properties-on-window). The DOM is
     // already fully parsed by the time the environment is installed (the engine batches scripts
     // after `parser.finish()`), so every static-markup id is visible to author scripts that follow.
@@ -138,6 +140,11 @@ pub(crate) const TIMERS_BOOTSTRAP: &str = include_str!("bootstrap/timers.js");
 /// document via the JS `document` layer + the node-id `document.__getAttr/__setAttr/__removeAttr`
 /// helpers (now built over the native primitives in DOCUMENT_BOOTSTRAP).
 pub(crate) const BROWSER_ENV_BOOTSTRAP: &str = include_str!("bootstrap/browser_env.js");
+
+/// In-memory IndexedDB (`indexedDB`, IDBDatabase/ObjectStore/Index/Cursor/KeyRange/…). A pure-JS
+/// implementation backed by per-realm in-memory stores; values are deep-copied with `structuredClone`
+/// and requests/transactions run asynchronously on the microtask queue. Not persisted to disk.
+pub(crate) const INDEXEDDB_BOOTSTRAP: &str = include_str!("bootstrap/indexeddb.js");
 
 // ---------------------------------------------------------------------------------------------
 // Event loop drain + script evaluation against a V8 context.
