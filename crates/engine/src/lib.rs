@@ -87,6 +87,9 @@ struct LayoutCache {
     /// The cascade's computed styles (kept so SVG rasterization can read inline `<svg>` shapes'
     /// CSS `fill`/`stroke` and forced-colors state, which aren't carried on the layout tree).
     styles: std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
+    /// The page's author stylesheets (kept so `::selection` styles can be resolved on demand at paint
+    /// time for a programmatic `getSelection()` highlight, which needs selector matching).
+    sheets: Vec<css::Stylesheet>,
     /// The page's resolved *used* color scheme (true = dark), captured during the cascade that
     /// produced this layout (see `style::cascade_with_root_scheme`). Drives the default canvas
     /// background when no html/body `background-color` is set. Stored here (rather than re-read from
@@ -1797,6 +1800,7 @@ mod tests {
             &no_canvas,
             &[],
             &mut 0,
+            &std::collections::HashMap::new(),
         );
 
         // The root box should exist; with the parallel layout stub it may have no children yet,
@@ -1861,6 +1865,7 @@ mod tests {
                 &no_canvas,
                 &[],
                 &mut 0,
+                &std::collections::HashMap::new(),
             );
             // Sample a pixel inside the div.
             let i = (50 * fb.stride + 50 * 4) as usize;
@@ -1943,6 +1948,7 @@ mod tests {
             &no_canvas,
             &[],
             &mut 0,
+            &std::collections::HashMap::new(),
         );
         fb
     }

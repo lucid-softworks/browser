@@ -21,6 +21,7 @@ pub(crate) fn paint_box(
     bg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
+    sel_styles: &HashMap<dom::NodeId, SelStyle>,
 ) {
     // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
     // declarations compose additional affines on top per-box.
@@ -41,8 +42,14 @@ pub(crate) fn paint_box(
         sel_ranges,
         run_idx,
         (0.0, fb.width as f32),
+        sel_styles,
     );
 }
+
+/// A selected run's `::selection` (background, text) colors — resolved (forced-colors-aware) by the
+/// engine and keyed by the originating element's node id. Empty for a plain mouse-drag selection,
+/// which paints the default highlight.
+pub(crate) type SelStyle = (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>);
 
 /// Forced-colors backplate pre-pass: paint each text line's Canvas backplate spanning the full line
 /// box (the nearest block ancestor's content width), BEFORE any glyphs are drawn. A single line can
@@ -230,6 +237,7 @@ pub(crate) fn paint_box_opacity(
     // colors backplate spans (the WPT refs paint a full-width Canvas block behind each text line,
     // not just the glyph run).
     line_x: (f32, f32),
+    sel_styles: &HashMap<dom::NodeId, SelStyle>,
 ) {
     // This box's opacity multiplies into the inherited (effective) opacity for itself + subtree.
     let opacity = parent_opacity * b.style.opacity.clamp(0.0, 1.0);
@@ -549,54 +557,85 @@ pub(crate) fn paint_box_opacity(
                 let fs = b.style.font_size * scale;
                 let ta = scale_alpha(255, opacity);
                 let tc = vlink(b.style.color);
+                // A run covered by a resolved `::selection` (a programmatic getSelection() highlight,
+                // keyed by the originating element) carries its own background + text colors. When the
+                // whole run is selected, repaint its glyphs in the `::selection` text color.
+                let sel_style = b.node.and_then(|n| sel_styles.get(&n)).copied();
+                let sel_range = sel_ranges.get(*run_idx).copied().flatten();
+                let fully_selected =
+                    matches!(sel_range, Some((0, ce)) if ce > 0 && ce >= s.chars().count());
+                let glyph = match (fully_selected, sel_style) {
+                    (true, Some((_, Some(fg)))) => fg,
+                    _ => tc,
+                };
                 let color = Color {
-                    r: tc.0,
-                    g: tc.1,
-                    b: tc.2,
+                    r: glyph.0,
+                    g: glyph.1,
+                    b: glyph.2,
                     a: ta,
                 };
                 let x = dx;
                 let baseline = dy + fs * 0.8;
                 // Selection highlight: if this run (identified by its DFS index) has a selected
-                // character sub-range, fill a translucent rect behind those glyphs BEFORE drawing
-                // the text so the glyphs stay legible on top. Advance widths use the SAME scaled
-                // font size + letter-spacing the glyph painter uses, so the band lines up exactly.
+                // character sub-range, fill a rect behind those glyphs BEFORE drawing the text so the
+                // glyphs stay legible on top. Advance widths use the SAME scaled font size +
+                // letter-spacing the glyph painter uses, so the band lines up exactly. A `::selection`
+                // background (opaque) overrides the default translucent mouse-selection blue; a
+                // transparent `::selection` background paints no box.
                 if !s.is_empty() {
-                    if let Some(Some((cs, ce))) = sel_ranges.get(*run_idx) {
+                    if let Some((cs, ce)) = sel_range {
                         let ls = b.style.letter_spacing * scale;
                         let mut hx0 = x;
                         let mut pen = x;
                         for (i, ch) in s.chars().enumerate() {
-                            if i == *cs {
+                            if i == cs {
                                 hx0 = pen;
                             }
                             pen += font.advance(ch, fs) + ls;
-                            if i + 1 == *ce {
+                            if i + 1 == ce {
                                 break;
                             }
                         }
                         // If the range starts at 0, hx0 stays at the run's left edge.
                         let hx1 = pen;
                         let top = dy.round() as i32;
-                        let h = (fs * 1.25).round().max(1.0) as i32;
+                        // A `::selection` highlight spans the run's full line box (matching an
+                        // element background — the WPT refs simulate it with one); the default
+                        // mouse-selection band uses the glyph-ish `1.25em`.
+                        let h = if sel_style.is_some() {
+                            let (_, by) = xf.apply(content.x, content.y + content.height);
+                            (by - dy).round().max(1.0) as i32
+                        } else {
+                            (fs * 1.25).round().max(1.0) as i32
+                        };
                         let w = (hx1 - hx0).round() as i32;
-                        if w > 0 {
-                            // A translucent macOS-ish selection blue, composited over the text bg.
-                            let hl = Color {
+                        let hl = match sel_style {
+                            Some((Some(bg), _)) => Some(Color {
+                                r: bg.0,
+                                g: bg.1,
+                                b: bg.2,
+                                a: ta,
+                            }),
+                            Some((None, _)) => None, // transparent ::selection background
+                            None => Some(Color {
                                 r: 74,
                                 g: 144,
                                 b: 255,
                                 a: scale_alpha(102, opacity),
-                            };
-                            fb.fill_rect(
-                                Rect {
-                                    x: hx0.round() as i32,
-                                    y: top,
-                                    w,
-                                    h,
-                                },
-                                hl,
-                            );
+                            }),
+                        };
+                        if w > 0 {
+                            if let Some(hl) = hl {
+                                fb.fill_rect(
+                                    Rect {
+                                        x: hx0.round() as i32,
+                                        y: top,
+                                        w,
+                                        h,
+                                    },
+                                    hl,
+                                );
+                            }
                         }
                     }
                 }
@@ -824,6 +863,7 @@ pub(crate) fn paint_box_opacity(
             sel_ranges,
             run_idx,
             line_x,
+            sel_styles,
         );
     }
     fb.clip = saved_clip;

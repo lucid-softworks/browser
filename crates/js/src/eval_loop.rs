@@ -67,6 +67,24 @@ pub(crate) fn cross_origin_isolated() -> bool {
     CROSS_ORIGIN_ISOLATED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The active programmatic text selection committed by page JS (`getSelection().addRange()` /
+/// `setBaseAndExtent()`), as `(startElementId, startOffset, endElementId, endOffset)` in document
+/// order. The start/end are the *element* containing the boundary text node (text-node boundaries
+/// are mapped to their parent element in JS). `None` when nothing is selected. The engine reads this
+/// each render to paint the `::selection` highlight; the JS worker writes it via `__commitSelection`.
+pub(crate) static ACTIVE_SELECTION: std::sync::Mutex<Option<(usize, u32, usize, u32)>> =
+    std::sync::Mutex::new(None);
+
+/// Replace the active programmatic selection (engine resets to `None` on each navigation).
+pub fn set_active_selection(sel: Option<(usize, u32, usize, u32)>) {
+    *ACTIVE_SELECTION.lock().unwrap_or_else(|e| e.into_inner()) = sel;
+}
+
+/// The active programmatic selection committed by page JS, for the engine's `::selection` paint.
+pub fn active_selection() -> Option<(usize, u32, usize, u32)> {
+    *ACTIVE_SELECTION.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Set the logical viewport size (px) and device pixel ratio surfaced to page JS.
 pub fn set_device_metrics(width: u32, height: u32, device_pixel_ratio: f32) {
     use std::sync::atomic::Ordering;

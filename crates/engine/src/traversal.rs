@@ -204,6 +204,9 @@ pub(crate) struct TextRun {
     pub(crate) text: String,
     pub(crate) font_size: f32,
     pub(crate) letter_spacing: f32,
+    /// The originating element's node id (text boxes carry their element, not the text node), for
+    /// mapping a programmatic (`getSelection()`) selection's element boundaries to painted runs.
+    pub(crate) node: Option<dom::NodeId>,
 }
 
 /// Walk the layout tree depth-first, collecting every `Text` run in reading (paint) order. Each
@@ -219,6 +222,7 @@ pub(crate) fn collect_text_runs(root: &layout::LayoutBox) -> Vec<TextRun> {
                     text: s.clone(),
                     font_size: b.style.font_size,
                     letter_spacing: b.style.letter_spacing,
+                    node: b.node,
                 });
             }
         }

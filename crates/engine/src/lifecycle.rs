@@ -131,6 +131,7 @@ impl Engine {
         self.prev_size.clear();
         self.session = None; // drop the previous page's runtime (stops its thread)
         self.selection = None; // a new page starts with nothing selected
+        js::set_active_selection(None); // and no programmatic (::selection) selection
         self.inspect_node = None; // and nothing highlighted in the Elements inspector
         self.favicon = None; // and no site icon until this page's loads
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
@@ -509,19 +510,22 @@ impl Engine {
             // device-px cursor, `getBoundingClientRect` divides back to CSS px).
             scale_layout_tree(&mut root, self.scale);
             let content_h = root.dimensions.margin_box().height;
-            Some((root, content_h, root_scheme_dark, computed))
+            Some((root, content_h, root_scheme_dark, computed, styles.clone()))
         } else {
             None
         };
         self.layout_cache =
-            computed.map(|(root, content_h, root_scheme_dark, styles)| LayoutCache {
-                dw,
-                dh,
-                root,
-                content_h,
-                root_scheme_dark,
-                styles,
-            });
+            computed.map(
+                |(root, content_h, root_scheme_dark, styles, sheets)| LayoutCache {
+                    dw,
+                    dh,
+                    root,
+                    content_h,
+                    root_scheme_dark,
+                    styles,
+                    sheets,
+                },
+            );
         true
     }
 
@@ -935,11 +939,30 @@ impl Engine {
                         // Resolve the selection (if any) into a per-text-run highlight range, in the
                         // same DFS order the painter visits text runs. A running counter in the
                         // painter indexes into this so each run highlights its selected sub-range.
-                        let sel_ranges = if self.selection.is_some() {
-                            let runs = collect_text_runs(&cache.root);
-                            self.selection_ranges(&runs)
-                        } else {
-                            Vec::new()
+                        // A programmatic `getSelection()` selection (committed by page JS) takes
+                        // precedence and carries per-element `::selection` colors; otherwise the
+                        // mouse-drag selection paints the default highlight.
+                        let (sel_ranges, sel_styles) = match js::active_selection() {
+                            Some((sn, so, en, eo)) => {
+                                let runs = collect_text_runs(&cache.root);
+                                let ranges = js_selection_ranges(&runs, sn, so, en, eo);
+                                let styles = selection_styles(
+                                    &runs,
+                                    &ranges,
+                                    doc,
+                                    &cache.styles,
+                                    &cache.sheets,
+                                );
+                                (ranges, styles)
+                            }
+                            None if self.selection.is_some() => {
+                                let runs = collect_text_runs(&cache.root);
+                                (
+                                    self.selection_ranges(&runs),
+                                    std::collections::HashMap::new(),
+                                )
+                            }
+                            None => (Vec::new(), std::collections::HashMap::new()),
                         };
                         let mut run_idx = 0usize;
                         // Forced-colors backplate pre-pass: paint every line's Canvas backplate
@@ -974,6 +997,7 @@ impl Engine {
                             &self.bg_bitmaps,
                             &sel_ranges,
                             &mut run_idx,
+                            &sel_styles,
                         );
                         // Overlay scrollbar on the right edge when the page overflows the viewport.
                         paint_scrollbar(
@@ -1132,4 +1156,91 @@ impl Engine {
         }
         find(doc, doc.root())
     }
+}
+
+/// `::selection` background/text color for a selected run's element.
+type SelStyle = (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>);
+
+/// Map a programmatic selection's element boundaries `(startEl, startOff, endEl, endOff)` to a
+/// per-run selected char range in DFS run order — the same shape `Engine::selection_ranges`
+/// produces for a mouse selection. Offsets are clamped to each run's length.
+fn js_selection_ranges(
+    runs: &[TextRun],
+    sn: usize,
+    so: u32,
+    en: usize,
+    eo: u32,
+) -> Vec<Option<(usize, usize)>> {
+    let mut out = vec![None; runs.len()];
+    let start = runs.iter().position(|r| r.node == Some(dom::NodeId(sn)));
+    let end = runs.iter().rposition(|r| r.node == Some(dom::NodeId(en)));
+    let (Some(s0), Some(e0)) = (start, end) else {
+        return out;
+    };
+    // Order the boundaries in run order, carrying each one's char offset.
+    let (sr, soff, er, eoff) = if s0 <= e0 {
+        (s0, so as usize, e0, eo as usize)
+    } else {
+        (e0, eo as usize, s0, so as usize)
+    };
+    for (i, slot) in out.iter_mut().enumerate() {
+        if i < sr || i > er {
+            continue;
+        }
+        let len = runs[i].text.chars().count();
+        let s = if i == sr { soff } else { 0 }.min(len);
+        let e = if i == er { eoff } else { len }.min(len);
+        if s < e {
+            *slot = Some((s, e));
+        }
+    }
+    out
+}
+
+/// Resolve the `::selection` background/text colors for each selected run's element. Applies forced
+/// colors: the highlight becomes Highlight/HighlightText unless the ORIGINATING element opted out
+/// with `forced-color-adjust: none` (the pseudo's own `forced-color-adjust` is ignored, per
+/// css-pseudo-4 — a highlight follows its originating element's value).
+fn selection_styles(
+    runs: &[TextRun],
+    ranges: &[Option<(usize, usize)>],
+    doc: &Option<dom::Document>,
+    styles: &std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
+    sheets: &[css::Stylesheet],
+) -> std::collections::HashMap<dom::NodeId, SelStyle> {
+    let mut out = std::collections::HashMap::new();
+    let Some(d) = doc else {
+        return out;
+    };
+    for (i, r) in runs.iter().enumerate() {
+        if ranges.get(i).copied().flatten().is_none() {
+            continue;
+        }
+        let Some(node) = r.node else { continue };
+        // A text run's node is the text node; `::selection` cascades on its element. Resolve the
+        // nearest ancestor that has a computed style (the originating element).
+        let mut el_id = node;
+        while !styles.contains_key(&el_id) {
+            match d.get(el_id).parent {
+                Some(p) => el_id = p,
+                None => break,
+            }
+        }
+        if out.contains_key(&node) {
+            continue;
+        }
+        let Some(el) = styles.get(&el_id) else {
+            continue;
+        };
+        let Some(ps) = style::compute_pseudo_style(d, sheets, el_id, el, "selection") else {
+            continue;
+        };
+        let (mut bg, mut fg) = (ps.background_color, Some(ps.color));
+        if style::forced_colors_active() && !el.forced_color_adjust_off {
+            bg = style::system_color("highlight");
+            fg = style::system_color("highlighttext");
+        }
+        out.insert(node, (bg, fg));
+    }
+    out
 }

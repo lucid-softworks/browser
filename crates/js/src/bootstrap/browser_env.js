@@ -8255,6 +8255,16 @@
     return sel;
   }
   function __selStart(sel) { return sel._ranges.length ? sel._ranges[0] : null; }
+  // Push the current selection (its single range's boundaries, in document order) to the engine so it
+  // can paint the ::selection highlight. The boundary node ids are passed as-is (the engine indexes
+  // painted text runs by their node id, which is the text node); cleared when there is no range.
+  function __syncSelection(sel) {
+    try {
+      var r = __selStart(sel);
+      if (!r || (r._sc === r._ec && r._so === r._eo)) { globalThis.__commitSelection(-1, 0, -1, 0); return; }
+      globalThis.__commitSelection(__idOf(r._sc), r._so, __idOf(r._ec), r._eo);
+    } catch (e) { try { globalThis.__commitSelection(-1, 0, -1, 0); } catch (e2) {} }
+  }
   Object.defineProperty(__selectionProto, "rangeCount", { get: function () { return this._ranges.length; }, enumerable: true, configurable: true });
   Object.defineProperty(__selectionProto, "isCollapsed", {
     get: function () { var r = __selStart(this); return r ? (r._sc === r._ec && r._so === r._eo) : true; },
@@ -8281,14 +8291,16 @@
     if (globalThis.__rootId(__idOf(range._sc)) !== __idOf(globalThis.document)) { return; }
     if (this._ranges.length) { return; }
     this._ranges = [range];
+    __syncSelection(this);
   });
   def(__selectionProto, "removeRange", function (range) {
     var i = this._ranges.indexOf(range);
     if (i < 0) { throw new globalThis.DOMException("Could not find the given range.", "NotFoundError"); }
     this._ranges.splice(i, 1);
+    __syncSelection(this);
   });
-  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; });
-  def(__selectionProto, "empty", function () { this._ranges = []; });
+  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; __syncSelection(this); });
+  def(__selectionProto, "empty", function () { this._ranges = []; __syncSelection(this); });
   // setBaseAndExtent: select from (anchorNode, anchorOffset) to (focusNode, focusOffset). We don't
   // track selection direction, so a backward selection's anchor/focus getters may read swapped; the
   // selected range itself is correct.
@@ -8297,14 +8309,16 @@
     try { range.setStart(anchorNode, anchorOffset); range.setEnd(focusNode, focusOffset); }
     catch (e) { try { range.setStart(focusNode, focusOffset); range.setEnd(anchorNode, anchorOffset); } catch (e2) { return; } }
     this._ranges = [range];
+    __syncSelection(this);
   });
   // Caret/selection movement built on the Range model (one range per selection). collapse places a
   // caret; extend moves the focus keeping the anchor; selectAllChildren selects a node's contents.
   def(__selectionProto, "collapse", function (node, offset) {
-    if (node == null) { this._ranges = []; return; }
+    if (node == null) { this._ranges = []; __syncSelection(this); return; }
     var range = globalThis.document.createRange();
     range.setStart(node, offset || 0); range.collapse(true);
     this._ranges = [range];
+    __syncSelection(this);
   });
   def(__selectionProto, "setPosition", __selectionProto.collapse);
   def(__selectionProto, "collapseToStart", function () {
@@ -8323,6 +8337,7 @@
   });
   def(__selectionProto, "selectAllChildren", function (node) {
     var range = globalThis.document.createRange(); range.selectNodeContents(node); this._ranges = [range];
+    __syncSelection(this);
   });
   def(__selectionProto, "containsNode", function (node) {
     var r = this._ranges[0];

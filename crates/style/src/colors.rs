@@ -382,7 +382,7 @@ pub fn is_system_color_keyword(lower: &str) -> bool {
     )
 }
 
-pub(crate) fn system_color(lower: &str) -> Option<(u8, u8, u8)> {
+pub fn system_color(lower: &str) -> Option<(u8, u8, u8)> {
     Some(match lower {
         "canvas" | "window" | "buttonface" | "field" | "infobackground" => (255, 255, 255),
         "canvastext" | "windowtext" | "buttontext" | "fieldtext" | "infotext" | "menutext"

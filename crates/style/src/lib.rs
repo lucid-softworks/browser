@@ -23,6 +23,7 @@ mod variables;
 
 pub use cascade::*;
 pub use colors::is_system_color_keyword;
+pub use colors::system_color;
 pub use computed_style::*;
 pub use lengths::*;
 pub use selector::*;

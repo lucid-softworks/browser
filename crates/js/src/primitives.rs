@@ -2033,6 +2033,26 @@ pub(crate) fn install_console_sink(scope: &mut v8::PinScope, global: v8::Local<v
 
 /// `__observersActive(bool)` — JS sets this true when the first `MutationObserver` is registered
 /// and false when the last disconnects. Gates whether the mutation primitives record anything.
+/// `__commitSelection(startEl, startOff, endEl, endOff)` — record the active programmatic text
+/// selection (boundary *elements* + char offsets, document order) so the engine can paint the
+/// `::selection` highlight. Called by `getSelection()` mutators. Any missing/invalid boundary clears
+/// the selection.
+pub(crate) fn prim_commit_selection(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let sel = match (arg_node(scope, &args, 0), arg_node(scope, &args, 2)) {
+        (Some(s), Some(e)) => {
+            let so = args.get(1).number_value(scope).unwrap_or(0.0).max(0.0) as u32;
+            let eo = args.get(3).number_value(scope).unwrap_or(0.0).max(0.0) as u32;
+            Some((s.0, so, e.0, eo))
+        }
+        _ => None,
+    };
+    crate::eval_loop::set_active_selection(sel);
+}
+
 pub(crate) fn prim_observers_active(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2213,6 +2233,7 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__wsSend", prim_ws_send);
     set_fn(scope, global, "__wsClose", prim_ws_close);
     set_fn(scope, global, "__observersActive", prim_observers_active);
+    set_fn(scope, global, "__commitSelection", prim_commit_selection);
     set_fn(scope, global, "__drainMutations", prim_drain_mutations);
     set_fn(
         scope,
