@@ -487,11 +487,8 @@ pub fn collect_module_graph(
                     notes.push(format!("[skipped bare import: {}]", sp.spec));
                     continue;
                 }
-                let resolved = match url::Url::parse(&base)
-                    .ok()
-                    .and_then(|b| b.join(sp.spec.trim()).ok())
-                {
-                    Some(u) => u.to_string(),
+                let resolved = match wurl::resolve(sp.spec.trim(), &base) {
+                    Some(u) => u,
                     None => {
                         notes.push(format!(
                             "[failed to resolve import: {} (in {url})]",

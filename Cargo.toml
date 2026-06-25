@@ -9,6 +9,7 @@ members = [
     "crates/style",
     "crates/layout",
     "crates/paint",
+    "crates/wurl",
     "crates/engine",
     "crates/ffi",
     "crates/webdriver",

@@ -31,11 +31,11 @@ impl ModuleRegistry {
     /// Resolve `specifier` against `base` (a canonical URL) via `Url::join`. Returns the canonical
     /// absolute URL, or `specifier` unchanged if neither parses (best-effort, never panics).
     fn resolve_specifier(specifier: &str, base: &str) -> String {
-        if let Some(joined) = crate::whatwg_url::resolve(specifier, base) {
+        if let Some(joined) = wurl::resolve(specifier, base) {
             return joined;
         }
         // Fall back to the specifier itself (already absolute in the common pre-rewritten case).
-        crate::whatwg_url::Url::parse(specifier)
+        wurl::Url::parse(specifier)
             .map(|u| u.href())
             .unwrap_or_else(|_| specifier.to_string())
     }

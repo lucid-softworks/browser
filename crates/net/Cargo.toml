@@ -19,7 +19,7 @@ webpki-roots = "0.26"
 # wss:// works without depending on the OS trust store.
 tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 base64 = "0.22"
-url = "2.5"
+wurl = { path = "../wurl" }
 
 [lints]
 workspace = true

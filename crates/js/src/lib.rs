@@ -294,7 +294,6 @@ mod runtime;
 mod selector;
 mod session;
 mod style_query;
-mod whatwg_url;
 mod worker;
 
 pub(crate) use dom_helpers::*;
