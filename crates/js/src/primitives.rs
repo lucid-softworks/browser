@@ -1720,6 +1720,26 @@ fn is_special_scheme(scheme: &str) -> bool {
     matches!(scheme, "ftp" | "file" | "http" | "https" | "ws" | "wss")
 }
 
+/// In a file URL a Windows drive letter may be written `X|`; WHATWG normalizes it to `X:`. The `url`
+/// crate doesn't, so rewrite the first drive-letter `|` at a path-segment boundary to `:`. Only safe
+/// for an absolute `file:` input (for a relative drive-letter the rewritten `X:` would be misread as
+/// a scheme by the crate's relative resolver).
+fn normalize_file_drive_pipe(input: &str) -> std::borrow::Cow<'_, str> {
+    let b = input.as_bytes();
+    for i in 1..b.len() {
+        if b[i] == b'|' && b[i - 1].is_ascii_alphabetic() {
+            let before_ok = i == 1 || matches!(b[i - 2], b'/' | b'\\' | b':');
+            let after_ok = i + 1 == b.len() || matches!(b[i + 1], b'/' | b'\\' | b'?' | b'#');
+            if before_ok && after_ok {
+                let mut s = input.to_string();
+                s.replace_range(i..i + 1, ":");
+                return std::borrow::Cow::Owned(s);
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(input)
+}
+
 /// WHATWG's "special authority ignore slashes" state skips any run of `/`/`\` for a special,
 /// non-`file` scheme, so a relative input like `///test` resolves to host `test`. The `url` crate
 /// stops after two slashes and reports `EmptyHost`, so collapse a leading run of 3+ slashes to two
@@ -1752,15 +1772,24 @@ pub(crate) fn prim_url_parse(
 ) {
     let input = arg_str(scope, &args, 0);
     let base_arg = args.get(1);
+    // An absolute `file:` input (only) gets drive-letter `|`->`:` normalization.
+    let tb = input.trim_start_matches(|c: char| c <= ' ').as_bytes();
+    let input_is_file = tb.len() >= 5 && tb[..5].eq_ignore_ascii_case(b"file:");
     let parsed = if base_arg.is_string() {
         let base = base_arg.to_rust_string_lossy(scope);
         match url::Url::parse(&base) {
             Ok(b) => {
                 let input2 = collapse_special_leading_slashes(&input, b.scheme());
-                b.join(&input2)
+                if input_is_file {
+                    b.join(&normalize_file_drive_pipe(&input2))
+                } else {
+                    b.join(&input2)
+                }
             }
             Err(e) => Err(e),
         }
+    } else if input_is_file {
+        url::Url::parse(&normalize_file_drive_pipe(&input))
     } else {
         url::Url::parse(&input)
     };

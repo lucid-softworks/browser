@@ -4678,6 +4678,41 @@ mod tests {
     }
 
     #[test]
+    fn url_parse_file_drive_letter_pipe() {
+        // An absolute file: URL's drive-letter `X|` normalizes to `X:`.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                out.push(new URL("file:///w|/m").href);
+                out.push(new URL("file:C|/m/").href);
+                document.body.setAttribute('data-out', out.join("|"));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(attr.as_deref(), Some("file:///w:/m|file:///C:/m/"));
+    }
+
+    #[test]
     fn url_parse_opaque_and_slash_edges() {
         // Opaque-path trailing space encodes the last as %20; for a non-file special base a relative
         // input with 3+ leading slashes collapses to the authority's host; file keeps the slashes.
