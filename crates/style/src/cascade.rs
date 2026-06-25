@@ -99,7 +99,7 @@ pub(crate) fn cascade_locked(
         &mut out,
     );
     if forced_colors_active() {
-        apply_forced_colors(doc, doc.root(), false, (0, 0, 0), &mut out);
+        apply_forced_colors(doc, doc.root(), false, (0, 0, 0), false, &mut out);
     }
     (out, root_used_scheme_dark())
 }
@@ -150,9 +150,15 @@ pub(crate) fn apply_forced_colors(
     id: dom::NodeId,
     ancestor_off: bool,
     parent_color: (u8, u8, u8),
+    visited_ancestor: bool,
     out: &mut HashMap<dom::NodeId, ComputedStyle>,
 ) {
     let off = ancestor_off || out.get(&id).is_some_and(|s| s.forced_color_adjust_off);
+    // A descendant of a visited link is itself "visited" for the painter's VisitedText mapping.
+    let this_visited = visited_ancestor
+        || matches!(&doc.get(id).data,
+            dom::NodeData::Element(e) if e.tag == "a"
+                && e.attrs.get("href").is_some_and(|h| { let h = h.trim(); h.is_empty() || h.starts_with('#') }));
     // The forced color this element contributes to `currentColor`/inheritance for its descendants.
     let mut my_color = parent_color;
     if off {
@@ -184,9 +190,17 @@ pub(crate) fn apply_forced_colors(
         let is_link = link_kind.is_some();
         // The *computed* link color is always LinkText, even for visited links — getComputedStyle
         // must not leak visited state. The painter maps a flagged visited link's LinkText to
-        // VisitedText at paint time.
-        let visited = link_kind == Some(true);
-        let text_color = if is_link { (0, 0, 238) } else { (0, 0, 0) };
+        // VisitedText at paint time (see `this_visited`).
+        // A link's text takes LinkText. Otherwise the forced color INHERITS: an element with its own
+        // explicit color is forced to CanvasText, but one that inherits its color follows the forced
+        // ancestor (e.g. an SVG shape inside a link uses the link's color via currentColor).
+        let text_color = if is_link {
+            (0, 0, 238) // LinkText
+        } else if out.get(&id).is_some_and(|s| !s.color_explicit) {
+            parent_color
+        } else {
+            (0, 0, 0) // CanvasText
+        };
         // The backplate: an element directly containing *visible* non-whitespace text paints a
         // Canvas block behind it so the text stays readable over images. We approximate the per-line
         // backplate with a Canvas background on the text box — exactly how the WPT refs simulate it.
@@ -218,7 +232,7 @@ pub(crate) fn apply_forced_colors(
             if is_link && !s.border_is_system {
                 s.border_color = text_color;
             }
-            s.visited_link = visited;
+            s.visited_link = this_visited;
             // ::before / ::after generated boxes are forced too (a pseudo with `content` is text).
             if let Some(b) = s.before.as_mut() {
                 let txt = b.content.is_some();
@@ -234,7 +248,7 @@ pub(crate) fn apply_forced_colors(
         my_color = out.get(&id).map_or(text_color, |s| s.color);
     }
     for child in doc.get(id).children.clone() {
-        apply_forced_colors(doc, child, off, my_color, out);
+        apply_forced_colors(doc, child, off, my_color, this_visited, out);
     }
 }
 

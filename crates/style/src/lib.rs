@@ -1069,7 +1069,7 @@ mod tests {
             r#"<html><body><div>text</div><a href="x">link</a><span class="keep">k</span></body></html>"#,
         );
         let mut map = cascade(&doc, &[sheet]);
-        cascade::apply_forced_colors(&doc, doc.root(), false, (0, 0, 0), &mut map);
+        cascade::apply_forced_colors(&doc, doc.root(), false, (0, 0, 0), false, &mut map);
         let div = elem(&doc, |e| e.tag == "div");
         let a = elem(&doc, |e| e.tag == "a");
         let keep = elem(&doc, |e| e.attrs.get("class").is_some_and(|c| c == "keep"));

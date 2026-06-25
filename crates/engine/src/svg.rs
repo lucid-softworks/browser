@@ -1012,13 +1012,16 @@ fn apply_paint(
     mut st: PaintState,
 ) -> PaintState {
     let style = attr(el, "style").map(|s| s.to_string());
-    // SVG `currentColor` resolves to the element's CSS `color` property.
-    let current = cs.map(|c| Color {
-        r: c.color.0,
-        g: c.color.1,
-        b: c.color.2,
-        a: 255,
+    // SVG `currentColor` resolves to the element's CSS `color` property. Inside a visited link, the
+    // computed LinkText is mapped to VisitedText for painting (matching the painter's text mapping).
+    let cur_rgb = cs.map(|c| {
+        if c.visited_link && c.color == (0, 0, 238) {
+            (85, 26, 139) // VisitedText
+        } else {
+            c.color
+        }
     });
+    let current = cur_rgb.map(|(r, g, b)| Color { r, g, b, a: 255 });
     if let Some(v) = prop(el, "fill", &style) {
         if let Some(id) = paint_url_id(&v) {
             // A `url(#id)` paint (gradient/pattern): remember the ref; keep a gray solid fallback in
@@ -1064,7 +1067,7 @@ fn apply_paint(
     // CSS `fill`/`stroke` (from author `<style>` rules / inline `style`, resolved by the cascade)
     // override the SVG presentation attributes above.
     if let Some(cs) = cs {
-        let (cr, cg, cb) = cs.color;
+        let (cr, cg, cb) = cur_rgb.unwrap_or(cs.color);
         if let Some(extra) = &cs.extra_colors {
             if let Some(&(r, g, b)) = extra.get("fill") {
                 st.fill = Some(Color { r, g, b, a: 255 });
@@ -1097,15 +1100,19 @@ fn apply_paint(
         // currentColor, unless the element opted out with forced-color-adjust:none. A `url()` paint
         // (gradient/pattern) is left alone — its own stops carry the forced/system colors.
         if style::forced_colors_active() && !cs.forced_color_adjust_off {
-            let (r, g, b) = cs.color;
-            let cc = Color { r, g, b, a: 255 };
+            let cc = Color {
+                r: cr,
+                g: cg,
+                b: cb,
+                a: 255,
+            };
             if st.fill.is_some() && st.fill_url.is_none() {
                 st.fill = Some(cc);
             }
             if st.stroke.is_some() {
                 st.stroke = Some(cc);
             }
-            st.force_stops = Some(cs.color);
+            st.force_stops = Some((cr, cg, cb));
         } else {
             st.force_stops = None;
         }
