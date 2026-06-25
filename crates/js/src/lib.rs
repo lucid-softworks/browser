@@ -4678,6 +4678,49 @@ mod tests {
 
 
     #[test]
+    fn performance_timeorigin_now_and_crossoriginisolated() {
+        // hr-time: performance.now() is a positive number, timeOrigin is a real epoch close to
+        // Date.now(), toJSON().timeOrigin matches, and crossOriginIsolated is a boolean.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var b = document.body;
+                b.setAttribute('data-now-pos', String(performance.now() > 0));
+                b.setAttribute('data-origin-close', String(Math.abs(Date.now() - performance.timeOrigin) < 1000));
+                b.setAttribute('data-tojson', String(performance.toJSON().timeOrigin === performance.timeOrigin));
+                b.setAttribute('data-coi', typeof self.crossOriginIsolated);
+                var n1 = performance.now(), n2 = performance.now();
+                b.setAttribute('data-monotonic', String((n2 - n1) >= 0));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(attr("data-now-pos").as_deref(), Some("true"), "now() should be positive");
+        assert_eq!(attr("data-origin-close").as_deref(), Some("true"), "timeOrigin close to Date.now()");
+        assert_eq!(attr("data-tojson").as_deref(), Some("true"), "toJSON().timeOrigin matches");
+        assert_eq!(attr("data-coi").as_deref(), Some("boolean"), "crossOriginIsolated is boolean");
+        assert_eq!(attr("data-monotonic").as_deref(), Some("true"), "now() monotonic");
+    }
+
+    #[test]
     fn offscreen_canvas_2d_reads_back_drawn_pixels() {
         // An OffscreenCanvas 2D context records a display list; getImageData rasterizes it
         // synchronously via the paint-crate rasterizer (the __rasterizeCanvas native), so a filled
