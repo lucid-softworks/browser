@@ -800,6 +800,8 @@ pub(crate) fn compute_element_style<'a>(
         font_variant_emoji_emoji: parent.font_variant_emoji_emoji, // inherited
         accent_color: parent.accent_color,                       // inherited
         extra_colors: parent.extra_colors.clone(), // fill/stroke etc. inherit; others reset on set
+        svg_fill_current: parent.svg_fill_current, // inherited
+        svg_stroke_current: parent.svg_stroke_current, // inherited
         pre_forced: None,                          // not inherited; set by the forced-colors pass
         color_explicit: false, // not inherited; set when color is set explicitly
         color_is_system: parent.color_is_system, // tracks `color`, which inherits

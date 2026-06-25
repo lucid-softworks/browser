@@ -438,6 +438,12 @@ pub(crate) fn apply_declaration(
         | "text-decoration-color"
         | "-webkit-tap-highlight-color"
         | "-webkit-text-emphasis-color" => {
+            let is_current = val.trim().eq_ignore_ascii_case("currentcolor");
+            match prop {
+                "fill" => style.svg_fill_current = is_current,
+                "stroke" => style.svg_stroke_current = is_current,
+                _ => {}
+            }
             if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style
                     .extra_colors

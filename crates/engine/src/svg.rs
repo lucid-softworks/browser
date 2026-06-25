@@ -1049,6 +1049,7 @@ fn apply_paint(
     // CSS `fill`/`stroke` (from author `<style>` rules / inline `style`, resolved by the cascade)
     // override the SVG presentation attributes above.
     if let Some(cs) = cs {
+        let (cr, cg, cb) = cs.color;
         if let Some(extra) = &cs.extra_colors {
             if let Some(&(r, g, b)) = extra.get("fill") {
                 st.fill = Some(Color { r, g, b, a: 255 });
@@ -1057,6 +1058,25 @@ fn apply_paint(
             if let Some(&(r, g, b)) = extra.get("stroke") {
                 st.stroke = Some(Color { r, g, b, a: 255 });
             }
+        }
+        // `fill/stroke: currentColor` follows the element's (possibly forced) color, not the value
+        // frozen at cascade time.
+        if cs.svg_fill_current {
+            st.fill = Some(Color {
+                r: cr,
+                g: cg,
+                b: cb,
+                a: 255,
+            });
+            st.fill_url = None;
+        }
+        if cs.svg_stroke_current {
+            st.stroke = Some(Color {
+                r: cr,
+                g: cg,
+                b: cb,
+                a: 255,
+            });
         }
         // Forced colors: a painted fill/stroke resolves to the element's (already-forced)
         // currentColor, unless the element opted out with forced-color-adjust:none. A `url()` paint
