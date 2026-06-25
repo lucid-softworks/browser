@@ -108,11 +108,23 @@ pub(crate) fn cascade_locked(
 /// links, else CanvasText); `paint_bg` requests a Canvas background (a painted box, or a text
 /// backplate). Border → CanvasText; a transparent box stays transparent; box shadows are dropped;
 /// background images/gradients are preserved (text reads over them).
-fn force_style_colors(s: &mut ComputedStyle, text_color: (u8, u8, u8), paint_bg: bool) {
+fn force_style_colors(
+    s: &mut ComputedStyle,
+    text_color: (u8, u8, u8),
+    paint_bg: bool,
+    drop_img: bool,
+) {
     s.color = text_color;
     s.border_color = (0, 0, 0); // CanvasText
     if s.background_color.is_some() || paint_bg {
         s.background_color = Some((255, 255, 255)); // Canvas
+    }
+    // Background images/gradients are dropped on regular elements (the Canvas backplate replaces
+    // them). The root/body image is kept — it propagates to the viewport, which the backplate sits
+    // over rather than replaces.
+    if drop_img {
+        s.background_image_url = None;
+        s.background_gradient = None;
     }
     s.box_shadows.clear();
     // Forced colors resolves `color-scheme` to `light dark` (the UA controls the actual colors).
@@ -145,16 +157,20 @@ pub(crate) fn apply_forced_colors(
             doc.get(id).children.iter().any(
                 |&c| matches!(&doc.get(c).data, dom::NodeData::Text(t) if !t.trim().is_empty()),
             );
+        // Keep the background image on the root/body (it propagates to the viewport); drop it
+        // elsewhere.
+        let is_root_or_body = matches!(&doc.get(id).data,
+            dom::NodeData::Element(e) if e.tag == "html" || e.tag == "body");
         if let Some(s) = out.get_mut(&id) {
-            force_style_colors(s, text_color, has_text);
+            force_style_colors(s, text_color, has_text, !is_root_or_body);
             // ::before / ::after generated boxes are forced too (a pseudo with `content` is text).
             if let Some(b) = s.before.as_mut() {
                 let txt = b.content.is_some();
-                force_style_colors(b, (0, 0, 0), txt);
+                force_style_colors(b, (0, 0, 0), txt, true);
             }
             if let Some(a) = s.after.as_mut() {
                 let txt = a.content.is_some();
-                force_style_colors(a, (0, 0, 0), txt);
+                force_style_colors(a, (0, 0, 0), txt, true);
             }
         }
     }
