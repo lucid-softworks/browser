@@ -343,10 +343,14 @@ pub(crate) fn parse_named_color(lower: &str) -> Option<(u8, u8, u8)> {
     Some(named)
 }
 
-/// CSS system colors (a light-theme palette). These are most relevant in forced colors mode; the
-/// exact values only need to be self-consistent so a property forced to `CanvasText` renders the
-/// same as an element that names `CanvasText` directly.
+/// CSS system colors (a light-theme palette). Only resolved when forced colors mode is active —
+/// outside it, returning `None` (unknown) keeps these keywords inert so they don't change rendering
+/// for pages that aren't being run in forced colors. The exact values only need to be self-consistent
+/// so a property forced to `CanvasText` renders the same as an element that names `CanvasText`.
 pub(crate) fn system_color(lower: &str) -> Option<(u8, u8, u8)> {
+    if !crate::cascade::forced_colors_active() {
+        return None;
+    }
     Some(match lower {
         "canvas" | "window" | "buttonface" | "field" | "infobackground" => (255, 255, 255),
         "canvastext" | "windowtext" | "buttontext" | "fieldtext" | "infotext" | "menutext"

@@ -110,5 +110,10 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 mkdir -p "$STORE"
+# The forced-colors-mode tests assume the browser runs in forced colors mode (real CI configures
+# this per-suite). When the target is that area, enable it for the engine via this env var.
+for arg in "$@"; do
+  case "$arg" in *forced-colors*) export LUCID_FORCED_COLORS=1 ;; esac
+done
 "$ROOT/scripts/run-wpt.sh" "$@" -- --log-raw=- | python3 "$ROOT/scripts/wpt-ingest.py" "$STORE"
 regen

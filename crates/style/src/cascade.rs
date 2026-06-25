@@ -113,20 +113,33 @@ fn apply_forced_colors(
     ancestor_off: bool,
     out: &mut HashMap<dom::NodeId, ComputedStyle>,
 ) {
-    let canvas_text = (0, 0, 0);
     let canvas = (255, 255, 255);
     let off = ancestor_off || out.get(&id).is_some_and(|s| s.forced_color_adjust_off);
     if !off {
+        // A hyperlink's text takes LinkText; everything else takes CanvasText.
+        let text_color = if matches!(&doc.get(id).data,
+            dom::NodeData::Element(e) if e.tag == "a" && e.attrs.contains_key("href"))
+        {
+            (0, 0, 238) // LinkText
+        } else {
+            (0, 0, 0) // CanvasText
+        };
+        // The backplate: an element that directly contains non-whitespace text paints a Canvas block
+        // behind it so the text stays readable over images. We approximate the per-line backplate
+        // with a Canvas background on the text box — exactly how the WPT refs simulate it.
+        let has_text =
+            doc.get(id).children.iter().any(
+                |&c| matches!(&doc.get(c).data, dom::NodeData::Text(t) if !t.trim().is_empty()),
+            );
         if let Some(s) = out.get_mut(&id) {
-            s.color = canvas_text;
-            s.border_color = canvas_text;
-            // A painted background becomes Canvas; a transparent one stays transparent.
-            if s.background_color.is_some() {
+            s.color = text_color;
+            s.border_color = (0, 0, 0); // CanvasText
+            // A painted background — or a text backplate — becomes Canvas; an empty transparent box
+            // stays transparent. Background images/gradients are preserved (text reads over them).
+            if s.background_color.is_some() || has_text {
                 s.background_color = Some(canvas);
             }
-            // Gradients/background images are suppressed in forced colors mode.
-            s.background_gradient = None;
-            s.background_image_url = None;
+            s.box_shadows.clear(); // box shadows are dropped in forced colors mode
         }
     }
     for child in doc.get(id).children.clone() {
