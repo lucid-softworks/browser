@@ -1615,6 +1615,7 @@ pub(crate) fn user_agent_stylesheet() -> css::Stylesheet {
          h5 { font-size: 15px; font-weight: bold; display: block; margin: 1.67em 0 }
          h6 { font-size: 13px; font-weight: bold; display: block; margin: 2.33em 0 }
          p { display: block; margin: 1em 0 }
+         svg { forced-color-adjust: none }
          div { display: block }
          section { display: block }
          article { display: block }
