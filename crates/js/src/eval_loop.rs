@@ -49,6 +49,24 @@ pub(crate) static DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::At
 pub(crate) static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the loaded document is cross-origin isolated (COOP `same-origin` + COEP `require-corp`),
+/// set by the engine from the main document's response headers before the session starts. Read when
+/// building each context's environment to set `self.crossOriginIsolated` (workers inherit the page's
+/// value). Process-global so the engine (any thread) can set it and the JS worker reads it live.
+pub(crate) static CROSS_ORIGIN_ISOLATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set whether the loaded document is cross-origin isolated. The engine calls this from the main
+/// document's response (COOP+COEP) before creating the JS session.
+pub fn set_cross_origin_isolated(isolated: bool) {
+    CROSS_ORIGIN_ISOLATED.store(isolated, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the live cross-origin-isolation flag (used when building the JS environment).
+pub(crate) fn cross_origin_isolated() -> bool {
+    CROSS_ORIGIN_ISOLATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Set the logical viewport size (px) and device pixel ratio surfaced to page JS.
 pub fn set_device_metrics(width: u32, height: u32, device_pixel_ratio: f32) {
     use std::sync::atomic::Ordering;
@@ -105,6 +123,13 @@ pub(crate) fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
         let k = v8::String::new(scope, name).unwrap();
         let n = v8::Number::new(scope, num);
         global.set(scope, k.into(), n.into());
+    }
+    // Cross-origin isolation flag (from the main document's COOP+COEP), read by the env bootstrap to
+    // set `self.crossOriginIsolated`. Workers inherit the page's value.
+    {
+        let k = v8::String::new(scope, "__crossOriginIsolated").unwrap();
+        let b = v8::Boolean::new(scope, cross_origin_isolated());
+        global.set(scope, k.into(), b.into());
     }
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
     // IndexedDB (in-memory) — depends on structuredClone + queueMicrotask from the prior bootstraps.
