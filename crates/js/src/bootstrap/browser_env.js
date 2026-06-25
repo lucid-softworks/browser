@@ -183,7 +183,9 @@
     return out;
   }
 
-  var __invalidURLRecord = { href: "", protocol: "", host: "", hostname: "", port: "", pathname: "", search: "", hash: "", origin: "null", username: "", password: "", __invalid: true };
+  // A null/unparseable URL: the HTMLHyperlinkElementUtils protocol getter returns ":" (scheme ""
+  // + ":"); every other component getter returns "" (origin "null").
+  var __invalidURLRecord = { href: "", protocol: ":", host: "", hostname: "", port: "", pathname: "", search: "", hash: "", origin: "null", username: "", password: "", __invalid: true };
   // Parse in Rust via the `url` crate (the authoritative WHATWG implementation). `base` may be a
   // string or an already-parsed record (use its href). A null native result is a parse failure.
   function parseURL(input, base) {
