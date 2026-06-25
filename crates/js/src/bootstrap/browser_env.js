@@ -10174,44 +10174,46 @@
   // application/x-www-form-urlencoded decode in Rust (handles invalid UTF-8 -> U+FFFD per spec).
   // (`globalThis.__formDecode` is the native; this IIFE-local wrapper just coerces to string.)
   function __formDecode(s) { return globalThis.__formDecode(String(s)); }
+  // USVString coercion shared by the URLSearchParams constructor and its prototype methods: a
+  // lone (unpaired) surrogate is replaced with U+FFFD.
+  function __uspUsv(s) {
+    s = String(s);
+    var out = "", i = 0, n = s.length;
+    while (i < n) {
+      var c = s.charCodeAt(i);
+      if (c >= 0xD800 && c <= 0xDBFF) {
+        var d = (i + 1 < n) ? s.charCodeAt(i + 1) : 0;
+        if (d >= 0xDC00 && d <= 0xDFFF) { out += s[i] + s[i + 1]; i += 2; continue; }
+        out += "�"; i++; continue;
+      }
+      if (c >= 0xDC00 && c <= 0xDFFF) { out += "�"; i++; continue; }
+      out += s[i]; i++;
+    }
+    return out;
+  }
+  // Parse an application/x-www-form-urlencoded string into the given pairs array.
+  function __uspParseInto(pairs, s) {
+    if (s.charAt(0) === "?") { s = s.slice(1); }
+    if (!s) { return; }
+    var segs = s.split("&");
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] === "") { continue; }
+      var eq = segs[i].indexOf("=");
+      var k = eq < 0 ? segs[i] : segs[i].slice(0, eq);
+      var v = eq < 0 ? "" : segs[i].slice(eq + 1);
+      pairs.push([__formDecode(k), __formDecode(v)]);
+    }
+  }
   if (typeof globalThis.URLSearchParams !== "function") {
     def(globalThis, "URLSearchParams", function (init) {
+      // WebIDL interface object: not callable without `new`.
+      if (!new.target) { throw new TypeError("Failed to construct 'URLSearchParams': Please use the 'new' operator, this DOM object constructor cannot be called as a function."); }
       var pairs = [];
-      var self = this;
-      // `__onChange` lets a URL keep its href/search in sync with mutations (set in the URL ctor).
-      function changed() { if (typeof self.__onChange === "function") { try { self.__onChange(); } catch (e) {} } }
-      // USVString coercion: every URLSearchParams string is a USVString, so lone (unpaired)
-      // surrogates are replaced with U+FFFD.
-      function usv(s) {
-        s = String(s);
-        var out = "", i = 0, n = s.length;
-        while (i < n) {
-          var c = s.charCodeAt(i);
-          if (c >= 0xD800 && c <= 0xDBFF) {
-            var d = (i + 1 < n) ? s.charCodeAt(i + 1) : 0;
-            if (d >= 0xDC00 && d <= 0xDFFF) { out += s[i] + s[i + 1]; i += 2; continue; }
-            out += "�"; i++; continue;
-          }
-          if (c >= 0xDC00 && c <= 0xDFFF) { out += "�"; i++; continue; }
-          out += s[i]; i++;
-        }
-        return out;
-      }
-      function add(k, v) { pairs.push([usv(k), usv(v)]); }
-      function parseQuery(s) {
-        if (s.charAt(0) === "?") { s = s.slice(1); }
-        if (!s) { return; }
-        var segs = s.split("&");
-        for (var i = 0; i < segs.length; i++) {
-          if (segs[i] === "") { continue; }
-          var eq = segs[i].indexOf("=");
-          var k = eq < 0 ? segs[i] : segs[i].slice(0, eq);
-          var v = eq < 0 ? "" : segs[i].slice(eq + 1);
-          add(__formDecode(k), __formDecode(v));
-        }
-      }
+      // Per-instance state in a holder; the (shared, WebIDL-conformant) prototype methods reach it
+      // via `this.__sp`. `__onChange` lets a URL keep its href/search in sync (set in the URL ctor).
+      Object.defineProperty(this, "__sp", { value: { pairs: pairs }, writable: true, configurable: true });
       if (init == null) { /* empty */ }
-      else if (typeof init === "string") { parseQuery(init); }
+      else if (typeof init === "string") { __uspParseInto(pairs, init); }
       else if (typeof init[Symbol.iterator] === "function") {
         // Sequence of two-element sequences (covers arrays AND another URLSearchParams).
         var it = init[Symbol.iterator](), step;
@@ -10219,86 +10221,113 @@
           var pair = step.value, a = [], pit = pair[Symbol.iterator](), ps;
           while (!(ps = pit.next()).done) { a.push(ps.value); }
           if (a.length !== 2) { throw new TypeError("Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements"); }
-          add(a[0], a[1]);
+          pairs.push([__uspUsv(a[0]), __uspUsv(a[1])]);
         }
       } else if (typeof init === "object") {
         // record<USVString, USVString>: own enumerable string keys, USVString-coerced. Duplicate
         // coerced keys collapse (a later entry overwrites the value but keeps the first position).
         var keys = Object.keys(init);
         var rec = new Map();
-        for (var j = 0; j < keys.length; j++) { rec.set(usv(keys[j]), usv(init[keys[j]])); }
+        for (var j = 0; j < keys.length; j++) { rec.set(__uspUsv(keys[j]), __uspUsv(init[keys[j]])); }
         rec.forEach(function (v, k) { pairs.push([k, v]); });
       }
-      // Methods are non-enumerable (so `new URLSearchParams(usp)` / record init never see them).
-      def(this, "append", function (k, v) { add(k, v); changed(); });
-      def(this, "set", function (k, v) { k = usv(k); v = usv(v); var found = false; for (var i = 0; i < pairs.length;) { if (pairs[i][0] === k) { if (!found) { pairs[i][1] = v; found = true; i++; } else { pairs.splice(i, 1); } } else { i++; } } if (!found) { add(k, v); } changed(); });
-      def(this, "get", function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; });
-      def(this, "getAll", function (k) { k = String(k); var out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; });
-      def(this, "has", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; });
-      def(this, "delete", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { pairs.splice(i, 1); } } changed(); });
-      // forEach + the iterators are LIVE: they read `pairs` by index on each step, so mutations made
-      // during iteration are observed (per the URLSearchParams spec / WPT "For-of Check").
-      def(this, "forEach", function (cb, thisArg) { for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } });
-      function liveIter(pick) {
-        var i = 0;
-        var it = { next: function () { if (i >= pairs.length) { return { value: undefined, done: true }; } var p = pairs[i++]; return { value: pick(p), done: false }; } };
-        it[Symbol.iterator] = function () { return this; };
-        return it;
-      }
-      def(this, "keys", function () { return liveIter(function (p) { return p[0]; }); });
-      def(this, "values", function () { return liveIter(function (p) { return p[1]; }); });
-      def(this, "entries", function () { return liveIter(function (p) { return [p[0], p[1]]; }); });
-      def(this, "sort", function () { pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); changed(); });
-      def(this, Symbol.iterator, function () { return this.entries(); });
-      def(this, "toString", function () { return pairs.map(function (p) { return __formEncode(p[0]) + "=" + __formEncode(p[1]); }).join("&"); });
-      // Internal: replace contents from a query string (used by URL when .search/.href changes).
-      def(this, "__setFromQuery", function (q) { pairs.length = 0; parseQuery(q == null ? "" : String(q)); });
-      Object.defineProperty(this, "size", { get: function () { return pairs.length; }, enumerable: false, configurable: true });
     });
+    // WebIDL members on the prototype (idlharness checks the prototype, not the instance).
+    (function () {
+      var P = globalThis.URLSearchParams.prototype;
+      function pr(self) { return self.__sp.pairs; }
+      function ch(self) { if (typeof self.__onChange === "function") { try { self.__onChange(); } catch (e) {} } }
+      function defOp(name, fn, len) {
+        try { Object.defineProperty(fn, "name", { value: name, configurable: true }); } catch (e) {}
+        if (len != null) { try { Object.defineProperty(fn, "length", { value: len, configurable: true }); } catch (e) {} }
+        Object.defineProperty(P, name, { value: fn, writable: true, enumerable: true, configurable: true });
+      }
+      // WebIDL: a missing required argument is a TypeError.
+      function req(name, n, count) { if (count < n) { throw new TypeError("Failed to execute '" + name + "' on 'URLSearchParams': " + n + " argument" + (n === 1 ? "" : "s") + " required, but only " + count + " present."); } }
+      defOp("append", function (k, v) { req("append", 2, arguments.length); pr(this).push([__uspUsv(k), __uspUsv(v)]); ch(this); }, 2);
+      defOp("set", function (k, v) { req("set", 2, arguments.length); k = __uspUsv(k); v = __uspUsv(v); var pairs = pr(this), found = false; for (var i = 0; i < pairs.length;) { if (pairs[i][0] === k) { if (!found) { pairs[i][1] = v; found = true; i++; } else { pairs.splice(i, 1); } } else { i++; } } if (!found) { pairs.push([k, v]); } ch(this); }, 2);
+      defOp("get", function (k) { req("get", 1, arguments.length); k = __uspUsv(k); var pairs = pr(this); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; }, 1);
+      defOp("getAll", function (k) { req("getAll", 1, arguments.length); k = __uspUsv(k); var pairs = pr(this), out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; }, 1);
+      defOp("has", function (k, v) { req("has", 1, arguments.length); k = __uspUsv(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = __uspUsv(v); } var pairs = pr(this); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; }, 1);
+      defOp("delete", function (k, v) { req("delete", 1, arguments.length); k = __uspUsv(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = __uspUsv(v); } var pairs = pr(this); for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { pairs.splice(i, 1); } } ch(this); }, 1);
+      defOp("forEach", function (cb, thisArg) { var pairs = pr(this); for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } }, 1);
+      function liveIter(self, pick) { var pairs = pr(self), i = 0; var it = { next: function () { if (i >= pairs.length) { return { value: undefined, done: true }; } var p = pairs[i++]; return { value: pick(p), done: false }; } }; it[Symbol.iterator] = function () { return this; }; return it; }
+      defOp("keys", function () { return liveIter(this, function (p) { return p[0]; }); }, 0);
+      defOp("values", function () { return liveIter(this, function (p) { return p[1]; }); }, 0);
+      defOp("entries", function () { return liveIter(this, function (p) { return [p[0], p[1]]; }); }, 0);
+      defOp("sort", function () { pr(this).sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); ch(this); }, 0);
+      defOp("toString", function () { return pr(this).map(function (p) { return __formEncode(p[0]) + "=" + __formEncode(p[1]); }).join("&"); }, 0);
+      // The default iterator is entries.
+      Object.defineProperty(P, Symbol.iterator, { value: P.entries, writable: true, enumerable: false, configurable: true });
+      // size: read-only attribute.
+      var sizeGetter = function () { return pr(this).length; };
+      try { Object.defineProperty(sizeGetter, "name", { value: "get size", configurable: true }); } catch (e) {}
+      Object.defineProperty(P, "size", { get: sizeGetter, enumerable: true, configurable: true });
+      // Internal (non-enumerable): replace contents from a query string (used by URL on .search/.href).
+      def(P, "__setFromQuery", function (q) { var pairs = pr(this); pairs.length = 0; __uspParseInto(pairs, q == null ? "" : String(q)); });
+    })();
+    // WebIDL conformance: name/prototype/@@toStringTag; constructor arity 0 (init is optional).
+    defClass("URLSearchParams");
+    try { Object.defineProperty(globalThis.URLSearchParams, "length", { value: 0, configurable: true }); } catch (e) {}
   }
 
   // --- URL ---------------------------------------------------------------------------------
   if (typeof globalThis.URL !== "function") {
     def(globalThis, "URL", function (url, base) {
+      // WebIDL interface object: not callable without `new`.
+      if (!new.target) { throw new TypeError("Failed to construct 'URL': Please use the 'new' operator, this DOM object constructor cannot be called as a function."); }
       var p = parseURL(url, base != null ? String(base) : null);
       // Per the URL standard, `new URL(...)` throws a TypeError for an invalid URL.
       if (p.__invalid) {
         throw new TypeError("Failed to construct 'URL': Invalid URL");
       }
-      var self = this;
       var sp = new globalThis.URLSearchParams(p.search);
-      Object.defineProperty(this, "searchParams", { value: sp, enumerable: true, configurable: true });
-      // Apply a fresh parsed record (after a setter) and re-sync searchParams from the new query.
-      function applyRec(r) { p = r; sp.__setFromQuery(p.search); }
+      // Per-instance mutable state lives in a holder so the prototype accessors (shared, WebIDL-
+      // conformant) can read/write it via `this`.
+      Object.defineProperty(this, "__url", { value: { rec: p, sp: sp }, writable: true, configurable: true });
+      var st = this.__url;
+      // Keep the URL in sync when searchParams is mutated (append/set/delete/sort/…): reserialize the
+      // query through __urlSet and adopt the new record (without re-syncing searchParams from it).
+      sp.__onChange = function () {
+        var json = __urlSet(st.rec.href, "search", sp.toString());
+        if (json != null) { try { st.rec = JSON.parse(json); } catch (e) {} }
+      };
+    });
+    // WebIDL: members live on URL.prototype (idlharness checks the prototype, not the instance).
+    (function () {
+      var P = globalThis.URL.prototype;
+      // WebIDL requires an attribute's accessor functions to be named "get <attr>"/"set <attr>" and
+      // operations to be enumerable on the prototype.
+      function named(fn, name) { try { Object.defineProperty(fn, "name", { value: name, configurable: true }); } catch (e) {} return fn; }
       // Each WHATWG URL attribute is live: the setter runs the spec setter in Rust (__urlSet) on the
       // current href and adopts the reserialized record; an invalid value is a no-op (per spec),
       // except href which throws.
       function defAttr(name) {
-        Object.defineProperty(self, name, {
-          get: function () { return p[name]; },
-          set: function (v) {
-            var json = __urlSet(p.href, name, String(v));
-            if (json == null) {
-              if (name === "href") { throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); }
-              return;
-            }
-            try { applyRec(JSON.parse(json)); } catch (e) {}
-          },
-          enumerable: true, configurable: true
-        });
+        var getter = named(function () { return this.__url.rec[name]; }, "get " + name);
+        var setter = named(function (v) {
+          var st = this.__url;
+          var json = __urlSet(st.rec.href, name, String(v));
+          if (json == null) {
+            if (name === "href") { throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); }
+            return;
+          }
+          try { st.rec = JSON.parse(json); st.sp.__setFromQuery(st.rec.search); } catch (e) {}
+        }, "set " + name);
+        Object.defineProperty(P, name, { get: getter, set: setter, enumerable: true, configurable: true });
       }
       ["href", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"].forEach(defAttr);
-      // origin is read-only.
-      Object.defineProperty(this, "origin", { get: function () { return p.origin; }, enumerable: true, configurable: true });
-      this.toString = function () { return p.href; };
-      this.toJSON = function () { return p.href; };
-      // Keep the URL in sync when searchParams is mutated (append/set/delete/sort/…): reserialize the
-      // query through __urlSet and adopt the new record (without re-syncing searchParams from it).
-      sp.__onChange = function () {
-        var json = __urlSet(p.href, "search", sp.toString());
-        if (json != null) { try { p = JSON.parse(json); } catch (e) {} }
-      };
-    });
+      // origin + searchParams are read-only ([SameObject] for searchParams).
+      Object.defineProperty(P, "origin", { get: named(function () { return this.__url.rec.origin; }, "get origin"), enumerable: true, configurable: true });
+      Object.defineProperty(P, "searchParams", { get: named(function () { return this.__url.sp; }, "get searchParams"), enumerable: true, configurable: true });
+      // Stringifier + toJSON are enumerable operations.
+      Object.defineProperty(P, "toString", { value: named(function () { return this.__url.rec.href; }, "toString"), writable: true, enumerable: true, configurable: true });
+      Object.defineProperty(P, "toJSON", { value: named(function () { return this.__url.rec.href; }, "toJSON"), writable: true, enumerable: true, configurable: true });
+    })();
+    // WebIDL conformance: interface name/prototype/@@toStringTag, and constructor arity 1 (url is
+    // required, base optional). `webkitURL` is the legacy window alias.
+    defClass("URL");
+    try { Object.defineProperty(globalThis.URL, "length", { value: 1, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+    def(globalThis, "webkitURL", globalThis.URL);
     // Static parsers (WHATWG URL): canParse(url[, base]) -> boolean; parse(url[, base]) -> URL|null.
     globalThis.URL.canParse = function (url, base) {
       if (arguments.length < 1) { throw new TypeError("Failed to execute 'canParse' on 'URL': 1 argument required, but only 0 present."); }
@@ -10308,6 +10337,11 @@
       if (arguments.length < 1) { throw new TypeError("Failed to execute 'parse' on 'URL': 1 argument required, but only 0 present."); }
       try { return new globalThis.URL(url, base); } catch (e) { return null; }
     };
+    // WebIDL: `url` is required, `base` optional -> static operation arity 1; named after the op.
+    try { Object.defineProperty(globalThis.URL.canParse, "length", { value: 1, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(globalThis.URL.parse, "length", { value: 1, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(globalThis.URL.canParse, "name", { value: "canParse", configurable: true }); } catch (e) {}
+    try { Object.defineProperty(globalThis.URL.parse, "name", { value: "parse", configurable: true }); } catch (e) {}
     // Encode the Blob's bytes as a self-contained data: URL so it actually works as an <img> src /
     // fetch target (we don't keep a blob: registry). revoke is a no-op (data: needs no cleanup).
     globalThis.URL.createObjectURL = function (obj) {

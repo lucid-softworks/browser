@@ -15,6 +15,8 @@ var __wDocStub = globalThis.document;
 var __wWinStub = globalThis;
 try { delete globalThis.document; } catch (e) {}
 try { delete globalThis.window; } catch (e) {}
+// `webkitURL` is a legacy *Window* alias for URL; it must not exist in a worker scope.
+try { delete globalThis.webkitURL; } catch (e) {}
 let document = __wDocStub;
 let window = __wWinStub;
 

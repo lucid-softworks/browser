@@ -4678,6 +4678,52 @@ mod tests {
     }
 
     #[test]
+    fn url_webidl_conformance() {
+        // URL/URLSearchParams are proper WebIDL interfaces: members on the prototype, @@toStringTag,
+        // constructors throw without `new`, and methods enforce required arguments.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                out.push(Object.getOwnPropertyDescriptor(URL.prototype, "href") != null); // on prototype
+                out.push(Object.prototype.toString.call(new URL("http://h/")) === "[object URL]");
+                out.push(URL.length === 1);
+                try { URL("http://h/"); out.push(false); } catch (e) { out.push(e instanceof TypeError); }
+                out.push(Object.getOwnPropertyDescriptor(URLSearchParams.prototype, "append") != null);
+                try { URLSearchParams(); out.push(false); } catch (e) { out.push(e instanceof TypeError); }
+                var p = new URLSearchParams("a=1&b=2");
+                try { p.get(); out.push(false); } catch (e) { out.push(e instanceof TypeError); }
+                out.push(p.size === 2 && p[Symbol.iterator] === p.entries);
+                document.body.setAttribute('data-out', out.join(","));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr.as_deref(),
+            Some("true,true,true,true,true,true,true,true")
+        );
+    }
+
+    #[test]
     fn window_open_throws_on_invalid_url() {
         // window.open() with an unparseable URL throws a SyntaxError DOMException; a valid URL
         // returns a window.
