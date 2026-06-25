@@ -13,6 +13,8 @@
 
 use std::fmt::Write as _;
 
+mod encoding;
+mod encoding_tables;
 mod idna;
 mod unicode_tables;
 
@@ -496,12 +498,18 @@ impl Url {
     /// Parse `input` as an absolute URL. `Err(())` (no detail — a spec parse failure carries none).
     #[allow(clippy::result_unit_err)]
     pub fn parse(input: &str) -> Result<Url, ()> {
-        basic_parse(input, None, None)
+        basic_parse(input, None, None, None)
     }
     /// Parse `input` against `base`. `Err(())` on failure (a spec parse failure carries no detail).
     #[allow(clippy::result_unit_err)]
     pub fn parse_with_base(input: &str, base: &Url) -> Result<Url, ()> {
-        basic_parse(input, Some(base), None)
+        basic_parse(input, Some(base), None, None)
+    }
+    /// Parse against an optional base using `encoding` (a document charset label) for the query
+    /// component (non-UTF-8 documents encode the query with their charset; path/fragment stay UTF-8).
+    #[allow(clippy::result_unit_err)]
+    pub fn parse_in_document(input: &str, base: Option<&Url>, encoding: &str) -> Result<Url, ()> {
+        basic_parse(input, base, None, Some(encoding))
     }
 
     // --- component accessors (serialized forms used by the JS record) ---
@@ -672,9 +680,13 @@ impl Url {
             }
             "host" => {
                 if !self.has_opaque_path() {
-                    let _ =
-                        basic_parse(value, None, Some((self.clone_into_override(), State::Host)))
-                            .map(|u| *self = u);
+                    let _ = basic_parse(
+                        value,
+                        None,
+                        Some((self.clone_into_override(), State::Host)),
+                        None,
+                    )
+                    .map(|u| *self = u);
                 }
             }
             "hostname" => {
@@ -683,6 +695,7 @@ impl Url {
                         value,
                         None,
                         Some((self.clone_into_override(), State::Hostname)),
+                        None,
                     )
                     .map(|u| *self = u);
                 }
@@ -696,6 +709,7 @@ impl Url {
                             value,
                             None,
                             Some((self.clone_into_override(), State::Port)),
+                            None,
                         )
                         .map(|u| *self = u);
                     }
@@ -708,6 +722,7 @@ impl Url {
                         value,
                         None,
                         Some((self.clone_into_override(), State::PathStart)),
+                        None,
                     )
                     .map(|u| *self = u);
                 }
@@ -718,8 +733,13 @@ impl Url {
                 } else {
                     let v = value.strip_prefix('?').unwrap_or(value);
                     self.query = Some(String::new());
-                    let _ = basic_parse(v, None, Some((self.clone_into_override(), State::Query)))
-                        .map(|u| *self = u);
+                    let _ = basic_parse(
+                        v,
+                        None,
+                        Some((self.clone_into_override(), State::Query)),
+                        None,
+                    )
+                    .map(|u| *self = u);
                 }
             }
             "hash" => {
@@ -728,9 +748,13 @@ impl Url {
                 } else {
                     let v = value.strip_prefix('#').unwrap_or(value);
                     self.fragment = Some(String::new());
-                    let _ =
-                        basic_parse(v, None, Some((self.clone_into_override(), State::Fragment)))
-                            .map(|u| *self = u);
+                    let _ = basic_parse(
+                        v,
+                        None,
+                        Some((self.clone_into_override(), State::Fragment)),
+                        None,
+                    )
+                    .map(|u| *self = u);
                 }
             }
             "href" => {
@@ -752,8 +776,8 @@ impl Url {
         // The scheme setter parses "value:" with scheme-start state override.
         let mut input = value.to_string();
         input.push(':');
-        let _ =
-            basic_parse(&input, None, Some((self.clone(), State::SchemeStart))).map(|u| *self = u);
+        let _ = basic_parse(&input, None, Some((self.clone(), State::SchemeStart)), None)
+            .map(|u| *self = u);
     }
 }
 
@@ -824,12 +848,17 @@ fn basic_parse(
     input_raw: &str,
     base: Option<&Url>,
     state_override: Option<(Url, State)>,
+    query_encoding: Option<&str>,
 ) -> Result<Url, ()> {
     let has_override = state_override.is_some();
     let (mut url, mut state) = match &state_override {
         Some((u, s)) => (u.clone(), *s),
         None => (Url::new(), State::SchemeStart),
     };
+    // When the query is parsed in a non-UTF-8 document, accumulate its raw code points so the query
+    // can be re-encoded with that encoding afterwards (the fragment/path stay UTF-8).
+    let query_enc = query_encoding.and_then(encoding::label);
+    let mut raw_query: Option<String> = None;
 
     // Remove leading/trailing C0 control or space (only when not a state override).
     let mut input = input_raw;
@@ -1355,6 +1384,9 @@ fn basic_parse(
                     url.fragment = Some(String::new());
                     state = State::Fragment;
                 } else if let Some(ch) = c {
+                    if query_enc.is_some() {
+                        raw_query.get_or_insert_with(String::new).push(ch);
+                    }
                     let set = if special {
                         in_special_query_set
                     } else {
@@ -1385,6 +1417,10 @@ fn basic_parse(
             break;
         }
         i += 1;
+    }
+    // Re-encode a query that was parsed from input under a non-UTF-8 document encoding.
+    if let (Some(enc), Some(raw)) = (query_enc, &raw_query) {
+        url.query = Some(encoding::percent_encode_query(enc, raw, url.is_special()));
     }
     Ok(url)
 }

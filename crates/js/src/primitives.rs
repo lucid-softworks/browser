@@ -1688,14 +1688,29 @@ pub(crate) fn prim_url_parse(
     use wurl::Url;
     let input = arg_str(scope, &args, 0);
     let base_arg = args.get(1);
-    let parsed = if base_arg.is_string() {
-        let base = base_arg.to_rust_string_lossy(scope);
-        match Url::parse(&base) {
-            Ok(b) => Url::parse_with_base(&input, &b),
-            Err(_) => Err(()),
-        }
+    // Optional 3rd arg: the document's character encoding (for query encoding in non-UTF-8 docs).
+    let enc = args.get(2);
+    let enc = if enc.is_string() {
+        Some(enc.to_rust_string_lossy(scope))
     } else {
-        Url::parse(&input)
+        None
+    };
+    let base_str = if base_arg.is_string() {
+        Some(base_arg.to_rust_string_lossy(scope))
+    } else {
+        None
+    };
+    let base = base_str.as_deref().and_then(|b| Url::parse(b).ok());
+    let parsed = match (&base_str, &base) {
+        // A base was given but didn't parse -> failure.
+        (Some(_), None) => Err(()),
+        _ => match &enc {
+            Some(e) => Url::parse_in_document(&input, base.as_ref(), e),
+            None => match base.as_ref() {
+                Some(b) => Url::parse_with_base(&input, b),
+                None => Url::parse(&input),
+            },
+        },
     };
     match parsed {
         Ok(u) => {

@@ -190,7 +190,9 @@
   // string or an already-parsed record (use its href). A null native result is a parse failure.
   function parseURL(input, base) {
     var baseStr = (base == null) ? null : (typeof base === "string" ? base : (base.href || null));
-    var json = __urlParse(String(input == null ? "" : input), baseStr);
+    // The document's character encoding (non-UTF-8 documents encode a URL's query with it).
+    var enc = (typeof globalThis.__documentCharset === "string") ? globalThis.__documentCharset : null;
+    var json = __urlParse(String(input == null ? "" : input), baseStr, enc);
     if (json == null) { return __invalidURLRecord; }
     try { var rec = JSON.parse(json); rec.__invalid = false; return rec; } catch (e) { return __invalidURLRecord; }
   }

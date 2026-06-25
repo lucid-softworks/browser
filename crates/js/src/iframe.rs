@@ -172,17 +172,17 @@ fn prim_iframe_load(
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
 
-    // Resolve the frame's document HTML + its base URL.
-    let (html_src, frame_url) = match &srcdoc {
-        Some(s) => (s.clone(), url.clone()),
+    // Resolve the frame's document HTML + its base URL (+ the response's charset, if any).
+    let (html_src, frame_url, frame_charset) = match &srcdoc {
+        Some(s) => (s.clone(), url.clone(), None),
         None => {
             if url.is_empty() || url == "about:blank" {
-                (String::new(), "about:blank".to_string())
+                (String::new(), "about:blank".to_string(), None)
             } else {
                 // Fetch the document HTML via the host fetcher (envelope JSON: {ok,status,body,...}).
                 match request_fetcher("GET", &url, "", "{}") {
                     Some(env) => match extract_envelope_body(&env) {
-                        Some(body) => (body, url.clone()),
+                        Some(body) => (body, url.clone(), extract_envelope_charset(&env)),
                         None => {
                             rv.set(v8::Boolean::new(scope, false).into());
                             return;
@@ -226,6 +226,13 @@ fn prim_iframe_load(
         let kid = v8::String::new(cscope, "__frameNodeId").unwrap();
         let vid = v8::Number::new(cscope, node_id as f64);
         g.set(cscope, kid.into(), vid.into());
+        // Seed the document's charset so the frame's URL parsing encodes queries with it.
+        if let Some(cs) = &frame_charset {
+            if let Some(kcs) = v8::String::new(cscope, "__documentCharset") {
+                let vcs = crate::js_str(cscope, cs);
+                g.set(cscope, kcs.into(), vcs);
+            }
+        }
         eval_internal(cscope, FRAME_ENV_BOOTSTRAP, "<frame-env>");
 
         // Run the document's classic scripts in order (external ones fetched synchronously).
@@ -363,6 +370,27 @@ pub fn pump_frames(scope: &mut v8::PinScope) -> (bool, usize) {
 
 /// Pull the `body` field out of a request envelope JSON (`{"ok":..,"body":"..."}`) without a JSON
 /// dependency: find `"body"`, then decode the following JSON string literal.
+/// Pull `charset=<label>` out of the envelope's `contentType` field (e.g. "text/html;charset=big5").
+fn extract_envelope_charset(env: &str) -> Option<String> {
+    let key = "\"contentType\"";
+    let after = &env[env.find(key)? + key.len()..];
+    let start = after.find('"')? + 1;
+    let value = &after[start..];
+    let end = value.find('"')?;
+    let ct = &value[..end];
+    let cs = ct.to_ascii_lowercase();
+    let idx = cs.find("charset=")? + "charset=".len();
+    let label: String = cs[idx..]
+        .chars()
+        .take_while(|&c| c != ';' && c != ' ')
+        .collect();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
 fn extract_envelope_body(env: &str) -> Option<String> {
     let key = "\"body\"";
     let mut i = env.find(key)? + key.len();
