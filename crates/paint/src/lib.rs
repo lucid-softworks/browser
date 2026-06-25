@@ -5,6 +5,9 @@
 //! behind the [`GlyphRasterizer`] trait so it can be replaced with a hand-written
 //! rasterizer later without touching the rest of paint.
 
+/// Canvas 2D display-list rasterizer (turns JS `<canvas>` command lists into RGBA bitmaps).
+pub mod canvas;
+
 /// A straight-alpha RGBA8 pixel buffer. `stride` is bytes per row (>= width * 4).
 pub struct Framebuffer {
     pub width: u32,

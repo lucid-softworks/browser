@@ -1174,6 +1174,7 @@ dependencies = [
  "css",
  "dom",
  "html",
+ "paint",
  "style",
  "url",
  "v8",

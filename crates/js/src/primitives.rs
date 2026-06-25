@@ -1080,6 +1080,47 @@ pub(crate) fn prim_canvas_pixels(
     rv.set(obj.into());
 }
 
+/// `__rasterizeCanvas(commandsJson, width, height) -> string | null`
+///
+/// Synchronously rasterize a SINGLE canvas's 2D display list into straight-alpha RGBA8 pixels
+/// (`width*height*4` bytes) and return them base64-encoded (JS decodes with `atob`). Returns `null`
+/// if the JSON cannot be parsed into a canvas list. This powers `OffscreenCanvas` operations that
+/// must read pixels back in-Session (getImageData / convertToBlob / transferToImageBitmap) without a
+/// round-trip through the engine.
+///
+/// `commandsJson` is the SAME shape `__canvasLists()` produces for one canvas — a one-element JSON
+/// array `[{id,width,height,commands:[...]}]` — so the JS side can reuse its existing serializer.
+/// `width`/`height` are passed for the caller's convenience but the bitmap size is taken from the
+/// parsed canvas list entry (its `width`/`height`), matching `parse_canvas_lists`.
+///
+/// NOTE: text glyphs and `drawImage`-from-node are NOT rendered here yet — there is no system font
+/// or decoded-source map available in-Session, so `font = None` and an empty `sources` map are used.
+/// Those ops are simply skipped (acceptable for offscreen for now).
+pub(crate) fn prim_rasterize_canvas(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let json = arg_str(scope, &args, 0);
+    let _width = args.get(1).number_value(scope).unwrap_or(0.0);
+    let _height = args.get(2).number_value(scope).unwrap_or(0.0);
+    let lists = paint::canvas::parse_canvas_lists(&json);
+    let cv = match lists.first() {
+        Some(cv) => cv,
+        None => {
+            rv.set_null();
+            return;
+        }
+    };
+    // No system font / drawImage sources in-Session: text + drawImage-from-node are skipped.
+    let sources: std::collections::HashMap<usize, (&[u8], u32, u32)> =
+        std::collections::HashMap::new();
+    let img = paint::canvas::rasterize_canvas(cv, None, &sources);
+    let b64 = base64_encode(&img.rgba);
+    let val = js_str(scope, &b64);
+    rv.set(val);
+}
+
 /// `__naturalSize(id) -> { w, h }`
 ///
 /// The decoded intrinsic size of an `<img>` (CSS px), pushed by the engine alongside the layout
@@ -1969,6 +2010,7 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__rect", prim_rect);
     set_fn(scope, global, "__naturalSize", prim_natural_size);
     set_fn(scope, global, "__canvasPixels", prim_canvas_pixels);
+    set_fn(scope, global, "__rasterizeCanvas", prim_rasterize_canvas);
     set_fn(scope, global, "__elemMetrics", prim_elem_metrics);
     set_fn(scope, global, "__textContent", prim_text_content);
     set_fn(scope, global, "__setTextContent", prim_set_text_content);
@@ -2040,4 +2082,8 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
         "__computedStyleNames",
         prim_computed_style_names,
     );
+    // Dedicated-worker bridge natives (create a worker context, post across the page<->worker
+    // boundary, run worker scripts at top level). Installed on every context so workers can spawn
+    // sub-workers.
+    crate::worker::register_worker_natives(scope, global);
 }

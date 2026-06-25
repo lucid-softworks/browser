@@ -520,6 +520,10 @@ pub(crate) fn session_thread_main(
         scope.get_current_context().set_slot(registry);
         install_browser_environment(scope, &url);
 
+        // Register the page context NOW (before the initial scripts run), so a worker created during
+        // page load can immediately deliver `postMessage` back into the page.
+        crate::set_page_context(v8::Global::new(scope, context));
+
         // Seed the engine-computed layout rects BEFORE scripts run, so synchronous
         // getBoundingClientRect / elementFromPoint / caret*FromPoint reads during page load see real
         // geometry (the rect table is otherwise empty until the engine's first post-load push).
@@ -729,7 +733,9 @@ pub(crate) fn session_thread_main(
             Ordering::Relaxed,
         );
     }
-    // Loop ended (Stop or sender dropped). Drop the isolate on its own thread.
+    // Loop ended (Stop or sender dropped). Drop worker realms + the page-context handle BEFORE the
+    // isolate so the thread-local doesn't outlive the isolate it holds handles into.
+    crate::clear_workers();
     drop(context);
     drop(isolate);
 }

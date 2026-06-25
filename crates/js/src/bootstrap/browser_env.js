@@ -5585,6 +5585,21 @@
         });
         if (typeof el.toDataURL !== "function") { def(el, "toDataURL", function () { return "data:,"; }); }
         if (typeof el.toBlob !== "function") { def(el, "toBlob", function (cb) { if (typeof cb === "function") { cb(null); } }); }
+        // transferControlToOffscreen(): hand this <canvas>'s rendering to an OffscreenCanvas whose 2D
+        // context composites back onto this element (via the placeholder node id) — the engine pulls
+        // it through __canvasLists like any other canvas. Throws if a context was already obtained.
+        if (typeof el.transferControlToOffscreen !== "function") {
+          def(el, "transferControlToOffscreen", function () {
+            if (el.__ctx2d || el.__transferred) {
+              throw new globalThis.DOMException("Failed to execute 'transferControlToOffscreen' on 'HTMLCanvasElement': Cannot transfer control from a canvas that has a rendering context.", "InvalidStateError");
+            }
+            if (typeof globalThis.OffscreenCanvas !== "function") { return null; }
+            def(el, "__transferred", true);
+            var oc = new globalThis.OffscreenCanvas(el.width | 0 || 300, el.height | 0 || 150);
+            oc.__placeholderNode = (typeof el.__node === "number") ? el.__node : -1;
+            return oc;
+          });
+        }
       }
     } catch (e) {}
     installEvents(el);
@@ -8935,8 +8950,90 @@
       this.abort = fn;
     });
   }
+  // --- Dedicated Workers --------------------------------------------------------------------
+  // A dedicated worker runs in its OWN V8 context (a real, separate global object) in the page's
+  // isolate, created and driven from Rust (crates/js/src/worker.rs + bootstrap/worker_env.js): `new
+  // Worker(url)` calls the `__workerCreate` native, which builds the worker context, installs the
+  // browser environment + a worker overlay, and runs the worker script there. Because the worker
+  // has its own global, `self === globalThis` truly holds, so top-level declarations in the worker
+  // script and every `importScripts`'d file become worker globals (visible across files) — matching
+  // real workers (and what helpers like canvas-tests.js rely on). Messages cross via the
+  // `__workerPostToWorker` / `__workerPostToParent` natives; the receiving context localises the
+  // value with its OWN structuredClone. The page side here is just the Worker EventTarget facade
+  // plus `__workerDeliver`, the entry the native bridge calls to dispatch at the right Worker.
   if (typeof globalThis.Worker !== "function") {
-    def(globalThis, "Worker", function () { this.postMessage = fn; this.terminate = fn; this.onmessage = null; this.onerror = null; this.addEventListener = fn; this.removeEventListener = fn; });
+    if (typeof globalThis.WorkerGlobalScope !== "function") { defClass("WorkerGlobalScope", globalThis.EventTarget); }
+    if (typeof globalThis.DedicatedWorkerGlobalScope !== "function") { defClass("DedicatedWorkerGlobalScope", globalThis.WorkerGlobalScope); }
+    if (typeof globalThis.WorkerNavigator !== "function") { defClass("WorkerNavigator"); }
+    if (typeof globalThis.WorkerLocation !== "function") { defClass("WorkerLocation"); }
+
+    globalThis.__workersById = globalThis.__workersById || {};
+    if (typeof globalThis.__nextWorkerId !== "number") { globalThis.__nextWorkerId = 0; }
+
+    // Called by the native bridge (worker -> page). Localise the value with the page's
+    // structuredClone, then deliver a `message` event at the matching Worker on a fresh task (so a
+    // result posted during `new Worker(...)` isn't missed by a listener attached right after).
+    def(globalThis, "__workerDeliver", function (id, value) {
+      var worker = globalThis.__workersById[id];
+      if (!worker || worker.__terminated) { return; }
+      var data; try { data = globalThis.structuredClone(value); } catch (e) { data = value; }
+      setTimeout(function () {
+        if (worker.__terminated) { return; }
+        var ev;
+        try { ev = new globalThis.MessageEvent("message", { data: data, origin: "", lastEventId: "", source: null, ports: [] }); }
+        catch (e2) { ev = { type: "message", data: data }; }
+        try { worker.dispatchEvent(ev); } catch (e3) {}
+      }, 0);
+    });
+
+    def(globalThis, "Worker", function (scriptURL, options) {
+      if (!(this instanceof globalThis.Worker)) {
+        throw new TypeError("Failed to construct 'Worker': Please use the 'new' operator, this object constructor cannot be called as a function.");
+      }
+      if (arguments.length < 1) {
+        throw new TypeError("Failed to construct 'Worker': 1 argument required, but only 0 present.");
+      }
+      var worker = this;
+      installEvents(worker);
+      worker.onmessage = null; worker.onmessageerror = null; worker.onerror = null;
+      options = options || {};
+
+      var base; try { base = globalThis.location.href; } catch (e) { base = "about:blank"; }
+      var href; try { href = (new globalThis.URL(String(scriptURL), base)).href; } catch (e) {
+        throw new globalThis.DOMException("Failed to construct 'Worker': Failed to resolve the script URL '" + scriptURL + "'.", "SyntaxError");
+      }
+
+      var id = (globalThis.__nextWorkerId += 1);
+      worker.__id = id; worker.__terminated = false;
+      globalThis.__workersById[id] = worker;
+
+      def(worker, "postMessage", function (data, transferOrOpts) {
+        if (worker.__terminated) { return; }
+        if (typeof __workerPostToWorker === "function") { __workerPostToWorker(id, data); }
+      });
+      def(worker, "terminate", function () {
+        if (worker.__terminated) { return; }
+        worker.__terminated = true;
+        try { delete globalThis.__workersById[id]; } catch (e) {}
+        if (typeof __workerTerminate === "function") { __workerTerminate(id); }
+      });
+
+      // Build the worker context + run its script. On failure, surface an async `error` event.
+      var ok = (typeof __workerCreate === "function") ? __workerCreate(id, href) : false;
+      if (!ok) {
+        setTimeout(function () {
+          var ev;
+          try { ev = new globalThis.ErrorEvent("error", { cancelable: true, message: "Failed to load worker script", filename: href }); }
+          catch (e) { ev = { type: "error", message: "Failed to load worker script", filename: href }; }
+          try { worker.dispatchEvent(ev); } catch (e2) {}
+        }, 0);
+      }
+    });
+    // Worker inherits from EventTarget for instanceof / idlharness conformance.
+    try {
+      globalThis.Worker.prototype = Object.create(globalThis.EventTarget.prototype);
+      Object.defineProperty(globalThis.Worker.prototype, "constructor", { value: globalThis.Worker, enumerable: false, configurable: true, writable: true });
+    } catch (e) {}
   }
   // --- MessageChannel / MessagePort --------------------------------------------------------
   // An entangled pair of ports: postMessage on one delivers a `message` MessageEvent on the other,
@@ -11715,6 +11812,126 @@
     };
   }
   globalThis.__makeCanvas2D = __makeCanvas2D;
+
+  // --- OffscreenCanvas ----------------------------------------------------------------------
+  // An OffscreenCanvas owns a 2D context that records the SAME display list as an on-screen
+  // <canvas> (via __makeCanvas2D over a detached element-like shim), but is not part of the page's
+  // layout. Pixel readback (getImageData / transferToImageBitmap / convertToBlob) rasterizes the
+  // display list SYNCHRONOUSLY via the __rasterizeCanvas native (the engine's software rasterizer,
+  // shared from the paint crate) — there is no engine compositing pass behind an offscreen canvas,
+  // so the on-screen "read engine-pushed pixels a frame later" path does not apply. Exposed on both
+  // the page and worker scopes (workers list OffscreenCanvas in __workerSelfGlobals).
+  if (typeof globalThis.OffscreenCanvas !== "function") {
+    defClass("OffscreenCanvasRenderingContext2D");
+    defClass("ImageBitmap");
+    defClass("OffscreenCanvas", globalThis.EventTarget);
+
+    // Rasterize an offscreen context's current display list into a full-canvas RGBA buffer.
+    function __offscreenRasterize(ctx, cw, chh) {
+      var out = new Uint8ClampedArray(Math.max(1, cw) * Math.max(1, chh) * 4);
+      try {
+        if (typeof __rasterizeCanvas !== "function") { return out; }
+        var listJson = JSON.stringify([{ id: 0, width: cw, height: chh, commands: ctx.__list }]);
+        var b64 = __rasterizeCanvas(listJson, cw, chh);
+        if (b64 && typeof atob === "function") {
+          var bin = atob(b64), n = Math.min(bin.length, out.length);
+          for (var i = 0; i < n; i++) { out[i] = bin.charCodeAt(i) & 0xff; }
+        }
+      } catch (e) {}
+      return out;
+    }
+    // Crop a (sx,sy,sw,sh) sub-rect out of a full-canvas RGBA buffer (out-of-bounds pixels stay 0).
+    function __cropRGBA(full, cw, chh, sx, sy, sw, sh) {
+      var out = new Uint8ClampedArray(Math.max(1, sw) * Math.max(1, sh) * 4);
+      for (var yy = 0; yy < sh; yy++) {
+        var srcY = sy + yy; if (srcY < 0 || srcY >= chh) { continue; }
+        for (var xx = 0; xx < sw; xx++) {
+          var srcX = sx + xx; if (srcX < 0 || srcX >= cw) { continue; }
+          var si = (srcY * cw + srcX) * 4, di = (yy * sw + xx) * 4;
+          out[di] = full[si]; out[di + 1] = full[si + 1]; out[di + 2] = full[si + 2]; out[di + 3] = full[si + 3];
+        }
+      }
+      return out;
+    }
+
+    function __makeOffscreen2D(oc) {
+      // A detached element-like shim so __makeCanvas2D records a display list. Its node id is the
+      // placeholder canvas's node when this offscreen came from transferControlToOffscreen() (so the
+      // engine composites the result onto that <canvas>), else -1 (pure offscreen, not composited).
+      var pnode = (typeof oc.__placeholderNode === "number") ? oc.__placeholderNode : -1;
+      var elShim = { tagName: "CANVAS", __node: pnode };
+      Object.defineProperty(elShim, "width", { get: function () { return oc.width | 0; }, configurable: true });
+      Object.defineProperty(elShim, "height", { get: function () { return oc.height | 0; }, configurable: true });
+      var ctx = globalThis.__makeCanvas2D(elShim);
+      Object.defineProperty(ctx, "canvas", { value: oc, enumerable: true, configurable: true });
+      try { Object.setPrototypeOf(ctx, globalThis.OffscreenCanvasRenderingContext2D.prototype); } catch (e) {}
+      // Synchronous readback overrides (offscreen surfaces are not engine-composited).
+      ctx.getImageData = function (x, y, w, h) {
+        var cw = oc.width | 0, chh = oc.height | 0;
+        var sw = Math.max(1, Math.abs(w | 0)), sh = Math.max(1, Math.abs(h | 0));
+        var full = __offscreenRasterize(ctx, cw, chh);
+        var data = __cropRGBA(full, cw, chh, x | 0, y | 0, sw, sh);
+        return { width: sw, height: sh, data: data, colorSpace: "srgb" };
+      };
+      // A placeholder-backed offscreen is composited by the engine like a normal canvas.
+      if (pnode >= 0) {
+        try { globalThis.__canvases = globalThis.__canvases || []; globalThis.__canvases.push(ctx); } catch (e) {}
+      }
+      return ctx;
+    }
+
+    globalThis.OffscreenCanvas = function OffscreenCanvas(width, height) {
+      if (!(this instanceof globalThis.OffscreenCanvas)) {
+        throw new TypeError("Failed to construct 'OffscreenCanvas': Please use the 'new' operator, this object constructor cannot be called as a function.");
+      }
+      if (arguments.length < 2) {
+        throw new TypeError("Failed to construct 'OffscreenCanvas': 2 arguments required, but only " + arguments.length + " present.");
+      }
+      installEvents(this);
+      var oc = this;
+      var w = width >>> 0, h = height >>> 0;   // [EnforceRange] unsigned long
+      var ctx2d = null;
+      Object.defineProperty(oc, "width", {
+        get: function () { return w; },
+        set: function (v) { w = v >>> 0; if (ctx2d && ctx2d.__list) { ctx2d.__list.length = 0; } },
+        enumerable: true, configurable: true
+      });
+      Object.defineProperty(oc, "height", {
+        get: function () { return h; },
+        set: function (v) { h = v >>> 0; if (ctx2d && ctx2d.__list) { ctx2d.__list.length = 0; } },
+        enumerable: true, configurable: true
+      });
+      oc.oncontextlost = null; oc.oncontextrestored = null;
+      def(oc, "getContext", function (type) {
+        if (String(type) === "2d") { if (!ctx2d) { ctx2d = __makeOffscreen2D(oc); } return ctx2d; }
+        return null; // webgl / webgpu / bitmaprenderer not supported
+      });
+      def(oc, "transferToImageBitmap", function () {
+        var cw = oc.width | 0, chh = oc.height | 0;
+        var bmp = Object.create(globalThis.ImageBitmap.prototype);
+        Object.defineProperty(bmp, "width", { value: cw, enumerable: true, configurable: true });
+        Object.defineProperty(bmp, "height", { value: chh, enumerable: true, configurable: true });
+        bmp.__rgba = ctx2d ? __offscreenRasterize(ctx2d, cw, chh) : new Uint8ClampedArray(Math.max(1, cw) * Math.max(1, chh) * 4);
+        def(bmp, "close", function () {});
+        // Transfer empties the source bitmap (approximate: drop the recorded commands).
+        if (ctx2d && ctx2d.__list) { ctx2d.__list.length = 0; }
+        return bmp;
+      });
+      def(oc, "convertToBlob", function (options) {
+        // No image encoder available: return a Blob carrying the raw RGBA bytes tagged with the
+        // requested MIME type, so callers that only inspect type/size resolve. (Simplification.)
+        var cw = oc.width | 0, chh = oc.height | 0;
+        var rgba = ctx2d ? __offscreenRasterize(ctx2d, cw, chh) : new Uint8ClampedArray(Math.max(1, cw) * Math.max(1, chh) * 4);
+        var type = (options && options.type) ? String(options.type) : "image/png";
+        try { return Promise.resolve(new globalThis.Blob([rgba], { type: type })); }
+        catch (e) { return Promise.reject(e); }
+      });
+    };
+    try {
+      globalThis.OffscreenCanvas.prototype = Object.create(globalThis.EventTarget.prototype);
+      Object.defineProperty(globalThis.OffscreenCanvas.prototype, "constructor", { value: globalThis.OffscreenCanvas, enumerable: false, configurable: true, writable: true });
+    } catch (e) {}
+  }
 
   // Approximate text advance for measureText. The JS crate has no font, so this is a proportional
   // per-character estimate (the engine rasterizes/aligns text with the REAL system font). Narrow

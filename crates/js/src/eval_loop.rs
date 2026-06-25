@@ -343,16 +343,19 @@ pub(crate) fn drain_event_loop(
         // Run any pending V8 microtasks/promise jobs first.
         scope.perform_microtask_checkpoint();
 
-        // Then run one due timer/microtask from the JS event loop.
+        // Then run one due timer/microtask from the JS event loop, and advance any dedicated
+        // workers' loops (their queued message deliveries / timers run in their own contexts).
         let ran = run_due_timers(scope);
+        let wran = crate::pump_workers(scope);
         iterations += 1;
-        if ran {
+        if ran || wran {
             did_work = true;
         } else {
-            // Nothing left in the JS loop; one more microtask checkpoint in case the last timer
-            // queued a job.
+            // Nothing left in the page loop; one more microtask checkpoint in case the last timer
+            // queued a job, and one more worker pump in case a microtask queued worker work.
             scope.perform_microtask_checkpoint();
-            if run_due_timers(scope) {
+            let wran2 = crate::pump_workers(scope);
+            if run_due_timers(scope) || wran2 {
                 did_work = true;
             } else if in_flight > 0 {
                 // No JS work is due but a request is still in flight: block briefly on the channel
@@ -412,6 +415,26 @@ pub(crate) fn drain_event_loop(
             scope.perform_microtask_checkpoint();
             did_work = true;
             rounds += 1;
+        }
+    }
+
+    // Final worker drain: a last few passes so any worker task queued right at the end (e.g. a
+    // testharness completion message posted to the page) is delivered, ping-ponging with the page
+    // loop until both go quiet (bounded).
+    {
+        let mut rounds = 0usize;
+        loop {
+            let w = crate::pump_workers(scope);
+            scope.perform_microtask_checkpoint();
+            let p = run_due_timers(scope);
+            scope.perform_microtask_checkpoint();
+            if w || p {
+                did_work = true;
+            }
+            rounds += 1;
+            if (!w && !p) || rounds >= 256 {
+                break;
+            }
         }
     }
 

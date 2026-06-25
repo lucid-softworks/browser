@@ -293,6 +293,7 @@ mod runtime;
 mod selector;
 mod session;
 mod style_query;
+mod worker;
 
 pub(crate) use dom_helpers::*;
 pub use eval_loop::*;
@@ -302,6 +303,7 @@ pub use runtime::*;
 pub(crate) use selector::*;
 pub use session::*;
 pub(crate) use style_query::*;
+pub use worker::*;
 
 #[cfg(test)]
 mod tests {
@@ -4569,6 +4571,149 @@ mod tests {
             _ => None,
         };
         assert_eq!(reply.as_deref(), Some("pong:ping"));
+    }
+
+    #[test]
+    fn dedicated_worker_round_trips_messages_and_imports() {
+        // A dedicated Worker runs its script in a DedicatedWorkerGlobalScope on the page's shared
+        // event loop. The page posts a message; the worker replies via self.postMessage; the reply
+        // arrives on worker.onmessage. Exercises construction, synchronous script fetch,
+        // importScripts, `with (self)` bare-global scoping (the worker calls bare `tag(...)` and
+        // bare `postMessage(...)`), and bidirectional structured-clone messaging.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var w = new Worker('worker.js');
+                w.onmessage = function (e) { document.body.setAttribute('data-reply', e.data); };
+                w.postMessage('ping');
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                let body = if u.ends_with("helper.js") {
+                    "self.tag = function (s) { return 'pong:' + s; };"
+                } else if u.ends_with("worker.js") {
+                    "importScripts('helper.js'); self.onmessage = function (e) { postMessage(tag(e.data)); };"
+                } else {
+                    ""
+                };
+                Some(format!(
+                    r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/javascript","body":"{body}"}}"#
+                ))
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let reply = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-reply").cloned(),
+            _ => None,
+        };
+        assert_eq!(reply.as_deref(), Some("pong:ping"));
+    }
+
+    #[test]
+    fn dedicated_worker_importscripts_shares_top_level_declarations() {
+        // The realm fix: each worker is its own V8 context, so `self === globalThis` and top-level
+        // `function`/`var` declarations in an importScripts'd file become worker globals visible to
+        // later scripts — exactly what canvas-tests.js et al. rely on (bare `function _assertSame`).
+        // Here helper.js declares a bare `function helperFn` and a bare `var helperVar`; the worker
+        // reports both back, proving cross-file global sharing inside the worker realm.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var w = new Worker('worker.js');
+                w.onmessage = function (e) { document.body.setAttribute('data-reply', e.data); };
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                let body = if u.ends_with("helper.js") {
+                    // Bare top-level declarations (no `self.` / `var x =` on globalThis).
+                    "function helperFn(s) { return 'fn:' + s; } var helperVar = 'V';"
+                } else if u.ends_with("worker.js") {
+                    "importScripts('helper.js'); postMessage(helperFn(helperVar));"
+                } else {
+                    ""
+                };
+                Some(format!(
+                    r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/javascript","body":"{body}"}}"#
+                ))
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let reply = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-reply").cloned(),
+            _ => None,
+        };
+        assert_eq!(reply.as_deref(), Some("fn:V"));
+    }
+
+
+
+    #[test]
+    fn offscreen_canvas_2d_reads_back_drawn_pixels() {
+        // An OffscreenCanvas 2D context records a display list; getImageData rasterizes it
+        // synchronously via the paint-crate rasterizer (the __rasterizeCanvas native), so a filled
+        // rect reads back as the fill color — no engine compositing pass needed.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var oc = new OffscreenCanvas(10, 10);
+                var ctx = oc.getContext('2d');
+                ctx.fillStyle = '#ff0000';
+                ctx.fillRect(0, 0, 10, 10);
+                var d = ctx.getImageData(2, 2, 1, 1).data;
+                document.body.setAttribute('data-px', d[0] + ',' + d[1] + ',' + d[2] + ',' + d[3]);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let px = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-px").cloned(),
+            _ => None,
+        };
+        assert_eq!(px.as_deref(), Some("255,0,0,255"));
     }
 
     #[test]
