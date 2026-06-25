@@ -5430,6 +5430,18 @@
       r.toJSON = function () { return this; };
       return r;
     });
+    // computedStyleMap(): a minimal CSS Typed OM StylePropertyMapReadOnly backed by
+    // getComputedStyle — `.get(prop)` returns a value whose toString() is the computed value string.
+    def(el, "computedStyleMap", function () {
+      var cs = globalThis.getComputedStyle(this);
+      return {
+        get: function (prop) {
+          var v = cs.getPropertyValue(String(prop));
+          return { toString: function () { return v; }, value: v };
+        },
+        has: function (prop) { return cs.getPropertyValue(String(prop)) !== ""; },
+      };
+    });
     def(el, "getClientRects", function () {
       var id = this.__node;
       var r = (typeof id === "number") ? __rect(id) : null;
