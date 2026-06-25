@@ -4678,6 +4678,42 @@ mod tests {
 
 
     #[test]
+    fn dedicated_worker_from_blob_object_url() {
+        // `new Worker(URL.createObjectURL(new Blob([src])))` — an inline (blob/data:) worker. The
+        // page decodes the data: URL and hands the source to the worker context directly. The worker
+        // reports back its performance.timeOrigin type, proving it ran with a working environment.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var src = "postMessage('to:' + (typeof performance.timeOrigin));";
+                var w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+                w.onmessage = function (e) { document.body.setAttribute('data-reply', e.data); };
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let reply = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-reply").cloned(),
+            _ => None,
+        };
+        assert_eq!(reply.as_deref(), Some("to:number"));
+    }
+
+    #[test]
     fn performance_timeorigin_now_and_crossoriginisolated() {
         // hr-time: performance.now() is a positive number, timeOrigin is a real epoch close to
         // Date.now(), toJSON().timeOrigin matches, and crossOriginIsolated is a boolean.

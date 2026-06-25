@@ -88,6 +88,15 @@ fn prim_worker_create(
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
     let script_url = arg_str(scope, &args, 1);
+    // Optional inline source (e.g. a decoded data:/blob: worker) to run instead of fetching.
+    let inline_src: Option<String> = {
+        let a = args.get(2);
+        if a.is_string() {
+            Some(a.to_rust_string_lossy(scope))
+        } else {
+            None
+        }
+    };
 
     // Inherit the page's network capabilities (synchronous `__request` powers importScripts). Async
     // fetch()/WebSocket inside workers is not routed yet, so give dead-end channels for those.
@@ -120,6 +129,11 @@ fn prim_worker_create(
         let kurl = v8::String::new(cscope, "__workerScriptURL").unwrap();
         let vurl = js_str(cscope, &script_url);
         g.set(cscope, kurl.into(), vurl);
+        if let Some(src) = &inline_src {
+            let ks = v8::String::new(cscope, "__workerInlineSource").unwrap();
+            let vs = js_str(cscope, src);
+            g.set(cscope, ks.into(), vs);
+        }
         crate::eval_loop::eval_internal(cscope, WORKER_ENV_BOOTSTRAP, "<worker-env>");
         v8::Global::new(cscope, ctx)
     };

@@ -81,12 +81,17 @@ let window = __wWinStub;
     }
   };
 
-  // Fetch + run the top-level worker script now. Its declarations land on the worker global.
+  // Run the top-level worker script now. Its declarations land on the worker global. An inline
+  // source (decoded data:/blob: worker, seeded by the native) is used directly; otherwise fetch it.
   try {
-    var topEnv = g.__request("GET", href, "", "{}");
-    if (topEnv) {
-      var tp = JSON.parse(topEnv);
-      if (tp && tp.ok) { g.__runWorkerScript(tp.body || "", href); }
+    if (typeof g.__workerInlineSource === "string") {
+      g.__runWorkerScript(g.__workerInlineSource, href);
+    } else {
+      var topEnv = g.__request("GET", href, "", "{}");
+      if (topEnv) {
+        var tp = JSON.parse(topEnv);
+        if (tp && tp.ok) { g.__runWorkerScript(tp.body || "", href); }
+      }
     }
   } catch (e) {}
 })();

@@ -6790,19 +6790,10 @@
   // Boolean globals the platform always exposes (hr-time and others read `self.crossOriginIsolated`
   // and assert it is a boolean). We are never cross-origin isolated (no COOP+COEP gating), so it is
   // `false`. `isSecureContext` is true for https/file/localhost; approximate from the page URL.
-  if (typeof globalThis.crossOriginIsolated !== "boolean") {
-    try { Object.defineProperty(globalThis, "crossOriginIsolated", { value: false, writable: false, enumerable: true, configurable: true }); }
-    catch (e) { try { globalThis.crossOriginIsolated = false; } catch (e2) {} }
-  }
-  if (typeof globalThis.isSecureContext !== "boolean") {
-    var __secure = false;
-    try {
-      var __u = String((globalThis.location && globalThis.location.href) || globalThis.__pageURL || "");
-      __secure = /^(https:|wss:|file:)/.test(__u) || /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?:[:\/]|$)/.test(__u);
-    } catch (e) {}
-    try { Object.defineProperty(globalThis, "isSecureContext", { value: __secure, writable: false, enumerable: true, configurable: true }); }
-    catch (e) { try { globalThis.isSecureContext = __secure; } catch (e2) {} }
-  }
+  var __pgurl = String((globalThis.location && globalThis.location.href) || globalThis.__pageURL || "");
+  def(globalThis, "crossOriginIsolated", false);
+  def(globalThis, "isSecureContext", /^(https:|wss:|file:)/.test(__pgurl) ||
+    /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?:[:\/]|$)/.test(__pgurl));
 
   // --- performance -------------------------------------------------------------------------
   if (!globalThis.performance || typeof globalThis.performance.now !== "function") {
@@ -6822,8 +6813,8 @@
     globalThis.performance = {
       now: __perfNow,
       timeOrigin: __perfOrigin,
-      timing: { navigationStart: __perfOrigin, fetchStart: __perfOrigin, domLoading: __perfOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: __perfOrigin, responseEnd: __perfOrigin, requestStart: __perfOrigin, connectStart: __perfOrigin, connectEnd: __perfOrigin, secureConnectionStart: 0, domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0 },
-      navigation: { type: 0, redirectCount: 0 },
+      timing: { navigationStart: __perfOrigin, fetchStart: __perfOrigin, domLoading: __perfOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: __perfOrigin, responseEnd: __perfOrigin, requestStart: __perfOrigin, connectStart: __perfOrigin, connectEnd: __perfOrigin, secureConnectionStart: 0, domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0, toJSON: function () { var o = {}, k = Object.keys(this); for (var i = 0; i < k.length; i++) { if (typeof this[k[i]] === "number") { o[k[i]] = this[k[i]]; } } return o; } },
+      navigation: { type: 0, redirectCount: 0, toJSON: function () { return { type: this.type, redirectCount: this.redirectCount }; } },
       memory: { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 },
       getEntries: function () { return (globalThis.__resourceEntries || []).slice(); },
       getEntriesByType: function (t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.entryType === t; }); },
@@ -6839,6 +6830,9 @@
     try { globalThis.performance.getEntriesByType = function (t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.entryType === t; }); }; } catch (e) {}
     try { globalThis.performance.getEntriesByName = function (n, t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.name === n && (!t || e.entryType === t); }); }; } catch (e) {}
   }
+  // The Performance interface extends EventTarget (it dispatches `resourcetimingbufferfull`), so it
+  // carries addEventListener/removeEventListener/dispatchEvent. (installEvents is idempotent.)
+  installEvents(globalThis.performance);
 
   // --- IdleDeadline-style object is already provided via requestIdleCallback above. ---------
 
@@ -9048,8 +9042,24 @@
         if (typeof __workerTerminate === "function") { __workerTerminate(id); }
       });
 
+      // `new Worker(URL.createObjectURL(blob))` is common (inline workers). Our createObjectURL
+      // returns a data: URL, which the worker's network fetch may not resolve; decode it to source
+      // here (the page has the bytes) and hand it to the worker context directly.
+      var inlineSrc = null;
+      if (/^data:/i.test(href)) {
+        try {
+          var comma = href.indexOf(","), meta = href.slice(5, comma), payload = href.slice(comma + 1);
+          if (/;base64/i.test(meta)) {
+            var bin = (typeof atob === "function") ? atob(payload) : "";
+            try { inlineSrc = decodeURIComponent(escape(bin)); } catch (e) { inlineSrc = bin; }
+          } else {
+            inlineSrc = decodeURIComponent(payload);
+          }
+        } catch (e) { inlineSrc = null; }
+      }
+
       // Build the worker context + run its script. On failure, surface an async `error` event.
-      var ok = (typeof __workerCreate === "function") ? __workerCreate(id, href) : false;
+      var ok = (typeof __workerCreate === "function") ? __workerCreate(id, href, inlineSrc) : false;
       if (!ok) {
         setTimeout(function () {
           var ev;
