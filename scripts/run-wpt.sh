@@ -39,12 +39,14 @@ fi
 #    CSS test helpers (e.g. interpolation-testcommon.js) that testharness tests under css/ load via
 #    /css/support/*; `fonts` holds the Ahem test font + ahem.css for exact glyph metrics; `quirks`
 #    holds reference pages that quirks-mode css/ reftests link to (e.g.
-#    /quirks/reference/*.html via ../../quirks/...). Without them those resources 404 (helper scripts
-#    report no subtests; Ahem tests use the fallback font; reftest refs fail to load and the
-#    comparison can't run).
+#    /quirks/reference/*.html via ../../quirks/...); `interfaces` holds the Web IDL fragments that
+#    every `idlharness` test fetches as `/interfaces/<spec>.idl` (without it idl_test setup fails
+#    with "Failed to fetch" / times out across every area). Without these those resources 404
+#    (helper scripts report no subtests; Ahem tests use the fallback font; reftest refs fail to load
+#    and the comparison can't run).
 #    The requested test paths ("${TESTS[@]}") are added too, so running an area that isn't yet in the
 #    sparse checkout pulls it into the working tree instead of silently finding 0 tests.
-( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks "${TESTS[@]}" >/dev/null 2>&1 || true )
+( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks interfaces "${TESTS[@]}" >/dev/null 2>&1 || true )
 
 # 2. Install our product into the checkout's wptrunner.browsers package (the checkout is gitignored,
 #    so the canonical copy lives in tools/wpt/). Register the product name in BUILTIN_PRODUCTS.
