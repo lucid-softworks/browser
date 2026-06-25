@@ -13,6 +13,8 @@ impl Default for ComputedStyle {
             forced_color_adjust_off: false,
             font_variant_emoji_emoji: false,
             accent_color: None,
+            pre_forced: None,
+            extra_colors: None,
             font_size: 16.0,
             font_family: None,
             bold: false,
@@ -220,6 +222,31 @@ impl ComputedStyle {
         })
     }
 
+    /// Like [`get_property`](Self::get_property) but reports the *computed* value — for the color
+    /// properties the forced-colors override replaced, the author value captured in `pre_forced`.
+    /// `computedStyleMap` uses this (forced colors are a used-value, not computed-value, transform).
+    pub fn get_property_computed(&self, name: &str) -> String {
+        if let Some((color, bg, border)) = self.pre_forced {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "color" | "caret-color" | "outline-color" => return rgb_str(color),
+                "background-color" => {
+                    return bg.map_or_else(|| "rgba(0, 0, 0, 0)".to_string(), rgb_str)
+                }
+                "border-top-color"
+                | "border-right-color"
+                | "border-bottom-color"
+                | "border-left-color"
+                | "border-color"
+                | "border-block-start-color"
+                | "border-block-end-color"
+                | "border-inline-start-color"
+                | "border-inline-end-color" => return rgb_str(border),
+                _ => {}
+            }
+        }
+        self.get_property(name)
+    }
+
     pub fn get_property(&self, name: &str) -> String {
         // Custom properties are case-sensitive and read straight from the resolved environment.
         let trimmed = name.trim();
@@ -228,6 +255,12 @@ impl ComputedStyle {
         }
         // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
         let name = trimmed.to_ascii_lowercase();
+        // Color-valued properties we only store opaquely (fill, stroke, …): serialize from the map.
+        if let Some(extra) = &self.extra_colors {
+            if let Some(&c) = extra.get(&name) {
+                return rgb_str(c);
+            }
+        }
         // Logical longhands resolve to a physical property for this element's writing mode.
         if let Some(phys) = self.physical_for_logical(&name) {
             return self.get_property(&phys);

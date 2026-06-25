@@ -114,6 +114,9 @@ fn force_style_colors(
     paint_bg: bool,
     drop_img: bool,
 ) {
+    // Capture the author colors so `computedStyleMap` can still report the computed value (forced
+    // colors are a used-value transform, not a computed-value one).
+    s.pre_forced = Some((s.color, s.background_color, s.border_color));
     s.color = text_color;
     s.border_color = (0, 0, 0); // CanvasText
     if s.background_color.is_some() || paint_bg {
@@ -756,7 +759,9 @@ pub(crate) fn compute_element_style<'a>(
         forced_color_adjust_off: parent.forced_color_adjust_off, // inherited
         font_variant_emoji_emoji: parent.font_variant_emoji_emoji, // inherited
         accent_color: parent.accent_color,                       // inherited
-        background_color: None,                                  // not inherited
+        extra_colors: parent.extra_colors.clone(), // fill/stroke etc. inherit; others reset on set
+        pre_forced: None,                          // not inherited; set by the forced-colors pass
+        background_color: None,                    // not inherited
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),
         bold: parent.bold,

@@ -5433,13 +5433,18 @@
     // computedStyleMap(): a minimal CSS Typed OM StylePropertyMapReadOnly backed by
     // getComputedStyle — `.get(prop)` returns a value whose toString() is the computed value string.
     def(el, "computedStyleMap", function () {
-      var cs = globalThis.getComputedStyle(this);
+      // Report the COMPUTED value (4th arg true), not the resolved value getComputedStyle returns —
+      // they differ for colors the forced-colors override replaced at used-value time.
+      var id = this.__node;
+      function computed(prop) {
+        try { return __computedStyleProp(id, String(prop).toLowerCase(), "", true); } catch (e) { return ""; }
+      }
       return {
         get: function (prop) {
-          var v = cs.getPropertyValue(String(prop));
+          var v = computed(prop);
           return { toString: function () { return v; }, value: v };
         },
-        has: function (prop) { return cs.getPropertyValue(String(prop)) !== ""; },
+        has: function (prop) { return computed(prop) !== ""; },
       };
     });
     def(el, "getClientRects", function () {

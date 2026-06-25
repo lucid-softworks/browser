@@ -421,6 +421,24 @@ pub(crate) fn apply_declaration(
         "font-variant-emoji" => {
             style.font_variant_emoji_emoji = val.trim().eq_ignore_ascii_case("emoji");
         }
+        // Color-valued properties the engine doesn't otherwise model: store the computed color so
+        // getComputedStyle / computedStyleMap can report it (e.g. forced-colors computed-value tests).
+        "fill"
+        | "stroke"
+        | "flood-color"
+        | "lighting-color"
+        | "stop-color"
+        | "column-rule-color"
+        | "text-decoration-color"
+        | "-webkit-tap-highlight-color"
+        | "-webkit-text-emphasis-color" => {
+            if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
+                style
+                    .extra_colors
+                    .get_or_insert_with(Default::default)
+                    .insert(prop.to_string(), c);
+            }
+        }
         "accent-color" => {
             let t = val.trim();
             if t.eq_ignore_ascii_case("auto") {

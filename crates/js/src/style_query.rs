@@ -601,155 +601,164 @@ pub(crate) fn prim_computed_style_prop(
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 2));
+    // A 4th truthy arg requests the *computed* value (computedStyleMap) rather than the resolved
+    // value (getComputedStyle) — they differ for colors the forced-colors override replaced.
+    let raw = args.get(3).is_true();
+    let get = |cs: &style::ComputedStyle| {
+        if raw {
+            cs.get_property_computed(&name)
+        } else {
+            cs.get_property(&name)
+        }
+    };
     let state = host_state(scope);
-    let value =
-        match (node, &pseudo) {
-            (None, _) | (_, style::GcsPseudo::Invalid) => String::new(),
-            (Some(n), style::GcsPseudo::Pseudo(key)) => with_pseudo_style(&state, n, key, |cs| {
-                cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
-            }),
-            (Some(n), style::GcsPseudo::Element) => {
-                // Inset longhands need the CSSOM resolved-value algorithm (position + containing
-                // block), which reads more than one element's style — handle them via the cascade map.
-                let inset_side = match name.as_str() {
-                    "top" => Some(style::EdgeSide::Top),
-                    "right" => Some(style::EdgeSide::Right),
-                    "bottom" => Some(style::EdgeSide::Bottom),
-                    "left" => Some(style::EdgeSide::Left),
-                    _ => None,
-                };
-                // Margin longhands report the CSSOM *used* value: the engine pushes resolved margins
-                // (including `auto` centering / over-constrained boxes) keyed by node id.
-                let margin_idx = match name.as_str() {
-                    "margin-top" => Some(0usize),
-                    "margin-right" => Some(1),
-                    "margin-bottom" => Some(2),
-                    "margin-left" => Some(3),
-                    _ => None,
-                };
-                // width/height report the CSSOM *used* (content-box px) value when the element has a box
-                // and the property applies — e.g. a percentage width the cascade couldn't resolve.
-                let size_is_width = match name.as_str() {
-                    "width" => Some(true),
-                    "height" => Some(false),
-                    _ => None,
-                };
-                // min-width / min-height: auto resolves to 0px, except a box with a preferred aspect
-                // ratio or a flex/grid item keeps `auto`; a box-less element (no layout box) is 0px.
-                if matches!(name.as_str(), "min-width" | "min-height") {
-                    with_cascade_map(&state, |doc, map| {
-                        let cs = match map.get(&n) {
-                            Some(c) => c,
-                            None => return String::new(),
-                        };
-                        let computed = cs.get_property(&name);
-                        if computed != "auto" {
-                            return computed;
-                        }
-                        // A box-less element (display:none, or inside one) generates no box → 0px.
-                        if cs.display_none || ancestor_display_none(doc, map, n) {
-                            return "0px".to_string();
-                        }
-                        let parent_flex_grid = doc
-                            .get(n)
-                            .parent
-                            .and_then(|p| map.get(&p))
-                            .map(|p| {
-                                matches!(
-                                    p.display,
-                                    style::Display::Flex
-                                        | style::Display::InlineFlex
-                                        | style::Display::Grid
-                                        | style::Display::InlineGrid
-                                )
-                            })
-                            .unwrap_or(false);
-                        if cs.aspect_ratio_set || parent_flex_grid {
-                            "auto".to_string()
-                        } else {
-                            "0px".to_string()
-                        }
-                    })
-                } else if let Some(is_width) = size_is_width {
-                    with_computed_style(&state, n, |cs| {
-                        let cs = match cs {
-                            Some(c) => c,
-                            None => return String::new(),
-                        };
-                        let computed = cs.get_property(&name);
-                        // A specified length is already the used value (and stays fresh between layouts);
-                        // only resolve `auto`/percentage via the laid-out box. width/height don't apply to
-                        // non-replaced inline boxes or display:none, where the computed value is reported.
-                        if computed != "auto"
-                            || cs.display_none
-                            || matches!(cs.display, style::Display::Inline)
-                        {
-                            return computed;
-                        }
-                        match state.layout_rects.borrow().get(&n.0) {
-                            Some(&(_, _, w, h)) => {
-                                let (b0, b1, p0, p1) = if is_width {
-                                    (
-                                        cs.border.left,
-                                        cs.border.right,
-                                        cs.padding.left,
-                                        cs.padding.right,
-                                    )
-                                } else {
-                                    (
-                                        cs.border.top,
-                                        cs.border.bottom,
-                                        cs.padding.top,
-                                        cs.padding.bottom,
-                                    )
-                                };
-                                let border_box = if is_width { w } else { h };
-                                style::serialize_px((border_box - b0 - b1 - p0 - p1).max(0.0))
-                            }
-                            None => computed,
-                        }
-                    })
-                } else if let Some(idx) = margin_idx {
-                    // Only an `auto` margin needs the engine's resolved used value; a specified margin's
-                    // computed value is always current (and not stale between layouts). Falls back to the
-                    // computed value if the engine hasn't pushed a used margin yet.
-                    with_computed_style(&state, n, |cs| match cs {
-                        Some(cs) if cs.margin_auto[idx] => state
-                            .used_margins
-                            .borrow()
-                            .get(&n.0)
-                            .map(|&(t, r, b, l)| style::serialize_px([t, r, b, l][idx]))
-                            .unwrap_or_else(|| cs.get_property(&name)),
-                        Some(cs) => cs.get_property(&name),
-                        None => String::new(),
-                    })
-                } else {
-                    match inset_side {
-                        Some(side) => {
-                            // The engine pushed this box's used inset values (px) keyed by node id; pick this
-                            // side. Used by the resolved-value algorithm for cases that need real layout
-                            // (absolute/fixed static position when both opposite insets are `auto`).
-                            let used =
-                                state.used_insets.borrow().get(&n.0).map(
-                                    |&(t, r, b, l)| match side {
-                                        style::EdgeSide::Top => t,
-                                        style::EdgeSide::Right => r,
-                                        style::EdgeSide::Bottom => b,
-                                        style::EdgeSide::Left => l,
-                                        style::EdgeSide::All => t,
-                                    },
-                                );
-                            with_cascade_map(&state, |doc, map| {
-                                resolved_inset_value(doc, map, n, side, used).unwrap_or_default()
-                            })
-                        }
-                        None => with_computed_style(&state, n, |cs| {
-                            cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
-                        }),
+    let value = match (node, &pseudo) {
+        (None, _) | (_, style::GcsPseudo::Invalid) => String::new(),
+        (Some(n), style::GcsPseudo::Pseudo(key)) => {
+            with_pseudo_style(&state, n, key, |cs| cs.map(get).unwrap_or_default())
+        }
+        (Some(n), style::GcsPseudo::Element) => {
+            // Inset longhands need the CSSOM resolved-value algorithm (position + containing
+            // block), which reads more than one element's style — handle them via the cascade map.
+            let inset_side = match name.as_str() {
+                "top" => Some(style::EdgeSide::Top),
+                "right" => Some(style::EdgeSide::Right),
+                "bottom" => Some(style::EdgeSide::Bottom),
+                "left" => Some(style::EdgeSide::Left),
+                _ => None,
+            };
+            // Margin longhands report the CSSOM *used* value: the engine pushes resolved margins
+            // (including `auto` centering / over-constrained boxes) keyed by node id.
+            let margin_idx = match name.as_str() {
+                "margin-top" => Some(0usize),
+                "margin-right" => Some(1),
+                "margin-bottom" => Some(2),
+                "margin-left" => Some(3),
+                _ => None,
+            };
+            // width/height report the CSSOM *used* (content-box px) value when the element has a box
+            // and the property applies — e.g. a percentage width the cascade couldn't resolve.
+            let size_is_width = match name.as_str() {
+                "width" => Some(true),
+                "height" => Some(false),
+                _ => None,
+            };
+            // min-width / min-height: auto resolves to 0px, except a box with a preferred aspect
+            // ratio or a flex/grid item keeps `auto`; a box-less element (no layout box) is 0px.
+            if matches!(name.as_str(), "min-width" | "min-height") {
+                with_cascade_map(&state, |doc, map| {
+                    let cs = match map.get(&n) {
+                        Some(c) => c,
+                        None => return String::new(),
+                    };
+                    let computed = cs.get_property(&name);
+                    if computed != "auto" {
+                        return computed;
                     }
+                    // A box-less element (display:none, or inside one) generates no box → 0px.
+                    if cs.display_none || ancestor_display_none(doc, map, n) {
+                        return "0px".to_string();
+                    }
+                    let parent_flex_grid = doc
+                        .get(n)
+                        .parent
+                        .and_then(|p| map.get(&p))
+                        .map(|p| {
+                            matches!(
+                                p.display,
+                                style::Display::Flex
+                                    | style::Display::InlineFlex
+                                    | style::Display::Grid
+                                    | style::Display::InlineGrid
+                            )
+                        })
+                        .unwrap_or(false);
+                    if cs.aspect_ratio_set || parent_flex_grid {
+                        "auto".to_string()
+                    } else {
+                        "0px".to_string()
+                    }
+                })
+            } else if let Some(is_width) = size_is_width {
+                with_computed_style(&state, n, |cs| {
+                    let cs = match cs {
+                        Some(c) => c,
+                        None => return String::new(),
+                    };
+                    let computed = cs.get_property(&name);
+                    // A specified length is already the used value (and stays fresh between layouts);
+                    // only resolve `auto`/percentage via the laid-out box. width/height don't apply to
+                    // non-replaced inline boxes or display:none, where the computed value is reported.
+                    if computed != "auto"
+                        || cs.display_none
+                        || matches!(cs.display, style::Display::Inline)
+                    {
+                        return computed;
+                    }
+                    match state.layout_rects.borrow().get(&n.0) {
+                        Some(&(_, _, w, h)) => {
+                            let (b0, b1, p0, p1) = if is_width {
+                                (
+                                    cs.border.left,
+                                    cs.border.right,
+                                    cs.padding.left,
+                                    cs.padding.right,
+                                )
+                            } else {
+                                (
+                                    cs.border.top,
+                                    cs.border.bottom,
+                                    cs.padding.top,
+                                    cs.padding.bottom,
+                                )
+                            };
+                            let border_box = if is_width { w } else { h };
+                            style::serialize_px((border_box - b0 - b1 - p0 - p1).max(0.0))
+                        }
+                        None => computed,
+                    }
+                })
+            } else if let Some(idx) = margin_idx {
+                // Only an `auto` margin needs the engine's resolved used value; a specified margin's
+                // computed value is always current (and not stale between layouts). Falls back to the
+                // computed value if the engine hasn't pushed a used margin yet.
+                with_computed_style(&state, n, |cs| match cs {
+                    Some(cs) if cs.margin_auto[idx] => state
+                        .used_margins
+                        .borrow()
+                        .get(&n.0)
+                        .map(|&(t, r, b, l)| style::serialize_px([t, r, b, l][idx]))
+                        .unwrap_or_else(|| cs.get_property(&name)),
+                    Some(cs) => cs.get_property(&name),
+                    None => String::new(),
+                })
+            } else {
+                match inset_side {
+                    Some(side) => {
+                        // The engine pushed this box's used inset values (px) keyed by node id; pick this
+                        // side. Used by the resolved-value algorithm for cases that need real layout
+                        // (absolute/fixed static position when both opposite insets are `auto`).
+                        let used =
+                            state
+                                .used_insets
+                                .borrow()
+                                .get(&n.0)
+                                .map(|&(t, r, b, l)| match side {
+                                    style::EdgeSide::Top => t,
+                                    style::EdgeSide::Right => r,
+                                    style::EdgeSide::Bottom => b,
+                                    style::EdgeSide::Left => l,
+                                    style::EdgeSide::All => t,
+                                });
+                        with_cascade_map(&state, |doc, map| {
+                            resolved_inset_value(doc, map, n, side, used).unwrap_or_default()
+                        })
+                    }
+                    None => with_computed_style(&state, n, |cs| cs.map(get).unwrap_or_default()),
                 }
             }
-        };
+        }
+    };
     let s = js_str(scope, &value);
     rv.set(s);
 }

@@ -312,6 +312,14 @@ pub struct ComputedStyle {
     /// In forced colors mode it computes to `auto` unless it's a system color or forced-color-adjust
     /// is none.
     pub accent_color: Option<((u8, u8, u8), bool)>,
+    /// The author `(color, background_color, border_color)` captured before the forced-colors
+    /// override replaced them. `Some` only on elements the override touched. Lets `computedStyleMap`
+    /// report the *computed* value (forced colors apply at used-value time, not computed-value time).
+    pub pre_forced: Option<((u8, u8, u8), Option<(u8, u8, u8)>, (u8, u8, u8))>,
+    /// Author-declared colors for properties the engine doesn't otherwise model (fill, stroke,
+    /// flood/lighting/stop-color, column-rule-color, text-decoration-color, the -webkit-* emphasis/
+    /// tap colors). Lazily allocated (rare). Keyed by the kebab-case property name.
+    pub extra_colors: Option<Box<std::collections::HashMap<String, (u8, u8, u8)>>>,
     /// Font size in pixels.
     pub font_size: f32,
     /// The specified `font-family` list, serialized to CSSOM canonical form (quoting normalized).
