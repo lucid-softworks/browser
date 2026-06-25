@@ -316,6 +316,12 @@ pub struct ComputedStyle {
     /// override replaced them. `Some` only on elements the override touched. Lets `computedStyleMap`
     /// report the *computed* value (forced colors apply at used-value time, not computed-value time).
     pub pre_forced: Option<((u8, u8, u8), Option<(u8, u8, u8)>, (u8, u8, u8))>,
+    /// Whether `color` (inherited), `background-color`, and `border-color` were authored with a CSS
+    /// *system color* keyword. Forced colors preserves author system colors rather than re-mapping
+    /// them.
+    pub color_is_system: bool,
+    pub bg_is_system: bool,
+    pub border_is_system: bool,
     /// Author-declared colors for properties the engine doesn't otherwise model (fill, stroke,
     /// flood/lighting/stop-color, column-rule-color, text-decoration-color, the -webkit-* emphasis/
     /// tap colors). Lazily allocated (rare). Keyed by the kebab-case property name.

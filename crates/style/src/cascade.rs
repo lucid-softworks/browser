@@ -117,9 +117,14 @@ fn force_style_colors(
     // Capture the author colors so `computedStyleMap` can still report the computed value (forced
     // colors are a used-value transform, not a computed-value one).
     s.pre_forced = Some((s.color, s.background_color, s.border_color));
-    s.color = text_color;
-    s.border_color = (0, 0, 0); // CanvasText
-    if s.background_color.is_some() || paint_bg {
+    // Author-specified system colors are preserved (not re-mapped).
+    if !s.color_is_system {
+        s.color = text_color;
+    }
+    if !s.border_is_system {
+        s.border_color = (0, 0, 0); // CanvasText
+    }
+    if (s.background_color.is_some() || paint_bg) && !s.bg_is_system {
         s.background_color = Some((255, 255, 255)); // Canvas
     }
     // On regular elements (not the root/body, whose image propagates to the viewport): a
@@ -761,6 +766,9 @@ pub(crate) fn compute_element_style<'a>(
         accent_color: parent.accent_color,                       // inherited
         extra_colors: parent.extra_colors.clone(), // fill/stroke etc. inherit; others reset on set
         pre_forced: None,                          // not inherited; set by the forced-colors pass
+        color_is_system: parent.color_is_system,   // tracks `color`, which inherits
+        bg_is_system: false,                       // not inherited
+        border_is_system: false,                   // not inherited
         background_color: None,                    // not inherited
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),

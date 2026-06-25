@@ -397,6 +397,12 @@ pub(crate) fn ancestor_table(
 
 /// Apply a single declaration to `style`. Unknown properties/values are ignored silently.
 #[allow(clippy::too_many_arguments)]
+/// Whether any whitespace/punctuation-separated token in a CSS value is a system color keyword.
+pub(crate) fn has_system_color(val: &str) -> bool {
+    val.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';'))
+        .any(|t| crate::colors::is_system_color_keyword(&t.to_ascii_lowercase()))
+}
+
 pub(crate) fn apply_declaration(
     style: &mut ComputedStyle,
     prop: &str,
@@ -461,10 +467,13 @@ pub(crate) fn apply_declaration(
             let trimmed = val.trim().to_ascii_lowercase();
             if trimmed == "inherit" {
                 style.color = inherited_color;
+                // keep the inherited color_is_system flag
             } else if trimmed == "initial" || trimmed == "unset" {
                 style.color = ComputedStyle::default().color;
+                style.color_is_system = false;
             } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.color = c;
+                style.color_is_system = has_system_color(&trimmed);
             }
         }
         "background-color" | "background" => {
@@ -487,6 +496,7 @@ pub(crate) fn apply_declaration(
                 if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                     // Solid color interpretation; `transparent`/`none` leave it unchanged.
                     style.background_color = Some(c);
+                    style.bg_is_system = has_system_color(val);
                 }
             }
         }
@@ -899,7 +909,8 @@ pub(crate) fn apply_declaration(
 
         // --- Box model: border ---
         "border" => {
-            apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color)
+            apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color);
+            style.border_is_system = has_system_color(val);
         }
         "border-top" => {
             apply_border_shorthand(style, val, EdgeSide::Top, current_color, inherited_color)
@@ -927,6 +938,7 @@ pub(crate) fn apply_declaration(
         "border-color" => {
             if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.border_color = c;
+                style.border_is_system = has_system_color(val);
             }
         }
 
