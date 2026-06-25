@@ -10,6 +10,7 @@ impl Default for ComputedStyle {
             writing_mode: WritingMode::HorizontalTb,
             color: ua_default_text_color(),
             background_color: None,
+            forced_color_adjust_off: false,
             font_size: 16.0,
             font_family: None,
             bold: false,
