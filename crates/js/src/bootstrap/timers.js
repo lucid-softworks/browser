@@ -48,8 +48,17 @@
   });
 
   define("requestAnimationFrame", function (fn) {
-    // No real frames; schedule ~16ms out (one 60fps frame) so rAF runs after 0ms timers.
-    return schedule(fn, 16, [currentTime() + 16], false);
+    // No real frames; schedule ~16ms out (one 60fps frame) so rAF runs after 0ms timers. The
+    // callback receives a DOMHighResTimeStamp read at FIRE time — performance.now() (the frame time),
+    // matching document.timeline.currentTime so animation-timeline tests line up.
+    return schedule(function () {
+      var ts = (globalThis.performance && typeof globalThis.performance.now === "function")
+        ? globalThis.performance.now() : currentTime();
+      // Freeze the frame time so document.timeline.currentTime reads the SAME value as the rAF
+      // timestamp during this frame (callbacks + their sync continuations).
+      globalThis.__frameTime = ts;
+      fn(ts);
+    }, 16, [], false);
   });
   define("cancelAnimationFrame", globalThis.clearTimeout);
 

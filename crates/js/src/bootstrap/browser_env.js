@@ -6834,6 +6834,46 @@
   // carries addEventListener/removeEventListener/dispatchEvent. (installEvents is idempotent.)
   installEvents(globalThis.performance);
 
+  // --- Animation timelines (Web Animations) ------------------------------------------------
+  // Minimal AnimationTimeline/DocumentTimeline: `currentTime` is the high-res time since the
+  // timeline's origin (default origin 0 → tracks performance.now()), matching the timestamp passed
+  // to requestAnimationFrame callbacks. `document.timeline` is the default document timeline.
+  if (typeof globalThis.DocumentTimeline !== "function") {
+    defClass("AnimationTimeline");
+    Object.defineProperty(globalThis.AnimationTimeline.prototype, "currentTime", {
+      // During a frame, read the frozen frame time (set by requestAnimationFrame) so the timeline
+      // matches the rAF timestamp exactly; otherwise the live high-res time.
+      get: function () {
+        var t = (typeof globalThis.__frameTime === "number")
+          ? globalThis.__frameTime
+          : (globalThis.performance ? globalThis.performance.now() : 0);
+        return t - (this.__originTime || 0);
+      },
+      enumerable: true, configurable: true
+    });
+    def(globalThis, "DocumentTimeline", function (options) {
+      this.__originTime = (options && typeof options.originTime === "number") ? options.originTime : 0;
+    });
+    globalThis.DocumentTimeline.prototype = Object.create(globalThis.AnimationTimeline.prototype);
+    Object.defineProperty(globalThis.DocumentTimeline.prototype, "constructor", { value: globalThis.DocumentTimeline, enumerable: false, configurable: true, writable: true });
+  }
+  if (typeof document === "object" && document && !document.timeline) {
+    try { Object.defineProperty(document, "timeline", { value: new globalThis.DocumentTimeline(), enumerable: true, configurable: true }); } catch (e) {}
+  }
+
+  // --- Viewport Segments (css-viewport-1) --------------------------------------------------
+  // `window.viewport`: for a non-segmented viewport, one segment covering the whole inner size.
+  if (typeof globalThis.viewport === "undefined") {
+    var __vp = {};
+    Object.defineProperty(__vp, "innerWidth", { get: function () { return globalThis.innerWidth; }, enumerable: true });
+    Object.defineProperty(__vp, "innerHeight", { get: function () { return globalThis.innerHeight; }, enumerable: true });
+    Object.defineProperty(__vp, "segments", {
+      get: function () { return [{ innerWidth: globalThis.innerWidth, innerHeight: globalThis.innerHeight }]; },
+      enumerable: true
+    });
+    def(globalThis, "viewport", __vp);
+  }
+
   // --- IdleDeadline-style object is already provided via requestIdleCallback above. ---------
 
   // ===== XML documents: an independent pure-JS DOM + parser + serializer ======================
