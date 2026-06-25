@@ -225,9 +225,14 @@ fn prim_worker_terminate(
     WORKER_REG.with(|r| r.borrow_mut().realms.retain(|w| w.id != id));
 }
 
+/// The page (top-level) context, if registered. Shared with the iframe realm bridge.
+pub(crate) fn page_context() -> Option<v8::Global<v8::Context>> {
+    WORKER_REG.with(|r| r.borrow().page_context.clone())
+}
+
 /// Call a global function `name` in the current context with `args`, ignoring the result and any
 /// thrown exception (a misbehaving handler must not unwind through the host).
-fn call_global_fn(scope: &mut v8::PinScope, name: &str, args: &[v8::Local<v8::Value>]) {
+pub(crate) fn call_global_fn(scope: &mut v8::PinScope, name: &str, args: &[v8::Local<v8::Value>]) {
     let global = scope.get_current_context().global(scope);
     let key = match v8::String::new(scope, name) {
         Some(k) => k,

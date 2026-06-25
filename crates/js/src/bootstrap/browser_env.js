@@ -8648,6 +8648,116 @@
     }
   } catch (e) {}
 
+  // --- Real iframe browsing contexts -------------------------------------------------------
+  // When an <iframe> has a src/srcdoc, load it as a REAL nested context (crates/js/src/iframe.rs):
+  // the frame's document + scripts run in their own V8 realm with their own window/performance/fetch.
+  // We trigger the load on src/srcdoc assignment and on connection, fire load/error here, and bridge
+  // cross-frame postMessage. contentWindow returns the real bridge for loaded frames (falling back to
+  // the lightweight facade above for srcdoc-via-document.write frames that have no realm).
+  try {
+    if (globalThis.HTMLIFrameElement && globalThis.HTMLIFrameElement.prototype && typeof __iframeLoad === "function") {
+      var IFP2 = globalThis.HTMLIFrameElement.prototype;
+      globalThis.__framesByNode = globalThis.__framesByNode || {};
+
+      function __loadFrame(el) {
+        if (!el || typeof el.__node !== "number") { return; }
+        var srcdoc = (el.getAttribute && el.hasAttribute && el.hasAttribute("srcdoc")) ? el.getAttribute("srcdoc") : null;
+        var rawSrc = (el.getAttribute) ? el.getAttribute("src") : null;
+        var url = null;
+        if (rawSrc != null && rawSrc !== "") {
+          try { url = new globalThis.URL(rawSrc, globalThis.location.href).href; } catch (e) { url = rawSrc; }
+        }
+        var key = (srcdoc != null) ? ("srcdoc:" + srcdoc) : (url || "");
+        if (key === "") { return; }
+        if (el.__frameLoadedKey === key) { return; }
+        el.__frameLoadedKey = key;
+        globalThis.__framesByNode[el.__node] = el;
+        var ok;
+        try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null)); }
+        catch (e) { ok = false; }
+        setTimeout(function () {
+          var ev;
+          try { ev = new globalThis.Event(ok ? "load" : "error"); } catch (e) { ev = { type: ok ? "load" : "error", target: el, currentTarget: el }; }
+          try { el.dispatchEvent(ev); } catch (e) {}
+        }, 0);
+      }
+      globalThis.__loadFrameEl = __loadFrame;
+
+      // Connection hook (called from document.js insertNode): when an <iframe> with a src/srcdoc is
+      // inserted into the tree, load its nested browsing context. Walks the inserted subtree so a
+      // frame nested inside an appended fragment also loads. Browsers load iframes on connection.
+      def(globalThis, "__frameOnInsert", function (nodeId) {
+        if (nodeId == null || nodeId < 0) { return; }
+        try {
+          var el = globalThis.__canonNode(globalThis.__wrapNode(nodeId));
+          if (el && el.tagName && el.tagName.toLowerCase() === "iframe") {
+            if (el.getAttribute && (el.getAttribute("src") || (el.hasAttribute && el.hasAttribute("srcdoc")))) { __loadFrame(el); }
+          }
+          var kids = __children(nodeId);
+          for (var i = 0; i < kids.length; i++) { globalThis.__frameOnInsert(kids[i]); }
+        } catch (e) {}
+      });
+
+      // contentWindow: real bridge for loaded frames; otherwise the facade getter defined above.
+      var __cwFacade = Object.getOwnPropertyDescriptor(IFP2, "contentWindow");
+      Object.defineProperty(IFP2, "contentWindow", {
+        get: function () {
+          if (this.__frameLoadedKey) {
+            var el = this;
+            if (!el.__cwinReal) {
+              var base = {
+                postMessage: function (data, targetOrigin, transfer) {
+                  if (typeof __framePostToFrame === "function") { __framePostToFrame(el.__node, data); }
+                },
+                focus: function () {}, blur: function () {}, close: function () {}, closed: false, frameElement: el
+              };
+              base.self = base; base.window = base;
+              try { base.parent = globalThis; base.top = globalThis; } catch (e) {}
+              // Reads not on `base` (performance, location, document, globals the frame's scripts
+              // set, …) reach into the frame realm via __frameGet.
+              if (typeof globalThis.Proxy === "function" && typeof __frameGet === "function") {
+                el.__cwinReal = new globalThis.Proxy(base, {
+                  get: function (t, prop) {
+                    if (prop in t) { return t[prop]; }
+                    if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
+                    return undefined;
+                  }
+                });
+              } else {
+                el.__cwinReal = base;
+              }
+            }
+            return el.__cwinReal;
+          }
+          return (__cwFacade && __cwFacade.get) ? __cwFacade.get.call(this) : undefined;
+        },
+        enumerable: true, configurable: true
+      });
+
+      // frame -> page message delivery (the native bridge calls this on the page context).
+      def(globalThis, "__frameDeliverToParent", function (nodeId, value) {
+        var el = globalThis.__framesByNode[nodeId];
+        var data; try { data = globalThis.structuredClone(value); } catch (e) { data = value; }
+        var src = el ? el.contentWindow : null;
+        setTimeout(function () {
+          var ev;
+          try { ev = new globalThis.MessageEvent("message", { data: data, origin: "", lastEventId: "", source: src, ports: [] }); }
+          catch (e2) { ev = { type: "message", data: data }; }
+          try { globalThis.dispatchEvent(ev); } catch (e3) {}
+        }, 0);
+      });
+
+      // Load any static iframes already in the parsed document (those with a src/srcdoc attribute).
+      try {
+        var __ifs = document.getElementsByTagName("iframe");
+        for (var __i = 0; __i < __ifs.length; __i++) {
+          var __f = __ifs[__i];
+          if ((__f.getAttribute && (__f.getAttribute("src") || (__f.hasAttribute && __f.hasAttribute("srcdoc"))))) { __loadFrame(__f); }
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+
   // --- Custom Elements (minimal) ---------------------------------------------------------------
   // `customElements.define(name, ctor)` registers a class, then upgrades matching elements already
   // in the tree (re-pointing their prototype at the ctor's) and runs the lifecycle reactions:

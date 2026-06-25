@@ -736,6 +736,7 @@ pub(crate) fn session_thread_main(
     // Loop ended (Stop or sender dropped). Drop worker realms + the page-context handle BEFORE the
     // isolate so the thread-local doesn't outlive the isolate it holds handles into.
     crate::clear_workers();
+    crate::clear_frames();
     drop(context);
     drop(isolate);
 }

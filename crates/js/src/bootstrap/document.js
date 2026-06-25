@@ -468,12 +468,15 @@
       var moving = __children(nodeId).slice();
       for (var i = 0; i < moving.length; i++) { __insertBefore(parentId, moving[i], refId); }
       if (globalThis.__ceOnInsert) { for (var k = 0; k < moving.length; k++) { try { globalThis.__ceOnInsert(moving[k]); } catch (e) {} } }
+      if (globalThis.__frameOnInsert) { for (var fk = 0; fk < moving.length; fk++) { try { globalThis.__frameOnInsert(moving[fk]); } catch (e) {} } }
       if (globalThis.__adoptOnInsert) { for (var m = 0; m < moving.length; m++) { try { globalThis.__adoptOnInsert(moving[m]); } catch (e) {} } }
       return nodeId;
     }
     __insertBefore(parentId, nodeId, refId);
     // Custom Elements: a newly-connected element (and its subtree) may need upgrading + connectedCallback.
     if (globalThis.__ceOnInsert) { try { globalThis.__ceOnInsert(nodeId); } catch (e) {} }
+    // Iframes: a newly-connected <iframe> with src/srcdoc starts loading its nested browsing context.
+    if (globalThis.__frameOnInsert) { try { globalThis.__frameOnInsert(nodeId); } catch (e) {} }
     // Cross-document adoption: clear adoptedStyleSheets of shadow roots moved into a frame document.
     if (globalThis.__adoptOnInsert) { try { globalThis.__adoptOnInsert(nodeId); } catch (e) {} }
     return nodeId;

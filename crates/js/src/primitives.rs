@@ -2086,4 +2086,7 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     // boundary, run worker scripts at top level). Installed on every context so workers can spawn
     // sub-workers.
     crate::worker::register_worker_natives(scope, global);
+    // Iframe browsing-context bridge natives (load a frame document into its own context, post
+    // across the frame<->parent boundary). Installed on every context so nested iframes work.
+    crate::register_iframe_natives(scope, global);
 }

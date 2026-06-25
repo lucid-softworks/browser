@@ -282,6 +282,14 @@ pub(crate) fn format_exception(
     "uncaught exception".to_string()
 }
 
+/// Pump every dedicated-worker AND iframe realm one pass, returning `(did_work, total_in_flight)`.
+/// Each realm advances its own timers / fetch completions / message deliveries in its own context.
+pub(crate) fn pump_realms(scope: &mut v8::PinScope) -> (bool, usize) {
+    let (w_did, w_if) = crate::pump_workers(scope);
+    let (f_did, f_if) = crate::pump_frames(scope);
+    (w_did || f_did, w_if + f_if)
+}
+
 /// Drive the event loop to completion (or the time/iteration cap) after page sources have run.
 /// Fires the DOM lifecycle events, then alternates V8 microtask checkpoints with the JS
 /// `__runDueTimers()` driver. Folds any console output + `__timerErrors` produced during the
@@ -378,7 +386,7 @@ pub(crate) fn drain_event_loop(
         // workers' loops (their queued message deliveries / fetches / timers run in their own
         // contexts). pump_workers reports whether it did work and the worker in-flight tally.
         let ran = run_due_timers(scope);
-        let (wran, wif) = crate::pump_workers(scope);
+        let (wran, wif) = pump_realms(scope);
         worker_in_flight = wif;
         iterations += 1;
         if ran || wran {
@@ -387,7 +395,7 @@ pub(crate) fn drain_event_loop(
             // Nothing left in the page loop; one more microtask checkpoint in case the last timer
             // queued a job, and one more worker pump in case a microtask queued worker work.
             scope.perform_microtask_checkpoint();
-            let (wran2, wif2) = crate::pump_workers(scope);
+            let (wran2, wif2) = pump_realms(scope);
             worker_in_flight = wif2;
             if run_due_timers(scope) || wran2 {
                 did_work = true;
@@ -463,7 +471,7 @@ pub(crate) fn drain_event_loop(
     {
         let mut rounds = 0usize;
         loop {
-            let (w, wif) = crate::pump_workers(scope);
+            let (w, wif) = pump_realms(scope);
             scope.perform_microtask_checkpoint();
             let p = run_due_timers(scope);
             scope.perform_microtask_checkpoint();

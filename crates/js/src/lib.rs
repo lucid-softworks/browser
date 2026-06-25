@@ -290,6 +290,7 @@ mod eval_loop;
 mod modules;
 mod primitives;
 mod runtime;
+mod iframe;
 mod selector;
 mod session;
 mod style_query;
@@ -300,6 +301,7 @@ pub use eval_loop::*;
 pub use modules::*;
 pub use primitives::*;
 pub use runtime::*;
+pub use iframe::*;
 pub(crate) use selector::*;
 pub use session::*;
 pub(crate) use style_query::*;
@@ -4676,6 +4678,60 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn iframe_loads_runs_scripts_and_cross_frame_postmessage() {
+        // An <iframe src> loads as a real nested realm: its script runs, the element fires `load`,
+        // and cross-frame postMessage works both ways. The frame's script posts to parent on a
+        // message; the page posts to the frame and records the reply.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.createElement('iframe');
+                f.onload = function () { document.body.setAttribute('data-loaded', 'yes'); };
+                window.addEventListener('message', function (e) { document.body.setAttribute('data-reply', e.data); });
+                f.src = 'frame.html';
+                document.body.appendChild(f);
+                f.onload = function () {
+                  document.body.setAttribute('data-loaded', 'yes');
+                  f.contentWindow.postMessage('hi', '*');
+                };
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("frame.html") {
+                    let body = "<!doctype html><html><body><script>self.addEventListener('message', function (e) { parent.postMessage('echo:' + e.data, '*'); });<\\/script></body></html>";
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{body}"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(attr("data-loaded").as_deref(), Some("yes"), "iframe should fire load");
+        assert_eq!(attr("data-reply").as_deref(), Some("echo:hi"), "cross-frame postMessage round-trip");
+    }
 
     #[test]
     fn dedicated_worker_async_fetch_resolves() {
