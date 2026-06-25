@@ -966,14 +966,42 @@
       TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25
     };
     var DOMExceptionCtor = function (message, name) {
-      this.message = message === undefined ? "" : String(message);
-      this.name = name === undefined ? "Error" : String(name);
-      this.code = __domCodes[this.name] || 0;
-      try { this.stack = new Error(this.message).stack; } catch (e) {}
+      var nm = name === undefined ? "Error" : String(name);
+      // WebIDL: message/name/code are readonly attributes (prototype getters); the real values live
+      // in an internal slot, so reading them on a non-branded object (e.g. DOMException.prototype)
+      // throws — which `new URLSearchParams(DOMException.prototype)` relies on.
+      Object.defineProperty(this, "__dom", {
+        value: { message: message === undefined ? "" : String(message), name: nm, code: __domCodes[nm] || 0 },
+        configurable: true
+      });
+      try { this.stack = new Error(this.__dom.message).stack; } catch (e) {}
     };
     DOMExceptionCtor.prototype = Object.create(Error.prototype);
-    DOMExceptionCtor.prototype.constructor = DOMExceptionCtor;
-    DOMExceptionCtor.prototype.toString = function () { return this.name + ": " + this.message; };
+    Object.defineProperty(DOMExceptionCtor.prototype, "constructor", { value: DOMExceptionCtor, writable: true, configurable: true });
+    function __domAttr(attr) {
+      Object.defineProperty(DOMExceptionCtor.prototype, attr, {
+        get: function () { if (!this || !this.__dom) { throw new TypeError("Illegal invocation"); } return this.__dom[attr]; },
+        enumerable: true, configurable: true
+      });
+    }
+    __domAttr("message"); __domAttr("name"); __domAttr("code");
+    Object.defineProperty(DOMExceptionCtor.prototype, "toString", { value: function () { return this.name + ": " + this.message; }, writable: true, configurable: true });
+    // Legacy error-code constants, on both the interface object and its prototype, enumerable per
+    // WebIDL (so `new URLSearchParams(DOMException)` enumerates them).
+    var __domConsts = [
+      ["INDEX_SIZE_ERR", 1], ["DOMSTRING_SIZE_ERR", 2], ["HIERARCHY_REQUEST_ERR", 3],
+      ["WRONG_DOCUMENT_ERR", 4], ["INVALID_CHARACTER_ERR", 5], ["NO_DATA_ALLOWED_ERR", 6],
+      ["NO_MODIFICATION_ALLOWED_ERR", 7], ["NOT_FOUND_ERR", 8], ["NOT_SUPPORTED_ERR", 9],
+      ["INUSE_ATTRIBUTE_ERR", 10], ["INVALID_STATE_ERR", 11], ["SYNTAX_ERR", 12],
+      ["INVALID_MODIFICATION_ERR", 13], ["NAMESPACE_ERR", 14], ["INVALID_ACCESS_ERR", 15],
+      ["VALIDATION_ERR", 16], ["TYPE_MISMATCH_ERR", 17], ["SECURITY_ERR", 18], ["NETWORK_ERR", 19],
+      ["ABORT_ERR", 20], ["URL_MISMATCH_ERR", 21], ["QUOTA_EXCEEDED_ERR", 22], ["TIMEOUT_ERR", 23],
+      ["INVALID_NODE_TYPE_ERR", 24], ["DATA_CLONE_ERR", 25]
+    ];
+    __domConsts.forEach(function (kv) {
+      Object.defineProperty(DOMExceptionCtor, kv[0], { value: kv[1], enumerable: true, writable: false, configurable: false });
+      Object.defineProperty(DOMExceptionCtor.prototype, kv[0], { value: kv[1], enumerable: true, writable: false, configurable: false });
+    });
     // The constructor's own .name must be "DOMException" (it's inferred as the variable name
     // otherwise): testharness's assert_throws_dom checks `constructor.name === "DOMException"` to
     // detect the explicit-constructor overload, so a wrong name silently misroutes its arguments.
@@ -10223,8 +10251,9 @@
           if (a.length !== 2) { throw new TypeError("Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements"); }
           pairs.push([__uspUsv(a[0]), __uspUsv(a[1])]);
         }
-      } else if (typeof init === "object") {
-        // record<USVString, USVString>: own enumerable string keys, USVString-coerced. Duplicate
+      } else if (typeof init === "object" || typeof init === "function") {
+        // record<USVString, USVString>: own enumerable string keys, USVString-coerced (a callable
+        // object — e.g. the DOMException interface object — is a record too). Duplicate
         // coerced keys collapse (a later entry overwrites the value but keeps the first position).
         var keys = Object.keys(init);
         var rec = new Map();

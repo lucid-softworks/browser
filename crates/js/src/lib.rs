@@ -4678,6 +4678,48 @@ mod tests {
     }
 
     #[test]
+    fn dom_exception_webidl_constants_and_branding() {
+        // DOMException exposes the legacy code constants (enumerable, on the interface object) and
+        // reads message/name/code through branding-checked prototype getters.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                var e = new DOMException("m", "SyntaxError");
+                out.push(e.name === "SyntaxError" && e.code === 12 && e.message === "m");
+                out.push(DOMException.INDEX_SIZE_ERR === 1 && DOMException.DATA_CLONE_ERR === 25);
+                try { Object.getOwnPropertyDescriptor(DOMException.prototype, "code").get.call({}); out.push(false); }
+                catch (err) { out.push(err instanceof TypeError); }
+                out.push(new URLSearchParams(DOMException).toString().indexOf("INDEX_SIZE_ERR=1") === 0);
+                try { new URLSearchParams(DOMException.prototype); out.push(false); }
+                catch (err) { out.push(err instanceof TypeError); }
+                document.body.setAttribute('data-out', out.join(","));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(attr.as_deref(), Some("true,true,true,true,true"));
+    }
+
+    #[test]
     fn url_parse_file_drive_letter_pipe() {
         // An absolute file: URL's drive-letter `X|` normalizes to `X:`.
         let (doc, body) = doc_with_body("");
