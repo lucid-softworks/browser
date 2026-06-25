@@ -977,12 +977,16 @@ fn style_prop(style: &str, name: &str) -> Option<String> {
 }
 
 /// Resolve a paint value (`fill`/`stroke`): `none` → None paint; otherwise parse the color.
-fn resolve_paint(val: &str, inherited: Option<Color>) -> Option<Color> {
+fn resolve_paint(val: &str, inherited: Option<Color>, current: Option<Color>) -> Option<Color> {
     let v = val.trim();
     if v.eq_ignore_ascii_case("none") {
         return None;
     }
-    if v.eq_ignore_ascii_case("currentcolor") || v.eq_ignore_ascii_case("inherit") {
+    // `currentColor` resolves to the element's `color` property (not the inherited fill/stroke).
+    if v.eq_ignore_ascii_case("currentcolor") {
+        return current.or(inherited);
+    }
+    if v.eq_ignore_ascii_case("inherit") {
         return inherited;
     }
     // url(#...) gradients/patterns are unsupported → fall back to a mid-gray so the shape is visible.
@@ -1008,6 +1012,13 @@ fn apply_paint(
     mut st: PaintState,
 ) -> PaintState {
     let style = attr(el, "style").map(|s| s.to_string());
+    // SVG `currentColor` resolves to the element's CSS `color` property.
+    let current = cs.map(|c| Color {
+        r: c.color.0,
+        g: c.color.1,
+        b: c.color.2,
+        a: 255,
+    });
     if let Some(v) = prop(el, "fill", &style) {
         if let Some(id) = paint_url_id(&v) {
             // A `url(#id)` paint (gradient/pattern): remember the ref; keep a gray solid fallback in
@@ -1021,11 +1032,11 @@ fn apply_paint(
             });
         } else {
             st.fill_url = None;
-            st.fill = resolve_paint(&v, st.fill);
+            st.fill = resolve_paint(&v, st.fill, current);
         }
     }
     if let Some(v) = prop(el, "stroke", &style) {
-        st.stroke = resolve_paint(&v, st.stroke);
+        st.stroke = resolve_paint(&v, st.stroke, current);
     }
     if let Some(v) = prop(el, "stroke-width", &style) {
         if let Some(w) = parse_len(&v) {
