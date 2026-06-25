@@ -1635,6 +1635,165 @@ pub(crate) fn prim_title_text(
     rv.set(v);
 }
 
+/// Append `"key":"<escaped value>"` to a JSON object body, with a trailing comma.
+fn json_field(out: &mut String, key: &str, value: &str) {
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":");
+    json_escape_into(value, out);
+    out.push(',');
+}
+
+/// Append a JSON string literal (with surrounding quotes) for `s` to `out`.
+fn json_escape_into(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Serialize a parsed `url::Url` into the component record the JS `URL`/`parseURL` layer expects.
+fn url_to_record(u: &url::Url) -> String {
+    let hostname = u.host_str().unwrap_or("");
+    let port = u.port().map(|p| p.to_string()).unwrap_or_default();
+    let host = if port.is_empty() {
+        hostname.to_string()
+    } else {
+        format!("{hostname}:{port}")
+    };
+    let search = u.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let hash = u.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+    // WHATWG origin serialization ("null" for opaque/cannot-be-a-base origins).
+    let origin = u.origin().ascii_serialization();
+    let mut s = String::from("{");
+    json_field(&mut s, "href", u.as_str());
+    json_field(&mut s, "protocol", &format!("{}:", u.scheme()));
+    json_field(&mut s, "username", u.username());
+    json_field(&mut s, "password", u.password().unwrap_or(""));
+    json_field(&mut s, "host", &host);
+    json_field(&mut s, "hostname", hostname);
+    json_field(&mut s, "port", &port);
+    json_field(&mut s, "pathname", u.path());
+    json_field(&mut s, "search", &search);
+    json_field(&mut s, "hash", &hash);
+    json_field(&mut s, "origin", &origin);
+    s.push_str(&format!("\"opaque\":{}", u.cannot_be_a_base()));
+    s.push('}');
+    s
+}
+
+/// `__urlParse(input, base|null) -> recordJSON | null`. WHATWG URL parsing via the `url` crate: the
+/// authoritative, spec-compliant parser (vs. the hand-written JS one). Returns the component record
+/// as JSON, or null on a parse failure (the JS `URL` constructor then throws).
+pub(crate) fn prim_url_parse(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let input = arg_str(scope, &args, 0);
+    let base_arg = args.get(1);
+    let parsed = if base_arg.is_string() {
+        let base = base_arg.to_rust_string_lossy(scope);
+        match url::Url::parse(&base) {
+            Ok(b) => b.join(&input),
+            Err(e) => Err(e),
+        }
+    } else {
+        url::Url::parse(&input)
+    };
+    match parsed {
+        Ok(u) => {
+            let rec = url_to_record(&u);
+            let v = js_str(scope, &rec);
+            rv.set(v);
+        }
+        Err(_) => rv.set_null(),
+    }
+}
+
+/// `__urlSet(href, prop, value) -> recordJSON | null`. Apply a WHATWG URL setter (protocol/username/
+/// password/host/hostname/port/pathname/search/hash) to an already-valid `href` and reserialize.
+/// Returns the updated record, or null if `href` itself doesn't parse. Invalid setter values are
+/// ignored (no-op) exactly as the URL setters specify.
+pub(crate) fn prim_url_set(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let href = arg_str(scope, &args, 0);
+    let prop = arg_str(scope, &args, 1);
+    let value = arg_str(scope, &args, 2);
+    let mut u = match url::Url::parse(&href) {
+        Ok(u) => u,
+        Err(_) => {
+            rv.set_null();
+            return;
+        }
+    };
+    match prop.as_str() {
+        "protocol" => {
+            let scheme = value.trim_end_matches(':');
+            let _ = u.set_scheme(scheme);
+        }
+        "username" => {
+            let _ = u.set_username(&value);
+        }
+        "password" => {
+            let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
+        }
+        "hostname" => {
+            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+        }
+        "host" => {
+            // host = hostname[:port]; let the parser handle both by splitting once.
+            let (h, p) = match value.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (value.as_str(), None),
+            };
+            if u.set_host(if h.is_empty() { None } else { Some(h) }).is_ok() {
+                if let Some(p) = p {
+                    let _ = u.set_port(p.parse::<u16>().ok());
+                }
+            }
+        }
+        "port" => {
+            let _ = u.set_port(value.parse::<u16>().ok());
+        }
+        "pathname" => u.set_path(&value),
+        "search" => {
+            let q = value.strip_prefix('?').unwrap_or(&value);
+            u.set_query(if q.is_empty() { None } else { Some(q) });
+        }
+        "hash" => {
+            let f = value.strip_prefix('#').unwrap_or(&value);
+            u.set_fragment(if f.is_empty() { None } else { Some(f) });
+        }
+        "href" => {
+            // href setter reparses from scratch; failure throws (signalled by null).
+            match url::Url::parse(&value) {
+                Ok(nu) => u = nu,
+                Err(_) => {
+                    rv.set_null();
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+    let rec = url_to_record(&u);
+    let v = js_str(scope, &rec);
+    rv.set(v);
+}
+
 /// `__fetch(url) -> string | null`
 ///
 /// Synchronous network primitive backing JS `fetch()`. Resolves `url` against `globalThis.__pageURL`
@@ -2062,6 +2221,8 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__headId", prim_head_id);
     set_fn(scope, global, "__rootId", prim_root_id);
     set_fn(scope, global, "__titleText", prim_title_text);
+    set_fn(scope, global, "__urlParse", prim_url_parse);
+    set_fn(scope, global, "__urlSet", prim_url_set);
     set_fn(scope, global, "__fetch", prim_fetch);
     set_fn(scope, global, "__request", prim_request);
     set_fn(scope, global, "__startFetch", prim_start_fetch);

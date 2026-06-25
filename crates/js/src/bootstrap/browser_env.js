@@ -175,11 +175,14 @@
     return out;
   }
 
+  var __invalidURLRecord = { href: "", protocol: "", host: "", hostname: "", port: "", pathname: "", search: "", hash: "", origin: "null", username: "", password: "", __invalid: true };
+  // Parse in Rust via the `url` crate (the authoritative WHATWG implementation). `base` may be a
+  // string or an already-parsed record (use its href). A null native result is a parse failure.
   function parseURL(input, base) {
-    if (base != null && typeof base === "string") { base = parseURLRecord(base, null); }
-    var r = parseURLRecord(input, base || null);
-    if (!r) { return { href: "", protocol: "", host: "", hostname: "", port: "", pathname: "", search: "", hash: "", origin: "null", username: "", password: "", __invalid: true }; }
-    return serializeURLRecord(r);
+    var baseStr = (base == null) ? null : (typeof base === "string" ? base : (base.href || null));
+    var json = __urlParse(String(input == null ? "" : input), baseStr);
+    if (json == null) { return __invalidURLRecord; }
+    try { var rec = JSON.parse(json); rec.__invalid = false; return rec; } catch (e) { return __invalidURLRecord; }
   }
 
   function parseURLRecord(input, base) {
@@ -371,18 +374,8 @@
     __syncLocation(p);
   }
   function __setLocationUrlPart(prop, v) {
-    var p = parseURL(locationState.href || parts.href);
-    var rec = p && p.__rec;
-    if (!rec) { return; }
-    v = String(v);
-    if (prop === "hash") {
-      if (v.charAt(0) === "#") { v = v.slice(1); }
-      rec.fragment = urlPctEncode(v, urlFragSet);
-    } else if (prop === "search") {
-      if (v.charAt(0) === "?") { v = v.slice(1); }
-      rec.query = urlPctEncode(v, urlQuerySet);
-    }
-    __syncLocation(serializeURLRecord(rec));
+    var json = __urlSet(locationState.href || parts.href, prop, String(v));
+    if (json != null) { try { __syncLocation(JSON.parse(json)); } catch (e) {} }
   }
   var location = {
     assign: function (url) { __setLocationHref(url); },
@@ -415,13 +408,8 @@
     Object.defineProperty(childLoc, "hash", {
       get: function () { return childState.hash; },
       set: function (v) {
-        var p = parseURL(childState.href || "about:blank");
-        var rec = p && p.__rec;
-        if (!rec) { return; }
-        v = String(v);
-        if (v.charAt(0) === "#") { v = v.slice(1); }
-        rec.fragment = urlPctEncode(v, urlFragSet);
-        childSync(serializeURLRecord(rec));
+        var json = __urlSet(childState.href || "about:blank", "hash", String(v));
+        if (json != null) { try { childSync(JSON.parse(json)); } catch (e) {} }
       },
       enumerable: true, configurable: true
     });
@@ -5194,6 +5182,9 @@
             var resolved = (raw == null) ? "" : __resolveURL(raw);
             return parseURL(resolved);
           };
+          // All hyperlink URL-decomposition setters run the WHATWG URL setter in Rust (__urlSet) on
+          // the element's current resolved href and store the reserialized result. `origin` is
+          // read-only; an invalid value is a no-op.
           var __defUrlPart = function (prop, field) {
             var d = null;
             try { d = Object.getOwnPropertyDescriptor(el, prop); } catch (eU2) {}
@@ -5201,17 +5192,11 @@
             Object.defineProperty(el, prop, {
               get: function () { return __hrefParts()[field]; },
               set: function (v) {
-                // Setters: replace the component, then store the reserialized URL.
-                var p = __hrefParts();
-                v = String(v);
-                var HASH = String.fromCharCode(35), QUES = String.fromCharCode(63);
-                if (prop === "protocol") { p.protocol = v.replace(/:*$/, "") + ":"; }
-                else if (prop === "hash") { p.hash = v && v.charAt(0) !== HASH ? HASH + v : v; }
-                else if (prop === "search") { p.search = v && v.charAt(0) !== QUES ? QUES + v : v; }
-                else { p[field] = v; }
-                var host = p.host || ((p.hostname || "") + (p.port ? ":" + p.port : ""));
-                var s = p.protocol + (host || p.hostname ? "//" + host : "") + (p.pathname || "") + (p.search || "") + (p.hash || "");
-                __setAttr(node, "href", s);
+                if (prop === "origin") { return; }
+                var href = __hrefParts().href;
+                if (!href) { return; }
+                var json = __urlSet(href, prop, String(v));
+                if (json != null) { try { __setAttr(node, "href", JSON.parse(json).href); } catch (e) {} }
               },
               configurable: true, enumerable: true
             });
@@ -5223,10 +5208,10 @@
             Object.defineProperty(el, prop, {
               get: function () { return __hrefParts()[prop]; },
               set: function (v) {
-                var rec = __hrefParts().__rec;
-                if (!rec || rec.host == null || rec.host === "" || rec.scheme === "file") { return; }
-                rec[prop] = urlPctEncode(String(v), urlUserSet);
-                __setAttr(node, "href", serializeURLRecord(rec).href);
+                var href = __hrefParts().href;
+                if (!href) { return; }
+                var json = __urlSet(href, prop, String(v));
+                if (json != null) { try { __setAttr(node, "href", JSON.parse(json).href); } catch (e) {} }
               },
               configurable: true, enumerable: true
             });
@@ -10195,40 +10180,38 @@
       if (p.__invalid) {
         throw new TypeError("Failed to construct 'URL': Invalid URL");
       }
-      this.href = p.href; this.protocol = p.protocol; this.host = p.host; this.hostname = p.hostname;
-      this.port = p.port; this.pathname = p.pathname; this.hash = p.hash; this.origin = p.origin;
-      this.username = p.username || ""; this.password = p.password || "";
       var self = this;
-      var _search = p.search;
-      // Splice the current query into href, preserving everything before `?` and the fragment.
-      function __syncHref() {
-        var h = self.href;
-        var hi = h.indexOf("#");
-        var frag = hi >= 0 ? h.slice(hi) : (self.hash || "");
-        var qi = h.indexOf("?");
-        var head = qi >= 0 ? h.slice(0, qi) : (hi >= 0 ? h.slice(0, hi) : h);
-        self.href = head + _search + frag;
+      var sp = new globalThis.URLSearchParams(p.search);
+      Object.defineProperty(this, "searchParams", { value: sp, enumerable: true, configurable: true });
+      // Apply a fresh parsed record (after a setter) and re-sync searchParams from the new query.
+      function applyRec(r) { p = r; sp.__setFromQuery(p.search); }
+      // Each WHATWG URL attribute is live: the setter runs the spec setter in Rust (__urlSet) on the
+      // current href and adopts the reserialized record; an invalid value is a no-op (per spec),
+      // except href which throws.
+      function defAttr(name) {
+        Object.defineProperty(self, name, {
+          get: function () { return p[name]; },
+          set: function (v) {
+            var json = __urlSet(p.href, name, String(v));
+            if (json == null) {
+              if (name === "href") { throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); }
+              return;
+            }
+            try { applyRec(JSON.parse(json)); } catch (e) {}
+          },
+          enumerable: true, configurable: true
+        });
       }
-      // `search` is live: setting it reparses into searchParams and rewrites href; a lone "?" or ""
-      // clears the query.
-      Object.defineProperty(this, "search", {
-        get: function () { return _search; },
-        set: function (v) {
-          v = String(v);
-          if (v.charAt(0) === "?") { v = v.slice(1); }
-          _search = v ? ("?" + v) : "";
-          self.searchParams.__setFromQuery(v);
-          __syncHref();
-        },
-        enumerable: true, configurable: true
-      });
-      this.searchParams = new globalThis.URLSearchParams(p.search);
-      this.toString = function () { return this.href; }; this.toJSON = function () { return this.href; };
-      // Keep href/search in sync when searchParams is mutated (append/set/delete/sort/…).
-      this.searchParams.__onChange = function () {
-        var q = self.searchParams.toString();
-        _search = q ? ("?" + q) : "";
-        __syncHref();
+      ["href", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"].forEach(defAttr);
+      // origin is read-only.
+      Object.defineProperty(this, "origin", { get: function () { return p.origin; }, enumerable: true, configurable: true });
+      this.toString = function () { return p.href; };
+      this.toJSON = function () { return p.href; };
+      // Keep the URL in sync when searchParams is mutated (append/set/delete/sort/…): reserialize the
+      // query through __urlSet and adopt the new record (without re-syncing searchParams from it).
+      sp.__onChange = function () {
+        var json = __urlSet(p.href, "search", sp.toString());
+        if (json != null) { try { p = JSON.parse(json); } catch (e) {} }
       };
     });
     // Static parsers (WHATWG URL): canParse(url[, base]) -> boolean; parse(url[, base]) -> URL|null.
