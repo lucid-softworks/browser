@@ -4678,6 +4678,51 @@ mod tests {
     }
 
     #[test]
+    fn window_open_throws_on_invalid_url() {
+        // window.open() with an unparseable URL throws a SyntaxError DOMException; a valid URL
+        // returns a window.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var bad = '';
+                try { self.open('file://example:1/'); } catch (e) { bad = e.name; }
+                document.body.setAttribute('data-bad', bad);
+                document.body.setAttribute('data-good', String(self.open('https://ok.example/') != null));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-bad").as_deref(),
+            Some("SyntaxError"),
+            "invalid URL throws SyntaxError"
+        );
+        assert_eq!(
+            attr("data-good").as_deref(),
+            Some("true"),
+            "valid URL returns a window"
+        );
+    }
+
+    #[test]
     fn urlsearchparams_usvstring_record_init() {
         // Object init builds a record<USVString,USVString>: lone surrogates -> U+FFFD, and coerced
         // keys collapse (later value wins, first position kept).

@@ -429,7 +429,14 @@
     childSync(parseURL(url == null ? "about:blank" : String(url), location.href));
     return { location: childLoc, document: childDoc, close: fn, closed: false };
   }
-  globalThis.open = function (url) { return __makeDetachedWindow(url); };
+  globalThis.open = function (url) {
+    // window.open() parses the URL against the entry document's base; an invalid URL is a
+    // SyntaxError (matching other browsers / the URL standard).
+    if (url !== undefined && url !== null && String(url) !== "" && parseURL(String(url), location.href).__invalid) {
+      throw new globalThis.DOMException("Failed to execute 'open' on 'Window': Unable to open a window with invalid URL '" + String(url) + "'.", "SyntaxError");
+    }
+    return __makeDetachedWindow(url);
+  };
   if (typeof document !== "undefined") {
     document.open = function (url) {
       if (arguments.length) { return __makeDetachedWindow(url); }
