@@ -1670,8 +1670,18 @@ fn url_to_record(u: &url::Url) -> String {
     } else {
         format!("{hostname}:{port}")
     };
-    let search = u.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let hash = u.fragment().map(|f| format!("#{f}")).unwrap_or_default();
+    // The `search`/`hash` getters are "" for an absent OR empty component (only a non-empty query/
+    // fragment serializes with its leading `?`/`#`).
+    let search = u
+        .query()
+        .filter(|q| !q.is_empty())
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let hash = u
+        .fragment()
+        .filter(|f| !f.is_empty())
+        .map(|f| format!("#{f}"))
+        .unwrap_or_default();
     // WHATWG origin serialization ("null" for opaque/cannot-be-a-base origins).
     let origin = u.origin().ascii_serialization();
     let mut s = String::from("{");
@@ -1731,7 +1741,11 @@ pub(crate) fn prim_url_set(
 ) {
     let href = arg_str(scope, &args, 0);
     let prop = arg_str(scope, &args, 1);
-    let value = arg_str(scope, &args, 2);
+    // WHATWG: every URL setter removes ASCII tab (0x09) and newlines (0x0A/0x0D) from the value.
+    let value: String = arg_str(scope, &args, 2)
+        .chars()
+        .filter(|&c| c != '\t' && c != '\n' && c != '\r')
+        .collect();
     let mut u = match url::Url::parse(&href) {
         Ok(u) => u,
         Err(_) => {
@@ -1766,7 +1780,12 @@ pub(crate) fn prim_url_set(
             }
         }
         "port" => {
-            let _ = u.set_port(value.parse::<u16>().ok());
+            if value.is_empty() {
+                let _ = u.set_port(None);
+            } else if let Ok(p) = value.parse::<u16>() {
+                // A valid port sets it; an invalid value is a no-op (per spec), not a clear.
+                let _ = u.set_port(Some(p));
+            }
         }
         "pathname" => u.set_path(&value),
         "search" => {
@@ -1791,6 +1810,39 @@ pub(crate) fn prim_url_set(
     }
     let rec = url_to_record(&u);
     let v = js_str(scope, &rec);
+    rv.set(v);
+}
+
+/// `__formDecode(s) -> string`. application/x-www-form-urlencoded decode: `+` -> space, percent-decode
+/// each valid `%XX`, then UTF-8 decode with replacement (invalid byte sequences -> U+FFFD). Done in
+/// Rust so invalid UTF-8 (e.g. `%FE%FF`) yields replacement characters, matching the URL standard.
+pub(crate) fn prim_form_decode(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let s = arg_str(scope, &args, 0);
+    let b = s.as_bytes();
+    let mut bytes: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'+' {
+            bytes.push(b' ');
+            i += 1;
+        } else if b[i] == b'%'
+            && i + 2 < b.len()
+            && b[i + 1].is_ascii_hexdigit()
+            && b[i + 2].is_ascii_hexdigit()
+        {
+            bytes.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(0));
+            i += 3;
+        } else {
+            bytes.push(b[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8_lossy(&bytes);
+    let v = js_str(scope, &decoded);
     rv.set(v);
 }
 
@@ -2223,6 +2275,7 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__titleText", prim_title_text);
     set_fn(scope, global, "__urlParse", prim_url_parse);
     set_fn(scope, global, "__urlSet", prim_url_set);
+    set_fn(scope, global, "__formDecode", prim_form_decode);
     set_fn(scope, global, "__fetch", prim_fetch);
     set_fn(scope, global, "__request", prim_request);
     set_fn(scope, global, "__startFetch", prim_start_fetch);

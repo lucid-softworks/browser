@@ -10108,15 +10108,9 @@
       .replace(/%20/g, "+")
       .replace(/[!'()~]/g, function (c) { return "%" + c.charCodeAt(0).toString(16).toUpperCase(); });
   }
-  function __formDecode(s) {
-    // application/x-www-form-urlencoded decode: `+` -> space, then percent-decode each VALID `%XX`
-    // run (leaving an invalid `%` literal — decodeURIComponent is all-or-nothing, the URL standard
-    // decodes per-escape). Runs are decoded together so multi-byte UTF-8 sequences round-trip.
-    s = String(s).replace(/\+/g, " ");
-    return s.replace(/(?:%[0-9A-Fa-f]{2})+/g, function (m) {
-      try { return decodeURIComponent(m); } catch (e) { return m; }
-    });
-  }
+  // application/x-www-form-urlencoded decode in Rust (handles invalid UTF-8 -> U+FFFD per spec).
+  // (`globalThis.__formDecode` is the native; this IIFE-local wrapper just coerces to string.)
+  function __formDecode(s) { return globalThis.__formDecode(String(s)); }
   if (typeof globalThis.URLSearchParams !== "function") {
     def(globalThis, "URLSearchParams", function (init) {
       var pairs = [];
@@ -11147,7 +11141,18 @@
   def(globalThis, "XMLHttpRequest", function () {
     this.readyState = 0; this.status = 0; this.responseText = ""; this.response = "";
     this.onreadystatechange = null; this.onload = null; this.onerror = null;
-    this.open = fn; this.send = fn; this.setRequestHeader = fn; this.abort = fn;
+    // open() validates the URL (resolved against the document base) and throws a SyntaxError for an
+    // invalid one, per the spec. The rest of XHR is inert (no real request is issued).
+    this.open = function (method, url) {
+      if (arguments.length >= 2) {
+        var base; try { base = globalThis.location && globalThis.location.href; } catch (e) {}
+        if (parseURL(String(url), base || null).__invalid) {
+          throw new globalThis.DOMException("Failed to execute 'open' on 'XMLHttpRequest': Invalid URL", "SyntaxError");
+        }
+      }
+      this.readyState = 1;
+    };
+    this.send = fn; this.setRequestHeader = fn; this.abort = fn;
     this.getResponseHeader = function () { return null; }; this.getAllResponseHeaders = function () { return ""; };
     this.addEventListener = fn; this.removeEventListener = fn;
   });
