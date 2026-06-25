@@ -338,9 +338,30 @@ pub(crate) fn parse_named_color(lower: &str) -> Option<(u8, u8, u8)> {
         "olive" => (128, 128, 0),
         "pink" => (255, 192, 203),
         "brown" => (165, 42, 42),
-        _ => return None,
+        _ => return system_color(lower),
     };
     Some(named)
+}
+
+/// CSS system colors (a light-theme palette). These are most relevant in forced colors mode; the
+/// exact values only need to be self-consistent so a property forced to `CanvasText` renders the
+/// same as an element that names `CanvasText` directly.
+pub(crate) fn system_color(lower: &str) -> Option<(u8, u8, u8)> {
+    Some(match lower {
+        "canvas" | "window" | "buttonface" | "field" | "infobackground" => (255, 255, 255),
+        "canvastext" | "windowtext" | "buttontext" | "fieldtext" | "infotext" | "menutext"
+        | "captiontext" => (0, 0, 0),
+        "graytext" => (128, 128, 128),
+        "linktext" => (0, 0, 238),
+        "visitedtext" => (85, 26, 139),
+        "activetext" => (255, 0, 0),
+        "highlight" | "selecteditem" | "accentcolor" => (0, 120, 215),
+        "highlighttext" | "selecteditemtext" | "accentcolortext" => (255, 255, 255),
+        "buttonborder" | "threedface" | "buttonshadow" => (128, 128, 128),
+        "mark" => (255, 255, 0),
+        "marktext" => (0, 0, 0),
+        _ => return None,
+    })
 }
 
 pub(crate) fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {

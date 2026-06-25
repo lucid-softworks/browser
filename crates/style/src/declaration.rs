@@ -418,6 +418,15 @@ pub(crate) fn apply_declaration(
         other => other,
     };
     match prop {
+        "forced-color-adjust" => {
+            // `none`/`preserve-parent-color` opt out of the forced-colors override; `auto` opts in.
+            match val.trim().to_ascii_lowercase().as_str() {
+                "none" | "preserve-parent-color" => style.forced_color_adjust_off = true,
+                "auto" => style.forced_color_adjust_off = false,
+                "inherit" => style.forced_color_adjust_off = parent.forced_color_adjust_off,
+                _ => {}
+            }
+        }
         "color" => {
             let trimmed = val.trim().to_ascii_lowercase();
             if trimmed == "inherit" {
