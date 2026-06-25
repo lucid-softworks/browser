@@ -80,6 +80,38 @@ pub fn set_active_selection(sel: Option<(usize, u32, usize, u32)>) {
     *ACTIVE_SELECTION.lock().unwrap_or_else(|e| e.into_inner()) = sel;
 }
 
+/// CSS Custom Highlight API registrations: node id → highlight name, for every node covered by a
+/// registered `Highlight`'s ranges (`CSS.highlights.set(name, …)`). The engine reads this each render
+/// to paint `::highlight(name)` pseudos. Rebuilt by the JS worker whenever the registry/ranges change
+/// (`__clearHighlights` then `__addHighlight` per node).
+pub(crate) static ACTIVE_HIGHLIGHTS: std::sync::Mutex<Vec<(usize, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Clear all Custom Highlight registrations (engine also resets on navigation).
+pub fn clear_active_highlights() {
+    ACTIVE_HIGHLIGHTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// Register that `node` is covered by the highlight named `name`.
+pub(crate) fn add_active_highlight(node: usize, name: String) {
+    ACTIVE_HIGHLIGHTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((node, name));
+}
+
+/// The Custom Highlight registrations `(node id, highlight name)`, for the engine's `::highlight`
+/// paint.
+pub fn active_highlights() -> Vec<(usize, String)> {
+    ACTIVE_HIGHLIGHTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// The active programmatic selection committed by page JS, for the engine's `::selection` paint.
 pub fn active_selection() -> Option<(usize, u32, usize, u32)> {
     *ACTIVE_SELECTION.lock().unwrap_or_else(|e| e.into_inner())

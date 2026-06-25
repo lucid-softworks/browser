@@ -10636,6 +10636,70 @@
     def(globalThis, "CSS", CSSns);
   }
 
+  // CSS Custom Highlight API: a Highlight is a setlike of Ranges; CSS.highlights is a maplike registry
+  // of named highlights. Whenever the registry or any highlight's ranges change we recompute the set
+  // of covered nodes and push them to the engine, which paints the matching ::highlight(name) pseudo.
+  (function () {
+    function Highlight() {
+      this._ranges = [];
+      for (var i = 0; i < arguments.length; i++) { this._ranges.push(arguments[i]); }
+      this.priority = 0;
+      this.type = "highlight";
+    }
+    Highlight.prototype.add = function (r) { if (this._ranges.indexOf(r) < 0) { this._ranges.push(r); } __syncHighlights(); return this; };
+    Highlight.prototype.delete = function (r) { var i = this._ranges.indexOf(r); if (i >= 0) { this._ranges.splice(i, 1); } __syncHighlights(); return i >= 0; };
+    Highlight.prototype.has = function (r) { return this._ranges.indexOf(r) >= 0; };
+    Highlight.prototype.clear = function () { this._ranges = []; __syncHighlights(); };
+    Highlight.prototype.forEach = function (cb, t) { var self = this; this._ranges.forEach(function (r) { cb.call(t, r, r, self); }); };
+    Object.defineProperty(Highlight.prototype, "size", { get: function () { return this._ranges.length; }, configurable: true });
+    try { Highlight.prototype[Symbol.iterator] = function () { return this._ranges[Symbol.iterator](); }; } catch (e) {}
+    def(globalThis, "Highlight", Highlight);
+
+    var __registry = new Map();
+    // Node ids covered by a range. Element-offset ranges (the common `setStart(el,0)/setEnd(el,n)`
+    // form) cover childNodes[start..end] inclusive of descendants; a text-offset range covers its
+    // text node. Cross-container ranges are approximated by their two endpoints' subtrees.
+    function __highlightNodes(r) {
+      var out = [];
+      try {
+        var sc = r._sc, so = r._so | 0, ec = r._ec, eo = r._eo | 0;
+        function pushAll(n) { if (!n) { return; } out.push(__idOf(n)); var ch = n.childNodes; if (ch) { for (var i = 0; i < ch.length; i++) { pushAll(ch[i]); } } }
+        if (sc === ec) {
+          if (sc.nodeType === 1) { var ch = sc.childNodes; for (var i = so; i < eo && i < ch.length; i++) { pushAll(ch[i]); } }
+          else { out.push(__idOf(sc)); }
+        } else { pushAll(sc); pushAll(ec); }
+      } catch (e) {}
+      return out;
+    }
+    function __syncHighlights() {
+      try {
+        globalThis.__clearHighlights();
+        __registry.forEach(function (hl, name) {
+          if (!hl || !hl._ranges) { return; }
+          hl._ranges.forEach(function (r) {
+            __highlightNodes(r).forEach(function (id) { if (id >= 0) { globalThis.__addHighlight(String(name), id); } });
+          });
+        });
+      } catch (e) {}
+    }
+    globalThis.__syncHighlights = __syncHighlights;
+
+    var highlights = {
+      set: function (name, hl) { __registry.set(String(name), hl); __syncHighlights(); return this; },
+      get: function (name) { return __registry.get(String(name)); },
+      has: function (name) { return __registry.has(String(name)); },
+      delete: function (name) { var r = __registry.delete(String(name)); __syncHighlights(); return r; },
+      clear: function () { __registry.clear(); __syncHighlights(); },
+      forEach: function (cb, t) { __registry.forEach(function (v, k) { cb.call(t, v, k, highlights); }); },
+      keys: function () { return __registry.keys(); },
+      values: function () { return __registry.values(); },
+      entries: function () { return __registry.entries(); }
+    };
+    Object.defineProperty(highlights, "size", { get: function () { return __registry.size; }, configurable: true });
+    try { highlights[Symbol.iterator] = function () { return __registry.entries(); }; } catch (e) {}
+    try { globalThis.CSS.highlights = highlights; } catch (e) {}
+  })();
+
   // NodeFilter constants (used with createTreeWalker / createNodeIterator below).
   if (typeof globalThis.NodeFilter === "undefined") {
     def(globalThis, "NodeFilter", {

@@ -132,6 +132,7 @@ impl Engine {
         self.session = None; // drop the previous page's runtime (stops its thread)
         self.selection = None; // a new page starts with nothing selected
         js::set_active_selection(None); // and no programmatic (::selection) selection
+        js::clear_active_highlights(); // and no CSS Custom Highlight registrations
         self.inspect_node = None; // and nothing highlighted in the Elements inspector
         self.favicon = None; // and no site icon until this page's loads
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
@@ -942,28 +943,46 @@ impl Engine {
                         // A programmatic `getSelection()` selection (committed by page JS) takes
                         // precedence and carries per-element `::selection` colors; otherwise the
                         // mouse-drag selection paints the default highlight.
-                        let (sel_ranges, sel_styles) = match js::active_selection() {
-                            Some((sn, so, en, eo)) => {
-                                let runs = collect_text_runs(&cache.root);
-                                let ranges = js_selection_ranges(&runs, sn, so, en, eo);
-                                let styles = selection_styles(
-                                    &runs,
-                                    &ranges,
-                                    doc,
-                                    &cache.styles,
-                                    &cache.sheets,
-                                );
-                                (ranges, styles)
-                            }
-                            None if self.selection.is_some() => {
-                                let runs = collect_text_runs(&cache.root);
-                                (
-                                    self.selection_ranges(&runs),
-                                    std::collections::HashMap::new(),
-                                )
-                            }
-                            None => (Vec::new(), std::collections::HashMap::new()),
+                        let active_sel = js::active_selection();
+                        let highlights = js::active_highlights();
+                        let (mut sel_ranges, mut sel_styles) = if let Some((sn, so, en, eo)) =
+                            active_sel
+                        {
+                            let runs = collect_text_runs(&cache.root);
+                            let ranges = js_selection_ranges(&runs, sn, so, en, eo);
+                            let styles =
+                                selection_styles(&runs, &ranges, doc, &cache.styles, &cache.sheets);
+                            (ranges, styles)
+                        } else if self.selection.is_some() {
+                            let runs = collect_text_runs(&cache.root);
+                            (
+                                self.selection_ranges(&runs),
+                                std::collections::HashMap::new(),
+                            )
+                        } else {
+                            (Vec::new(), std::collections::HashMap::new())
                         };
+                        // CSS Custom Highlight API: each registered `::highlight(name)` paints its
+                        // highlighted runs on top of any selection (later-registered wins on overlap).
+                        if !highlights.is_empty() {
+                            let runs = collect_text_runs(&cache.root);
+                            let (hr, hs) = highlight_styles(
+                                &runs,
+                                &highlights,
+                                doc,
+                                &cache.styles,
+                                &cache.sheets,
+                            );
+                            if sel_ranges.len() < hr.len() {
+                                sel_ranges.resize(hr.len(), None);
+                            }
+                            for (i, r) in hr.into_iter().enumerate() {
+                                if r.is_some() {
+                                    sel_ranges[i] = r;
+                                }
+                            }
+                            sel_styles.extend(hs);
+                        }
                         let mut run_idx = 0usize;
                         // Forced-colors backplate pre-pass: paint every line's Canvas backplate
                         // BEFORE any glyphs, so adjacent inline fragments on one line don't overwrite
@@ -1159,7 +1178,46 @@ impl Engine {
 }
 
 /// `::selection` background/text color for a selected run's element.
-type SelStyle = (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>);
+use crate::painter::SelStyle;
+
+/// Resolve a highlight pseudo's (`::selection` / `::highlight(name)`) painted colors for an
+/// originating element: its background, text, and (if it underlines) decoration colors. Forced
+/// colors map the highlight to Highlight/HighlightText unless the ORIGINATING element opted out with
+/// `forced-color-adjust: none` (the pseudo's own value is ignored, per css-pseudo-4 — a highlight
+/// follows its originating element). Returns `None` if the pseudo has no style.
+fn resolve_highlight_style(
+    d: &dom::Document,
+    sheets: &[css::Stylesheet],
+    el_id: dom::NodeId,
+    el: &style::ComputedStyle,
+    pseudo_key: &str,
+) -> Option<SelStyle> {
+    let ps = style::compute_pseudo_style(d, sheets, el_id, el, pseudo_key)?;
+    let (mut bg, mut fg) = (ps.background_color, Some(ps.color));
+    if style::forced_colors_active() && !el.forced_color_adjust_off {
+        bg = style::system_color("highlight");
+        fg = style::system_color("highlighttext");
+    }
+    // The painter draws text-decoration lines in the text color (it doesn't honor a separate
+    // text-decoration-color), so the highlight's underline takes the resolved text color too — this
+    // keeps it consistent with how the WPT refs (a styled inline span) render their own underline.
+    let underline = if ps.underline { fg } else { None };
+    Some((bg, fg, underline))
+}
+
+/// Resolve the element a text run belongs to: a run's node is the text node, but highlight pseudos
+/// cascade on its nearest ancestor element (the one with a computed style).
+fn run_element(
+    d: &dom::Document,
+    styles: &std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
+    node: dom::NodeId,
+) -> Option<dom::NodeId> {
+    let mut el = node;
+    while !styles.contains_key(&el) {
+        el = d.get(el).parent?;
+    }
+    Some(el)
+}
 
 /// Map a programmatic selection's element boundaries `(startEl, startOff, endEl, endOff)` to a
 /// per-run selected char range in DFS run order — the same shape `Engine::selection_ranges`
@@ -1217,30 +1275,62 @@ fn selection_styles(
             continue;
         }
         let Some(node) = r.node else { continue };
-        // A text run's node is the text node; `::selection` cascades on its element. Resolve the
-        // nearest ancestor that has a computed style (the originating element).
-        let mut el_id = node;
-        while !styles.contains_key(&el_id) {
-            match d.get(el_id).parent {
-                Some(p) => el_id = p,
-                None => break,
-            }
+        if out.contains_key(&node) {
+            continue;
         }
+        let Some(el_id) = run_element(d, styles, node) else {
+            continue;
+        };
+        let Some(el) = styles.get(&el_id) else {
+            continue;
+        };
+        if let Some(st) = resolve_highlight_style(d, sheets, el_id, el, "selection") {
+            out.insert(node, st);
+        }
+    }
+    out
+}
+
+/// Resolve the Custom Highlight registrations (node id → highlight name) into per-run selected
+/// ranges (each fully highlighted) and the resolved `::highlight(name)` colors per element.
+fn highlight_styles(
+    runs: &[TextRun],
+    highlights: &[(usize, String)],
+    doc: &Option<dom::Document>,
+    styles: &std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
+    sheets: &[css::Stylesheet],
+) -> (
+    Vec<Option<(usize, usize)>>,
+    std::collections::HashMap<dom::NodeId, SelStyle>,
+) {
+    let mut ranges = vec![None; runs.len()];
+    let mut out = std::collections::HashMap::new();
+    let Some(d) = doc else {
+        return (ranges, out);
+    };
+    for (i, r) in runs.iter().enumerate() {
+        let Some(node) = r.node else { continue };
+        // The run is highlighted if its text node (or its element) is in any highlight's node set.
+        let Some(el_id) = run_element(d, styles, node) else {
+            continue;
+        };
+        let Some((_, name)) = highlights
+            .iter()
+            .find(|(id, _)| *id == node.0 || *id == el_id.0)
+        else {
+            continue;
+        };
+        ranges[i] = Some((0, runs[i].text.chars().count()));
         if out.contains_key(&node) {
             continue;
         }
         let Some(el) = styles.get(&el_id) else {
             continue;
         };
-        let Some(ps) = style::compute_pseudo_style(d, sheets, el_id, el, "selection") else {
-            continue;
-        };
-        let (mut bg, mut fg) = (ps.background_color, Some(ps.color));
-        if style::forced_colors_active() && !el.forced_color_adjust_off {
-            bg = style::system_color("highlight");
-            fg = style::system_color("highlighttext");
+        let key = format!("highlight({name})");
+        if let Some(st) = resolve_highlight_style(d, sheets, el_id, el, &key) {
+            out.insert(node, st);
         }
-        out.insert(node, (bg, fg));
     }
-    out
+    (ranges, out)
 }

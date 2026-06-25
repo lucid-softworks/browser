@@ -2053,6 +2053,32 @@ pub(crate) fn prim_commit_selection(
     crate::eval_loop::set_active_selection(sel);
 }
 
+/// `__clearHighlights()` — drop all CSS Custom Highlight registrations (the JS worker rebuilds them
+/// from scratch on every `CSS.highlights`/`Highlight` change).
+pub(crate) fn prim_clear_highlights(
+    _scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    crate::eval_loop::clear_active_highlights();
+}
+
+/// `__addHighlight(name, nodeId)` — register that `nodeId` is covered by the highlight `name`
+/// (its `::highlight(name)` pseudo applies). Called once per node in each registered highlight's
+/// ranges.
+pub(crate) fn prim_add_highlight(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = arg_str(scope, &args, 0);
+    if let Some(node) = arg_node(scope, &args, 1) {
+        if !name.is_empty() {
+            crate::eval_loop::add_active_highlight(node.0, name);
+        }
+    }
+}
+
 pub(crate) fn prim_observers_active(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2234,6 +2260,8 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__wsClose", prim_ws_close);
     set_fn(scope, global, "__observersActive", prim_observers_active);
     set_fn(scope, global, "__commitSelection", prim_commit_selection);
+    set_fn(scope, global, "__clearHighlights", prim_clear_highlights);
+    set_fn(scope, global, "__addHighlight", prim_add_highlight);
     set_fn(scope, global, "__drainMutations", prim_drain_mutations);
     set_fn(
         scope,

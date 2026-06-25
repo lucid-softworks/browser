@@ -46,10 +46,15 @@ pub(crate) fn paint_box(
     );
 }
 
-/// A selected run's `::selection` (background, text) colors — resolved (forced-colors-aware) by the
-/// engine and keyed by the originating element's node id. Empty for a plain mouse-drag selection,
-/// which paints the default highlight.
-pub(crate) type SelStyle = (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>);
+/// A highlighted run's resolved (forced-colors-aware) highlight-pseudo colors — `(background, text,
+/// underline)` — for a `::selection` or `::highlight(name)`, keyed by the originating element's node
+/// id. `None` components are absent (e.g. no underline; a `::selection` never carries one). Empty for
+/// a plain mouse-drag selection, which paints the default highlight.
+pub(crate) type SelStyle = (
+    Option<(u8, u8, u8)>,
+    Option<(u8, u8, u8)>,
+    Option<(u8, u8, u8)>,
+);
 
 /// Forced-colors backplate pre-pass: paint each text line's Canvas backplate spanning the full line
 /// box (the nearest block ancestor's content width), BEFORE any glyphs are drawn. A single line can
@@ -565,7 +570,7 @@ pub(crate) fn paint_box_opacity(
                 let fully_selected =
                     matches!(sel_range, Some((0, ce)) if ce > 0 && ce >= s.chars().count());
                 let glyph = match (fully_selected, sel_style) {
-                    (true, Some((_, Some(fg)))) => fg,
+                    (true, Some((_, Some(fg), _))) => fg,
                     _ => tc,
                 };
                 let color = Color {
@@ -610,13 +615,13 @@ pub(crate) fn paint_box_opacity(
                         };
                         let w = (hx1 - hx0).round() as i32;
                         let hl = match sel_style {
-                            Some((Some(bg), _)) => Some(Color {
+                            Some((Some(bg), _, _)) => Some(Color {
                                 r: bg.0,
                                 g: bg.1,
                                 b: bg.2,
                                 a: ta,
                             }),
-                            Some((None, _)) => None, // transparent ::selection background
+                            Some((None, _, _)) => None, // transparent highlight background
                             None => Some(Color {
                                 r: 74,
                                 g: 144,
@@ -651,6 +656,26 @@ pub(crate) fn paint_box_opacity(
                     b.style.letter_spacing * scale,
                 );
                 let run_w = (end_x - x).max(0.0);
+                // A highlight pseudo (`::highlight(name)`/`::selection`) may carry its own underline.
+                if run_w > 0.0 {
+                    if let (true, Some((_, _, Some(uc)))) = (fully_selected, sel_style) {
+                        let thickness = (fs / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
+                        fb.fill_rect(
+                            Rect {
+                                x: x.round() as i32,
+                                y: (baseline + 1.0).round() as i32,
+                                w: run_w.round() as i32,
+                                h: thickness,
+                            },
+                            Color {
+                                r: uc.0,
+                                g: uc.1,
+                                b: uc.2,
+                                a: ta,
+                            },
+                        );
+                    }
+                }
                 if run_w > 0.0 {
                     let thickness = (fs / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
                     if b.style.underline {
