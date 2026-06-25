@@ -99,7 +99,7 @@ pub(crate) fn cascade_locked(
         &mut out,
     );
     if forced_colors_active() {
-        apply_forced_colors(doc, doc.root(), false, &mut out);
+        apply_forced_colors(doc, doc.root(), false, (0, 0, 0), &mut out);
     }
     (out, root_used_scheme_dark())
 }
@@ -149,9 +149,23 @@ pub(crate) fn apply_forced_colors(
     doc: &dom::Document,
     id: dom::NodeId,
     ancestor_off: bool,
+    parent_color: (u8, u8, u8),
     out: &mut HashMap<dom::NodeId, ComputedStyle>,
 ) {
     let off = ancestor_off || out.get(&id).is_some_and(|s| s.forced_color_adjust_off);
+    // The forced color this element contributes to `currentColor`/inheritance for its descendants.
+    let mut my_color = parent_color;
+    if off {
+        // forced-color-adjust:none/preserve: keep author colors, BUT an inherited `color` (or
+        // `currentColor`/`inherit`) still follows the forced ancestor — so currentColor resolves to
+        // the forced color even inside a `none` subtree.
+        if let Some(s) = out.get_mut(&id) {
+            if !s.color_explicit {
+                s.color = parent_color;
+            }
+            my_color = s.color;
+        }
+    }
     if !off {
         // A hyperlink's text takes LinkText, or VisitedText when the link is visited; everything
         // else takes CanvasText. A link whose href is empty or a pure fragment targets the current
@@ -202,9 +216,12 @@ pub(crate) fn apply_forced_colors(
                 force_style_colors(a, (0, 0, 0), txt, true);
             }
         }
+        // This element's forced color (LinkText/VisitedText/CanvasText, or a preserved system color)
+        // is what its descendants inherit for `currentColor`.
+        my_color = out.get(&id).map_or(text_color, |s| s.color);
     }
     for child in doc.get(id).children.clone() {
-        apply_forced_colors(doc, child, off, out);
+        apply_forced_colors(doc, child, off, my_color, out);
     }
 }
 
@@ -784,12 +801,13 @@ pub(crate) fn compute_element_style<'a>(
         accent_color: parent.accent_color,                       // inherited
         extra_colors: parent.extra_colors.clone(), // fill/stroke etc. inherit; others reset on set
         pre_forced: None,                          // not inherited; set by the forced-colors pass
-        color_is_system: parent.color_is_system,   // tracks `color`, which inherits
-        bg_is_system: false,                       // not inherited
-        border_is_system: false,                   // not inherited
-        background_color: None,                    // not inherited
-        background_alpha: 255,                     // not inherited
-        visited_link: false,                       // not inherited; set by the forced-colors pass
+        color_explicit: false, // not inherited; set when color is set explicitly
+        color_is_system: parent.color_is_system, // tracks `color`, which inherits
+        bg_is_system: false,   // not inherited
+        border_is_system: false, // not inherited
+        background_color: None, // not inherited
+        background_alpha: 255, // not inherited
+        visited_link: false,   // not inherited; set by the forced-colors pass
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),
         bold: parent.bold,

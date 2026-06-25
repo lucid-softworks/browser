@@ -322,6 +322,11 @@ pub struct ComputedStyle {
     /// override replaced them. `Some` only on elements the override touched. Lets `computedStyleMap`
     /// report the *computed* value (forced colors apply at used-value time, not computed-value time).
     pub pre_forced: Option<((u8, u8, u8), Option<(u8, u8, u8)>, (u8, u8, u8))>,
+    /// Whether `color` was set to an explicit color value on this element (not `inherit` /
+    /// `currentColor` / `unset` / `initial`). A `forced-color-adjust:none` element keeps an explicit
+    /// color, but an inherited one still follows the forced ancestor (so `currentColor` resolves to
+    /// the forced color even inside a `none` subtree).
+    pub color_explicit: bool,
     /// Whether `color` (inherited), `background-color`, and `border-color` were authored with a CSS
     /// *system color* keyword. Forced colors preserves author system colors rather than re-mapping
     /// them.

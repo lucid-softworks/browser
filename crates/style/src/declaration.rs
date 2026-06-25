@@ -467,13 +467,18 @@ pub(crate) fn apply_declaration(
             let trimmed = val.trim().to_ascii_lowercase();
             if trimmed == "inherit" {
                 style.color = inherited_color;
-                // keep the inherited color_is_system flag
+                // `inherit` follows the cascade, so it's not an explicit color (keep the flags).
+                style.color_explicit = false;
             } else if trimmed == "initial" || trimmed == "unset" {
                 style.color = ComputedStyle::default().color;
                 style.color_is_system = false;
+                style.color_explicit = false;
             } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.color = c;
                 style.color_is_system = has_system_color(&trimmed);
+                // `currentColor` resolves to the inherited color, so it isn't an explicit value
+                // either — under forced-color-adjust:none it must follow the forced ancestor color.
+                style.color_explicit = trimmed != "currentcolor";
             }
         }
         "background-color" | "background" => {
