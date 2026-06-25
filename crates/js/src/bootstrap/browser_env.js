@@ -6791,7 +6791,7 @@
   // and assert it is a boolean). We are never cross-origin isolated (no COOP+COEP gating), so it is
   // `false`. `isSecureContext` is true for https/file/localhost; approximate from the page URL.
   var __pgurl = String((globalThis.location && globalThis.location.href) || globalThis.__pageURL || "");
-  def(globalThis, "crossOriginIsolated", false);
+  def(globalThis, "crossOriginIsolated", globalThis.__crossOriginIsolated === true);
   def(globalThis, "isSecureContext", /^(https:|wss:|file:)/.test(__pgurl) ||
     /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?:[:\/]|$)/.test(__pgurl));
 

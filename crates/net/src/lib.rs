@@ -144,6 +144,11 @@ pub struct ResponseMeta {
     pub status: u16,
     pub content_type: String,
     pub final_url: String,
+    /// True when the response makes the document cross-origin isolated: a `same-origin`
+    /// Cross-Origin-Opener-Policy AND a `require-corp`/`credentialless` Cross-Origin-Embedder-Policy.
+    /// Drives `self.crossOriginIsolated` in page JS. Non-HTTP responses (about:/file:/cache) are
+    /// never isolated.
+    pub cross_origin_isolated: bool,
 }
 
 /// Result of [`fixup_url`]: the normalized URL plus whether we supplied a default `https://` scheme
@@ -537,6 +542,7 @@ fn request_streaming_inner(
             status: 200,
             content_type: "text/html; charset=utf-8".to_string(),
             final_url: url.to_string(),
+            cross_origin_isolated: false,
         });
     }
 
@@ -549,6 +555,7 @@ fn request_streaming_inner(
             status: resp.status,
             content_type: resp.content_type,
             final_url: resp.final_url,
+            cross_origin_isolated: false,
         });
     }
 
@@ -573,6 +580,7 @@ fn request_streaming_inner(
                 status: 200,
                 content_type,
                 final_url,
+                cross_origin_isolated: false,
             });
         }
     }
@@ -658,6 +666,22 @@ fn request_streaming_inner(
         .unwrap_or("application/octet-stream")
         .to_string();
 
+    // Cross-origin isolation: COOP `same-origin` + COEP `require-corp`/`credentialless` (first token
+    // of each, case-insensitive). Drives `self.crossOriginIsolated` for the loaded document.
+    let cross_origin_isolated = {
+        let first = |v: Option<&str>| {
+            v.unwrap_or("")
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        };
+        let coop = first(resp.header("Cross-Origin-Opener-Policy"));
+        let coep = first(resp.header("Cross-Origin-Embedder-Policy"));
+        coop == "same-origin" && (coep == "require-corp" || coep == "credentialless")
+    };
+
     // Record HSTS pins, but only from an https response (a header sent over plain http is ignored
     // per the spec, since it could be injected by a network attacker).
     if url.starts_with("https://") {
@@ -725,6 +749,7 @@ fn request_streaming_inner(
         status,
         content_type,
         final_url,
+        cross_origin_isolated,
     })
 }
 

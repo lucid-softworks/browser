@@ -4765,6 +4765,55 @@ mod tests {
     }
 
     #[test]
+    fn cross_origin_isolated_reflects_engine_flag() {
+        // The engine sets the COOP+COEP isolation flag from the main document's response; the JS env
+        // reflects it as self.crossOriginIsolated (and a worker inherits the page's value).
+        set_cross_origin_isolated(true);
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var w = new Worker('worker.js');
+                w.onmessage = function (e) { document.body.setAttribute('data-worker', e.data); };
+                document.body.setAttribute('data-page', String(self.crossOriginIsolated));
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                let body = if u.ends_with("worker.js") {
+                    "postMessage('w:' + self.crossOriginIsolated)"
+                } else {
+                    ""
+                };
+                Some(format!(
+                    r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/javascript","body":"{body}"}}"#
+                ))
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        set_cross_origin_isolated(false); // reset the process-global flag for other tests
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(attr("data-page").as_deref(), Some("true"));
+        assert_eq!(attr("data-worker").as_deref(), Some("w:true"));
+    }
+
+    #[test]
     fn performance_timeorigin_now_and_crossoriginisolated() {
         // hr-time: performance.now() is a positive number, timeOrigin is a real epoch close to
         // Date.now(), toJSON().timeOrigin matches, and crossOriginIsolated is a boolean.
