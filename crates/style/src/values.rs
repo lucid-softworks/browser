@@ -308,6 +308,10 @@ pub struct ComputedStyle {
     /// Whether `font-variant-emoji` is the `emoji` keyword (inherited). In forced colors mode every
     /// other value computes to `text`; `emoji` is preserved.
     pub font_variant_emoji_emoji: bool,
+    /// `accent-color` (inherited): `None` = `auto`; `Some((rgb, is_system_color))` for a set color.
+    /// In forced colors mode it computes to `auto` unless it's a system color or forced-color-adjust
+    /// is none.
+    pub accent_color: Option<((u8, u8, u8), bool)>,
     /// Font size in pixels.
     pub font_size: f32,
     /// The specified `font-family` list, serialized to CSSOM canonical form (quoting normalized).

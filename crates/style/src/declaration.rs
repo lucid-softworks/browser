@@ -421,6 +421,15 @@ pub(crate) fn apply_declaration(
         "font-variant-emoji" => {
             style.font_variant_emoji_emoji = val.trim().eq_ignore_ascii_case("emoji");
         }
+        "accent-color" => {
+            let t = val.trim();
+            if t.eq_ignore_ascii_case("auto") {
+                style.accent_color = None;
+            } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
+                let is_sys = crate::colors::is_system_color_keyword(&t.to_ascii_lowercase());
+                style.accent_color = Some((c, is_sys));
+            }
+        }
         "forced-color-adjust" => {
             // `none`/`preserve-parent-color` opt out of the forced-colors override; `auto` opts in.
             match val.trim().to_ascii_lowercase().as_str() {
