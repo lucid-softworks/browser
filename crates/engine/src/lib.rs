@@ -84,6 +84,9 @@ struct LayoutCache {
     dh: u32,
     root: layout::LayoutBox,
     content_h: f32,
+    /// The cascade's computed styles (kept so SVG rasterization can read inline `<svg>` shapes'
+    /// CSS `fill`/`stroke` and forced-colors state, which aren't carried on the layout tree).
+    styles: std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
     /// The page's resolved *used* color scheme (true = dark), captured during the cascade that
     /// produced this layout (see `style::cascade_with_root_scheme`). Drives the default canvas
     /// background when no html/body `background-color` is set. Stored here (rather than re-read from

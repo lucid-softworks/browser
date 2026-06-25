@@ -788,7 +788,7 @@ pub(crate) fn rasterize_mask_coverage(
                     dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("svg"))
             });
             match svg_id {
-                Some(id) => svg::rasterize_svg(&doc, id, out_w, out_h, font),
+                Some(id) => svg::rasterize_svg(&doc, id, out_w, out_h, font, None),
                 None => DecodedImage {
                     rgba: vec![0; (out_w * out_h * 4) as usize],
                     w: out_w,

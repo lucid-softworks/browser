@@ -508,17 +508,19 @@ impl Engine {
             // device-px cursor, `getBoundingClientRect` divides back to CSS px).
             scale_layout_tree(&mut root, self.scale);
             let content_h = root.dimensions.margin_box().height;
-            Some((root, content_h, root_scheme_dark))
+            Some((root, content_h, root_scheme_dark, computed))
         } else {
             None
         };
-        self.layout_cache = computed.map(|(root, content_h, root_scheme_dark)| LayoutCache {
-            dw,
-            dh,
-            root,
-            content_h,
-            root_scheme_dark,
-        });
+        self.layout_cache =
+            computed.map(|(root, content_h, root_scheme_dark, styles)| LayoutCache {
+                dw,
+                dh,
+                root,
+                content_h,
+                root_scheme_dark,
+                styles,
+            });
         true
     }
 
@@ -610,6 +612,7 @@ impl Engine {
             collect_content_rects(&cache.root, &mut rects);
         }
         let font = self.font.as_ref();
+        let svg_styles = self.layout_cache.as_ref().map(|c| &c.styles);
         let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         for id in svg_ids {
             let el = match &doc.get(id).data {
@@ -624,7 +627,7 @@ impl Engine {
             };
             w = w.round().clamp(1.0, 4096.0);
             h = h.round().clamp(1.0, 4096.0);
-            let bmp = svg::rasterize_svg(doc, id, w as u32, h as u32, font);
+            let bmp = svg::rasterize_svg(doc, id, w as u32, h as u32, font, svg_styles);
             next.insert(id, bmp);
         }
         self.svg_bitmaps = next;

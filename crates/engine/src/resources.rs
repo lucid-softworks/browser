@@ -800,7 +800,7 @@ fn decode_svg_sized(
     let markup = String::from_utf8_lossy(bytes);
     let doc = html::parse(&markup);
     let svg_id = find_svg_root(&doc, doc.root())?;
-    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, font))
+    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, font, None))
 }
 
 /// Parse standalone SVG markup and rasterize it at its intrinsic size (from width/height/viewBox),
@@ -815,7 +815,7 @@ fn decode_svg_image(bytes: &[u8]) -> Option<DecodedImage> {
     };
     let w = (iw.round() as u32).clamp(1, 1024);
     let h = (ih.round() as u32).clamp(1, 1024);
-    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, None))
+    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, None, None))
 }
 
 /// Whether `bytes` look like a JPEG XL stream: either the raw codestream marker (`FF 0A`) or the

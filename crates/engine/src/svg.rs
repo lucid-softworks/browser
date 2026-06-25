@@ -993,8 +993,16 @@ fn resolve_paint(val: &str, inherited: Option<Color>) -> Option<Color> {
     parse_css_color(v).or(inherited)
 }
 
-/// Apply this element's presentation attributes/style onto an inherited paint state.
-fn apply_paint(el: &dom::ElementData, mut st: PaintState) -> PaintState {
+type StyleMap = std::collections::HashMap<NodeId, style::ComputedStyle>;
+
+/// Apply this element's presentation attributes/style onto an inherited paint state. `cs` is the
+/// element's cascaded style (CSS `fill`/`stroke` override presentation attributes; forced colors
+/// maps a painted fill/stroke to the element's `currentColor`, which the cascade already forced).
+fn apply_paint(
+    el: &dom::ElementData,
+    cs: Option<&style::ComputedStyle>,
+    mut st: PaintState,
+) -> PaintState {
     let style = attr(el, "style").map(|s| s.to_string());
     if let Some(v) = prop(el, "fill", &style) {
         if let Some(id) = paint_url_id(&v) {
@@ -1038,6 +1046,32 @@ fn apply_paint(el: &dom::ElementData, mut st: PaintState) -> PaintState {
     if let Some(v) = prop(el, "fill-rule", &style) {
         st.evenodd = v.trim().eq_ignore_ascii_case("evenodd");
     }
+    // CSS `fill`/`stroke` (from author `<style>` rules / inline `style`, resolved by the cascade)
+    // override the SVG presentation attributes above.
+    if let Some(cs) = cs {
+        if let Some(extra) = &cs.extra_colors {
+            if let Some(&(r, g, b)) = extra.get("fill") {
+                st.fill = Some(Color { r, g, b, a: 255 });
+                st.fill_url = None;
+            }
+            if let Some(&(r, g, b)) = extra.get("stroke") {
+                st.stroke = Some(Color { r, g, b, a: 255 });
+            }
+        }
+        // Forced colors: a painted fill/stroke resolves to the element's (already-forced)
+        // currentColor, unless the element opted out with forced-color-adjust:none.
+        if style::forced_colors_active() && !cs.forced_color_adjust_off {
+            let (r, g, b) = cs.color;
+            let cc = Color { r, g, b, a: 255 };
+            if st.fill.is_some() {
+                st.fill = Some(cc);
+                st.fill_url = None;
+            }
+            if st.stroke.is_some() {
+                st.stroke = Some(cc);
+            }
+        }
+    }
     st
 }
 
@@ -1072,6 +1106,7 @@ pub fn rasterize_svg(
     out_w: u32,
     out_h: u32,
     font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
 ) -> DecodedImage {
     let out_w = out_w.clamp(1, MAX_DIM);
     let out_h = out_h.clamp(1, MAX_DIM);
@@ -1091,8 +1126,12 @@ pub fn rasterize_svg(
     // viewBox → device: uniform scale-to-fit (xMidYMid meet), centered.
     let base = viewbox_affine(el, out_w as f32, out_h as f32);
 
-    let root_state = apply_paint(el, PaintState::default());
-    render_children(doc, svg_id, base, &root_state, &mut surf, font, 0);
+    let root_state = apply_paint(
+        el,
+        styles.and_then(|m| m.get(&svg_id)),
+        PaintState::default(),
+    );
+    render_children(doc, svg_id, base, &root_state, &mut surf, font, styles, 0);
 
     DecodedImage {
         rgba: surf.px,
@@ -1135,13 +1174,14 @@ fn render_children(
     state: &PaintState,
     surf: &mut Surface,
     font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
     depth: usize,
 ) {
     if depth > 256 {
         return;
     }
     for &child in &doc.get(parent).children {
-        render_element(doc, child, m, state, surf, font, depth);
+        render_element(doc, child, m, state, surf, font, styles, depth);
     }
 }
 
@@ -1153,6 +1193,7 @@ fn render_element(
     state: &PaintState,
     surf: &mut Surface,
     font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
     depth: usize,
 ) {
     if depth > 256 {
@@ -1186,11 +1227,20 @@ fn render_element(
             Some(t) => m.then(parse_transform(t)),
             None => m,
         };
-        let child_state = apply_paint(el, state.clone());
+        let child_state = apply_paint(el, styles.and_then(|mm| mm.get(&child)), state.clone());
 
         match tag.as_str() {
             "g" | "a" => {
-                render_children(doc, child, child_m, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    child_m,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
             // A nested `<svg>` / `<symbol>` establishes its own viewport at (x,y) with its own
             // viewBox — the structure SVG sprite sheets use (one inner <svg> per icon).
@@ -1212,7 +1262,16 @@ fn render_element(
                 } else {
                     child_m.then(Affine::translate(x, y))
                 };
-                render_children(doc, child, inner, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    inner,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
             // `<use xlink:href="#id">`: render the referenced element at this use's (x,y).
             "use" => {
@@ -1224,7 +1283,16 @@ fn render_element(
                             let ux = num_attr(el, "x", 0.0);
                             let uy = num_attr(el, "y", 0.0);
                             let use_m = child_m.then(Affine::translate(ux, uy));
-                            render_element(doc, target, use_m, &child_state, surf, font, depth + 1);
+                            render_element(
+                                doc,
+                                target,
+                                use_m,
+                                &child_state,
+                                surf,
+                                font,
+                                styles,
+                                depth + 1,
+                            );
                         }
                     }
                 }
@@ -1311,11 +1379,29 @@ fn render_element(
                     draw_text(doc, child, el, &child_m, &child_state, surf, font);
                 }
                 // Recurse for nested tspans.
-                render_children(doc, child, child_m, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    child_m,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
             _ => {
                 // Unknown element: recurse in case it wraps shapes (defensive, e.g. <switch>).
-                render_children(doc, child, child_m, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    child_m,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
         }
     }
@@ -1820,7 +1906,7 @@ mod tests {
     fn render(html: &str, w: u32, h: u32) -> DecodedImage {
         let doc = html::parse(html);
         let id = svg_id(&doc);
-        rasterize_svg(&doc, id, w, h, None)
+        rasterize_svg(&doc, id, w, h, None, None)
     }
 
     #[test]
