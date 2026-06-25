@@ -1782,9 +1782,13 @@ pub(crate) fn prim_url_set(
         "port" => {
             if value.is_empty() {
                 let _ = u.set_port(None);
-            } else if let Ok(p) = value.parse::<u16>() {
-                // A valid port sets it; an invalid value is a no-op (per spec), not a clear.
-                let _ = u.set_port(Some(p));
+            } else {
+                // The port state consumes leading ASCII digits and stops at the first non-digit
+                // ("90\0..00" -> 90). No leading digit, or an out-of-range value, is a no-op.
+                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(p) = digits.parse::<u16>() {
+                    let _ = u.set_port(Some(p));
+                }
             }
         }
         "pathname" => u.set_path(&value),

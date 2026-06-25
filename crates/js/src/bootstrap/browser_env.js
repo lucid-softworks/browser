@@ -43,7 +43,15 @@
     plugins: [],
     mimeTypes: [],
     userActivation: { hasBeenActive: false, isActive: false },
-    sendBeacon: function () { return false; },
+    sendBeacon: function (url) {
+      // Validate the URL (resolved against the document base) and throw on an invalid one, per spec;
+      // otherwise inert (no beacon is actually sent).
+      var base; try { base = globalThis.location && globalThis.location.href; } catch (e) {}
+      if (globalThis.__urlParse(String(url), base || null) == null) {
+        throw new globalThis.TypeError("Failed to execute 'sendBeacon' on 'Navigator': The URL argument is ill-formed.");
+      }
+      return true;
+    },
     registerProtocolHandler: function () {},
     unregisterProtocolHandler: function () {},
     clipboard: {},
