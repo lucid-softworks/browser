@@ -164,11 +164,11 @@ pub(crate) fn apply_forced_colors(
             _ => None,
         };
         let is_link = link_kind.is_some();
-        let text_color = match link_kind {
-            Some(true) => (85, 26, 139), // VisitedText
-            Some(false) => (0, 0, 238),  // LinkText
-            None => (0, 0, 0),           // CanvasText
-        };
+        // The *computed* link color is always LinkText, even for visited links — getComputedStyle
+        // must not leak visited state. The painter maps a flagged visited link's LinkText to
+        // VisitedText at paint time.
+        let visited = link_kind == Some(true);
+        let text_color = if is_link { (0, 0, 238) } else { (0, 0, 0) };
         // The backplate: an element directly containing *visible* non-whitespace text paints a
         // Canvas block behind it so the text stays readable over images. We approximate the per-line
         // backplate with a Canvas background on the text box — exactly how the WPT refs simulate it.
@@ -191,6 +191,7 @@ pub(crate) fn apply_forced_colors(
             if is_link && !s.border_is_system {
                 s.border_color = text_color;
             }
+            s.visited_link = visited;
             // ::before / ::after generated boxes are forced too (a pseudo with `content` is text).
             if let Some(b) = s.before.as_mut() {
                 let txt = b.content.is_some();
@@ -788,6 +789,7 @@ pub(crate) fn compute_element_style<'a>(
         border_is_system: false,                   // not inherited
         background_color: None,                    // not inherited
         background_alpha: 255,                     // not inherited
+        visited_link: false,                       // not inherited; set by the forced-colors pass
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),
         bold: parent.bold,

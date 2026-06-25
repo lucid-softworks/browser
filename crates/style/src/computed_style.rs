@@ -11,6 +11,7 @@ impl Default for ComputedStyle {
             color: ua_default_text_color(),
             background_color: None,
             background_alpha: 255,
+            visited_link: false,
             forced_color_adjust_off: false,
             font_variant_emoji_emoji: false,
             accent_color: None,

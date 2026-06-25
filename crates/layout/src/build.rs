@@ -295,6 +295,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         white_space: cs.white_space,
         opacity: cs.opacity,
         visible: cs.visibility == style::Visibility::Visible,
+        visited_link: cs.visited_link,
         clips_overflow: cs.overflow_scrollport,
         letter_spacing: cs.letter_spacing,
         line_height: cs.line_height,

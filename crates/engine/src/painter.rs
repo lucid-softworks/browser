@@ -213,6 +213,15 @@ pub(crate) fn paint_box_opacity(
     // run counter still advances below) but paints none of its OWN content. Children are recursed
     // regardless — `visibility` inherits, but a descendant can opt back in with `visibility: visible`.
     if !offscreen && opacity > 0.0 && b.style.visible {
+        // In forced colors mode the cascade keeps a visited link's color/border as LinkText (so
+        // getComputedStyle can't leak visited state); map that LinkText to VisitedText for painting.
+        let vlink = |c: (u8, u8, u8)| {
+            if b.style.visited_link && c == (0, 0, 238) {
+                (85, 26, 139)
+            } else {
+                c
+            }
+        };
         // (0) OUTER box-shadows: painted BEFORE the background so the box sits on top.
         if let Some(ex) = extras {
             for sh in &ex.box_shadows {
@@ -289,10 +298,11 @@ pub(crate) fn paint_box_opacity(
         // not a doubled/gapped pair). Otherwise: the normal four filled edge rects.
         let e = b.dimensions.border;
         let ba = scale_alpha(255, opacity);
+        let bcol = vlink(b.style.border_color);
         let bc = Color {
-            r: b.style.border_color.0,
-            g: b.style.border_color.1,
-            b: b.style.border_color.2,
+            r: bcol.0,
+            g: bcol.1,
+            b: bcol.2,
             a: ba,
         };
         let collapsed_cell = b.style.is_table_cell
@@ -427,10 +437,11 @@ pub(crate) fn paint_box_opacity(
                 let scale = ((sx + sy) * 0.5).max(0.01);
                 let fs = b.style.font_size * scale;
                 let ta = scale_alpha(255, opacity);
+                let tc = vlink(b.style.color);
                 let color = Color {
-                    r: b.style.color.0,
-                    g: b.style.color.1,
-                    b: b.style.color.2,
+                    r: tc.0,
+                    g: tc.1,
+                    b: tc.2,
                     a: ta,
                 };
                 let x = dx;

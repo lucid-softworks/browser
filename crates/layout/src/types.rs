@@ -89,6 +89,9 @@ pub struct PaintStyle {
     /// inherits, descendants are `false` too unless one opts back in with `visibility: visible` —
     /// so the painter still recurses into children rather than culling the subtree.
     pub visible: bool,
+    /// A visited link in forced colors mode: the painter maps its LinkText to VisitedText (kept out
+    /// of the computed style so getComputedStyle can't leak visited state).
+    pub visited_link: bool,
     /// `overflow` is not `visible` (hidden/clip/scroll/auto): the painter clips this box's
     /// descendants to its padding box. Drives CSS `overflow` clipping (and hides `sr-only` content).
     pub clips_overflow: bool,
@@ -146,6 +149,7 @@ impl Default for PaintStyle {
             white_space: style::WhiteSpace::Normal,
             opacity: 1.0,
             visible: true,
+            visited_link: false,
             clips_overflow: false,
             letter_spacing: 0.0,
             line_height: None,

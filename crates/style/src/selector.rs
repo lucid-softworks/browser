@@ -1014,10 +1014,8 @@ pub(crate) fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spe
         "focus-within" => Pseudo::FocusWithin,
         "focus-visible" => Pseudo::FocusVisible,
         // Best-effort never-match (parse cleanly, never match).
-        "visited" | "target" | "default" | "placeholder-shown" | "read-only" | "read-write"
-        | "in-range" | "out-of-range" | "valid" | "invalid" | "indeterminate" | "autofill" => {
-            Pseudo::NeverMatch
-        }
+        "target" | "default" | "placeholder-shown" | "read-only" | "read-write" | "in-range"
+        | "out-of-range" | "valid" | "invalid" | "indeterminate" | "autofill" => Pseudo::NeverMatch,
         "lang" => {
             let a = arg?.trim().trim_matches(|c| c == '"' || c == '\'').trim();
             if a.is_empty() {
