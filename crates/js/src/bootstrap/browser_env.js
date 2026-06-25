@@ -1133,6 +1133,18 @@
         try { __lk.dispatchEvent(new Event("load")); } catch (e) {}
       }
     } catch (e) {}
+    // Fire `load` on each <link rel=preload> (e.g. a preloaded image) once the page's resources have
+    // been fetched. Reftests commonly gate takeScreenshot() on a preload's onload, so without this
+    // the `reftest-wait` class never clears and the test times out.
+    try {
+      var __pls = document.querySelectorAll("link[rel~=preload]");
+      for (var __k = 0; __k < __pls.length; __k++) {
+        var __pl = __pls[__k];
+        if (__pl.__loadFired || !(__pl.getAttribute && __pl.getAttribute("href"))) { continue; }
+        def(__pl, "__loadFired", true);
+        try { __pl.dispatchEvent(new Event("load")); } catch (e) {}
+      }
+    } catch (e) {}
     // <style> elements fire `load` once their style block is processed (synchronously available).
     try {
       var __sts = document.querySelectorAll("style");
