@@ -1795,7 +1795,21 @@ fn paint_shape(
             }
         }
     }
-    if let Some(g) = gradient {
+    // A gradient whose stops are all the same color (e.g. after the forced-colors collapse above)
+    // renders as a SOLID fill, so its edge anti-aliasing matches a plain solid rect (the WPT refs
+    // use one) rather than the gradient rasterizer's.
+    let solid_stop = gradient.as_ref().and_then(|g| {
+        let first = g.stops.first()?.color;
+        g.stops.iter().all(|s| s.color == first).then_some(first)
+    });
+    if let Some(col) = solid_stop {
+        fill_subpaths(
+            surf,
+            subpaths,
+            apply_alpha(col, state.fill_opacity * state.opacity),
+            state.evenodd,
+        );
+    } else if let Some(g) = gradient {
         fill_subpaths_gradient(
             surf,
             subpaths,
