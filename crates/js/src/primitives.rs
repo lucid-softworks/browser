@@ -1715,6 +1715,33 @@ fn url_to_record(u: &url::Url) -> String {
     s
 }
 
+/// The special URL schemes (special host parsing, port concept, `\` as a path separator).
+fn is_special_scheme(scheme: &str) -> bool {
+    matches!(scheme, "ftp" | "file" | "http" | "https" | "ws" | "wss")
+}
+
+/// WHATWG's "special authority ignore slashes" state skips any run of `/`/`\` for a special,
+/// non-`file` scheme, so a relative input like `///test` resolves to host `test`. The `url` crate
+/// stops after two slashes and reports `EmptyHost`, so collapse a leading run of 3+ slashes to two
+/// when resolving against a non-`file` special base (`file` keeps them: `file:///x`).
+fn collapse_special_leading_slashes<'a>(
+    input: &'a str,
+    base_scheme: &str,
+) -> std::borrow::Cow<'a, str> {
+    if base_scheme == "file" || !is_special_scheme(base_scheme) {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    // Leading C0-control/space are stripped by the parser; look past them.
+    let lead_ws = input.len() - input.trim_start_matches(|c: char| c <= ' ').len();
+    let rest = &input[lead_ws..];
+    let run = rest.chars().take_while(|&c| c == '/' || c == '\\').count();
+    if run >= 3 {
+        std::borrow::Cow::Owned(format!("{}//{}", &input[..lead_ws], &rest[run..]))
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    }
+}
+
 /// `__urlParse(input, base|null) -> recordJSON | null`. WHATWG URL parsing via the `url` crate: the
 /// authoritative, spec-compliant parser (vs. the hand-written JS one). Returns the component record
 /// as JSON, or null on a parse failure (the JS `URL` constructor then throws).
@@ -1728,7 +1755,10 @@ pub(crate) fn prim_url_parse(
     let parsed = if base_arg.is_string() {
         let base = base_arg.to_rust_string_lossy(scope);
         match url::Url::parse(&base) {
-            Ok(b) => b.join(&input),
+            Ok(b) => {
+                let input2 = collapse_special_leading_slashes(&input, b.scheme());
+                b.join(&input2)
+            }
             Err(e) => Err(e),
         }
     } else {

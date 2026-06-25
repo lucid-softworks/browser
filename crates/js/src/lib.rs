@@ -4678,6 +4678,47 @@ mod tests {
     }
 
     #[test]
+    fn url_parse_opaque_and_slash_edges() {
+        // Opaque-path trailing space encodes the last as %20; for a non-file special base a relative
+        // input with 3+ leading slashes collapses to the authority's host; file keeps the slashes.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                out.push(new URL("non-special:opaque  ?hi").href);
+                out.push(new URL("///test", "http://example.org/").href);
+                out.push(new URL("///example.org/path", "http://example.org/").href);
+                out.push(new URL("///test", "file:///tmp/x").href);
+                document.body.setAttribute('data-out', out.join("|"));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr.as_deref(),
+            Some("non-special:opaque %20?hi|http://test/|http://example.org/path|file:///test"),
+        );
+    }
+
+    #[test]
     fn url_webidl_conformance() {
         // URL/URLSearchParams are proper WebIDL interfaces: members on the prototype, @@toStringTag,
         // constructors throw without `new`, and methods enforce required arguments.
