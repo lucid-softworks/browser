@@ -1853,7 +1853,13 @@ pub(crate) fn prim_url_set(
                 }
             }
         }
-        "pathname" => u.set_path(&value),
+        // WHATWG: the pathname setter is a no-op when the URL has an opaque path (e.g. data:, a
+        // non-special scheme without an authority).
+        "pathname" => {
+            if !u.cannot_be_a_base() {
+                u.set_path(&value);
+            }
+        }
         "search" => {
             let q = value.strip_prefix('?').unwrap_or(&value);
             let opaque = u.cannot_be_a_base();
