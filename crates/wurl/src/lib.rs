@@ -13,6 +13,9 @@
 
 use std::fmt::Write as _;
 
+mod idna;
+mod unicode_tables;
+
 // ---------------------------------------------------------------------------------------------
 // Code-point classification + percent-encode sets
 // ---------------------------------------------------------------------------------------------
@@ -194,7 +197,7 @@ fn parse_host(input: &str, is_not_special: bool) -> Result<Host, ()> {
     // domain to ASCII (UTS-46) on the percent-decoded, UTF-8 domain.
     let decoded = percent_decode(input);
     let domain = String::from_utf8_lossy(&decoded);
-    let ascii = domain_to_ascii(&domain)?;
+    let ascii = idna::domain_to_ascii(&domain)?;
     if ascii.is_empty() {
         return Err(());
     }
@@ -205,254 +208,6 @@ fn parse_host(input: &str, is_not_special: bool) -> Result<Host, ()> {
         return Ok(Host::Ipv4(parse_ipv4(&ascii)?));
     }
     Ok(Host::Domain(ascii))
-}
-
-/// Domain to ASCII (a pragmatic UTS-46 + Punycode, from scratch — no external IDNA crate).
-/// ASCII labels pass through lowercased; a label containing non-ASCII is mapped (case-folded via the
-/// Unicode tables in `std`) and Punycode-encoded to `xn--…`. Unicode normalization (NFC) is not
-/// applied, which is sufficient for the WPT host cases we target.
-fn domain_to_ascii(domain: &str) -> Result<String, ()> {
-    // 1. UTS-46 map the whole domain. The ideographic full stops also map to '.', so this must run
-    //    before splitting into labels.
-    let mut mapped = String::new();
-    for c in domain.chars() {
-        if let Some(s) = uts46_map(c)? {
-            mapped.push_str(&s);
-        }
-    }
-    // 2. Process each label: ASCII labels pass through (an xn-- label is Punycode-validated); a label
-    //    with non-ASCII is Punycode-encoded.
-    let mut out = String::new();
-    for (i, label) in mapped.split('.').enumerate() {
-        if i > 0 {
-            out.push('.');
-        }
-        if label.is_ascii() {
-            if let Some(rest) = label.strip_prefix("xn--") {
-                // Validate an xn-- label: it must be non-empty, decode to a non-empty sequence of
-                // valid code points (no noncharacters / U+FFFD).
-                if rest.is_empty() {
-                    return Err(());
-                }
-                let decoded = punycode_decode(rest).ok_or(())?;
-                if decoded.is_empty() {
-                    return Err(());
-                }
-                for &ch in &decoded {
-                    let u = ch as u32;
-                    if ch == '\u{fffd}'
-                        || (u & 0xfffe) == 0xfffe
-                        || (0xfdd0..=0xfdef).contains(&u)
-                        || ch.is_ascii()
-                    {
-                        return Err(());
-                    }
-                }
-            }
-            out.push_str(label);
-        } else {
-            out.push_str("xn--");
-            out.push_str(&punycode_encode(&label.chars().collect::<Vec<_>>()).ok_or(())?);
-        }
-    }
-    Ok(out)
-}
-
-/// A from-scratch UTS-46 mapping (the subset the WPT host cases exercise): case-fold, map the
-/// ideographic full stops and full-width forms, drop the ignorable code points, and reject the
-/// clearly-disallowed ones (noncharacters, U+FFFD, the non-ASCII spaces).
-fn uts46_map(c: char) -> Result<Option<String>, ()> {
-    let u = c as u32;
-    // Ideographic / fullwidth full stops -> '.'
-    if matches!(c, '\u{3002}' | '\u{ff0e}' | '\u{ff61}') {
-        return Ok(Some(".".to_string()));
-    }
-    // Ignored code points (zero-width joiners/non-joiners, soft hyphen, BOM, word joiner).
-    if matches!(
-        c,
-        '\u{00ad}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}' | '\u{feff}'
-    ) {
-        return Ok(None);
-    }
-    // Disallowed: U+FFFD, noncharacters, and non-ASCII spaces (NBSP, ideographic space).
-    let noncharacter = (u & 0xfffe) == 0xfffe || (0xfdd0..=0xfdef).contains(&u);
-    if c == '\u{fffd}' || noncharacter || matches!(c, '\u{00a0}' | '\u{3000}') {
-        return Err(());
-    }
-    // Fullwidth ASCII forms U+FF01..U+FF5E -> U+0021..U+007E.
-    if ('\u{ff01}'..='\u{ff5e}').contains(&c) {
-        if let Some(m) = char::from_u32(u - 0xfee0) {
-            return Ok(Some(m.to_lowercase().collect()));
-        }
-    }
-    Ok(Some(c.to_lowercase().collect()))
-}
-
-/// Punycode decode (RFC 3492); returns the decoded code points, or `None` on a malformed input.
-fn punycode_decode(input: &str) -> Option<Vec<char>> {
-    const BASE: u32 = 36;
-    const TMIN: u32 = 1;
-    const TMAX: u32 = 26;
-    const SKEW: u32 = 38;
-    const DAMP: u32 = 700;
-    const INITIAL_BIAS: u32 = 72;
-    const INITIAL_N: u32 = 128;
-    fn basic_to_digit(c: u8) -> Option<u32> {
-        match c {
-            b'a'..=b'z' => Some((c - b'a') as u32),
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'0'..=b'9' => Some((c - b'0' + 26) as u32),
-            _ => None,
-        }
-    }
-    fn adapt(mut delta: u32, num_points: u32, first_time: bool) -> u32 {
-        delta = if first_time { delta / DAMP } else { delta / 2 };
-        delta += delta / num_points;
-        let mut k = 0;
-        while delta > ((BASE - TMIN) * TMAX) / 2 {
-            delta /= BASE - TMIN;
-            k += BASE;
-        }
-        k + (((BASE - TMIN + 1) * delta) / (delta + SKEW))
-    }
-    let bytes = input.as_bytes();
-    let mut output: Vec<u32> = Vec::new();
-    // The portion up to and including the last '-' is the literal (basic) part.
-    let (basic, rest) = match input.rfind('-') {
-        Some(idx) => (&bytes[..idx], &bytes[idx + 1..]),
-        None => (&bytes[..0], bytes),
-    };
-    for &b in basic {
-        if b >= 0x80 {
-            return None;
-        }
-        output.push(b as u32);
-    }
-    let mut n = INITIAL_N;
-    let mut i: u32 = 0;
-    let mut bias = INITIAL_BIAS;
-    let mut pos = 0usize;
-    while pos < rest.len() {
-        let oldi = i;
-        let mut w = 1u32;
-        let mut k = BASE;
-        loop {
-            if pos >= rest.len() {
-                return None;
-            }
-            let digit = basic_to_digit(rest[pos])?;
-            pos += 1;
-            i = i.checked_add(digit.checked_mul(w)?)?;
-            let t = if k <= bias {
-                TMIN
-            } else if k >= bias + TMAX {
-                TMAX
-            } else {
-                k - bias
-            };
-            if digit < t {
-                break;
-            }
-            w = w.checked_mul(BASE - t)?;
-            k += BASE;
-        }
-        let out_len = output.len() as u32 + 1;
-        bias = adapt(i - oldi, out_len, oldi == 0);
-        n = n.checked_add(i / out_len)?;
-        i %= out_len;
-        // n must be a valid scalar value.
-        char::from_u32(n)?;
-        output.insert(i as usize, n);
-        i += 1;
-    }
-    output.into_iter().map(char::from_u32).collect()
-}
-
-/// Punycode encode (RFC 3492) of a single label's code points.
-fn punycode_encode(input: &[char]) -> Option<String> {
-    const BASE: u32 = 36;
-    const TMIN: u32 = 1;
-    const TMAX: u32 = 26;
-    const SKEW: u32 = 38;
-    const DAMP: u32 = 700;
-    const INITIAL_BIAS: u32 = 72;
-    const INITIAL_N: u32 = 128;
-
-    fn digit_to_basic(d: u32) -> char {
-        // 0..25 -> 'a'..'z', 26..35 -> '0'..'9'
-        if d < 26 {
-            (b'a' + d as u8) as char
-        } else {
-            (b'0' + (d - 26) as u8) as char
-        }
-    }
-    fn adapt(mut delta: u32, num_points: u32, first_time: bool) -> u32 {
-        delta = if first_time { delta / DAMP } else { delta / 2 };
-        delta += delta / num_points;
-        let mut k = 0;
-        while delta > ((BASE - TMIN) * TMAX) / 2 {
-            delta /= BASE - TMIN;
-            k += BASE;
-        }
-        k + (((BASE - TMIN + 1) * delta) / (delta + SKEW))
-    }
-
-    let mut output = String::new();
-    let mut n = INITIAL_N;
-    let mut delta: u32 = 0;
-    let mut bias = INITIAL_BIAS;
-
-    let basics: Vec<u32> = input
-        .iter()
-        .map(|&c| c as u32)
-        .filter(|&c| c < 0x80)
-        .collect();
-    let b = basics.len();
-    for &c in &basics {
-        output.push(char::from_u32(c)?);
-    }
-    if b > 0 {
-        output.push('-');
-    }
-    let mut h = b as u32;
-    let total = input.len() as u32;
-    while h < total {
-        let m = input.iter().map(|&c| c as u32).filter(|&c| c >= n).min()?;
-        delta = delta.checked_add((m - n).checked_mul(h + 1)?)?;
-        n = m;
-        for &cc in input {
-            let c = cc as u32;
-            if c < n {
-                delta = delta.checked_add(1)?;
-            }
-            if c == n {
-                let mut q = delta;
-                let mut k = BASE;
-                loop {
-                    let t = if k <= bias {
-                        TMIN
-                    } else if k >= bias + TMAX {
-                        TMAX
-                    } else {
-                        k - bias
-                    };
-                    if q < t {
-                        break;
-                    }
-                    output.push(digit_to_basic(t + (q - t) % (BASE - t)));
-                    q = (q - t) / (BASE - t);
-                    k += BASE;
-                }
-                output.push(digit_to_basic(q));
-                bias = adapt(delta, h + 1, h == b as u32);
-                delta = 0;
-                h += 1;
-            }
-        }
-        delta += 1;
-        n += 1;
-    }
-    Some(output)
 }
 
 fn parse_opaque_host(input: &str) -> Result<String, ()> {
@@ -1649,6 +1404,84 @@ impl Url {
 #[cfg(test)]
 mod conformance {
     use super::*;
+
+    /// Replace lone-surrogate `\uXXXX` escapes (which serde_json can't parse) with `�`,
+    /// matching the USVString coercion the engine applies before URL parsing.
+    fn sanitize_lone_surrogates(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0;
+        let hex = |p: usize| -> Option<u32> {
+            if p + 6 <= b.len() && b[p] == b'\\' && b[p + 1] == b'u' {
+                std::str::from_utf8(&b[p + 2..p + 6])
+                    .ok()
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+            } else {
+                None
+            }
+        };
+        while i < b.len() {
+            if let Some(u) = hex(i) {
+                if (0xd800..0xdc00).contains(&u) {
+                    // high surrogate: keep only if a low surrogate follows
+                    if matches!(hex(i + 6), Some(l) if (0xdc00..0xe000).contains(&l)) {
+                        out.push_str(&s[i..i + 12]);
+                        i += 12;
+                        continue;
+                    }
+                    out.push_str("\\ufffd");
+                    i += 6;
+                    continue;
+                } else if (0xdc00..0xe000).contains(&u) {
+                    out.push_str("\\ufffd");
+                    i += 6;
+                    continue;
+                }
+            }
+            out.push(b[i] as char);
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn idna_testv2_conformance() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../wpt/url/resources/IdnaTestV2.json"
+        ))
+        .unwrap();
+        // serde_json rejects lone-surrogate \uXXXX escapes; in the engine these are USVString-coerced
+        // to U+FFFD before the host parser, so rewrite lone surrogates to � for parsing.
+        let data = sanitize_lone_surrogates(&raw);
+        let cases: serde_json::Value = serde_json::from_str(&data).unwrap();
+        let (mut pass, mut fail, mut examples) = (0u32, 0u32, Vec::new());
+        for case in cases.as_array().unwrap() {
+            if !case.is_object() {
+                continue;
+            }
+            let input = case["input"].as_str().unwrap_or("");
+            let expected = case["output"].as_str().unwrap_or("");
+            let got = crate::idna::domain_to_ascii(input);
+            let ok = if expected.is_empty() {
+                got.is_err()
+            } else {
+                got.as_deref() == Ok(expected)
+            };
+            if ok {
+                pass += 1;
+            } else {
+                fail += 1;
+                if examples.len() < 30 {
+                    examples.push(format!("{input:?} exp {expected:?} got {got:?}"));
+                }
+            }
+        }
+        eprintln!("IdnaTestV2: {pass} pass / {fail} fail");
+        for e in &examples {
+            eprintln!("  FAIL {e}");
+        }
+    }
 
     fn record(u: &Url) -> std::collections::HashMap<String, String> {
         let mut m = std::collections::HashMap::new();
