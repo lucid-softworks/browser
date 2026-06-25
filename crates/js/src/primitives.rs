@@ -1684,15 +1684,29 @@ fn url_to_record(u: &url::Url) -> String {
         .unwrap_or_default();
     // WHATWG origin serialization ("null" for opaque/cannot-be-a-base origins).
     let origin = u.origin().ascii_serialization();
+    // Opaque path ending in spaces (only possible when a query/fragment follows, else the parser
+    // strips them): WHATWG percent-encodes the final trailing space as %20 so the serialization
+    // doesn't end in whitespace and round-trips. The `url` crate keeps them literal, so fix both the
+    // pathname and the href here.
+    let raw_path = u.path();
+    let (pathname, href) = if u.cannot_be_a_base() && raw_path.ends_with(' ') {
+        let fixed = format!("{}%20", &raw_path[..raw_path.len() - 1]);
+        let mut h = format!("{}:{}", u.scheme(), fixed);
+        h.push_str(&search);
+        h.push_str(&hash);
+        (fixed, h)
+    } else {
+        (raw_path.to_string(), u.as_str().to_string())
+    };
     let mut s = String::from("{");
-    json_field(&mut s, "href", u.as_str());
+    json_field(&mut s, "href", &href);
     json_field(&mut s, "protocol", &format!("{}:", u.scheme()));
     json_field(&mut s, "username", u.username());
     json_field(&mut s, "password", u.password().unwrap_or(""));
     json_field(&mut s, "host", &host);
     json_field(&mut s, "hostname", hostname);
     json_field(&mut s, "port", &port);
-    json_field(&mut s, "pathname", u.path());
+    json_field(&mut s, "pathname", &pathname);
     json_field(&mut s, "search", &search);
     json_field(&mut s, "hash", &hash);
     json_field(&mut s, "origin", &origin);
