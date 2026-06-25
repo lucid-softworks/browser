@@ -16,11 +16,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
+use crate::primitives::{arg_str, set_fn};
 use crate::{
     deliver_fetch_completion, deliver_ws_event, eval_internal, eval_source, host_state,
     install_browser_environment, run_due_timers, FetchCompletion, HostState, SharedDoc, WsEvent,
 };
-use crate::primitives::{arg_str, set_fn};
 
 /// JS overlay run in the frame context after the browser env is installed: wires `parent`/`top`/
 /// `frameElement`/`postMessage`-to-parent and fires the frame's own load lifecycle.
@@ -48,8 +48,18 @@ pub fn clear_frames() {
 /// iframes work).
 pub(crate) fn register_iframe_natives(scope: &mut v8::PinScope, global: v8::Local<v8::Object>) {
     set_fn(scope, global, "__iframeLoad", prim_iframe_load);
-    set_fn(scope, global, "__framePostToFrame", prim_frame_post_to_frame);
-    set_fn(scope, global, "__framePostToParent", prim_frame_post_to_parent);
+    set_fn(
+        scope,
+        global,
+        "__framePostToFrame",
+        prim_frame_post_to_frame,
+    );
+    set_fn(
+        scope,
+        global,
+        "__framePostToParent",
+        prim_frame_post_to_parent,
+    );
     set_fn(scope, global, "__frameUnload", prim_frame_unload);
     set_fn(scope, global, "__frameGet", prim_frame_get);
 }
@@ -108,7 +118,8 @@ fn collect_classic_scripts(doc: &dom::Document, base: &str) -> Vec<(bool, String
             if e.tag == "script" {
                 // type=module is not classic; skip (best-effort — frames rarely need modules here).
                 let ty = e.attrs.get("type").map(String::as_str);
-                if ty.map(|t| t.trim().eq_ignore_ascii_case("module")) != Some(true) && is_js_type(ty)
+                if ty.map(|t| t.trim().eq_ignore_ascii_case("module")) != Some(true)
+                    && is_js_type(ty)
                 {
                     if let Some(src) = e.attrs.get("src") {
                         if let Ok(abs) = url::Url::parse(base).and_then(|u| u.join(src)) {

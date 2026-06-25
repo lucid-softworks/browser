@@ -1773,7 +1773,9 @@ pub(crate) fn prim_url_set(
                 Some((h, p)) => (h, Some(p)),
                 None => (value.as_str(), None),
             };
-            if u.set_host(if h.is_empty() { None } else { Some(h) }).is_ok() {
+            if u.set_host(if h.is_empty() { None } else { Some(h) })
+                .is_ok()
+            {
                 if let Some(p) = p {
                     let _ = u.set_port(p.parse::<u16>().ok());
                 }

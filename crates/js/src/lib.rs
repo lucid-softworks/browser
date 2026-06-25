@@ -287,10 +287,10 @@ fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
 
 mod dom_helpers;
 mod eval_loop;
+mod iframe;
 mod modules;
 mod primitives;
 mod runtime;
-mod iframe;
 mod selector;
 mod session;
 mod style_query;
@@ -298,10 +298,10 @@ mod worker;
 
 pub(crate) use dom_helpers::*;
 pub use eval_loop::*;
+pub use iframe::*;
 pub use modules::*;
 pub use primitives::*;
 pub use runtime::*;
-pub use iframe::*;
 pub(crate) use selector::*;
 pub use session::*;
 pub(crate) use style_query::*;
@@ -4677,8 +4677,6 @@ mod tests {
         assert_eq!(reply.as_deref(), Some("fn:V"));
     }
 
-
-
     #[test]
     fn url_searchparams_conformance() {
         // URLSearchParams/URL conformance: set() updates the first occurrence in place + removes the
@@ -4702,19 +4700,46 @@ mod tests {
             .to_string(),
         );
         let (_session, snapshot, out) = Session::new(
-            doc, vec![], vec![entry], modules, "https://x/",
-            no_fetch(), no_request(), no_ws(), None,
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
         );
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         let attr = |name: &str| match &snapshot.get(body).data {
             dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
             _ => None,
         };
-        assert_eq!(attr("data-set").as_deref(), Some("a=B&c=d"), "set updates first, removes rest");
-        assert_eq!(attr("data-clear").as_deref(), Some("0|http://h/"), "url.search='?' clears query");
-        assert_eq!(attr("data-dec").as_deref(), Some("b=%252sf*"), "lenient form decode");
-        assert_eq!(attr("data-parse").as_deref(), Some("null"), "relative vs opaque base is null");
-        assert_eq!(attr("data-static").as_deref(), Some("function,function"), "URL.canParse/parse exist");
+        assert_eq!(
+            attr("data-set").as_deref(),
+            Some("a=B&c=d"),
+            "set updates first, removes rest"
+        );
+        assert_eq!(
+            attr("data-clear").as_deref(),
+            Some("0|http://h/"),
+            "url.search='?' clears query"
+        );
+        assert_eq!(
+            attr("data-dec").as_deref(),
+            Some("b=%252sf*"),
+            "lenient form decode"
+        );
+        assert_eq!(
+            attr("data-parse").as_deref(),
+            Some("null"),
+            "relative vs opaque base is null"
+        );
+        assert_eq!(
+            attr("data-static").as_deref(),
+            Some("function,function"),
+            "URL.canParse/parse exist"
+        );
     }
 
     #[test]
@@ -4767,8 +4792,16 @@ mod tests {
             dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
             _ => None,
         };
-        assert_eq!(attr("data-loaded").as_deref(), Some("yes"), "iframe should fire load");
-        assert_eq!(attr("data-reply").as_deref(), Some("echo:hi"), "cross-frame postMessage round-trip");
+        assert_eq!(
+            attr("data-loaded").as_deref(),
+            Some("yes"),
+            "iframe should fire load"
+        );
+        assert_eq!(
+            attr("data-reply").as_deref(),
+            Some("echo:hi"),
+            "cross-frame postMessage round-trip"
+        );
     }
 
     #[test]
@@ -4943,11 +4976,31 @@ mod tests {
             dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
             _ => None,
         };
-        assert_eq!(attr("data-now-pos").as_deref(), Some("true"), "now() should be positive");
-        assert_eq!(attr("data-origin-close").as_deref(), Some("true"), "timeOrigin close to Date.now()");
-        assert_eq!(attr("data-tojson").as_deref(), Some("true"), "toJSON().timeOrigin matches");
-        assert_eq!(attr("data-coi").as_deref(), Some("boolean"), "crossOriginIsolated is boolean");
-        assert_eq!(attr("data-monotonic").as_deref(), Some("true"), "now() monotonic");
+        assert_eq!(
+            attr("data-now-pos").as_deref(),
+            Some("true"),
+            "now() should be positive"
+        );
+        assert_eq!(
+            attr("data-origin-close").as_deref(),
+            Some("true"),
+            "timeOrigin close to Date.now()"
+        );
+        assert_eq!(
+            attr("data-tojson").as_deref(),
+            Some("true"),
+            "toJSON().timeOrigin matches"
+        );
+        assert_eq!(
+            attr("data-coi").as_deref(),
+            Some("boolean"),
+            "crossOriginIsolated is boolean"
+        );
+        assert_eq!(
+            attr("data-monotonic").as_deref(),
+            Some("true"),
+            "now() monotonic"
+        );
     }
 
     #[test]

@@ -25,12 +25,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
+use crate::primitives::{arg_str, set_fn};
 use crate::{
     deliver_fetch_completion, deliver_ws_event, eval_source, host_state,
     install_browser_environment, js_str, run_due_timers, FetchCompletion, HostState, SharedDoc,
     WsEvent,
 };
-use crate::primitives::{arg_str, set_fn};
 
 /// JS overlay turning a freshly browser-env'd context into a DedicatedWorkerGlobalScope, then
 /// fetching + running the worker's top-level script. Runs in the worker context.
@@ -79,8 +79,18 @@ pub fn clear_workers() {
 /// worker can spawn sub-workers).
 pub(crate) fn register_worker_natives(scope: &mut v8::PinScope, global: v8::Local<v8::Object>) {
     set_fn(scope, global, "__workerCreate", prim_worker_create);
-    set_fn(scope, global, "__workerPostToWorker", prim_worker_post_to_worker);
-    set_fn(scope, global, "__workerPostToParent", prim_worker_post_to_parent);
+    set_fn(
+        scope,
+        global,
+        "__workerPostToWorker",
+        prim_worker_post_to_worker,
+    );
+    set_fn(
+        scope,
+        global,
+        "__workerPostToParent",
+        prim_worker_post_to_parent,
+    );
     set_fn(scope, global, "__workerTerminate", prim_worker_terminate);
     set_fn(scope, global, "__runWorkerScript", prim_run_worker_script);
 }
@@ -169,7 +179,10 @@ fn prim_run_worker_script(
     // Surface an uncaught top-level error into the worker console so it isn't silently lost.
     if let Some(err) = out.error {
         if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
-            state.console.borrow_mut().push(format!("⚠ worker script error: {err}"));
+            state
+                .console
+                .borrow_mut()
+                .push(format!("⚠ worker script error: {err}"));
         }
     }
 }
