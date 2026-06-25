@@ -1719,16 +1719,11 @@ pub(crate) fn prim_url_set(
     use wurl::Url;
     let href = arg_str(scope, &args, 0);
     let prop = arg_str(scope, &args, 1);
-    // WHATWG: the parser-based setters remove ASCII tab/newline from the value; username/password
-    // run through percent-encoding instead, so tab/newline become %09/%0A/%0D there.
-    let raw = arg_str(scope, &args, 2);
-    let value: String = if matches!(prop.as_str(), "username" | "password") {
-        raw
-    } else {
-        raw.chars()
-            .filter(|&c| c != '\t' && c != '\n' && c != '\r')
-            .collect()
-    };
+    // Pass the raw value: the parser-based setters strip ASCII tab/newline inside the basic parser
+    // (so a value like "\n\n\t" for `port` is non-empty here, runs through the parser to an empty
+    // buffer, and leaves the port unchanged — rather than being treated as the empty string), and
+    // username/password percent-encode tab/newline (%09/%0A/%0D).
+    let value = arg_str(scope, &args, 2);
     let mut u = match Url::parse(&href) {
         Ok(u) => u,
         Err(_) => {

@@ -4034,25 +4034,14 @@
   }
   function __reflResolveURL(v) {
     v = String(v);
-    var base = __effectiveBaseURL();
-    var resolved;
+    // Resolve against the document base via the URL parser. An unparseable result (e.g. an empty or
+    // fragment-only ref against an opaque-path base, which fails per the URL standard) reflects the
+    // raw input — matching what the reflection harness expects.
     try {
-      if (v === "") {
-        // Empty relative URL: resolve to the base, but keep the base's path/query (drop its fragment).
-        var bp = parseURL(base);
-        resolved = bp.protocol + (bp.host ? "//" + bp.host : "") + bp.pathname + bp.search;
-      } else if (v.charCodeAt(0) === 35 /* '#' */) {
-        var bp2 = parseURL(base);
-        resolved = bp2.protocol + (bp2.host ? "//" + bp2.host : "") + bp2.pathname + bp2.search + v;
-      } else {
-        resolved = new URL(v, base).href;
-      }
-    } catch (e) { return v; }
-    var p = parseURL(resolved);
-    // Serialize the resolved record. Only special/authority URLs get the `//` separator — a
-    // non-special scheme with an opaque path (e.g. `data:`, `mailto:`) must never gain one.
-    if (p.__invalid || p.href === "") { return v; }
-    return p.href;
+      return new URL(v, __effectiveBaseURL()).href;
+    } catch (e) {
+      return v;
+    }
   }
   var __refl = (function () {
     var maxInt = 2147483647, minInt = -2147483648;

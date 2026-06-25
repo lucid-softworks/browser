@@ -627,10 +627,13 @@ impl Url {
                 s
             }
             "blob" => {
-                // origin of the inner URL path, best-effort.
+                // Parse the path as a URL; its origin is used only when its scheme is http/https/
+                // file (the URL standard returns an opaque origin otherwise).
                 if let PathKind::Opaque(p) = &self.path {
                     if let Ok(inner) = Url::parse(p) {
-                        return inner.origin();
+                        if matches!(inner.scheme.as_str(), "http" | "https" | "file") {
+                            return inner.origin();
+                        }
                     }
                 }
                 "null".to_string()
