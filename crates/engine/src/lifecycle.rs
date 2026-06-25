@@ -942,6 +942,18 @@ impl Engine {
                             Vec::new()
                         };
                         let mut run_idx = 0usize;
+                        // Forced-colors backplate pre-pass: paint every line's Canvas backplate
+                        // BEFORE any glyphs, so adjacent inline fragments on one line don't overwrite
+                        // each other's text. Spans the full line box (the WPT refs use block bgs).
+                        paint_backplates(
+                            &mut fb,
+                            &cache.root,
+                            left,
+                            header_h - scroll_y,
+                            header_h,
+                            page_max_y,
+                            (0.0, dw as f32),
+                        );
                         paint_box(
                             &mut fb,
                             Fonts {

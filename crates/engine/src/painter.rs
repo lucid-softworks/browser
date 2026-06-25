@@ -40,6 +40,92 @@ pub(crate) fn paint_box(
         1.0,
         sel_ranges,
         run_idx,
+        (0.0, fb.width as f32),
+    );
+}
+
+/// Forced-colors backplate pre-pass: paint each text line's Canvas backplate spanning the full line
+/// box (the nearest block ancestor's content width), BEFORE any glyphs are drawn. A single line can
+/// hold several inline fragments (each its own text box); painting per-fragment in the main pass
+/// would let a later fragment's full-width backplate erase an earlier fragment's text. Running this
+/// first puts every backplate beneath all glyphs. Only active in forced colors mode; a no-op
+/// otherwise. Axis-aligned (scroll-translated) boxes only — CSS-transformed subtrees are skipped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_backplates(
+    fb: &mut Framebuffer,
+    b: &layout::LayoutBox,
+    ox: f32,
+    oy: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    line_x: (f32, f32),
+) {
+    if !style::forced_colors_active() {
+        return;
+    }
+    fn walk(
+        fb: &mut Framebuffer,
+        b: &layout::LayoutBox,
+        xf: &Affine,
+        clip_top: f32,
+        clip_bottom: f32,
+        line_x: (f32, f32),
+    ) {
+        // A CSS transform makes the mapping non-axis-aligned; backplates under one are rare — skip
+        // the subtree rather than mis-place them.
+        if b.style
+            .extras
+            .as_deref()
+            .and_then(|e| e.transform)
+            .is_some()
+        {
+            return;
+        }
+        let border = b.dimensions.border_box();
+        let content = b.dimensions.content;
+        // A block establishes the line-box extent for its inline descendants.
+        let line_x = if b.style.display_block {
+            let (lx, _) = xf.apply(content.x, content.y);
+            let (rx, _) = xf.apply(content.x + content.width, content.y);
+            (lx.min(rx), lx.max(rx))
+        } else {
+            line_x
+        };
+        let is_backplate = b.style.visible
+            && matches!(b.content, layout::BoxContent::Text(_))
+            && b.style.background_color == Some((255, 255, 255));
+        if is_backplate {
+            let (_, dy0) = xf.apply(border.x, border.y);
+            let (_, dy1) = xf.apply(border.x + border.width, border.y + border.height);
+            let (y0, y1) = (dy0.min(dy1), dy0.max(dy1));
+            if y1 > clip_top && y0 < clip_bottom {
+                fb.fill_rect(
+                    Rect {
+                        x: line_x.0.round() as i32,
+                        y: y0.round() as i32,
+                        w: (line_x.1 - line_x.0).round().max(0.0) as i32,
+                        h: (y1 - y0).round().max(1.0) as i32,
+                    },
+                    Color {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 255,
+                    },
+                );
+            }
+        }
+        for child in &b.children {
+            walk(fb, child, xf, clip_top, clip_bottom, line_x);
+        }
+    }
+    walk(
+        fb,
+        b,
+        &Affine::translate(ox, oy),
+        clip_top,
+        clip_bottom,
+        line_x,
     );
 }
 
@@ -136,12 +222,24 @@ pub(crate) fn paint_box_opacity(
     parent_opacity: f32,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
+    // Device-px content left/right of the nearest block ancestor — the line-box extent a forced
+    // colors backplate spans (the WPT refs paint a full-width Canvas block behind each text line,
+    // not just the glyph run).
+    line_x: (f32, f32),
 ) {
     // This box's opacity multiplies into the inherited (effective) opacity for itself + subtree.
     let opacity = parent_opacity * b.style.opacity.clamp(0.0, 1.0);
 
     let border = b.dimensions.border_box();
     let content = b.dimensions.content;
+    // A block establishes the line-box extent for its inline descendants (used by the backplate).
+    let line_x = if b.style.display_block {
+        let (lx, _) = xf.apply(content.x, content.y);
+        let (rx, _) = xf.apply(content.x + content.width, content.y);
+        (lx.min(rx), lx.max(rx))
+    } else {
+        line_x
+    };
     let radius = b.style.border_radius();
     let extras = b.style.extras.as_deref();
 
@@ -259,17 +357,26 @@ pub(crate) fn paint_box_opacity(
                 b: bl,
                 a: scale_alpha(255, opacity),
             };
-            fill_box(
-                fb,
-                xf,
-                border.x,
-                border.y,
-                border.width,
-                border.height,
-                radius,
-                c,
-                axis,
-            );
+            // Forced-colors backplate: a per-line text fragment's Canvas background is painted by the
+            // separate `paint_backplates` pre-pass (full line-box width, before any glyphs), so skip
+            // it here — re-painting it now would overwrite an earlier inline fragment's glyphs.
+            let _ = line_x;
+            let is_backplate = matches!(b.content, layout::BoxContent::Text(_))
+                && (r, g, bl) == (255, 255, 255)
+                && style::forced_colors_active();
+            if !is_backplate {
+                fill_box(
+                    fb,
+                    xf,
+                    border.x,
+                    border.y,
+                    border.width,
+                    border.height,
+                    radius,
+                    c,
+                    axis,
+                );
+            }
         }
 
         // (a2) `background-image: url(...)`: composed per-box into a border-box-sized bitmap (image
@@ -712,6 +819,7 @@ pub(crate) fn paint_box_opacity(
             opacity,
             sel_ranges,
             run_idx,
+            line_x,
         );
     }
     fb.clip = saved_clip;

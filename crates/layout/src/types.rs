@@ -92,6 +92,8 @@ pub struct PaintStyle {
     /// A visited link in forced colors mode: the painter maps its LinkText to VisitedText (kept out
     /// of the computed style so getComputedStyle can't leak visited state).
     pub visited_link: bool,
+    /// `display: block`-level (establishes a line-box context for inline descendants).
+    pub display_block: bool,
     /// `overflow` is not `visible` (hidden/clip/scroll/auto): the painter clips this box's
     /// descendants to its padding box. Drives CSS `overflow` clipping (and hides `sr-only` content).
     pub clips_overflow: bool,
@@ -150,6 +152,7 @@ impl Default for PaintStyle {
             opacity: 1.0,
             visible: true,
             visited_link: false,
+            display_block: false,
             clips_overflow: false,
             letter_spacing: 0.0,
             line_height: None,
