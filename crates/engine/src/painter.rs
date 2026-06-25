@@ -1574,15 +1574,25 @@ pub(crate) fn paint_box_shadow(
 /// to white when neither sets one. Walks the first-child chain (html → body) so it never picks up a
 /// content element's background.
 pub(crate) fn page_background(root: &layout::LayoutBox, root_scheme_dark: bool) -> Color {
+    // In forced colors mode the viewport background comes only from the root element (`<html>`) —
+    // `<body>`'s background (and its `forced-color-adjust`) does NOT propagate to the viewport — and
+    // defaults to Canvas (white) otherwise.
+    let forced = style::forced_colors_active();
     let mut node = root;
     for _ in 0..3 {
         if let Some((r, g, b)) = node.style.background_color {
             return Color::rgb(r, g, b);
         }
+        if forced {
+            break;
+        }
         match node.children.first() {
             Some(c) => node = c,
             None => break,
         }
+    }
+    if forced {
+        return Color::WHITE; // Canvas
     }
     // No explicit html/body background: default canvas is white, or dark (`#1e1e1e`) when the page
     // opted into a dark `color-scheme` (resolved during the cascade and stored on the layout cache).

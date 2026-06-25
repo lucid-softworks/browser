@@ -496,7 +496,7 @@ pub(crate) static FORCED_COLORS: std::sync::atomic::AtomicBool =
 pub fn set_forced_colors(active: bool) {
     FORCED_COLORS.store(active, std::sync::atomic::Ordering::Relaxed);
 }
-pub(crate) fn forced_colors_active() -> bool {
+pub fn forced_colors_active() -> bool {
     // Honour the LUCID_FORCED_COLORS env var (read once) so a test run can enable forced colors for
     // the whole process without per-call engine plumbing.
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
