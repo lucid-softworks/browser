@@ -294,8 +294,10 @@ pub(crate) fn domain_to_ascii(domain: &str) -> Result<String, ()> {
                 return Err(());
             }
             let decoded = punycode_decode(rest).ok_or(())?;
-            // An ACE label must decode to ≥1 non-ASCII code point and round-trip.
+            // An ACE label must decode to ≥1 non-ASCII code point, round-trip, and not itself look
+            // like another ACE label (a decoded U-label must not start with "xn--").
             if decoded.iter().all(char::is_ascii)
+                || decoded.starts_with(&['x', 'n', '-', '-'])
                 || punycode_encode(&decoded).as_deref() != Some(rest)
             {
                 return Err(());
