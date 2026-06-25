@@ -130,6 +130,9 @@ struct PaintState {
     /// Group/element `opacity` accumulates multiplicatively down the tree.
     opacity: f32,
     evenodd: bool,
+    /// In forced colors mode (and not forced-color-adjust:none), the element's forced `currentColor`
+    /// — gradient stops authored with non-system colors resolve to it (so the gradient goes solid).
+    force_stops: Option<(u8, u8, u8)>,
 }
 
 impl Default for PaintState {
@@ -148,6 +151,7 @@ impl Default for PaintState {
             stroke_opacity: 1.0,
             opacity: 1.0,
             evenodd: false,
+            force_stops: None,
         }
     }
 }
@@ -1090,6 +1094,9 @@ fn apply_paint(
             if st.stroke.is_some() {
                 st.stroke = Some(cc);
             }
+            st.force_stops = Some(cs.color);
+        } else {
+            st.force_stops = None;
         }
     }
     st
@@ -1446,6 +1453,8 @@ fn paint_url_id(v: &str) -> Option<String> {
 struct GradStop {
     offset: f32, // 0..1
     color: Color,
+    /// Whether `stop-color` was a CSS system color keyword — forced colors preserves it.
+    is_system: bool,
 }
 
 enum GradKind {
@@ -1578,7 +1587,11 @@ fn collect_stops(doc: &Document, grad: NodeId) -> Vec<GradStop> {
                 }
                 None => 0.0,
             };
-        let mut color = prop(el, "stop-color", &style)
+        let stop_color_str = prop(el, "stop-color", &style);
+        let is_system = stop_color_str
+            .as_deref()
+            .is_some_and(|c| style::is_system_color_keyword(&c.trim().to_ascii_lowercase()));
+        let mut color = stop_color_str
             .and_then(|c| parse_css_color(c.trim()))
             .unwrap_or(Color {
                 r: 0,
@@ -1593,6 +1606,7 @@ fn collect_stops(doc: &Document, grad: NodeId) -> Vec<GradStop> {
         out.push(GradStop {
             offset: offset.clamp(0.0, 1.0),
             color,
+            is_system,
         });
     }
     out
@@ -1763,10 +1777,24 @@ fn paint_shape(
     m: &Affine,
 ) {
     // Gradient fill takes precedence over the solid fallback when the ref resolves.
-    let gradient = state
+    let mut gradient = state
         .fill_url
         .as_deref()
         .and_then(|id| resolve_gradient(doc, id));
+    // Forced colors: a non-system gradient stop resolves to the shape's forced currentColor (so a
+    // gradient of author colors collapses to solid); system-color stops are preserved.
+    if let (Some(g), Some((r, gn, b))) = (gradient.as_mut(), state.force_stops) {
+        for stop in &mut g.stops {
+            if !stop.is_system {
+                stop.color = Color {
+                    r,
+                    g: gn,
+                    b,
+                    a: stop.color.a,
+                };
+            }
+        }
+    }
     if let Some(g) = gradient {
         fill_subpaths_gradient(
             surf,

@@ -349,7 +349,7 @@ pub(crate) fn parse_named_color(lower: &str) -> Option<(u8, u8, u8)> {
 /// so a property forced to `CanvasText` renders the same as an element that names `CanvasText`.
 /// Whether `lower` (already lowercased) is a CSS system color keyword — independent of forced
 /// colors mode (used to detect author-specified system colors, which forced colors preserves).
-pub(crate) fn is_system_color_keyword(lower: &str) -> bool {
+pub fn is_system_color_keyword(lower: &str) -> bool {
     matches!(
         lower,
         "canvas"
