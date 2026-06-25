@@ -59,8 +59,12 @@ pub(crate) fn paint_backplates(
     clip_top: f32,
     clip_bottom: f32,
     line_x: (f32, f32),
+    has_bg_image: bool,
 ) {
-    if !style::forced_colors_active() {
+    // The backplate exists to keep text legible over a background IMAGE. With no image the canvas is
+    // a flat system color and a Canvas backplate would be invisible (and the WPT refs only simulate
+    // backplates for the image cases), so skip the pre-pass entirely.
+    if !style::forced_colors_active() || !has_bg_image {
         return;
     }
     fn walk(

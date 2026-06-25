@@ -945,6 +945,7 @@ impl Engine {
                         // Forced-colors backplate pre-pass: paint every line's Canvas backplate
                         // BEFORE any glyphs, so adjacent inline fragments on one line don't overwrite
                         // each other's text. Spans the full line box (the WPT refs use block bgs).
+                        let has_bg_image = self.canvas_bg.is_some() || !self.bg_bitmaps.is_empty();
                         paint_backplates(
                             &mut fb,
                             &cache.root,
@@ -953,6 +954,7 @@ impl Engine {
                             header_h,
                             page_max_y,
                             (0.0, dw as f32),
+                            has_bg_image,
                         );
                         paint_box(
                             &mut fb,

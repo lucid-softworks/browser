@@ -506,12 +506,14 @@ pub(crate) fn apply_declaration(
                 }
                 if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                     // Solid color interpretation; `transparent`/`none` leave it unchanged.
-                    style.background_color = Some(c);
+                    let alpha = crate::colors::parse_rgba_ctx(val, current_color, inherited_color)
+                        .map_or(255, |rgba| rgba.a);
+                    // A fully transparent color (e.g. `rgba(0,0,0,0)`) paints nothing — treat it as
+                    // no background, not opaque black (the painter fills `background_color` opaquely).
+                    style.background_color = if alpha == 0 { None } else { Some(c) };
                     style.bg_is_system = has_system_color(val);
                     style.bg_is_currentcolor = val.trim().eq_ignore_ascii_case("currentcolor");
-                    style.background_alpha =
-                        crate::colors::parse_rgba_ctx(val, current_color, inherited_color)
-                            .map_or(255, |rgba| rgba.a);
+                    style.background_alpha = alpha;
                 }
             }
         }
