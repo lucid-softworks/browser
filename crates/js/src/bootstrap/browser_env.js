@@ -8662,6 +8662,8 @@
         var url = null;
         if (rawSrc != null && rawSrc !== "") {
           try { url = new globalThis.URL(rawSrc, globalThis.location.href).href; } catch (e) { url = rawSrc; }
+        } else if (srcdoc == null) {
+          url = "about:blank"; // a srcless iframe still gets an about:blank browsing context
         }
         var key = (srcdoc != null) ? ("srcdoc:" + srcdoc) : (url || "");
         if (key === "") { return; }
@@ -8698,6 +8700,11 @@
       var __cwFacade = Object.getOwnPropertyDescriptor(IFP2, "contentWindow");
       Object.defineProperty(IFP2, "contentWindow", {
         get: function () {
+          // A srcless iframe still has a window: lazily give it an about:blank realm on first access.
+          if (!this.__frameLoadedKey) {
+            var hasSrc = this.getAttribute && (this.getAttribute("src") || (this.hasAttribute && this.hasAttribute("srcdoc")));
+            if (!hasSrc) { __loadFrame(this); }
+          }
           if (this.__frameLoadedKey) {
             var el = this;
             if (!el.__cwinReal) {
@@ -8710,13 +8717,31 @@
               base.self = base; base.window = base;
               try { base.parent = globalThis; base.top = globalThis; } catch (e) {}
               // Reads not on `base` (performance, location, document, globals the frame's scripts
-              // set, …) reach into the frame realm via __frameGet.
+              // set, …) reach into the frame realm via __frameGet. Assigning `location` forwards to
+              // the frame's Location href setter (PutForwards=href): an invalid URL throws the
+              // frame's SyntaxError DOMException, a valid one navigates the frame.
               if (typeof globalThis.Proxy === "function" && typeof __frameGet === "function") {
                 el.__cwinReal = new globalThis.Proxy(base, {
                   get: function (t, prop) {
                     if (prop in t) { return t[prop]; }
                     if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
                     return undefined;
+                  },
+                  set: function (t, prop, v) {
+                    if (prop === "location") {
+                      var loc; try { loc = __frameGet(el.__node, "location"); } catch (e) {}
+                      var fbase = (loc && loc.href) || "about:blank";
+                      if (globalThis.__urlParse(String(v), fbase) == null) {
+                        var DE; try { DE = __frameGet(el.__node, "DOMException"); } catch (e) {}
+                        if (typeof DE !== "function") { DE = globalThis.DOMException; }
+                        throw new DE("Failed to set the 'href' property on 'Location': '" + v + "' is not a valid URL.", "SyntaxError");
+                      }
+                      // Valid: navigate the frame to the new URL.
+                      try { el.setAttribute("src", String(v)); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el); } catch (e) {}
+                      return true;
+                    }
+                    t[prop] = v;
+                    return true;
                   }
                 });
               } else {

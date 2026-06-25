@@ -4678,6 +4678,54 @@ mod tests {
     }
 
     #[test]
+    fn srcless_iframe_has_window_and_location_throws_on_invalid() {
+        // A srcless <iframe> still has an about:blank browsing context: contentWindow exposes the
+        // frame realm's globals (e.g. DOMException), and assigning contentWindow.location an invalid
+        // URL throws the frame's SyntaxError DOMException (PutForwards=href).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.body.appendChild(document.createElement('iframe'));
+                document.body.setAttribute('data-de', typeof f.contentWindow.DOMException);
+                var threw = '';
+                try { f.contentWindow.location = 'file://example:1/'; }
+                catch (e) { threw = e.name + ':' + (e instanceof f.contentWindow.DOMException); }
+                document.body.setAttribute('data-throw', threw);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-de").as_deref(),
+            Some("function"),
+            "frame has DOMException"
+        );
+        assert_eq!(
+            attr("data-throw").as_deref(),
+            Some("SyntaxError:true"),
+            "invalid location throws frame's SyntaxError"
+        );
+    }
+
+    #[test]
     fn url_host_setter_conformance() {
         // host setter: a file URL can't have a port, so `host = 'x:123'` is rejected (no-op); a
         // special URL's host setter splits host:port; an opaque-path query removal keeps trailing
