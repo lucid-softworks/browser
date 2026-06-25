@@ -6786,13 +6786,43 @@
     def(globalThis.PerformanceObserver.prototype, "takeRecords", function () { return []; });
   }
 
+  // --- crossOriginIsolated / isSecureContext ----------------------------------------------
+  // Boolean globals the platform always exposes (hr-time and others read `self.crossOriginIsolated`
+  // and assert it is a boolean). We are never cross-origin isolated (no COOP+COEP gating), so it is
+  // `false`. `isSecureContext` is true for https/file/localhost; approximate from the page URL.
+  if (typeof globalThis.crossOriginIsolated !== "boolean") {
+    try { Object.defineProperty(globalThis, "crossOriginIsolated", { value: false, writable: false, enumerable: true, configurable: true }); }
+    catch (e) { try { globalThis.crossOriginIsolated = false; } catch (e2) {} }
+  }
+  if (typeof globalThis.isSecureContext !== "boolean") {
+    var __secure = false;
+    try {
+      var __u = String((globalThis.location && globalThis.location.href) || globalThis.__pageURL || "");
+      __secure = /^(https:|wss:|file:)/.test(__u) || /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?:[:\/]|$)/.test(__u);
+    } catch (e) {}
+    try { Object.defineProperty(globalThis, "isSecureContext", { value: __secure, writable: false, enumerable: true, configurable: true }); }
+    catch (e) { try { globalThis.isSecureContext = __secure; } catch (e2) {} }
+  }
+
   // --- performance -------------------------------------------------------------------------
   if (!globalThis.performance || typeof globalThis.performance.now !== "function") {
-    var perfStart = 0;
+    // The time origin: a real wall-clock epoch (ms) captured at context creation, so `timeOrigin`
+    // is close to Date.now() and `timeOrigin + now()` tracks the wall clock (per spec). `now()` is
+    // the high-res time since the origin, clamped monotonically so two reads never go backwards even
+    // if the system clock is adjusted (hr-time requires a non-negative, monotonic clock).
+    var __perfOrigin = (function () { try { return Date.now(); } catch (e) { return 0; } })();
+    var __perfLast = 0;
+    function __perfNow() {
+      var t;
+      try { t = Date.now() - __perfOrigin; } catch (e) { t = __perfLast; }
+      if (!(t >= __perfLast)) { t = __perfLast; }
+      __perfLast = t;
+      return t;
+    }
     globalThis.performance = {
-      now: function () { try { return (globalThis.__eventLoop ? globalThis.__eventLoop.now : 0); } catch (e) { return 0; } },
-      timeOrigin: 0,
-      timing: { navigationStart: 0, fetchStart: 0, domLoading: 0, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: 0, responseEnd: 0, requestStart: 0, connectStart: 0, connectEnd: 0, secureConnectionStart: 0, domainLookupStart: 0, domainLookupEnd: 0, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0 },
+      now: __perfNow,
+      timeOrigin: __perfOrigin,
+      timing: { navigationStart: __perfOrigin, fetchStart: __perfOrigin, domLoading: __perfOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: __perfOrigin, responseEnd: __perfOrigin, requestStart: __perfOrigin, connectStart: __perfOrigin, connectEnd: __perfOrigin, secureConnectionStart: 0, domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0 },
       navigation: { type: 0, redirectCount: 0 },
       memory: { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 },
       getEntries: function () { return (globalThis.__resourceEntries || []).slice(); },
@@ -6801,7 +6831,7 @@
       mark: fn, measure: fn, clearMarks: fn, clearMeasures: fn,
       clearResourceTimings: function () { globalThis.__resourceEntries = []; },
       setResourceTimingBufferSize: fn,
-      toJSON: function () { return {}; }
+      toJSON: function () { return { timeOrigin: __perfOrigin, timing: this.timing, navigation: this.navigation }; }
     };
   } else {
     // A native/earlier-installed `performance` is present: route its resource-timing readers at our
