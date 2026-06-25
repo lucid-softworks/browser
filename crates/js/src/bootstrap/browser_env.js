@@ -6801,29 +6801,49 @@
     // is close to Date.now() and `timeOrigin + now()` tracks the wall clock (per spec). `now()` is
     // the high-res time since the origin, clamped monotonically so two reads never go backwards even
     // if the system clock is adjusted (hr-time requires a non-negative, monotonic clock).
-    var __perfOrigin = (function () { try { return Date.now(); } catch (e) { return 0; } })();
-    var __perfLast = 0;
-    function __perfNow() {
+    // A real `Performance` interface (extends EventTarget): the members live on the prototype so
+    // idlharness's existence/inheritance/stringification checks pass, and `performance` is an actual
+    // instance. now() is high-res time since a real wall-clock origin, clamped monotonically.
+    defClass("Performance", globalThis.EventTarget);
+    var Pp = globalThis.Performance.prototype;
+    // Named function expressions so `.name` is the operation name (WebIDL / idlharness).
+    Pp.now = function now() {
+      if (!Object.prototype.hasOwnProperty.call(this, "__origin")) { throw new TypeError("Illegal invocation"); }
       var t;
-      try { t = Date.now() - __perfOrigin; } catch (e) { t = __perfLast; }
-      if (!(t >= __perfLast)) { t = __perfLast; }
-      __perfLast = t;
+      try { t = Date.now() - this.__origin; } catch (e) { t = this.__last; }
+      if (!(t >= this.__last)) { t = this.__last; }
+      this.__last = t;
       return t;
-    }
-    globalThis.performance = {
-      now: __perfNow,
-      timeOrigin: __perfOrigin,
-      timing: { navigationStart: __perfOrigin, fetchStart: __perfOrigin, domLoading: __perfOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: __perfOrigin, responseEnd: __perfOrigin, requestStart: __perfOrigin, connectStart: __perfOrigin, connectEnd: __perfOrigin, secureConnectionStart: 0, domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0, toJSON: function () { var o = {}, k = Object.keys(this); for (var i = 0; i < k.length; i++) { if (typeof this[k[i]] === "number") { o[k[i]] = this[k[i]]; } } return o; } },
-      navigation: { type: 0, redirectCount: 0, toJSON: function () { return { type: this.type, redirectCount: this.redirectCount }; } },
-      memory: { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 },
-      getEntries: function () { return (globalThis.__resourceEntries || []).slice(); },
-      getEntriesByType: function (t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.entryType === t; }); },
-      getEntriesByName: function (n, t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.name === n && (!t || e.entryType === t); }); },
-      mark: fn, measure: fn, clearMarks: fn, clearMeasures: fn,
-      clearResourceTimings: function () { globalThis.__resourceEntries = []; },
-      setResourceTimingBufferSize: fn,
-      toJSON: function () { return { timeOrigin: __perfOrigin, timing: this.timing, navigation: this.navigation }; }
     };
+    // WebIDL: reading an attribute getter on the interface prototype object (no instance) must throw.
+    Object.defineProperty(Pp, "timeOrigin", {
+      get: function () {
+        if (!Object.prototype.hasOwnProperty.call(this, "__origin")) { throw new TypeError("Illegal invocation"); }
+        return this.__origin;
+      },
+      enumerable: true, configurable: true
+    });
+    Pp.getEntries = function () { return (globalThis.__resourceEntries || []).slice(); };
+    Pp.getEntriesByType = function (t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.entryType === t; }); };
+    Pp.getEntriesByName = function (n, t) { return (globalThis.__resourceEntries || []).filter(function (e) { return e.name === n && (!t || e.entryType === t); }); };
+    Pp.mark = fn; Pp.measure = fn; Pp.clearMarks = fn; Pp.clearMeasures = fn;
+    Pp.clearResourceTimings = function () { globalThis.__resourceEntries = []; };
+    Pp.setResourceTimingBufferSize = fn;
+    Pp.toJSON = function toJSON() { return { timeOrigin: this.__origin, timing: this.timing, navigation: this.navigation }; };
+
+    var __perfOrigin = (function () { try { return Date.now(); } catch (e) { return 0; } })();
+    var perf = Object.create(Pp);
+    perf.__origin = __perfOrigin;
+    perf.__last = 0;
+    perf.timing = { navigationStart: __perfOrigin, fetchStart: __perfOrigin, domLoading: __perfOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: __perfOrigin, responseEnd: __perfOrigin, requestStart: __perfOrigin, connectStart: __perfOrigin, connectEnd: __perfOrigin, secureConnectionStart: 0, domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0, toJSON: function () { var o = {}, k = Object.keys(this); for (var i = 0; i < k.length; i++) { if (typeof this[k[i]] === "number") { o[k[i]] = this[k[i]]; } } return o; } };
+    perf.navigation = { type: 0, redirectCount: 0, toJSON: function () { return { type: this.type, redirectCount: this.redirectCount }; } };
+    perf.memory = { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 };
+    // WebIDL: `performance` is an attribute (accessor with a getter), not a data property.
+    Object.defineProperty(globalThis, "performance", {
+      get: function () { return perf; },
+      set: function (v) { perf = v; },
+      enumerable: true, configurable: true
+    });
   } else {
     // A native/earlier-installed `performance` is present: route its resource-timing readers at our
     // buffer too (best-effort; ignored if the methods are non-configurable).
@@ -7185,9 +7205,16 @@
   // (see __wrapNode below) so `el instanceof HTMLElement/Element/Node` returns true.
   function defClass(name, parentCtor) {
     var ctor = typeof globalThis[name] === "function" ? globalThis[name] : function () {};
+    // WebIDL: the interface object's `name` is the interface name (idlharness checks it). An
+    // anonymous function would otherwise infer the variable name ("ctor").
+    try { Object.defineProperty(ctor, "name", { value: name, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+    // WebIDL: an interface object's [[Prototype]] is its inherited interface's object (so
+    // `Object.getPrototypeOf(Sub) === Base`), and the interface prototype object is non-writable.
     if (parentCtor && parentCtor.prototype) {
       try { Object.setPrototypeOf(ctor.prototype, parentCtor.prototype); } catch (e) {}
+      try { Object.setPrototypeOf(ctor, parentCtor); } catch (e) {}
     }
+    try { Object.defineProperty(ctor, "prototype", { writable: false }); } catch (e) {}
     // Per WebIDL, an interface prototype object carries `@@toStringTag` = the interface name, so
     // `Object.prototype.toString.call(instance)` reports `[object <Interface>]`. Defined here on the
     // own prototype (configurable, non-enumerable) so e.g. a `CSSFontFaceRule` stringifies correctly.
