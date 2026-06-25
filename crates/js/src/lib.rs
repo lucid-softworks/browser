@@ -5213,6 +5213,55 @@ mod tests {
     }
 
     #[test]
+    fn iframe_data_url_decodes_and_runs() {
+        // An <iframe> with a data: src decodes the URL inline (no fetch), parses it as the frame
+        // document, runs its script, and posts to the parent.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                window.addEventListener('message', function (e) {
+                  document.body.setAttribute('data-msg', e.data);
+                });
+                var f = document.body.appendChild(document.createElement('iframe'));
+                f.onload = function () {
+                  document.body.setAttribute('data-q', f.contentDocument.querySelector('a').search);
+                };
+                f.src = "data:text/html,<a href='http://h/?q=1'>x</a><script>parent.postMessage('ran','*')<\/script>";
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-msg").as_deref(),
+            Some("ran"),
+            "data: frame script runs + posts"
+        );
+        assert_eq!(
+            attr("data-q").as_deref(),
+            Some("?q=1"),
+            "frame anchor decomposition"
+        );
+    }
+
+    #[test]
     fn iframe_contentdocument_queries_loaded_realm() {
         // Setting iframe.src navigates the frame; contentDocument exposes the loaded realm's parsed
         // document, so querySelector finds its content and the anchor decomposition works.
