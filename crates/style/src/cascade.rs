@@ -163,6 +163,10 @@ pub(crate) fn apply_forced_colors(
             if !s.color_explicit {
                 s.color = parent_color;
             }
+            // `background: currentColor` follows the (now forced) color.
+            if s.bg_is_currentcolor {
+                s.background_color = Some(s.color);
+            }
             my_color = s.color;
         }
     }
@@ -198,8 +202,17 @@ pub(crate) fn apply_forced_colors(
         // elsewhere.
         let is_root_or_body = matches!(&doc.get(id).data,
             dom::NodeData::Element(e) if e.tag == "html" || e.tag == "body");
+        // `<mark>` is a highlight: forced colors maps it to the Mark/MarkText system colors (its
+        // default highlight), not Canvas/CanvasText.
+        let is_mark = matches!(&doc.get(id).data, dom::NodeData::Element(e) if e.tag == "mark");
         if let Some(s) = out.get_mut(&id) {
             force_style_colors(s, text_color, has_text, !is_root_or_body);
+            if is_mark {
+                s.background_color = Some((255, 255, 0)); // Mark
+            }
+            if s.bg_is_currentcolor && !s.bg_is_system {
+                s.background_color = Some(s.color);
+            }
             // A link's border takes its link color (LinkText/VisitedText), not CanvasText. Its
             // outline-color and caret-color resolve to `color`, so they follow automatically.
             if is_link && !s.border_is_system {
@@ -809,6 +822,7 @@ pub(crate) fn compute_element_style<'a>(
         border_is_system: false, // not inherited
         background_color: None, // not inherited
         background_alpha: 255, // not inherited
+        bg_is_currentcolor: false, // not inherited
         visited_link: false,   // not inherited; set by the forced-colors pass
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),

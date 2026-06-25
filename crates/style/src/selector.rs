@@ -1664,7 +1664,7 @@ pub(crate) fn user_agent_stylesheet() -> css::Stylesheet {
          u, ins { text-decoration: underline }
          s, del, strike { text-decoration: line-through }
          abbr[title] { text-decoration: underline }
-         mark { background-color: #ffff00; color: #000 }
+         mark { background-color: Mark; color: MarkText }
          cite, var, dfn, address { font-style: italic }
          small { font-size: smaller }
          sub, sup { font-size: smaller }

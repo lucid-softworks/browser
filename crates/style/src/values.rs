@@ -305,6 +305,9 @@ pub struct ComputedStyle {
     /// Alpha (0..=255) of `background_color`. Forced colors replaces the RGB with Canvas but keeps
     /// this alpha, so a translucent background stays translucent.
     pub background_alpha: u8,
+    /// Whether `background-color` was authored as `currentColor`; it then follows the element's
+    /// (possibly forced) `color` rather than a value frozen at cascade time.
+    pub bg_is_currentcolor: bool,
     /// A visited link in forced colors mode. `color`/`border_color` keep LinkText (so getComputedStyle
     /// can't leak visited state — a privacy requirement); the painter maps that LinkText to VisitedText.
     pub visited_link: bool,

@@ -508,6 +508,7 @@ pub(crate) fn apply_declaration(
                     // Solid color interpretation; `transparent`/`none` leave it unchanged.
                     style.background_color = Some(c);
                     style.bg_is_system = has_system_color(val);
+                    style.bg_is_currentcolor = val.trim().eq_ignore_ascii_case("currentcolor");
                     style.background_alpha =
                         crate::colors::parse_rgba_ctx(val, current_color, inherited_color)
                             .map_or(255, |rgba| rgba.a);
