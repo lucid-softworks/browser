@@ -104,6 +104,19 @@ pub(crate) fn cascade_locked(
     (out, root_used_scheme_dark())
 }
 
+/// Map one style's colors to system colors. `text_color` is the forced text color (LinkText for
+/// links, else CanvasText); `paint_bg` requests a Canvas background (a painted box, or a text
+/// backplate). Border → CanvasText; a transparent box stays transparent; box shadows are dropped;
+/// background images/gradients are preserved (text reads over them).
+fn force_style_colors(s: &mut ComputedStyle, text_color: (u8, u8, u8), paint_bg: bool) {
+    s.color = text_color;
+    s.border_color = (0, 0, 0); // CanvasText
+    if s.background_color.is_some() || paint_bg {
+        s.background_color = Some((255, 255, 255)); // Canvas
+    }
+    s.box_shadows.clear();
+}
+
 /// In forced colors mode, replace author text/background/border colors with system colors
 /// (CanvasText / Canvas), skipping any element (or descendant of an element) with
 /// `forced-color-adjust: none`. `forced-color-adjust` inherits, hence the `ancestor_off` flag.
@@ -113,7 +126,6 @@ pub(crate) fn apply_forced_colors(
     ancestor_off: bool,
     out: &mut HashMap<dom::NodeId, ComputedStyle>,
 ) {
-    let canvas = (255, 255, 255);
     let off = ancestor_off || out.get(&id).is_some_and(|s| s.forced_color_adjust_off);
     if !off {
         // A hyperlink's text takes LinkText; everything else takes CanvasText.
@@ -124,7 +136,7 @@ pub(crate) fn apply_forced_colors(
         } else {
             (0, 0, 0) // CanvasText
         };
-        // The backplate: an element that directly contains non-whitespace text paints a Canvas block
+        // The backplate: an element directly containing non-whitespace text paints a Canvas block
         // behind it so the text stays readable over images. We approximate the per-line backplate
         // with a Canvas background on the text box — exactly how the WPT refs simulate it.
         let has_text =
@@ -132,15 +144,16 @@ pub(crate) fn apply_forced_colors(
                 |&c| matches!(&doc.get(c).data, dom::NodeData::Text(t) if !t.trim().is_empty()),
             );
         if let Some(s) = out.get_mut(&id) {
-            // Border → CanvasText. A painted background (or a text backplate) → Canvas; an empty
-            // transparent box stays transparent. Background images/gradients are preserved (text
-            // reads over them), and box shadows are dropped.
-            s.color = text_color;
-            s.border_color = (0, 0, 0);
-            if s.background_color.is_some() || has_text {
-                s.background_color = Some(canvas);
+            force_style_colors(s, text_color, has_text);
+            // ::before / ::after generated boxes are forced too (a pseudo with `content` is text).
+            if let Some(b) = s.before.as_mut() {
+                let txt = b.content.is_some();
+                force_style_colors(b, (0, 0, 0), txt);
             }
-            s.box_shadows.clear();
+            if let Some(a) = s.after.as_mut() {
+                let txt = a.content.is_some();
+                force_style_colors(a, (0, 0, 0), txt);
+            }
         }
     }
     for child in doc.get(id).children.clone() {
