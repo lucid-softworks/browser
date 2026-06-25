@@ -10112,42 +10112,68 @@
   }
 
   // --- URLSearchParams ---------------------------------------------------------------------
+  // application/x-www-form-urlencoded serialization: alnum + `*-._` pass through, space -> `+`,
+  // everything else -> %XX of its UTF-8 bytes (encodeURIComponent covers UTF-8; we then fix the
+  // characters it leaves but the form serializer must encode, and turn %20 into +).
+  function __formEncode(s) {
+    return encodeURIComponent(String(s))
+      .replace(/%20/g, "+")
+      .replace(/[!'()~]/g, function (c) { return "%" + c.charCodeAt(0).toString(16).toUpperCase(); });
+  }
+  function __formDecode(s) {
+    try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch (e) { return String(s).replace(/\+/g, " "); }
+  }
   if (typeof globalThis.URLSearchParams !== "function") {
     def(globalThis, "URLSearchParams", function (init) {
       var pairs = [];
+      var self = this;
+      // `__onChange` lets a URL keep its href/search in sync with mutations (set in the URL ctor).
+      function changed() { if (typeof self.__onChange === "function") { try { self.__onChange(); } catch (e) {} } }
       function add(k, v) { pairs.push([String(k), String(v)]); }
-      if (typeof init === "string") {
-        var s = init.charAt(0) === "?" ? init.slice(1) : init;
-        if (s) {
-          var segs = s.split("&");
-          for (var i = 0; i < segs.length; i++) {
-            if (!segs[i]) { continue; }
-            var eq = segs[i].indexOf("=");
-            var k = eq < 0 ? segs[i] : segs[i].slice(0, eq);
-            var v = eq < 0 ? "" : segs[i].slice(eq + 1);
-            try { add(decodeURIComponent(k.replace(/\+/g, " ")), decodeURIComponent(v.replace(/\+/g, " "))); } catch (e) { add(k, v); }
-          }
-        }
-      } else if (init && typeof init === "object") {
-        if (typeof init.forEach === "function" && typeof init.length === "number") {
-          for (var j = 0; j < init.length; j++) { add(init[j][0], init[j][1]); }
-        } else {
-          for (var key in init) { if (Object.prototype.hasOwnProperty.call(init, key)) { add(key, init[key]); } }
+      function parseQuery(s) {
+        if (s.charAt(0) === "?") { s = s.slice(1); }
+        if (!s) { return; }
+        var segs = s.split("&");
+        for (var i = 0; i < segs.length; i++) {
+          if (segs[i] === "") { continue; }
+          var eq = segs[i].indexOf("=");
+          var k = eq < 0 ? segs[i] : segs[i].slice(0, eq);
+          var v = eq < 0 ? "" : segs[i].slice(eq + 1);
+          add(__formDecode(k), __formDecode(v));
         }
       }
-      this.append = function (k, v) { add(k, v); };
-      this.set = function (k, v) { k = String(k); for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k) { pairs.splice(i, 1); } } add(k, v); };
-      this.get = function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; };
-      this.getAll = function (k) { k = String(k); var out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; };
-      this.has = function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return true; } } return false; };
-      this.delete = function (k) { k = String(k); for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k) { pairs.splice(i, 1); } } };
-      this.forEach = function (cb, thisArg) { for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } };
-      this.keys = function () { return pairs.map(function (p) { return p[0]; })[Symbol.iterator](); };
-      this.values = function () { return pairs.map(function (p) { return p[1]; })[Symbol.iterator](); };
-      this.entries = function () { return pairs.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); };
-      this.sort = function () { pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); };
-      this[Symbol.iterator] = function () { return this.entries(); };
-      this.toString = function () { return pairs.map(function (p) { return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]); }).join("&"); };
+      if (init == null) { /* empty */ }
+      else if (typeof init === "string") { parseQuery(init); }
+      else if (typeof init[Symbol.iterator] === "function") {
+        // Sequence of two-element sequences (covers arrays AND another URLSearchParams).
+        var it = init[Symbol.iterator](), step;
+        while (!(step = it.next()).done) {
+          var pair = step.value, a = [], pit = pair[Symbol.iterator](), ps;
+          while (!(ps = pit.next()).done) { a.push(ps.value); }
+          if (a.length !== 2) { throw new TypeError("Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements"); }
+          add(a[0], a[1]);
+        }
+      } else if (typeof init === "object") {
+        // Record: own enumerable string-keyed properties.
+        var keys = Object.keys(init);
+        for (var j = 0; j < keys.length; j++) { add(keys[j], init[keys[j]]); }
+      }
+      // Methods are non-enumerable (so `new URLSearchParams(usp)` / record init never see them).
+      def(this, "append", function (k, v) { add(k, v); changed(); });
+      def(this, "set", function (k, v) { k = String(k); v = String(v); var done = false; for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k) { if (done) { pairs.splice(i, 1); } else { pairs[i][1] = v; done = true; } } } if (!done) { add(k, v); } changed(); });
+      def(this, "get", function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; });
+      def(this, "getAll", function (k) { k = String(k); var out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; });
+      def(this, "has", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; });
+      def(this, "delete", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { pairs.splice(i, 1); } } changed(); });
+      def(this, "forEach", function (cb, thisArg) { for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } });
+      def(this, "keys", function () { return pairs.map(function (p) { return p[0]; })[Symbol.iterator](); });
+      def(this, "values", function () { return pairs.map(function (p) { return p[1]; })[Symbol.iterator](); });
+      def(this, "entries", function () { return pairs.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); });
+      def(this, "sort", function () { pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); changed(); });
+      def(this, Symbol.iterator, function () { return this.entries(); });
+      def(this, "toString", function () { return pairs.map(function (p) { return __formEncode(p[0]) + "=" + __formEncode(p[1]); }).join("&"); });
+      // Internal: replace contents from a query string (used by URL when .search/.href changes).
+      def(this, "__setFromQuery", function (q) { pairs.length = 0; parseQuery(q == null ? "" : String(q)); });
       Object.defineProperty(this, "size", { get: function () { return pairs.length; }, enumerable: false, configurable: true });
     });
   }
@@ -10165,7 +10191,29 @@
       this.username = p.username || ""; this.password = p.password || "";
       this.searchParams = new globalThis.URLSearchParams(p.search);
       this.toString = function () { return this.href; }; this.toJSON = function () { return this.href; };
+      // Keep href/search in sync when searchParams is mutated (append/set/delete/sort/…). Splice the
+      // freshly-serialized query back into href, preserving everything before `?` and the fragment.
+      var self = this;
+      this.searchParams.__onChange = function () {
+        var q = self.searchParams.toString();
+        self.search = q ? ("?" + q) : "";
+        var h = self.href;
+        var hi = h.indexOf("#");
+        var frag = hi >= 0 ? h.slice(hi) : (self.hash || "");
+        var qi = h.indexOf("?");
+        var head = qi >= 0 ? h.slice(0, qi) : (hi >= 0 ? h.slice(0, hi) : h);
+        self.href = head + self.search + frag;
+      };
     });
+    // Static parsers (WHATWG URL): canParse(url[, base]) -> boolean; parse(url[, base]) -> URL|null.
+    globalThis.URL.canParse = function (url, base) {
+      if (arguments.length < 1) { throw new TypeError("Failed to execute 'canParse' on 'URL': 1 argument required, but only 0 present."); }
+      try { return !parseURL(String(url), base != null ? String(base) : null).__invalid; } catch (e) { return false; }
+    };
+    globalThis.URL.parse = function (url, base) {
+      if (arguments.length < 1) { throw new TypeError("Failed to execute 'parse' on 'URL': 1 argument required, but only 0 present."); }
+      try { return new globalThis.URL(url, base); } catch (e) { return null; }
+    };
     // Encode the Blob's bytes as a self-contained data: URL so it actually works as an <img> src /
     // fetch target (we don't keep a blob: registry). revoke is a no-op (data: needs no cleanup).
     globalThis.URL.createObjectURL = function (obj) {
