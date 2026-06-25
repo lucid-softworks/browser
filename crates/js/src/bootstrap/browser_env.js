@@ -5229,6 +5229,27 @@
           __defUrlPart("pathname", "pathname"); __defUrlPart("search", "search");
           __defUrlPart("hash", "hash"); __defUrlPart("origin", "origin");
           __defUserInfoPart("username"); __defUserInfoPart("password");
+          // Activation behaviour: click() fires a cancelable click event, and if it isn't
+          // prevented, follows the link. We don't navigate documents, but a `javascript:` href is
+          // executed in the page realm (per HTML) — its side effects run; a string result would
+          // navigate (ignored here). An invalid URL does nothing.
+          def(el, "click", function () {
+            var notPrevented = true;
+            try {
+              var ev = new globalThis.MouseEvent("click", { bubbles: true, cancelable: true, composed: true });
+              notPrevented = el.dispatchEvent(ev);
+            } catch (e) {}
+            if (!notPrevented) { return; }
+            var raw = __getAttr(node, "href");
+            if (raw == null) { return; }
+            var rec = parseURL(raw, (globalThis.location && globalThis.location.href) || null);
+            if (rec.__invalid) { return; }
+            if (rec.protocol === "javascript:") {
+              var code; try { code = decodeURIComponent(rec.href.slice("javascript:".length)); } catch (e) { code = rec.href.slice("javascript:".length); }
+              // Navigating to a javascript: URL runs in a queued task, not synchronously.
+              setTimeout(function () { try { (0, eval)(code); } catch (e) {} }, 0);
+            }
+          });
         }
         // <img>.naturalWidth / naturalHeight: the decoded intrinsic size from the engine
         // (0 when the image is missing/broken/not yet decoded). `width`/`height` reflect the

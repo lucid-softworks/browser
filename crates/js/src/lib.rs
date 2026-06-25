@@ -4678,6 +4678,57 @@ mod tests {
     }
 
     #[test]
+    fn anchor_click_executes_javascript_url() {
+        // Clicking <a href="javascript:..."> runs the script in the page realm; a javascript: URL
+        // that fails to parse (invalid host) does not execute.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var a = document.body.appendChild(document.createElement('a'));
+                a.href = 'javascript:globalThis.ranGood = 7';
+                a.click();
+                a.href = 'javascript://test:test/%0aglobalThis.ranBad = 1';
+                a.click();
+                // javascript: URLs run in a queued task, so read after them.
+                setTimeout(function () {
+                  document.body.setAttribute('data-good', String(globalThis.ranGood));
+                  document.body.setAttribute('data-bad', String(globalThis.ranBad));
+                }, 0);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-good").as_deref(),
+            Some("7"),
+            "valid javascript: URL executes"
+        );
+        assert_eq!(
+            attr("data-bad").as_deref(),
+            Some("undefined"),
+            "invalid-host javascript: URL does not execute"
+        );
+    }
+
+    #[test]
     fn srcless_iframe_has_window_and_location_throws_on_invalid() {
         // A srcless <iframe> still has an about:blank browsing context: contentWindow exposes the
         // frame realm's globals (e.g. DOMException), and assigning contentWindow.location an invalid
