@@ -85,8 +85,14 @@ def build_tree(results, area):
             node = node.dirs.setdefault(seg, Node(seg))
         fname = path[-1] if path else r["test"]
         subs = r.get("subtests", [])
-        sp = sum(1 for s in subs if s["status"] in GOOD_SUB)
-        sf = len(subs) - sp
+        if subs:
+            sp = sum(1 for s in subs if s["status"] in GOOD_SUB)
+            sf = len(subs) - sp
+        else:
+            # Reftests / single-page tests have no subtests; count the file-level status as one
+            # pass/fail so the report shows 1/1 or 0/1 rather than 0/0.
+            sp = 1 if r["status"] in GOOD_FILE else 0
+            sf = 1 - sp
         broken = r["status"] not in GOOD_FILE or sf > 0
         node.files.append((fname, r, sp, sf, broken))
     return root
