@@ -3,10 +3,11 @@
 //! ordering + composition, including the algorithmic Hangul handling), and Punycode (RFC 3492). No
 //! external `idna`/`url` dependency.
 //!
-//! Processing options match the WPT IDNA suites: non-transitional, UseSTD3ASCIIRules=false,
-//! CheckBidi=false; we validate the disallowed/NFC/leading-combining-mark criteria.
+//! Processing options match the WHATWG URL spec / WPT IDNA suites: non-transitional,
+//! UseSTD3ASCIIRules=false, CheckHyphens=false, CheckBidi=true, CheckJoiners=true. We validate the
+//! disallowed/NFC/leading-combining-mark/ContextJ/Bidi criteria.
 
-use crate::unicode_tables::{CCC, COMPOSE, DECOMP, JOINING, MARK, UTS46, UTS46_MAP};
+use crate::unicode_tables::{BIDI, CCC, COMPOSE, DECOMP, JOINING, MARK, UTS46, UTS46_MAP};
 
 fn is_mark(c: char) -> bool {
     let u = c as u32;
@@ -14,6 +15,45 @@ fn is_mark(c: char) -> bool {
     idx < MARK.len() && {
         let (start, end) = MARK[idx];
         u >= start && u <= end
+    }
+}
+
+// Bidi_Class codes (see the BIDI table): 1=L 2=R 3=AL 4=AN 5=EN 6=ES 7=CS 8=ET 9=ON 10=BN 11=NSM.
+fn bidi_class(c: char) -> u8 {
+    let u = c as u32;
+    let idx = BIDI.partition_point(|&(_, end, _)| end < u);
+    if idx < BIDI.len() {
+        let (start, end, t) = BIDI[idx];
+        if u >= start && u <= end {
+            return t;
+        }
+    }
+    1 // default L (unlisted assigned code points are otherwise disallowed before this point)
+}
+
+/// IDNA CheckBidi rule (RFC 5893) for one label of a bidi domain.
+fn label_bidi_ok(chars: &[char]) -> bool {
+    let classes: Vec<u8> = chars.iter().map(|&c| bidi_class(c)).collect();
+    let last_non_nsm = classes.iter().rev().find(|&&c| c != 11).copied();
+    match classes[0] {
+        // RTL label (starts R or AL).
+        2 | 3 => {
+            if !classes.iter().all(|&c| matches!(c, 2..=11)) {
+                return false;
+            }
+            if !matches!(last_non_nsm, Some(2..=5)) {
+                return false;
+            }
+            !(classes.contains(&5) && classes.contains(&4))
+        }
+        // LTR label (starts L).
+        1 => {
+            if !classes.iter().all(|&c| matches!(c, 1 | 5..=11)) {
+                return false;
+            }
+            matches!(last_non_nsm, Some(1 | 5))
+        }
+        _ => false,
     }
 }
 
@@ -202,12 +242,15 @@ fn nfc(input: &str) -> String {
 
 /// A UTS-46 label is valid if it is NFC, doesn't begin with a combining mark, and every code point
 /// has "valid" status (CheckHyphens/CheckBidi off, per the WPT options).
-fn valid_label(chars: &[char]) -> bool {
+fn valid_label(chars: &[char], check_bidi: bool) -> bool {
     if chars.is_empty() {
         return false;
     }
     // A label must not begin with a combining mark (General_Category Mark).
     if is_mark(chars[0]) {
+        return false;
+    }
+    if check_bidi && !label_bidi_ok(chars) {
         return false;
     }
     for (idx, &c) in chars.iter().enumerate() {
@@ -242,38 +285,52 @@ pub(crate) fn domain_to_ascii(domain: &str) -> Result<String, ()> {
     }
     // 2. Normalize (NFC).
     let normalized = nfc(&mapped);
-    // 3. Per label: an ACE (xn--) label must decode to a valid label; a non-ASCII label is
-    //    Punycode-encoded; an empty/ASCII label passes through.
-    let mut out = String::new();
-    for (i, label) in normalized.split('.').enumerate() {
-        if i > 0 {
-            out.push('.');
-        }
+    // 3. Split into labels. For an ACE (xn--) label, decode + pre-validate the Punycode; `verbatim`
+    //    holds the ASCII output for ASCII/ACE labels, `uni` the Unicode form used for validation.
+    let mut labels: Vec<(Option<String>, Vec<char>)> = Vec::new();
+    for label in normalized.split('.') {
         if let Some(rest) = label.strip_prefix("xn--") {
             if rest.is_empty() {
                 return Err(());
             }
-            // punycode_decode fails if the ACE suffix isn't valid basic (e.g. it contains non-ASCII).
             let decoded = punycode_decode(rest).ok_or(())?;
-            // An ACE label must decode to a label with at least one non-ASCII code point and must
-            // round-trip (re-encoding yields the same ACE suffix), and the decoded label must be
-            // valid.
+            // An ACE label must decode to ≥1 non-ASCII code point and round-trip.
             if decoded.iter().all(char::is_ascii)
                 || punycode_encode(&decoded).as_deref() != Some(rest)
-                || !valid_label(&decoded)
             {
                 return Err(());
             }
-            out.push_str(label);
+            labels.push((Some(label.to_string()), decoded));
         } else if label.is_ascii() {
-            out.push_str(label);
+            labels.push((Some(label.to_string()), label.chars().collect()));
         } else {
-            let chars: Vec<char> = label.chars().collect();
-            if !valid_label(&chars) {
-                return Err(());
+            labels.push((None, label.chars().collect()));
+        }
+    }
+    // 4. A domain is a "bidi domain" if any label (in its Unicode form) has an R/AL/AN code point;
+    //    CheckBidi then applies to every label.
+    let check_bidi = labels
+        .iter()
+        .any(|(_, uni)| uni.iter().any(|&c| matches!(bidi_class(c), 2..=4)));
+    // 5. Validate each non-empty label and assemble the ASCII output.
+    let mut out = String::new();
+    for (i, (verbatim, uni)) in labels.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        if uni.is_empty() {
+            // Empty label (e.g. a trailing dot) — allowed.
+            continue;
+        }
+        if !valid_label(uni, check_bidi) {
+            return Err(());
+        }
+        match verbatim {
+            Some(s) => out.push_str(s),
+            None => {
+                out.push_str("xn--");
+                out.push_str(&punycode_encode(uni).ok_or(())?);
             }
-            out.push_str("xn--");
-            out.push_str(&punycode_encode(&chars).ok_or(())?);
         }
     }
     if out.is_empty() {

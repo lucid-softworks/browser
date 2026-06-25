@@ -122,5 +122,25 @@ o += ["];", "/// Code-point ranges with General_Category in {Mn, Mc, Me} (combin
       "pub(crate) static MARK: &[(u32, u32)] = &["]
 o += [f"    ({s},{e})," for s, e in mmerged]
 o += ["];"]
+
+# Bidi_Class (for the IDNA CheckBidi rule, RFC 5893). Encode the classes the rule references.
+BC = {'L': 1, 'R': 2, 'AL': 3, 'AN': 4, 'EN': 5, 'ES': 6, 'CS': 7, 'ET': 8, 'ON': 9, 'BN': 10, 'NSM': 11}
+bidi = []
+for line in read("DerivedBidiClass.txt", extracted=True).splitlines():
+    line = line.split('#')[0].strip()
+    if not line: continue
+    p = [x.strip() for x in line.split(';')]
+    if len(p) < 2 or p[1] not in BC: continue
+    s, e = (int(x, 16) for x in p[0].split('..')) if '..' in p[0] else (int(p[0], 16),) * 2
+    bidi.append([s, e, BC[p[1]]])
+bidi.sort()
+bmerged = []
+for s, e, t in bidi:
+    if bmerged and bmerged[-1][2] == t and bmerged[-1][1] + 1 == s: bmerged[-1][1] = e
+    else: bmerged.append([s, e, t])
+o += ["/// Bidi_Class ranges for the IDNA CheckBidi rule: 1=L 2=R 3=AL 4=AN 5=EN 6=ES 7=CS 8=ET 9=ON 10=BN 11=NSM.",
+      "pub(crate) static BIDI: &[(u32, u32, u8)] = &["]
+o += [f"    ({s},{e},{t})," for s, e, t in bmerged]
+o += ["];"]
 open("crates/wurl/src/unicode_tables.rs", "w").write("\n".join(o) + "\n")
 print(f"wrote {len(merged)} UTS46 ranges, {len(fulldecomp)} decomp, {len(compose)} compose")
