@@ -49,6 +49,38 @@ for line in read("IdnaMappingTable.txt", idna=True).splitlines():
     elif st == 'ignored': kind, m = 2, ''
     else: kind, m = 3, ''
     rows.append([s, e, kind, m])
+
+# The published IdnaMappingTable may lag the UCD by a version (it's derived, not in /ucd). Apply the
+# UCD's assigned CJK Ideograph ranges as UTS-46 "valid" (CJK ideographs are valid in IDNA), splitting
+# any "disallowed" (unassigned) row they overlap. Lets a newer UCD's CJK extensions parse.
+cjk = []
+ud_lines = read("UnicodeData.txt").splitlines()
+for i, line in enumerate(ud_lines):
+    f = line.split(';')
+    if len(f) > 1 and f[1].startswith('<CJK Ideograph') and 'First>' in f[1]:
+        s = int(f[0], 16)
+        e = int(ud_lines[i + 1].split(';')[0], 16)
+        cjk.append((s, e))
+def apply_cjk(rows, cjk):
+    out = []
+    for s, e, k, m in rows:
+        if k != 3:
+            out.append([s, e, k, m]); continue
+        segs = [(s, e, 3)]
+        for cs, ce in cjk:
+            nxt = []
+            for a, b, kind in segs:
+                if kind != 3 or ce < a or cs > b:
+                    nxt.append((a, b, kind)); continue
+                lo, hi = max(a, cs), min(b, ce)
+                if a < lo: nxt.append((a, lo - 1, 3))
+                nxt.append((lo, hi, 0))
+                if hi < b: nxt.append((hi + 1, b, 3))
+            segs = nxt
+        out.extend([a, b, kind, ''] for a, b, kind in segs)
+    return out
+rows = apply_cjk(rows, cjk)
+
 merged = []
 for s, e, k, m in rows:
     if merged and merged[-1][2] == k and k != 1 and merged[-1][1] + 1 == s and merged[-1][3] == m:
