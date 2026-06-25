@@ -1796,7 +1796,24 @@ pub(crate) fn prim_url_set(
         "pathname" => u.set_path(&value),
         "search" => {
             let q = value.strip_prefix('?').unwrap_or(&value);
+            let opaque = u.cannot_be_a_base();
+            let orig_path = u.path().to_string();
             u.set_query(if q.is_empty() { None } else { Some(q) });
+            // Removing the query from an opaque-path URL whose path ends in spaces: the `url` crate
+            // strips them, but WHATWG keeps them and percent-encodes the final trailing space as
+            // %20 (so the serialization doesn't end in whitespace and round-trips). Rebuild from a
+            // corrected serialization in that case.
+            if opaque && q.is_empty() && orig_path.ends_with(' ') {
+                let fixed = format!("{}%20", &orig_path[..orig_path.len() - 1]);
+                let mut s = format!("{}:{}", u.scheme(), fixed);
+                if let Some(f) = u.fragment() {
+                    s.push('#');
+                    s.push_str(f);
+                }
+                if let Ok(nu) = url::Url::parse(&s) {
+                    u = nu;
+                }
+            }
         }
         "hash" => {
             let f = value.strip_prefix('#').unwrap_or(&value);
