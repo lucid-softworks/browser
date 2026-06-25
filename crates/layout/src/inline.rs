@@ -66,11 +66,15 @@ pub(crate) fn layout_inline_children(
     for item in items {
         // A forced break (`<br>` / preserved `\n`) ends the current line unconditionally and starts
         // a fresh one — even when the line is empty (so consecutive breaks produce blank lines).
-        if let InlineItem::Break { font_size } = &item {
+        if let InlineItem::Break {
+            font_size,
+            line_height,
+        } = &item
+        {
             let h = if line_h > 0.0 {
                 line_h
             } else {
-                measurer.line_height(*font_size, None)
+                line_height.unwrap_or_else(|| measurer.line_height(*font_size, None))
             };
             let fs = if max_fs > 0.0 { max_fs } else { *font_size };
             lines.push(PlacedLine {
@@ -370,8 +374,13 @@ pub(crate) enum InlineItem {
     /// origin; it advances the pen by its margin-box width and is repositioned on its line.
     Atomic(Box<LayoutBox>),
     /// A forced line break (`<br>` or a preserved `\n`): ends the current line box. `font_size` lets
-    /// an empty break line still advance by a sensible line height.
-    Break { font_size: f32 },
+    /// an empty break line still advance by a sensible line height; `line_height` is the element's
+    /// computed `line-height` when set (so an empty break line honors CSS `line-height`, not just the
+    /// font metric).
+    Break {
+        font_size: f32,
+        line_height: Option<f32>,
+    },
 }
 
 impl InlineItem {
@@ -410,10 +419,13 @@ impl InlineItem {
                 let mb = b.dimensions.margin_box();
                 (mb.width, b.style.font_size, mb.height, false)
             }
-            InlineItem::Break { font_size } => (
+            InlineItem::Break {
+                font_size,
+                line_height,
+            } => (
                 0.0,
                 *font_size,
-                measurer.line_height(*font_size, None),
+                line_height.unwrap_or_else(|| measurer.line_height(*font_size, None)),
                 false,
             ),
         }
@@ -507,6 +519,7 @@ pub(crate) fn collect_inline_items(
             BoxContent::LineBreak => {
                 out.push(InlineItem::Break {
                     font_size: child.style.font_size,
+                    line_height: child.style.line_height,
                 });
             }
             BoxContent::Inline => {

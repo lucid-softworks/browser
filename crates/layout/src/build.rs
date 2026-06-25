@@ -378,8 +378,13 @@ pub(crate) fn build_children(
     // If there are no block-level children, no anonymous wrapping is needed.
     let has_block = flat.iter().any(&is_block_level);
     let has_inline = flat.iter().any(|b| {
-        matches!(b.content, BoxContent::Inline | BoxContent::Text(_))
-            || (matches!(b.content, BoxContent::Image(_)) && !image_is_block(b, styles))
+        // A lone `<br>` (LineBreak) between block siblings is inline-level content too: it must be
+        // wrapped in an anonymous block so it generates a line box (an empty line of its line-height),
+        // not laid out as a childless — hence zero-height — anonymous box.
+        matches!(
+            b.content,
+            BoxContent::Inline | BoxContent::Text(_) | BoxContent::LineBreak
+        ) || (matches!(b.content, BoxContent::Image(_)) && !image_is_block(b, styles))
     });
     if !(has_block && has_inline) {
         return flat;
