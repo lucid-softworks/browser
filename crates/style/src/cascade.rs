@@ -115,6 +115,8 @@ fn force_style_colors(s: &mut ComputedStyle, text_color: (u8, u8, u8), paint_bg:
         s.background_color = Some((255, 255, 255)); // Canvas
     }
     s.box_shadows.clear();
+    // Forced colors resolves `color-scheme` to `light dark` (the UA controls the actual colors).
+    s.color_scheme = ColorScheme::LightDark;
 }
 
 /// In forced colors mode, replace author text/background/border colors with system colors
