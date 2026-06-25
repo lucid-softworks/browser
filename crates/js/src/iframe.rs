@@ -176,7 +176,9 @@ fn prim_iframe_load(
     let (html_src, frame_url, frame_charset) = match &srcdoc {
         Some(s) => (s.clone(), url.clone(), None),
         None => {
-            if url.is_empty() || url == "about:blank" {
+            if let Some((html, charset)) = decode_data_url(&url) {
+                (html, url.clone(), charset)
+            } else if url.is_empty() || url == "about:blank" {
                 (String::new(), "about:blank".to_string(), None)
             } else {
                 // Fetch the document HTML via the host fetcher (envelope JSON: {ok,status,body,...}).
@@ -370,6 +372,88 @@ pub fn pump_frames(scope: &mut v8::PinScope) -> (bool, usize) {
 
 /// Pull the `body` field out of a request envelope JSON (`{"ok":..,"body":"..."}`) without a JSON
 /// dependency: find `"body"`, then decode the following JSON string literal.
+/// Decode a `data:` URL into its document text + charset (None for a non-data URL). Handles the
+/// `data:[<mediatype>][;base64],<data>` form; the fragment is the document's, not part of the body.
+fn decode_data_url(url: &str) -> Option<(String, Option<String>)> {
+    let rest = url
+        .strip_prefix("data:")
+        .or_else(|| url.strip_prefix("DATA:"))?;
+    // The fragment is not part of the data.
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let data = &rest[comma + 1..];
+    let meta_l = meta.to_ascii_lowercase();
+    let charset = meta_l
+        .find("charset=")
+        .map(|i| {
+            meta_l[i + "charset=".len()..]
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|s| !s.is_empty());
+    let bytes = if meta_l.trim_end().ends_with(";base64") {
+        base64_decode(data)?
+    } else {
+        // application/x-www-form-urlencoded-style spaces aren't special here; just percent-decode.
+        percent_decode_bytes(data)
+    };
+    Some((String::from_utf8_lossy(&bytes).into_owned(), charset))
+}
+
+fn percent_decode_bytes(input: &str) -> Vec<u8> {
+    let b = input.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && (b[i + 1] as char).is_ascii_hexdigit()
+            && (b[i + 2] as char).is_ascii_hexdigit()
+        {
+            let h = (b[i + 1] as char).to_digit(16).unwrap() as u8;
+            let l = (b[i + 2] as char).to_digit(16).unwrap() as u8;
+            out.push(h * 16 + l);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for &c in input.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c)?;
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Pull `charset=<label>` out of the envelope's `contentType` field (e.g. "text/html;charset=big5").
 fn extract_envelope_charset(env: &str) -> Option<String> {
     let key = "\"contentType\"";
