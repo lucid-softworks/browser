@@ -101,7 +101,10 @@ pub(crate) enum Pseudo {
     Enabled,
     Required,
     Optional,
-    Link, // <a href> (also :any-link / :visited→never matches, see parse)
+    Link, // <a href> (also :any-link)
+    /// `:visited` — a link to a page in history. We treat a link to the current page (empty or
+    /// pure-fragment href) as visited (history has no other entries in our model).
+    Visited,
     // State (interaction)
     Hover,
     Focus,
@@ -1004,6 +1007,7 @@ pub(crate) fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spe
         "required" => Pseudo::Required,
         "optional" => Pseudo::Optional,
         "link" | "any-link" => Pseudo::Link,
+        "visited" => Pseudo::Visited,
         "hover" => Pseudo::Hover,
         "focus" => Pseudo::Focus,
         "active" => Pseudo::Active,
@@ -1451,6 +1455,14 @@ pub(crate) fn pseudo_matches(
         Pseudo::Required => is_form_control(&el.tag) && has_attr(el, "required"),
         Pseudo::Optional => is_form_control(&el.tag) && !has_attr(el, "required"),
         Pseudo::Link => el.tag.eq_ignore_ascii_case("a") && has_attr(el, "href"),
+        // A link to the current page (empty / pure-fragment href) is in history → visited.
+        Pseudo::Visited => {
+            el.tag.eq_ignore_ascii_case("a")
+                && el.attrs.get("href").is_some_and(|h| {
+                    let h = h.trim();
+                    h.is_empty() || h.starts_with('#')
+                })
+        }
         Pseudo::Hover => {
             let h = interaction_hovered();
             h == Some(id.0)
