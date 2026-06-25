@@ -4680,6 +4680,44 @@ mod tests {
 
 
     #[test]
+    fn url_searchparams_conformance() {
+        // URLSearchParams/URL conformance: set() updates the first occurrence in place + removes the
+        // rest; url.search setter clears searchParams; lenient form percent-decode keeps invalid `%`
+        // literal but decodes valid escapes; URL.parse(relative, opaque-base) is null.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var b = document.body;
+                var p = new URLSearchParams('a=b&c=d&a=e'); p.set('a', 'B');
+                b.setAttribute('data-set', p.toString());
+                var u = new URL('http://h/?a=1&b=2&a=3'); u.search = '?';
+                b.setAttribute('data-clear', String(u.searchParams.size) + '|' + u.href);
+                b.setAttribute('data-dec', new URLSearchParams('b=%2sf%2a').toString());
+                b.setAttribute('data-parse', String(URL.parse('undefined', 'aaa:b')));
+                b.setAttribute('data-static', typeof URL.canParse + ',' + typeof URL.parse);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc, vec![], vec![entry], modules, "https://x/",
+            no_fetch(), no_request(), no_ws(), None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(attr("data-set").as_deref(), Some("a=B&c=d"), "set updates first, removes rest");
+        assert_eq!(attr("data-clear").as_deref(), Some("0|http://h/"), "url.search='?' clears query");
+        assert_eq!(attr("data-dec").as_deref(), Some("b=%252sf*"), "lenient form decode");
+        assert_eq!(attr("data-parse").as_deref(), Some("null"), "relative vs opaque base is null");
+        assert_eq!(attr("data-static").as_deref(), Some("function,function"), "URL.canParse/parse exist");
+    }
+
+    #[test]
     fn iframe_loads_runs_scripts_and_cross_frame_postmessage() {
         // An <iframe src> loads as a real nested realm: its script runs, the element fires `load`,
         // and cross-frame postMessage works both ways. The frame's script posts to parent on a

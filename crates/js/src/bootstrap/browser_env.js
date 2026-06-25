@@ -193,7 +193,10 @@
     var rest = input;
     if (sm) { u.scheme = sm[1].toLowerCase(); rest = input.slice(sm[0].length); }
     else if (base) {
-      // No scheme → relative; inherit from base.
+      // No scheme → relative reference, resolved against `base`. A base with an opaque path (a
+      // non-special scheme like `aaa:b` / `mailto:` / `javascript:`) can only be the base for an
+      // empty input or a fragment ("#…"); anything else is a parse failure (WHATWG URL).
+      if (base.opaque && rest !== "" && rest.charAt(0) !== "#") { return null; }
       u.scheme = base.scheme; u.username = base.username; u.password = base.password;
       u.host = base.host; u.port = base.port; u.opaque = base.opaque;
       u.path = base.path.slice(); u.query = base.query;
@@ -10121,7 +10124,13 @@
       .replace(/[!'()~]/g, function (c) { return "%" + c.charCodeAt(0).toString(16).toUpperCase(); });
   }
   function __formDecode(s) {
-    try { return decodeURIComponent(String(s).replace(/\+/g, " ")); } catch (e) { return String(s).replace(/\+/g, " "); }
+    // application/x-www-form-urlencoded decode: `+` -> space, then percent-decode each VALID `%XX`
+    // run (leaving an invalid `%` literal — decodeURIComponent is all-or-nothing, the URL standard
+    // decodes per-escape). Runs are decoded together so multi-byte UTF-8 sequences round-trip.
+    s = String(s).replace(/\+/g, " ");
+    return s.replace(/(?:%[0-9A-Fa-f]{2})+/g, function (m) {
+      try { return decodeURIComponent(m); } catch (e) { return m; }
+    });
   }
   if (typeof globalThis.URLSearchParams !== "function") {
     def(globalThis, "URLSearchParams", function (init) {
@@ -10160,7 +10169,7 @@
       }
       // Methods are non-enumerable (so `new URLSearchParams(usp)` / record init never see them).
       def(this, "append", function (k, v) { add(k, v); changed(); });
-      def(this, "set", function (k, v) { k = String(k); v = String(v); var done = false; for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k) { if (done) { pairs.splice(i, 1); } else { pairs[i][1] = v; done = true; } } } if (!done) { add(k, v); } changed(); });
+      def(this, "set", function (k, v) { k = String(k); v = String(v); var found = false; for (var i = 0; i < pairs.length;) { if (pairs[i][0] === k) { if (!found) { pairs[i][1] = v; found = true; i++; } else { pairs.splice(i, 1); } } else { i++; } } if (!found) { add(k, v); } changed(); });
       def(this, "get", function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; });
       def(this, "getAll", function (k) { k = String(k); var out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; });
       def(this, "has", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; });
@@ -10187,22 +10196,39 @@
         throw new TypeError("Failed to construct 'URL': Invalid URL");
       }
       this.href = p.href; this.protocol = p.protocol; this.host = p.host; this.hostname = p.hostname;
-      this.port = p.port; this.pathname = p.pathname; this.search = p.search; this.hash = p.hash; this.origin = p.origin;
+      this.port = p.port; this.pathname = p.pathname; this.hash = p.hash; this.origin = p.origin;
       this.username = p.username || ""; this.password = p.password || "";
-      this.searchParams = new globalThis.URLSearchParams(p.search);
-      this.toString = function () { return this.href; }; this.toJSON = function () { return this.href; };
-      // Keep href/search in sync when searchParams is mutated (append/set/delete/sort/…). Splice the
-      // freshly-serialized query back into href, preserving everything before `?` and the fragment.
       var self = this;
-      this.searchParams.__onChange = function () {
-        var q = self.searchParams.toString();
-        self.search = q ? ("?" + q) : "";
+      var _search = p.search;
+      // Splice the current query into href, preserving everything before `?` and the fragment.
+      function __syncHref() {
         var h = self.href;
         var hi = h.indexOf("#");
         var frag = hi >= 0 ? h.slice(hi) : (self.hash || "");
         var qi = h.indexOf("?");
         var head = qi >= 0 ? h.slice(0, qi) : (hi >= 0 ? h.slice(0, hi) : h);
-        self.href = head + self.search + frag;
+        self.href = head + _search + frag;
+      }
+      // `search` is live: setting it reparses into searchParams and rewrites href; a lone "?" or ""
+      // clears the query.
+      Object.defineProperty(this, "search", {
+        get: function () { return _search; },
+        set: function (v) {
+          v = String(v);
+          if (v.charAt(0) === "?") { v = v.slice(1); }
+          _search = v ? ("?" + v) : "";
+          self.searchParams.__setFromQuery(v);
+          __syncHref();
+        },
+        enumerable: true, configurable: true
+      });
+      this.searchParams = new globalThis.URLSearchParams(p.search);
+      this.toString = function () { return this.href; }; this.toJSON = function () { return this.href; };
+      // Keep href/search in sync when searchParams is mutated (append/set/delete/sort/…).
+      this.searchParams.__onChange = function () {
+        var q = self.searchParams.toString();
+        _search = q ? ("?" + q) : "";
+        __syncHref();
       };
     });
     // Static parsers (WHATWG URL): canParse(url[, base]) -> boolean; parse(url[, base]) -> URL|null.
