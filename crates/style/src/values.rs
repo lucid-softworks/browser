@@ -305,6 +305,9 @@ pub struct ComputedStyle {
     /// `forced-color-adjust`: when `true` (the `none`/`preserve-parent-color` keywords), this
     /// element opts out of the forced-colors system-color override.
     pub forced_color_adjust_off: bool,
+    /// Whether `font-variant-emoji` is the `emoji` keyword (inherited). In forced colors mode every
+    /// other value computes to `text`; `emoji` is preserved.
+    pub font_variant_emoji_emoji: bool,
     /// Font size in pixels.
     pub font_size: f32,
     /// The specified `font-family` list, serialized to CSSOM canonical form (quoting normalized).

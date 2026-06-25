@@ -733,6 +733,7 @@ pub(crate) fn compute_element_style<'a>(
         writing_mode: parent.writing_mode, // inherited
         color: parent.color,
         forced_color_adjust_off: parent.forced_color_adjust_off, // inherited
+        font_variant_emoji_emoji: parent.font_variant_emoji_emoji, // inherited
         background_color: None,                                  // not inherited
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),

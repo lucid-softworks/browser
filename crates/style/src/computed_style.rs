@@ -11,6 +11,7 @@ impl Default for ComputedStyle {
             color: ua_default_text_color(),
             background_color: None,
             forced_color_adjust_off: false,
+            font_variant_emoji_emoji: false,
             font_size: 16.0,
             font_family: None,
             bold: false,
@@ -295,6 +296,12 @@ impl ComputedStyle {
                 ColorScheme::LightDark => "light dark",
             }
             .to_string(),
+            // Forced colors forces these to their UA-controlled value at computed time. We don't
+            // otherwise model them, so report them only while forced colors is active.
+            "scrollbar-color" if crate::forced_colors_active() => "auto".to_string(),
+            "font-variant-emoji" if crate::forced_colors_active() => {
+                if self.font_variant_emoji_emoji { "emoji" } else { "text" }.to_string()
+            }
             "opacity" => num(self.opacity),
             "border-radius" => px(self.border_radius),
 

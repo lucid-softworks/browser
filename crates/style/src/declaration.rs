@@ -418,6 +418,9 @@ pub(crate) fn apply_declaration(
         other => other,
     };
     match prop {
+        "font-variant-emoji" => {
+            style.font_variant_emoji_emoji = val.trim().eq_ignore_ascii_case("emoji");
+        }
         "forced-color-adjust" => {
             // `none`/`preserve-parent-color` opt out of the forced-colors override; `auto` opts in.
             match val.trim().to_ascii_lowercase().as_str() {
