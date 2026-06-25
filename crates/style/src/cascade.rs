@@ -119,12 +119,15 @@ fn force_style_colors(
     if s.background_color.is_some() || paint_bg {
         s.background_color = Some((255, 255, 255)); // Canvas
     }
-    // Background images/gradients are dropped on regular elements (the Canvas backplate replaces
-    // them). The root/body image is kept — it propagates to the viewport, which the backplate sits
-    // over rather than replaces.
+    // On regular elements (not the root/body, whose image propagates to the viewport): a
+    // non-url() background image — a gradient — is always dropped; a url() image is dropped only
+    // when the backplate covers it (i.e. the box has text). A url() image on a box with no text
+    // stays visible.
     if drop_img {
-        s.background_image_url = None;
         s.background_gradient = None;
+        if paint_bg {
+            s.background_image_url = None;
+        }
     }
     s.box_shadows.clear();
     // Forced colors resolves `color-scheme` to `light dark` (the UA controls the actual colors).
