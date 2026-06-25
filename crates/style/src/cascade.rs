@@ -161,11 +161,15 @@ pub(crate) fn apply_forced_colors(
         } else {
             (0, 0, 0) // CanvasText
         };
-        // The backplate: an element directly containing non-whitespace text paints a Canvas block
-        // behind it so the text stays readable over images. We approximate the per-line backplate
-        // with a Canvas background on the text box — exactly how the WPT refs simulate it.
-        let has_text =
-            doc.get(id).children.iter().any(
+        // The backplate: an element directly containing *visible* non-whitespace text paints a
+        // Canvas block behind it so the text stays readable over images. We approximate the per-line
+        // backplate with a Canvas background on the text box — exactly how the WPT refs simulate it.
+        // No backplate for visibility:hidden/collapse text (it isn't painted).
+        let visible = out
+            .get(&id)
+            .is_none_or(|s| matches!(s.visibility, Visibility::Visible));
+        let has_text = visible
+            && doc.get(id).children.iter().any(
                 |&c| matches!(&doc.get(c).data, dom::NodeData::Text(t) if !t.trim().is_empty()),
             );
         // Keep the background image on the root/body (it propagates to the viewport); drop it
