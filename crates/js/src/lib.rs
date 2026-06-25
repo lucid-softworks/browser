@@ -5236,6 +5236,65 @@ mod tests {
     }
 
     #[test]
+    fn iframe_contentdocument_queries_loaded_realm() {
+        // Setting iframe.src navigates the frame; contentDocument exposes the loaded realm's parsed
+        // document, so querySelector finds its content and the anchor decomposition works.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.body.appendChild(document.createElement('iframe'));
+                f.onload = function () {
+                  var a = f.contentDocument.querySelector('a');
+                  document.body.setAttribute('data-hash', a.hash);
+                  document.body.setAttribute('data-search', a.search);
+                };
+                f.src = 'page.html';
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("page.html") {
+                    let body = "<!doctype html><html><body><a href='http://h/p?q=1#frag'>x</a></body></html>";
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{body}"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-hash").as_deref(),
+            Some("#frag"),
+            "frame anchor hash"
+        );
+        assert_eq!(
+            attr("data-search").as_deref(),
+            Some("?q=1"),
+            "frame anchor search"
+        );
+    }
+
+    #[test]
     fn dedicated_worker_async_fetch_resolves() {
         // A worker's async fetch() resolves: its completion is routed back into the worker context by
         // pump_workers (its own fetch channel), so the promise settles and the worker posts the body.

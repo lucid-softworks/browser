@@ -5217,6 +5217,26 @@
           });
         };
         __reflectURL("src", { img: 1, script: 1, iframe: 1, source: 1, video: 1, audio: 1, embed: 1, track: 1, input: 1, frame: 1 });
+        // Setting an <iframe>'s src navigates its nested browsing context: re-run the frame loader so
+        // a connected frame (re)loads the new document.
+        if (__formTag === "iframe") {
+          var __srcDesc = Object.getOwnPropertyDescriptor(el, "src");
+          if (__srcDesc && __srcDesc.set) {
+            var __srcSet = __srcDesc.set;
+            Object.defineProperty(el, "src", {
+              get: __srcDesc.get,
+              set: function (v) {
+                __srcSet.call(this, v);
+                var self = this;
+                if (typeof globalThis.__loadFrameEl === "function") {
+                  self.__frameLoadedKey = undefined; self.__cwinReal = undefined;
+                  try { globalThis.__loadFrameEl(self); } catch (e) {}
+                }
+              },
+              enumerable: true, configurable: true
+            });
+          }
+        }
         __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 });
         // HTMLHyperlinkElementUtils URL-decomposition accessors on <a>/<area>: protocol/host/...
         // derived from the resolved href. These also make the WPT reflection harness' resolveUrl()
@@ -8633,6 +8653,13 @@
       var IFP = globalThis.HTMLIFrameElement.prototype;
       Object.defineProperty(IFP, "contentDocument", {
         get: function () {
+          // A loaded frame (real nested realm) exposes its own parsed document.
+          if (this.__frameLoadedKey && typeof __frameGet === "function") {
+            try {
+              var rdoc = __frameGet(this.__node, "document");
+              if (rdoc) { return rdoc; }
+            } catch (e) {}
+          }
           if (!this.__cdoc) {
             var body = document.createElement("body");
             var doc = {
