@@ -309,6 +309,9 @@ pub(crate) fn drain_event_loop(
     let network_budget = std::time::Duration::from_millis(15000);
     let mut iterations = 0usize;
     let mut did_work = false;
+    // Outstanding async fetches across all dedicated workers (updated each pass by pump_workers); the
+    // loop stays alive on the network budget while either the page or a worker has requests pending.
+    let mut worker_in_flight = 0usize;
     loop {
         // Pull any completed background fetches and settle their JS promises, then run a microtask
         // checkpoint so the `.then` chains progress within this same drain.
@@ -325,13 +328,16 @@ pub(crate) fn drain_event_loop(
             scope.perform_microtask_checkpoint();
         }
 
-        let in_flight = scope
+        let page_in_flight = scope
             .get_current_context()
             .get_slot::<HostState>()
             .map(|s| s.in_flight.get())
             .unwrap_or(0);
-        // While requests are outstanding we use the longer budget (so a network-bound page isn't
-        // cut off); otherwise the short idle budget keeps idle ticks cheap.
+        // While requests are outstanding (on the page OR in any worker) we use the longer budget (so
+        // a network-bound page/worker isn't cut off); otherwise the short idle budget keeps idle
+        // ticks cheap. Worker fetches resolve inside pump_workers below, which also reports the live
+        // worker in-flight count.
+        let in_flight = page_in_flight + worker_in_flight;
         let budget = if in_flight > 0 {
             network_budget
         } else {
@@ -344,9 +350,11 @@ pub(crate) fn drain_event_loop(
         scope.perform_microtask_checkpoint();
 
         // Then run one due timer/microtask from the JS event loop, and advance any dedicated
-        // workers' loops (their queued message deliveries / timers run in their own contexts).
+        // workers' loops (their queued message deliveries / fetches / timers run in their own
+        // contexts). pump_workers reports whether it did work and the worker in-flight tally.
         let ran = run_due_timers(scope);
-        let wran = crate::pump_workers(scope);
+        let (wran, wif) = crate::pump_workers(scope);
+        worker_in_flight = wif;
         iterations += 1;
         if ran || wran {
             did_work = true;
@@ -354,10 +362,11 @@ pub(crate) fn drain_event_loop(
             // Nothing left in the page loop; one more microtask checkpoint in case the last timer
             // queued a job, and one more worker pump in case a microtask queued worker work.
             scope.perform_microtask_checkpoint();
-            let wran2 = crate::pump_workers(scope);
+            let (wran2, wif2) = crate::pump_workers(scope);
+            worker_in_flight = wif2;
             if run_due_timers(scope) || wran2 {
                 did_work = true;
-            } else if in_flight > 0 {
+            } else if page_in_flight > 0 {
                 // No JS work is due but a request is still in flight: block briefly on the channel
                 // (instead of busy-spinning) for the next completion, then loop to resolve it.
                 if let Some(rx) = fetch_rx {
@@ -372,6 +381,11 @@ pub(crate) fn drain_event_loop(
                         Err(_) => break,
                     }
                 }
+            } else if wif2 > 0 {
+                // No page work, but a worker has a request in flight (its completion arrives on the
+                // worker's own channel, drained by pump_workers). Sleep briefly to avoid busy-spin,
+                // then loop so the next pump picks it up.
+                std::thread::sleep(std::time::Duration::from_millis(5));
             } else {
                 break;
             }
@@ -424,7 +438,7 @@ pub(crate) fn drain_event_loop(
     {
         let mut rounds = 0usize;
         loop {
-            let w = crate::pump_workers(scope);
+            let (w, wif) = crate::pump_workers(scope);
             scope.perform_microtask_checkpoint();
             let p = run_due_timers(scope);
             scope.perform_microtask_checkpoint();
@@ -432,7 +446,16 @@ pub(crate) fn drain_event_loop(
                 did_work = true;
             }
             rounds += 1;
-            if (!w && !p) || rounds >= 256 {
+            // Keep ping-ponging while there is work; if only worker fetches remain in flight, sleep
+            // briefly so their completions can arrive before the next pass. Bounded by `rounds`.
+            if !w && !p {
+                if wif > 0 && rounds < 256 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                } else {
+                    break;
+                }
+            }
+            if rounds >= 256 {
                 break;
             }
         }
