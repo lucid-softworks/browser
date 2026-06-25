@@ -333,6 +333,10 @@ pub struct ComputedStyle {
     pub color_is_system: bool,
     pub bg_is_system: bool,
     pub border_is_system: bool,
+    /// Whether SVG `fill`/`stroke` were authored as `currentColor` (inherited). They then follow the
+    /// element's (possibly forced) `color` at paint time rather than a value frozen at cascade time.
+    pub svg_fill_current: bool,
+    pub svg_stroke_current: bool,
     /// Author-declared colors for properties the engine doesn't otherwise model (fill, stroke,
     /// flood/lighting/stop-color, column-rule-color, text-decoration-color, the -webkit-* emphasis/
     /// tap colors). Lazily allocated (rare). Keyed by the kebab-case property name.

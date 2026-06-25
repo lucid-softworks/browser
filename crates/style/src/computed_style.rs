@@ -17,6 +17,8 @@ impl Default for ComputedStyle {
             accent_color: None,
             pre_forced: None,
             extra_colors: None,
+            svg_fill_current: false,
+            svg_stroke_current: false,
             color_explicit: false,
             color_is_system: false,
             bg_is_system: false,
