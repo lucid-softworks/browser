@@ -153,13 +153,21 @@ pub(crate) fn apply_forced_colors(
 ) {
     let off = ancestor_off || out.get(&id).is_some_and(|s| s.forced_color_adjust_off);
     if !off {
-        // A hyperlink's text takes LinkText; everything else takes CanvasText.
-        let text_color = if matches!(&doc.get(id).data,
-            dom::NodeData::Element(e) if e.tag == "a" && e.attrs.contains_key("href"))
-        {
-            (0, 0, 238) // LinkText
-        } else {
-            (0, 0, 0) // CanvasText
+        // A hyperlink's text takes LinkText, or VisitedText when the link is visited; everything
+        // else takes CanvasText. A link whose href is empty or a pure fragment targets the current
+        // page, which is in history — i.e. visited.
+        let link_kind = match &doc.get(id).data {
+            dom::NodeData::Element(e) if e.tag == "a" => e.attrs.get("href").map(|h| {
+                let h = h.trim();
+                h.is_empty() || h.starts_with('#') // visited (current page) vs unvisited
+            }),
+            _ => None,
+        };
+        let is_link = link_kind.is_some();
+        let text_color = match link_kind {
+            Some(true) => (85, 26, 139), // VisitedText
+            Some(false) => (0, 0, 238),  // LinkText
+            None => (0, 0, 0),           // CanvasText
         };
         // The backplate: an element directly containing *visible* non-whitespace text paints a
         // Canvas block behind it so the text stays readable over images. We approximate the per-line
@@ -178,6 +186,11 @@ pub(crate) fn apply_forced_colors(
             dom::NodeData::Element(e) if e.tag == "html" || e.tag == "body");
         if let Some(s) = out.get_mut(&id) {
             force_style_colors(s, text_color, has_text, !is_root_or_body);
+            // A link's border takes its link color (LinkText/VisitedText), not CanvasText. Its
+            // outline-color and caret-color resolve to `color`, so they follow automatically.
+            if is_link && !s.border_is_system {
+                s.border_color = text_color;
+            }
             // ::before / ::after generated boxes are forced too (a pseudo with `content` is text).
             if let Some(b) = s.before.as_mut() {
                 let txt = b.content.is_some();
