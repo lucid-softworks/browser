@@ -98,40 +98,7 @@ pub(crate) fn cascade_locked(
         &index,
         &mut out,
     );
-    if forced_colors_active() {
-        apply_forced_colors(doc, doc.root(), false, &mut out);
-    }
     (out, root_used_scheme_dark())
-}
-
-/// In forced colors mode, replace author text/background/border colors with system colors
-/// (CanvasText / Canvas), skipping any element (or descendant of an element) with
-/// `forced-color-adjust: none`. `forced-color-adjust` inherits, hence the `ancestor_off` flag.
-fn apply_forced_colors(
-    doc: &dom::Document,
-    id: dom::NodeId,
-    ancestor_off: bool,
-    out: &mut HashMap<dom::NodeId, ComputedStyle>,
-) {
-    let canvas_text = (0, 0, 0);
-    let canvas = (255, 255, 255);
-    let off = ancestor_off || out.get(&id).is_some_and(|s| s.forced_color_adjust_off);
-    if !off {
-        if let Some(s) = out.get_mut(&id) {
-            s.color = canvas_text;
-            s.border_color = canvas_text;
-            // A painted background becomes Canvas; a transparent one stays transparent.
-            if s.background_color.is_some() {
-                s.background_color = Some(canvas);
-            }
-            // Gradients/background images are suppressed in forced colors mode.
-            s.background_gradient = None;
-            s.background_image_url = None;
-        }
-    }
-    for child in doc.get(id).children.clone() {
-        apply_forced_colors(doc, child, off, out);
-    }
 }
 
 /// Cascade only the subtree rooted at `root_id` (e.g. an `<iframe>` facade document's body),
@@ -461,22 +428,6 @@ pub fn set_color_scheme_dark(is_dark: bool) {
     COLOR_SCHEME_DARK.store(is_dark, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether forced colors mode is active (drives `@media (forced-colors)` and the cascade's
-/// system-color override). Set by the engine (e.g. from an OS high-contrast setting / test config).
-pub(crate) static FORCED_COLORS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-pub fn set_forced_colors(active: bool) {
-    FORCED_COLORS.store(active, std::sync::atomic::Ordering::Relaxed);
-}
-pub(crate) fn forced_colors_active() -> bool {
-    // Honour the LUCID_FORCED_COLORS env var (read once) so a test run can enable forced colors for
-    // the whole process without per-call engine plumbing.
-    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    FORCED_COLORS.load(std::sync::atomic::Ordering::Relaxed)
-        || *ENV.get_or_init(|| std::env::var("LUCID_FORCED_COLORS").is_ok())
-}
-
 /// Whether the effective OS appearance is currently Dark (drives `prefers-color-scheme`).
 pub(crate) fn color_scheme_dark() -> bool {
     COLOR_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
@@ -705,8 +656,7 @@ pub(crate) fn compute_element_style<'a>(
         direction: parent.direction,       // inherited
         writing_mode: parent.writing_mode, // inherited
         color: parent.color,
-        forced_color_adjust_off: parent.forced_color_adjust_off, // inherited
-        background_color: None,                                  // not inherited
+        background_color: None, // not inherited
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),
         bold: parent.bold,

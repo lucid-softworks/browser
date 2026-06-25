@@ -302,9 +302,6 @@ pub struct ComputedStyle {
     pub color: (u8, u8, u8),
     /// Background color, if any (r, g, b). `None` means transparent.
     pub background_color: Option<(u8, u8, u8)>,
-    /// `forced-color-adjust`: when `true` (the `none`/`preserve-parent-color` keywords), this
-    /// element opts out of the forced-colors system-color override.
-    pub forced_color_adjust_off: bool,
     /// Font size in pixels.
     pub font_size: f32,
     /// The specified `font-family` list, serialized to CSSOM canonical form (quoting normalized).
