@@ -294,6 +294,7 @@ mod runtime;
 mod selector;
 mod session;
 mod style_query;
+mod whatwg_url;
 mod worker;
 
 pub(crate) use dom_helpers::*;
@@ -5086,29 +5087,6 @@ mod tests {
     }
 
     #[test]
-    fn diag_sethost_panic() {
-        // file URLs + various host values; find which set_host panics (url crate bug).
-        let bases = ["file://y/", "file:///p", "http://h/", "sc://x/"];
-        let vals = [
-            "", "a", "a:1", "[::1]", "x|", "C:", "/", "\\", "h\\p", "a b", "a%2fb", "host:", ":80",
-            "[v1.x]",
-        ];
-        for b in bases {
-            for v in vals {
-                let r = std::panic::catch_unwind(|| {
-                    let mut u = url::Url::parse(b).unwrap();
-                    let _ = u.set_host(Some(v));
-                    u.as_str().to_string()
-                });
-                if r.is_err() {
-                    eprintln!("DIAG PANIC base={:?} host={:?}", b, v);
-                }
-            }
-        }
-        eprintln!("DIAG done");
-    }
-
-    #[test]
     fn url_searchparams_conformance() {
         // URLSearchParams/URL conformance: set() updates the first occurrence in place + removes the
         // rest; url.search setter clears searchParams; lenient form percent-decode keeps invalid `%`
@@ -5153,8 +5131,8 @@ mod tests {
         );
         assert_eq!(
             attr("data-clear").as_deref(),
-            Some("0|http://h/"),
-            "url.search='?' clears query"
+            Some("0|http://h/?"),
+            "url.search='?' -> empty (non-null) query: 0 params, href keeps the '?'"
         );
         assert_eq!(
             attr("data-dec").as_deref(),

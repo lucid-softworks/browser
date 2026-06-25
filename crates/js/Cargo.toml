@@ -19,12 +19,13 @@ style = { path = "../style" }
 css = { path = "../css" }
 # HTML parsing, so the `innerHTML` setter can build real child nodes from markup.
 html = { path = "../html" }
-# URL parsing/joining, so dynamic `import()` can resolve relative specifiers against the
-# importing module's canonical URL and fetch modules not in the pre-fetched static graph.
-url = "2"
 # The software canvas 2D rasterizer (a leaf crate, no internal deps), so OffscreenCanvas can
 # synchronously rasterize its display list for getImageData/convertToBlob/transferToImageBitmap.
 paint = { path = "../paint" }
+
+[dev-dependencies]
+# Drive the WHATWG URL parser conformance tests off the WPT JSON fixtures.
+serde_json = "1"
 
 [lints]
 workspace = true

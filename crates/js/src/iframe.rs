@@ -122,8 +122,8 @@ fn collect_classic_scripts(doc: &dom::Document, base: &str) -> Vec<(bool, String
                     && is_js_type(ty)
                 {
                     if let Some(src) = e.attrs.get("src") {
-                        if let Ok(abs) = url::Url::parse(base).and_then(|u| u.join(src)) {
-                            out.push((true, abs.to_string()));
+                        if let Some(abs) = crate::whatwg_url::resolve(src, base) {
+                            out.push((true, abs));
                         } else {
                             out.push((true, src.clone()));
                         }

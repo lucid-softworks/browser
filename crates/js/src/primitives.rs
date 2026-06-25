@@ -360,10 +360,7 @@ pub(crate) fn prim_get_attr(
 /// then runs with just the UA sheet + inline `style=""` attributes).
 /// Join `href` onto `base` (both treated as URLs); returns `base` if either fails to parse.
 pub(crate) fn join_url(base: &str, href: &str) -> String {
-    match url::Url::parse(base).and_then(|b| b.join(href.trim())) {
-        Ok(u) => u.into(),
-        Err(_) => base.to_string(),
-    }
+    crate::whatwg_url::resolve(href.trim(), base).unwrap_or_else(|| base.to_string())
 }
 
 /// The document's base URL: the first `<base href>` resolved against the page URL, else the page URL.
@@ -1661,137 +1658,44 @@ fn json_escape_into(s: &str, out: &mut String) {
     out.push('"');
 }
 
-/// Serialize a parsed `url::Url` into the component record the JS `URL`/`parseURL` layer expects.
-fn url_to_record(u: &url::Url) -> String {
-    let hostname = u.host_str().unwrap_or("");
-    let port = u.port().map(|p| p.to_string()).unwrap_or_default();
-    let host = if port.is_empty() {
-        hostname.to_string()
-    } else {
-        format!("{hostname}:{port}")
-    };
-    // The `search`/`hash` getters are "" for an absent OR empty component (only a non-empty query/
-    // fragment serializes with its leading `?`/`#`).
-    let search = u
-        .query()
-        .filter(|q| !q.is_empty())
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
-    let hash = u
-        .fragment()
-        .filter(|f| !f.is_empty())
-        .map(|f| format!("#{f}"))
-        .unwrap_or_default();
-    // WHATWG origin serialization ("null" for opaque/cannot-be-a-base origins).
-    let origin = u.origin().ascii_serialization();
-    // Opaque path ending in spaces (only possible when a query/fragment follows, else the parser
-    // strips them): WHATWG percent-encodes the final trailing space as %20 so the serialization
-    // doesn't end in whitespace and round-trips. The `url` crate keeps them literal, so fix both the
-    // pathname and the href here.
-    let raw_path = u.path();
-    let (pathname, href) = if u.cannot_be_a_base() && raw_path.ends_with(' ') {
-        let fixed = format!("{}%20", &raw_path[..raw_path.len() - 1]);
-        let mut h = format!("{}:{}", u.scheme(), fixed);
-        h.push_str(&search);
-        h.push_str(&hash);
-        (fixed, h)
-    } else {
-        (raw_path.to_string(), u.as_str().to_string())
-    };
+/// Serialize a parsed URL into the component record the JS `URL`/`parseURL` layer expects.
+fn url_to_record(u: &crate::whatwg_url::Url) -> String {
     let mut s = String::from("{");
-    json_field(&mut s, "href", &href);
+    json_field(&mut s, "href", &u.href());
     json_field(&mut s, "protocol", &format!("{}:", u.scheme()));
     json_field(&mut s, "username", u.username());
-    json_field(&mut s, "password", u.password().unwrap_or(""));
-    json_field(&mut s, "host", &host);
-    json_field(&mut s, "hostname", hostname);
-    json_field(&mut s, "port", &port);
-    json_field(&mut s, "pathname", &pathname);
-    json_field(&mut s, "search", &search);
-    json_field(&mut s, "hash", &hash);
-    json_field(&mut s, "origin", &origin);
+    json_field(&mut s, "password", u.password());
+    json_field(&mut s, "host", &u.host_str());
+    json_field(&mut s, "hostname", &u.hostname());
+    json_field(&mut s, "port", &u.port_str());
+    json_field(&mut s, "pathname", &u.path_str());
+    json_field(&mut s, "search", &u.query_str());
+    json_field(&mut s, "hash", &u.fragment_str());
+    json_field(&mut s, "origin", &u.origin());
     s.push_str(&format!("\"opaque\":{}", u.cannot_be_a_base()));
     s.push('}');
     s
 }
 
-/// The special URL schemes (special host parsing, port concept, `\` as a path separator).
-fn is_special_scheme(scheme: &str) -> bool {
-    matches!(scheme, "ftp" | "file" | "http" | "https" | "ws" | "wss")
-}
-
-/// In a file URL a Windows drive letter may be written `X|`; WHATWG normalizes it to `X:`. The `url`
-/// crate doesn't, so rewrite the first drive-letter `|` at a path-segment boundary to `:`. Only safe
-/// for an absolute `file:` input (for a relative drive-letter the rewritten `X:` would be misread as
-/// a scheme by the crate's relative resolver).
-fn normalize_file_drive_pipe(input: &str) -> std::borrow::Cow<'_, str> {
-    let b = input.as_bytes();
-    for i in 1..b.len() {
-        if b[i] == b'|' && b[i - 1].is_ascii_alphabetic() {
-            let before_ok = i == 1 || matches!(b[i - 2], b'/' | b'\\' | b':');
-            let after_ok = i + 1 == b.len() || matches!(b[i + 1], b'/' | b'\\' | b'?' | b'#');
-            if before_ok && after_ok {
-                let mut s = input.to_string();
-                s.replace_range(i..i + 1, ":");
-                return std::borrow::Cow::Owned(s);
-            }
-        }
-    }
-    std::borrow::Cow::Borrowed(input)
-}
-
-/// WHATWG's "special authority ignore slashes" state skips any run of `/`/`\` for a special,
-/// non-`file` scheme, so a relative input like `///test` resolves to host `test`. The `url` crate
-/// stops after two slashes and reports `EmptyHost`, so collapse a leading run of 3+ slashes to two
-/// when resolving against a non-`file` special base (`file` keeps them: `file:///x`).
-fn collapse_special_leading_slashes<'a>(
-    input: &'a str,
-    base_scheme: &str,
-) -> std::borrow::Cow<'a, str> {
-    if base_scheme == "file" || !is_special_scheme(base_scheme) {
-        return std::borrow::Cow::Borrowed(input);
-    }
-    // Leading C0-control/space are stripped by the parser; look past them.
-    let lead_ws = input.len() - input.trim_start_matches(|c: char| c <= ' ').len();
-    let rest = &input[lead_ws..];
-    let run = rest.chars().take_while(|&c| c == '/' || c == '\\').count();
-    if run >= 3 {
-        std::borrow::Cow::Owned(format!("{}//{}", &input[..lead_ws], &rest[run..]))
-    } else {
-        std::borrow::Cow::Borrowed(input)
-    }
-}
-
-/// `__urlParse(input, base|null) -> recordJSON | null`. WHATWG URL parsing via the `url` crate: the
-/// authoritative, spec-compliant parser (vs. the hand-written JS one). Returns the component record
-/// as JSON, or null on a parse failure (the JS `URL` constructor then throws).
+/// `__urlParse(input, base|null) -> recordJSON | null`. WHATWG URL parsing via our spec-compliant
+/// parser ([`crate::whatwg_url`]). Returns the component record as JSON, or null on a parse failure
+/// (the JS `URL` constructor then throws).
 pub(crate) fn prim_url_parse(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    use crate::whatwg_url::Url;
     let input = arg_str(scope, &args, 0);
     let base_arg = args.get(1);
-    // An absolute `file:` input (only) gets drive-letter `|`->`:` normalization.
-    let tb = input.trim_start_matches(|c: char| c <= ' ').as_bytes();
-    let input_is_file = tb.len() >= 5 && tb[..5].eq_ignore_ascii_case(b"file:");
     let parsed = if base_arg.is_string() {
         let base = base_arg.to_rust_string_lossy(scope);
-        match url::Url::parse(&base) {
-            Ok(b) => {
-                let input2 = collapse_special_leading_slashes(&input, b.scheme());
-                if input_is_file {
-                    b.join(&normalize_file_drive_pipe(&input2))
-                } else {
-                    b.join(&input2)
-                }
-            }
-            Err(e) => Err(e),
+        match Url::parse(&base) {
+            Ok(b) => Url::parse_with_base(&input, &b),
+            Err(_) => Err(()),
         }
-    } else if input_is_file {
-        url::Url::parse(&normalize_file_drive_pipe(&input))
     } else {
-        url::Url::parse(&input)
+        Url::parse(&input)
     };
     match parsed {
         Ok(u) => {
@@ -1812,120 +1716,32 @@ pub(crate) fn prim_url_set(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    use crate::whatwg_url::Url;
     let href = arg_str(scope, &args, 0);
     let prop = arg_str(scope, &args, 1);
-    // WHATWG: every URL setter removes ASCII tab (0x09) and newlines (0x0A/0x0D) from the value.
-    let value: String = arg_str(scope, &args, 2)
-        .chars()
-        .filter(|&c| c != '\t' && c != '\n' && c != '\r')
-        .collect();
-    let mut u = match url::Url::parse(&href) {
+    // WHATWG: the parser-based setters remove ASCII tab/newline from the value; username/password
+    // run through percent-encoding instead, so tab/newline become %09/%0A/%0D there.
+    let raw = arg_str(scope, &args, 2);
+    let value: String = if matches!(prop.as_str(), "username" | "password") {
+        raw
+    } else {
+        raw.chars()
+            .filter(|&c| c != '\t' && c != '\n' && c != '\r')
+            .collect()
+    };
+    let mut u = match Url::parse(&href) {
         Ok(u) => u,
         Err(_) => {
             rv.set_null();
             return;
         }
     };
-    match prop.as_str() {
-        "protocol" => {
-            let scheme = value.trim_end_matches(':');
-            let _ = u.set_scheme(scheme);
-        }
-        "username" => {
-            let _ = u.set_username(&value);
-        }
-        "password" => {
-            let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
-        }
-        "hostname" => {
-            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
-        }
-        "host" => {
-            // file URLs can't have a port: a `:` (outside an IPv6 `[...]` literal) makes the host
-            // value invalid, so the whole setter is a no-op (the url crate would otherwise drop the
-            // port part and accept the host).
-            if u.scheme() == "file" {
-                if value.starts_with('[') || !value.contains(':') {
-                    let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
-                }
-            } else {
-                // host = hostname[:port]; split once (an IPv6 literal keeps its inner colons).
-                let (h, p) = if value.starts_with('[') {
-                    match value.split_once("]:") {
-                        Some((h, p)) => (format!("{h}]"), Some(p.to_string())),
-                        None => (value.clone(), None),
-                    }
-                } else {
-                    match value.split_once(':') {
-                        Some((h, p)) => (h.to_string(), Some(p.to_string())),
-                        None => (value.clone(), None),
-                    }
-                };
-                if u.set_host(if h.is_empty() { None } else { Some(&h) })
-                    .is_ok()
-                {
-                    if let Some(p) = p {
-                        let _ = u.set_port(p.parse::<u16>().ok());
-                    }
-                }
-            }
-        }
-        "port" => {
-            if value.is_empty() {
-                let _ = u.set_port(None);
-            } else {
-                // The port state consumes leading ASCII digits and stops at the first non-digit
-                // ("90\0..00" -> 90). No leading digit, or an out-of-range value, is a no-op.
-                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(p) = digits.parse::<u16>() {
-                    let _ = u.set_port(Some(p));
-                }
-            }
-        }
-        // WHATWG: the pathname setter is a no-op when the URL has an opaque path (e.g. data:, a
-        // non-special scheme without an authority).
-        "pathname" => {
-            if !u.cannot_be_a_base() {
-                u.set_path(&value);
-            }
-        }
-        "search" => {
-            let q = value.strip_prefix('?').unwrap_or(&value);
-            let opaque = u.cannot_be_a_base();
-            let orig_path = u.path().to_string();
-            u.set_query(if q.is_empty() { None } else { Some(q) });
-            // Removing the query from an opaque-path URL whose path ends in spaces: the `url` crate
-            // strips them, but WHATWG keeps them and percent-encodes the final trailing space as
-            // %20 (so the serialization doesn't end in whitespace and round-trips). Rebuild from a
-            // corrected serialization in that case.
-            if opaque && q.is_empty() && orig_path.ends_with(' ') {
-                let fixed = format!("{}%20", &orig_path[..orig_path.len() - 1]);
-                let mut s = format!("{}:{}", u.scheme(), fixed);
-                if let Some(f) = u.fragment() {
-                    s.push('#');
-                    s.push_str(f);
-                }
-                if let Ok(nu) = url::Url::parse(&s) {
-                    u = nu;
-                }
-            }
-        }
-        "hash" => {
-            let f = value.strip_prefix('#').unwrap_or(&value);
-            u.set_fragment(if f.is_empty() { None } else { Some(f) });
-        }
-        "href" => {
-            // href setter reparses from scratch; failure throws (signalled by null).
-            match url::Url::parse(&value) {
-                Ok(nu) => u = nu,
-                Err(_) => {
-                    rv.set_null();
-                    return;
-                }
-            }
-        }
-        _ => {}
+    // The href setter signals an invalid value (which the JS layer turns into a throw) by failing.
+    if prop == "href" && Url::parse(&value).is_err() {
+        rv.set_null();
+        return;
     }
+    u.set(&prop, &value);
     let rec = url_to_record(&u);
     let v = js_str(scope, &rec);
     rv.set(v);
@@ -1986,11 +1802,9 @@ pub(crate) fn prim_fetch(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                // Join failed: fall back to the raw URL (likely already absolute).
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => {
+                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
+            }
             _ => raw.clone(),
         }
     };
@@ -2030,11 +1844,9 @@ pub(crate) fn prim_request(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                // Join failed: fall back to the raw URL (likely already absolute).
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => {
+                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
+            }
             _ => raw.clone(),
         }
     };
@@ -2076,10 +1888,9 @@ pub(crate) fn prim_start_fetch(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => {
+                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
+            }
             _ => raw.clone(),
         }
     };
@@ -2128,10 +1939,9 @@ pub(crate) fn prim_ws_connect(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => {
+                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
+            }
             _ => raw.clone(),
         }
     };
