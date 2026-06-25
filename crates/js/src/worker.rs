@@ -23,10 +23,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 
 use crate::{
-    eval_source, host_state, install_browser_environment, js_str, run_due_timers, HostState,
-    SharedDoc,
+    deliver_fetch_completion, deliver_ws_event, eval_source, host_state,
+    install_browser_environment, js_str, run_due_timers, FetchCompletion, HostState, SharedDoc,
+    WsEvent,
 };
 use crate::primitives::{arg_str, set_fn};
 
@@ -35,10 +37,14 @@ use crate::primitives::{arg_str, set_fn};
 const WORKER_ENV_BOOTSTRAP: &str = include_str!("bootstrap/worker_env.js");
 
 /// One live worker: its own context. The context owns its `HostState` (set as a context slot) and
-/// keeps the worker global alive for the whole worker lifetime.
+/// keeps the worker global alive for the whole worker lifetime. `fetch_rx`/`ws_evt_rx` are the
+/// worker's own async-IO channels, drained by [`pump_workers`] in the worker's context so `fetch()`
+/// / `XMLHttpRequest` / `WebSocket` resolve inside the worker just like on the page.
 struct WorkerRealm {
     id: u32,
     context: v8::Global<v8::Context>,
+    fetch_rx: Receiver<FetchCompletion>,
+    ws_evt_rx: Receiver<WsEvent>,
     alive: bool,
 }
 
@@ -98,13 +104,13 @@ fn prim_worker_create(
         }
     };
 
-    // Inherit the page's network capabilities (synchronous `__request` powers importScripts). Async
-    // fetch()/WebSocket inside workers is not routed yet, so give dead-end channels for those.
+    // Inherit the page's network capabilities (synchronous `__request` powers importScripts; the
+    // async fetch/WebSocket channels are the worker's own, drained by pump_workers in its context).
     let page_state = host_state(scope);
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
-    let (fetch_tx, _fetch_rx) = std::sync::mpsc::channel();
-    let (ws_tx, _ws_rx) = std::sync::mpsc::channel();
+    let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
+    let (ws_tx, ws_evt_rx) = std::sync::mpsc::channel();
 
     let ctx_global = {
         let ctx = v8::Context::new(scope, Default::default());
@@ -142,6 +148,8 @@ fn prim_worker_create(
         r.borrow_mut().realms.push(WorkerRealm {
             id,
             context: ctx_global,
+            fetch_rx,
+            ws_evt_rx,
             alive: true,
         })
     });
@@ -235,22 +243,50 @@ fn call_global_fn(scope: &mut v8::PinScope, name: &str, args: &[v8::Local<v8::Va
     }
 }
 
-/// Advance every live worker's event loop one pass: run its due timers and a microtask checkpoint in
-/// its own context. Returns whether any worker did work (so the page drain keeps looping while a
-/// worker still has pending tasks — e.g. queued message deliveries or `setTimeout`s). Called from
-/// [`crate::drain_event_loop`].
-pub fn pump_workers(scope: &mut v8::PinScope) -> bool {
-    // Snapshot the contexts under a short borrow; running worker JS may itself touch WORKER_REG
-    // (spawn a sub-worker, terminate), so we must not hold the borrow across execution.
-    let ctxs: Vec<v8::Global<v8::Context>> = WORKER_REG.with(|r| {
-        r.borrow()
-            .realms
-            .iter()
-            .filter(|w| w.alive)
-            .map(|w| w.context.clone())
-            .collect()
+/// Advance every live worker's event loop one pass: deliver any completed fetches / WebSocket events,
+/// run due timers, and a microtask checkpoint — each in the worker's own context. Returns
+/// `(did_work, in_flight)`: `did_work` keeps the page drain looping while a worker still has pending
+/// tasks (queued message deliveries, timers, settled fetches), and `in_flight` is the total
+/// outstanding async fetches across all workers so the drain keeps waiting (on the longer network
+/// budget) until they settle. Called from [`crate::drain_event_loop`].
+pub fn pump_workers(scope: &mut v8::PinScope) -> (bool, usize) {
+    // Phase 1: collect completed fetches / ws events per realm under a short borrow (try_recv runs
+    // no JS). Running worker JS may re-enter WORKER_REG (spawn a sub-worker, terminate), so we must
+    // not hold the borrow across the delivery in phase 2.
+    let mut ctxs: Vec<v8::Global<v8::Context>> = Vec::new();
+    let mut fetches: Vec<(v8::Global<v8::Context>, FetchCompletion)> = Vec::new();
+    let mut ws_events: Vec<(v8::Global<v8::Context>, WsEvent)> = Vec::new();
+    WORKER_REG.with(|r| {
+        for w in r.borrow().realms.iter().filter(|w| w.alive) {
+            ctxs.push(w.context.clone());
+            while let Ok(c) = w.fetch_rx.try_recv() {
+                fetches.push((w.context.clone(), c));
+            }
+            while let Ok(e) = w.ws_evt_rx.try_recv() {
+                ws_events.push((w.context.clone(), e));
+            }
+        }
     });
+
     let mut did_work = false;
+    // Phase 2a: deliver fetch completions in each owning worker context.
+    for (ctx_g, completion) in fetches {
+        let ctx = v8::Local::new(scope, &ctx_g);
+        let cscope = &mut v8::ContextScope::new(scope, ctx);
+        deliver_fetch_completion(cscope, completion);
+        cscope.perform_microtask_checkpoint();
+        did_work = true;
+    }
+    // Phase 2b: deliver WebSocket events.
+    for (ctx_g, (id, kind, payload)) in ws_events {
+        let ctx = v8::Local::new(scope, &ctx_g);
+        let cscope = &mut v8::ContextScope::new(scope, ctx);
+        deliver_ws_event(cscope, id, kind, &payload);
+        cscope.perform_microtask_checkpoint();
+        did_work = true;
+    }
+    // Phase 2c: run timers + microtasks per worker, and tally outstanding fetches.
+    let mut in_flight = 0usize;
     for ctx_g in ctxs {
         let ctx = v8::Local::new(scope, &ctx_g);
         let cscope = &mut v8::ContextScope::new(scope, ctx);
@@ -258,6 +294,9 @@ pub fn pump_workers(scope: &mut v8::PinScope) -> bool {
             did_work = true;
         }
         cscope.perform_microtask_checkpoint();
+        if let Some(state) = cscope.get_current_context().get_slot::<HostState>() {
+            in_flight += state.in_flight.get();
+        }
     }
-    did_work
+    (did_work, in_flight)
 }

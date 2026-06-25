@@ -4678,6 +4678,57 @@ mod tests {
 
 
     #[test]
+    fn dedicated_worker_async_fetch_resolves() {
+        // A worker's async fetch() resolves: its completion is routed back into the worker context by
+        // pump_workers (its own fetch channel), so the promise settles and the worker posts the body.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var w = new Worker('worker.js');
+                w.onmessage = function (e) { document.body.setAttribute('data-reply', e.data); };
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                let body = if u.ends_with("worker.js") {
+                    "fetch('data.txt').then(function (r) { return r.text(); }).then(function (t) { postMessage('got:' + t); });".to_string()
+                } else if u.ends_with("data.txt") {
+                    r#"{"ok":true,"status":200,"statusText":"OK","url":"x","contentType":"text/plain","body":"HELLO"}"#.to_string()
+                } else {
+                    return None;
+                };
+                if u.ends_with("data.txt") {
+                    Some(body)
+                } else {
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/javascript","body":"{body}"}}"#
+                    ))
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let reply = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-reply").cloned(),
+            _ => None,
+        };
+        assert_eq!(reply.as_deref(), Some("got:HELLO"));
+    }
+
+    #[test]
     fn dedicated_worker_from_blob_object_url() {
         // `new Worker(URL.createObjectURL(new Blob([src])))` — an inline (blob/data:) worker. The
         // page decodes the data: URL and hands the source to the worker context directly. The worker
