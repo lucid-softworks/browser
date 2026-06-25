@@ -4678,6 +4678,60 @@ mod tests {
     }
 
     #[test]
+    fn url_host_setter_conformance() {
+        // host setter: a file URL can't have a port, so `host = 'x:123'` is rejected (no-op); a
+        // special URL's host setter splits host:port; an opaque-path query removal keeps trailing
+        // spaces (encoding the final one).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var b = document.body;
+                var f = new URL('file://y/'); f.host = 'x:123';
+                b.setAttribute('data-file', f.href);
+                var h = new URL('http://y/'); h.host = 'z:8080';
+                b.setAttribute('data-http', h.host + '|' + h.href);
+                var u = new URL('data:space    ?test'); u.search = '';
+                b.setAttribute('data-opaque', u.href);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-file").as_deref(),
+            Some("file://y/"),
+            "file host with port is rejected"
+        );
+        assert_eq!(
+            attr("data-http").as_deref(),
+            Some("z:8080|http://z:8080/"),
+            "host splits host:port"
+        );
+        assert_eq!(
+            attr("data-opaque").as_deref(),
+            Some("data:space   %20"),
+            "opaque trailing space kept"
+        );
+    }
+
+    #[test]
     fn url_searchparams_conformance() {
         // URLSearchParams/URL conformance: set() updates the first occurrence in place + removes the
         // rest; url.search setter clears searchParams; lenient form percent-decode keeps invalid `%`

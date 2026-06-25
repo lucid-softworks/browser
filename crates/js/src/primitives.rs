@@ -1768,16 +1768,32 @@ pub(crate) fn prim_url_set(
             let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
         }
         "host" => {
-            // host = hostname[:port]; let the parser handle both by splitting once.
-            let (h, p) = match value.split_once(':') {
-                Some((h, p)) => (h, Some(p)),
-                None => (value.as_str(), None),
-            };
-            if u.set_host(if h.is_empty() { None } else { Some(h) })
-                .is_ok()
-            {
-                if let Some(p) = p {
-                    let _ = u.set_port(p.parse::<u16>().ok());
+            // file URLs can't have a port: a `:` (outside an IPv6 `[...]` literal) makes the host
+            // value invalid, so the whole setter is a no-op (the url crate would otherwise drop the
+            // port part and accept the host).
+            if u.scheme() == "file" {
+                if value.starts_with('[') || !value.contains(':') {
+                    let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
+                }
+            } else {
+                // host = hostname[:port]; split once (an IPv6 literal keeps its inner colons).
+                let (h, p) = if value.starts_with('[') {
+                    match value.split_once("]:") {
+                        Some((h, p)) => (format!("{h}]"), Some(p.to_string())),
+                        None => (value.clone(), None),
+                    }
+                } else {
+                    match value.split_once(':') {
+                        Some((h, p)) => (h.to_string(), Some(p.to_string())),
+                        None => (value.clone(), None),
+                    }
+                };
+                if u.set_host(if h.is_empty() { None } else { Some(&h) })
+                    .is_ok()
+                {
+                    if let Some(p) = p {
+                        let _ = u.set_port(p.parse::<u16>().ok());
+                    }
                 }
             }
         }
