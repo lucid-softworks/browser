@@ -774,6 +774,7 @@ pub(crate) fn compute_element_style<'a>(
         bg_is_system: false,                       // not inherited
         border_is_system: false,                   // not inherited
         background_color: None,                    // not inherited
+        background_alpha: 255,                     // not inherited
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),
         bold: parent.bold,

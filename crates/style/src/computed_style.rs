@@ -10,6 +10,7 @@ impl Default for ComputedStyle {
             writing_mode: WritingMode::HorizontalTb,
             color: ua_default_text_color(),
             background_color: None,
+            background_alpha: 255,
             forced_color_adjust_off: false,
             font_variant_emoji_emoji: false,
             accent_color: None,
@@ -144,6 +145,32 @@ pub fn serialize_px(v: f32) -> String {
 /// Format an opaque color as `rgb(r, g, b)`.
 pub(crate) fn rgb_str((r, g, b): (u8, u8, u8)) -> String {
     format!("rgb({r}, {g}, {b})")
+}
+
+/// The CSSOM serialization of an 8-bit alpha: the shortest 1–3 place decimal that round-trips to the
+/// same byte (e.g. 77 → "0.3"). 255 is full opacity (caller uses `rgb()` then).
+pub(crate) fn alpha_str(a: u8) -> String {
+    for places in 1..=3u32 {
+        let scale = 10f32.powi(places as i32);
+        let d = (a as f32 / 255.0 * scale).round() / scale;
+        if (d * 255.0).round() as u8 == a {
+            let mut s = format!("{:.*}", places as usize, d);
+            while s.ends_with('0') {
+                s.pop();
+            }
+            return s;
+        }
+    }
+    format!("{}", a as f32 / 255.0)
+}
+
+/// Format a color with alpha: `rgb(r, g, b)` when opaque, else `rgba(r, g, b, a)`.
+pub(crate) fn rgba_str((r, g, b): (u8, u8, u8), a: u8) -> String {
+    if a == 255 {
+        rgb_str((r, g, b))
+    } else {
+        format!("rgba({r}, {g}, {b}, {})", alpha_str(a))
+    }
 }
 
 impl ComputedStyle {
@@ -308,7 +335,7 @@ impl ComputedStyle {
             // --- color / paint ---
             "color" => rgb_str(self.color),
             "background-color" => match self.background_color {
-                Some(c) => rgb_str(c),
+                Some(c) => rgba_str(c, self.background_alpha),
                 None => "rgba(0, 0, 0, 0)".to_string(), // CSS transparent
             },
             "background-image" => match &self.background_image_url {

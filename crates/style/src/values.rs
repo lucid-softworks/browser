@@ -302,6 +302,9 @@ pub struct ComputedStyle {
     pub color: (u8, u8, u8),
     /// Background color, if any (r, g, b). `None` means transparent.
     pub background_color: Option<(u8, u8, u8)>,
+    /// Alpha (0..=255) of `background_color`. Forced colors replaces the RGB with Canvas but keeps
+    /// this alpha, so a translucent background stays translucent.
+    pub background_alpha: u8,
     /// `forced-color-adjust`: when `true` (the `none`/`preserve-parent-color` keywords), this
     /// element opts out of the forced-colors system-color override.
     pub forced_color_adjust_off: bool,
