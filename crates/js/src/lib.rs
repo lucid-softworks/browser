@@ -4678,6 +4678,52 @@ mod tests {
     }
 
     #[test]
+    fn urlsearchparams_usvstring_record_init() {
+        // Object init builds a record<USVString,USVString>: lone surrogates -> U+FFFD, and coerced
+        // keys collapse (later value wins, first position kept).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var a = new URLSearchParams({ "x\uDC53": "1", "x\uDC5C": "2", "x\uDC65": "3" });
+                var b = new URLSearchParams({ "\uD835x": "1", "xx": "2", "\uD83Dx": "3" });
+                document.body.setAttribute('data-a', a.toString());
+                document.body.setAttribute('data-b', b.toString());
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        // U+FFFD encodes to %EF%BF%BD in application/x-www-form-urlencoded.
+        assert_eq!(
+            attr("data-a").as_deref(),
+            Some("x%EF%BF%BD=3"),
+            "3 keys collapse to one, last value"
+        );
+        assert_eq!(
+            attr("data-b").as_deref(),
+            Some("%EF%BF%BDx=3&xx=2"),
+            "first position kept, value updated"
+        );
+    }
+
+    #[test]
     fn anchor_click_executes_javascript_url() {
         // Clicking <a href="javascript:..."> runs the script in the page realm; a javascript: URL
         // that fails to parse (invalid host) does not execute.
@@ -4828,6 +4874,29 @@ mod tests {
             Some("data:space   %20"),
             "opaque trailing space kept"
         );
+    }
+
+    #[test]
+    fn diag_sethost_panic() {
+        // file URLs + various host values; find which set_host panics (url crate bug).
+        let bases = ["file://y/", "file:///p", "http://h/", "sc://x/"];
+        let vals = [
+            "", "a", "a:1", "[::1]", "x|", "C:", "/", "\\", "h\\p", "a b", "a%2fb", "host:", ":80",
+            "[v1.x]",
+        ];
+        for b in bases {
+            for v in vals {
+                let r = std::panic::catch_unwind(|| {
+                    let mut u = url::Url::parse(b).unwrap();
+                    let _ = u.set_host(Some(v));
+                    u.as_str().to_string()
+                });
+                if r.is_err() {
+                    eprintln!("DIAG PANIC base={:?} host={:?}", b, v);
+                }
+            }
+        }
+        eprintln!("DIAG done");
     }
 
     #[test]

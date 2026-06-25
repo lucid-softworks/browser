@@ -10173,7 +10173,24 @@
       var self = this;
       // `__onChange` lets a URL keep its href/search in sync with mutations (set in the URL ctor).
       function changed() { if (typeof self.__onChange === "function") { try { self.__onChange(); } catch (e) {} } }
-      function add(k, v) { pairs.push([String(k), String(v)]); }
+      // USVString coercion: every URLSearchParams string is a USVString, so lone (unpaired)
+      // surrogates are replaced with U+FFFD.
+      function usv(s) {
+        s = String(s);
+        var out = "", i = 0, n = s.length;
+        while (i < n) {
+          var c = s.charCodeAt(i);
+          if (c >= 0xD800 && c <= 0xDBFF) {
+            var d = (i + 1 < n) ? s.charCodeAt(i + 1) : 0;
+            if (d >= 0xDC00 && d <= 0xDFFF) { out += s[i] + s[i + 1]; i += 2; continue; }
+            out += "�"; i++; continue;
+          }
+          if (c >= 0xDC00 && c <= 0xDFFF) { out += "�"; i++; continue; }
+          out += s[i]; i++;
+        }
+        return out;
+      }
+      function add(k, v) { pairs.push([usv(k), usv(v)]); }
       function parseQuery(s) {
         if (s.charAt(0) === "?") { s = s.slice(1); }
         if (!s) { return; }
@@ -10198,13 +10215,16 @@
           add(a[0], a[1]);
         }
       } else if (typeof init === "object") {
-        // Record: own enumerable string-keyed properties.
+        // record<USVString, USVString>: own enumerable string keys, USVString-coerced. Duplicate
+        // coerced keys collapse (a later entry overwrites the value but keeps the first position).
         var keys = Object.keys(init);
-        for (var j = 0; j < keys.length; j++) { add(keys[j], init[keys[j]]); }
+        var rec = new Map();
+        for (var j = 0; j < keys.length; j++) { rec.set(usv(keys[j]), usv(init[keys[j]])); }
+        rec.forEach(function (v, k) { pairs.push([k, v]); });
       }
       // Methods are non-enumerable (so `new URLSearchParams(usp)` / record init never see them).
       def(this, "append", function (k, v) { add(k, v); changed(); });
-      def(this, "set", function (k, v) { k = String(k); v = String(v); var found = false; for (var i = 0; i < pairs.length;) { if (pairs[i][0] === k) { if (!found) { pairs[i][1] = v; found = true; i++; } else { pairs.splice(i, 1); } } else { i++; } } if (!found) { add(k, v); } changed(); });
+      def(this, "set", function (k, v) { k = usv(k); v = usv(v); var found = false; for (var i = 0; i < pairs.length;) { if (pairs[i][0] === k) { if (!found) { pairs[i][1] = v; found = true; i++; } else { pairs.splice(i, 1); } } else { i++; } } if (!found) { add(k, v); } changed(); });
       def(this, "get", function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; });
       def(this, "getAll", function (k) { k = String(k); var out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; });
       def(this, "has", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; });
