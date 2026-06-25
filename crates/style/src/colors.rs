@@ -347,6 +347,41 @@ pub(crate) fn parse_named_color(lower: &str) -> Option<(u8, u8, u8)> {
 /// outside it, returning `None` (unknown) keeps these keywords inert so they don't change rendering
 /// for pages that aren't being run in forced colors. The exact values only need to be self-consistent
 /// so a property forced to `CanvasText` renders the same as an element that names `CanvasText`.
+/// Whether `lower` (already lowercased) is a CSS system color keyword — independent of forced
+/// colors mode (used to detect author-specified system colors, which forced colors preserves).
+pub(crate) fn is_system_color_keyword(lower: &str) -> bool {
+    matches!(
+        lower,
+        "canvas"
+            | "window"
+            | "buttonface"
+            | "field"
+            | "infobackground"
+            | "canvastext"
+            | "windowtext"
+            | "buttontext"
+            | "fieldtext"
+            | "infotext"
+            | "menutext"
+            | "captiontext"
+            | "graytext"
+            | "linktext"
+            | "visitedtext"
+            | "activetext"
+            | "highlight"
+            | "selecteditem"
+            | "accentcolor"
+            | "highlighttext"
+            | "selecteditemtext"
+            | "accentcolortext"
+            | "buttonborder"
+            | "threedface"
+            | "buttonshadow"
+            | "mark"
+            | "marktext"
+    )
+}
+
 pub(crate) fn system_color(lower: &str) -> Option<(u8, u8, u8)> {
     if !crate::cascade::forced_colors_active() {
         return None;

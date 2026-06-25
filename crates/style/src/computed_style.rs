@@ -12,6 +12,7 @@ impl Default for ComputedStyle {
             background_color: None,
             forced_color_adjust_off: false,
             font_variant_emoji_emoji: false,
+            accent_color: None,
             font_size: 16.0,
             font_family: None,
             bold: false,
@@ -298,6 +299,18 @@ impl ComputedStyle {
             .to_string(),
             // Forced colors forces these to their UA-controlled value at computed time. We don't
             // otherwise model them, so report them only while forced colors is active.
+            // Forced colors computes accent-color to `auto` unless this element opted out
+            // (forced-color-adjust:none) or the author used a system color.
+            "accent-color" => match self.accent_color {
+                _ if crate::forced_colors_active()
+                    && !self.forced_color_adjust_off
+                    && !matches!(self.accent_color, Some((_, true))) =>
+                {
+                    "auto".to_string()
+                }
+                Some((c, _)) => rgb_str(c),
+                None => "auto".to_string(),
+            },
             "scrollbar-color" if crate::forced_colors_active() => "auto".to_string(),
             "font-variant-emoji" if crate::forced_colors_active() => {
                 if self.font_variant_emoji_emoji { "emoji" } else { "text" }.to_string()
