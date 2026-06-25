@@ -107,7 +107,7 @@ pub(crate) fn cascade_locked(
 /// In forced colors mode, replace author text/background/border colors with system colors
 /// (CanvasText / Canvas), skipping any element (or descendant of an element) with
 /// `forced-color-adjust: none`. `forced-color-adjust` inherits, hence the `ancestor_off` flag.
-fn apply_forced_colors(
+pub(crate) fn apply_forced_colors(
     doc: &dom::Document,
     id: dom::NodeId,
     ancestor_off: bool,
@@ -132,14 +132,15 @@ fn apply_forced_colors(
                 |&c| matches!(&doc.get(c).data, dom::NodeData::Text(t) if !t.trim().is_empty()),
             );
         if let Some(s) = out.get_mut(&id) {
+            // Border → CanvasText. A painted background (or a text backplate) → Canvas; an empty
+            // transparent box stays transparent. Background images/gradients are preserved (text
+            // reads over them), and box shadows are dropped.
             s.color = text_color;
-            s.border_color = (0, 0, 0); // CanvasText
-            // A painted background — or a text backplate — becomes Canvas; an empty transparent box
-            // stays transparent. Background images/gradients are preserved (text reads over them).
+            s.border_color = (0, 0, 0);
             if s.background_color.is_some() || has_text {
                 s.background_color = Some(canvas);
             }
-            s.box_shadows.clear(); // box shadows are dropped in forced colors mode
+            s.box_shadows.clear();
         }
     }
     for child in doc.get(id).children.clone() {
