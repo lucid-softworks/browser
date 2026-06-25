@@ -10159,10 +10159,18 @@
       def(this, "getAll", function (k) { k = String(k); var out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; });
       def(this, "has", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; });
       def(this, "delete", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { pairs.splice(i, 1); } } changed(); });
+      // forEach + the iterators are LIVE: they read `pairs` by index on each step, so mutations made
+      // during iteration are observed (per the URLSearchParams spec / WPT "For-of Check").
       def(this, "forEach", function (cb, thisArg) { for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } });
-      def(this, "keys", function () { return pairs.map(function (p) { return p[0]; })[Symbol.iterator](); });
-      def(this, "values", function () { return pairs.map(function (p) { return p[1]; })[Symbol.iterator](); });
-      def(this, "entries", function () { return pairs.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); });
+      function liveIter(pick) {
+        var i = 0;
+        var it = { next: function () { if (i >= pairs.length) { return { value: undefined, done: true }; } var p = pairs[i++]; return { value: pick(p), done: false }; } };
+        it[Symbol.iterator] = function () { return this; };
+        return it;
+      }
+      def(this, "keys", function () { return liveIter(function (p) { return p[0]; }); });
+      def(this, "values", function () { return liveIter(function (p) { return p[1]; }); });
+      def(this, "entries", function () { return liveIter(function (p) { return [p[0], p[1]]; }); });
       def(this, "sort", function () { pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); changed(); });
       def(this, Symbol.iterator, function () { return this.entries(); });
       def(this, "toString", function () { return pairs.map(function (p) { return __formEncode(p[0]) + "=" + __formEncode(p[1]); }).join("&"); });
