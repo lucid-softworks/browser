@@ -29,6 +29,7 @@ impl Engine {
             favicon: None,
             bg_sources: HashMap::new(),
             bg_bitmaps: HashMap::new(),
+            canvas_bg: None,
         }
     }
 
@@ -711,6 +712,7 @@ impl Engine {
             if !self.bg_sources.is_empty() {
                 self.bg_sources.clear();
             }
+            self.canvas_bg = None;
             return;
         }
 
@@ -731,6 +733,40 @@ impl Engine {
         let live: std::collections::HashSet<&String> =
             targets.iter().map(|(_, _, b)| &b.url).collect();
         self.bg_sources.retain(|k, _| live.contains(k));
+
+        // CSS background propagation: the root (`<html>`) background image — or the `<body>`'s when
+        // html has none — is painted on the canvas at the viewport size, not on its own box. (Without
+        // this, a body image tiles to the body box's height, which varies with content.)
+        self.canvas_bg = None;
+        let prop = self.layout_cache.as_ref().and_then(|cache| {
+            // Walk the first-child chain (root → html → body) for the first element with a background
+            // image — that's the one whose background propagates to the canvas.
+            let mut node = &cache.root;
+            for _ in 0..3 {
+                if let Some(nid) = node.node {
+                    if targets.iter().any(|(n, _, _)| *n == nid) {
+                        return Some((nid, cache.content_h));
+                    }
+                }
+                match node.children.first() {
+                    Some(c) => node = c,
+                    None => break,
+                }
+            }
+            None
+        });
+        if let Some((pid, content_h)) = prop {
+            if let Some(pos) = targets.iter().position(|(n, _, _)| *n == pid) {
+                let (_, _, bg) = targets.remove(pos);
+                let vw = (self.vp_w as f32 * self.scale).round().clamp(1.0, 8192.0) as u32;
+                let vh = ((self.vp_h as f32 * self.scale).max(content_h))
+                    .round()
+                    .clamp(1.0, 8192.0) as u32;
+                if let Some(src) = self.bg_sources.get(&bg.url) {
+                    self.canvas_bg = Some(compose_background(src, vw, vh, &bg));
+                }
+            }
+        }
 
         let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         for (id, rect, bg) in targets {
@@ -844,7 +880,18 @@ impl Engine {
         // background). The splash / non-HTML / error states (no layout tree) keep the chrome gradient.
         match (&self.state, &self.layout_cache) {
             (LoadState::Loaded { .. }, Some(cache)) => {
-                fb.clear(page_background(&cache.root, cache.root_scheme_dark))
+                fb.clear(page_background(&cache.root, cache.root_scheme_dark));
+                // Then the propagated root/body background image (CSS background propagation), at the
+                // canvas origin, scrolled with the page.
+                if let Some(bg) = &self.canvas_bg {
+                    let dst = Rect {
+                        x: 0,
+                        y: -(self.scroll_y.round() as i32),
+                        w: bg.w as i32,
+                        h: bg.h as i32,
+                    };
+                    fb.blit_rgba(dst, &bg.rgba, bg.w, bg.h);
+                }
             }
             _ => paint_gradient(&mut fb),
         }

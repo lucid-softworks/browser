@@ -200,6 +200,10 @@ pub struct Engine {
     /// Per-box composed `background-image` bitmaps (border-box device size, image placed per
     /// size/repeat/position), keyed by node id. Rebuilt each layout (`update_bg_image_bitmaps`).
     bg_bitmaps: HashMap<dom::NodeId, DecodedImage>,
+    /// The root/body `background-image` propagated to the viewport (CSS background propagation),
+    /// composed at the full viewport size. Painted on the canvas after the background color; the
+    /// originating box does not paint it. `None` when no root/body background image is set.
+    canvas_bg: Option<DecodedImage>,
 }
 
 /// A fetched/decoded `mask-image` source, ready to rasterize to a per-box coverage bitmap.

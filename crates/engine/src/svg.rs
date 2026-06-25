@@ -1059,13 +1059,13 @@ fn apply_paint(
             }
         }
         // Forced colors: a painted fill/stroke resolves to the element's (already-forced)
-        // currentColor, unless the element opted out with forced-color-adjust:none.
+        // currentColor, unless the element opted out with forced-color-adjust:none. A `url()` paint
+        // (gradient/pattern) is left alone — its own stops carry the forced/system colors.
         if style::forced_colors_active() && !cs.forced_color_adjust_off {
             let (r, g, b) = cs.color;
             let cc = Color { r, g, b, a: 255 };
-            if st.fill.is_some() {
+            if st.fill.is_some() && st.fill_url.is_none() {
                 st.fill = Some(cc);
-                st.fill_url = None;
             }
             if st.stroke.is_some() {
                 st.stroke = Some(cc);
