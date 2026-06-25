@@ -31,14 +31,12 @@ impl ModuleRegistry {
     /// Resolve `specifier` against `base` (a canonical URL) via `Url::join`. Returns the canonical
     /// absolute URL, or `specifier` unchanged if neither parses (best-effort, never panics).
     fn resolve_specifier(specifier: &str, base: &str) -> String {
-        if let Ok(base_url) = url::Url::parse(base) {
-            if let Ok(joined) = base_url.join(specifier) {
-                return joined.to_string();
-            }
+        if let Some(joined) = wurl::resolve(specifier, base) {
+            return joined;
         }
         // Fall back to the specifier itself (already absolute in the common pre-rewritten case).
-        url::Url::parse(specifier)
-            .map(|u| u.to_string())
+        wurl::Url::parse(specifier)
+            .map(|u| u.href())
             .unwrap_or_else(|_| specifier.to_string())
     }
 

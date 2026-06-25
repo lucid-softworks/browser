@@ -22,6 +22,8 @@ mod values;
 mod variables;
 
 pub use cascade::*;
+pub use colors::is_system_color_keyword;
+pub use colors::system_color;
 pub use computed_style::*;
 pub use lengths::*;
 pub use selector::*;
@@ -1088,6 +1090,39 @@ mod tests {
             map[&p].color,
             (4, 5, 6),
             "light rule should win in Light mode"
+        );
+    }
+
+    #[test]
+    fn forced_colors_maps_to_system_colors() {
+        // Drive the override directly (not via the process-global flag) so this doesn't race other
+        // colour-asserting tests run in parallel.
+        let sheet = css::parse(
+            "div { color: rgb(255,0,0); background-color: rgb(0,0,255); \
+                   border: 1px solid rgb(0,255,0) } \
+             a { color: rgb(255,0,0) } \
+             .keep { forced-color-adjust: none; color: rgb(255,0,0) }",
+        );
+        let doc = html::parse(
+            r#"<html><body><div>text</div><a href="x">link</a><span class="keep">k</span></body></html>"#,
+        );
+        let mut map = cascade(&doc, &[sheet]);
+        cascade::apply_forced_colors(&doc, doc.root(), false, (0, 0, 0), false, &mut map);
+        let div = elem(&doc, |e| e.tag == "div");
+        let a = elem(&doc, |e| e.tag == "a");
+        let keep = elem(&doc, |e| e.attrs.get("class").is_some_and(|c| c == "keep"));
+        assert_eq!(map[&div].color, (0, 0, 0), "text -> CanvasText");
+        assert_eq!(
+            map[&div].background_color,
+            Some((255, 255, 255)),
+            "painted bg + text backplate -> Canvas"
+        );
+        assert_eq!(map[&div].border_color, (0, 0, 0), "border -> CanvasText");
+        assert_eq!(map[&a].color, (0, 0, 238), "link -> LinkText");
+        assert_eq!(
+            map[&keep].color,
+            (255, 0, 0),
+            "forced-color-adjust:none keeps the author color"
         );
     }
 

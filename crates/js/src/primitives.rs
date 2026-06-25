@@ -360,10 +360,7 @@ pub(crate) fn prim_get_attr(
 /// then runs with just the UA sheet + inline `style=""` attributes).
 /// Join `href` onto `base` (both treated as URLs); returns `base` if either fails to parse.
 pub(crate) fn join_url(base: &str, href: &str) -> String {
-    match url::Url::parse(base).and_then(|b| b.join(href.trim())) {
-        Ok(u) => u.into(),
-        Err(_) => base.to_string(),
-    }
+    wurl::resolve(href.trim(), base).unwrap_or_else(|| base.to_string())
 }
 
 /// The document's base URL: the first `<base href>` resolved against the page URL, else the page URL.
@@ -1661,64 +1658,59 @@ fn json_escape_into(s: &str, out: &mut String) {
     out.push('"');
 }
 
-/// Serialize a parsed `url::Url` into the component record the JS `URL`/`parseURL` layer expects.
-fn url_to_record(u: &url::Url) -> String {
-    let hostname = u.host_str().unwrap_or("");
-    let port = u.port().map(|p| p.to_string()).unwrap_or_default();
-    let host = if port.is_empty() {
-        hostname.to_string()
-    } else {
-        format!("{hostname}:{port}")
-    };
-    // The `search`/`hash` getters are "" for an absent OR empty component (only a non-empty query/
-    // fragment serializes with its leading `?`/`#`).
-    let search = u
-        .query()
-        .filter(|q| !q.is_empty())
-        .map(|q| format!("?{q}"))
-        .unwrap_or_default();
-    let hash = u
-        .fragment()
-        .filter(|f| !f.is_empty())
-        .map(|f| format!("#{f}"))
-        .unwrap_or_default();
-    // WHATWG origin serialization ("null" for opaque/cannot-be-a-base origins).
-    let origin = u.origin().ascii_serialization();
+/// Serialize a parsed URL into the component record the JS `URL`/`parseURL` layer expects.
+fn url_to_record(u: &wurl::Url) -> String {
     let mut s = String::from("{");
-    json_field(&mut s, "href", u.as_str());
+    json_field(&mut s, "href", &u.href());
     json_field(&mut s, "protocol", &format!("{}:", u.scheme()));
     json_field(&mut s, "username", u.username());
-    json_field(&mut s, "password", u.password().unwrap_or(""));
-    json_field(&mut s, "host", &host);
-    json_field(&mut s, "hostname", hostname);
-    json_field(&mut s, "port", &port);
-    json_field(&mut s, "pathname", u.path());
-    json_field(&mut s, "search", &search);
-    json_field(&mut s, "hash", &hash);
-    json_field(&mut s, "origin", &origin);
+    json_field(&mut s, "password", u.password());
+    json_field(&mut s, "host", &u.host_str());
+    json_field(&mut s, "hostname", &u.hostname());
+    json_field(&mut s, "port", &u.port_str());
+    json_field(&mut s, "pathname", &u.path_str());
+    json_field(&mut s, "search", &u.query_str());
+    json_field(&mut s, "hash", &u.fragment_str());
+    json_field(&mut s, "origin", &u.origin());
     s.push_str(&format!("\"opaque\":{}", u.cannot_be_a_base()));
     s.push('}');
     s
 }
 
-/// `__urlParse(input, base|null) -> recordJSON | null`. WHATWG URL parsing via the `url` crate: the
-/// authoritative, spec-compliant parser (vs. the hand-written JS one). Returns the component record
-/// as JSON, or null on a parse failure (the JS `URL` constructor then throws).
+/// `__urlParse(input, base|null) -> recordJSON | null`. WHATWG URL parsing via our spec-compliant
+/// parser ([`wurl`]). Returns the component record as JSON, or null on a parse failure
+/// (the JS `URL` constructor then throws).
 pub(crate) fn prim_url_parse(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    use wurl::Url;
     let input = arg_str(scope, &args, 0);
     let base_arg = args.get(1);
-    let parsed = if base_arg.is_string() {
-        let base = base_arg.to_rust_string_lossy(scope);
-        match url::Url::parse(&base) {
-            Ok(b) => b.join(&input),
-            Err(e) => Err(e),
-        }
+    // Optional 3rd arg: the document's character encoding (for query encoding in non-UTF-8 docs).
+    let enc = args.get(2);
+    let enc = if enc.is_string() {
+        Some(enc.to_rust_string_lossy(scope))
     } else {
-        url::Url::parse(&input)
+        None
+    };
+    let base_str = if base_arg.is_string() {
+        Some(base_arg.to_rust_string_lossy(scope))
+    } else {
+        None
+    };
+    let base = base_str.as_deref().and_then(|b| Url::parse(b).ok());
+    let parsed = match (&base_str, &base) {
+        // A base was given but didn't parse -> failure.
+        (Some(_), None) => Err(()),
+        _ => match &enc {
+            Some(e) => Url::parse_in_document(&input, base.as_ref(), e),
+            None => match base.as_ref() {
+                Some(b) => Url::parse_with_base(&input, b),
+                None => Url::parse(&input),
+            },
+        },
     };
     match parsed {
         Ok(u) => {
@@ -1739,81 +1731,27 @@ pub(crate) fn prim_url_set(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    use wurl::Url;
     let href = arg_str(scope, &args, 0);
     let prop = arg_str(scope, &args, 1);
-    // WHATWG: every URL setter removes ASCII tab (0x09) and newlines (0x0A/0x0D) from the value.
-    let value: String = arg_str(scope, &args, 2)
-        .chars()
-        .filter(|&c| c != '\t' && c != '\n' && c != '\r')
-        .collect();
-    let mut u = match url::Url::parse(&href) {
+    // Pass the raw value: the parser-based setters strip ASCII tab/newline inside the basic parser
+    // (so a value like "\n\n\t" for `port` is non-empty here, runs through the parser to an empty
+    // buffer, and leaves the port unchanged — rather than being treated as the empty string), and
+    // username/password percent-encode tab/newline (%09/%0A/%0D).
+    let value = arg_str(scope, &args, 2);
+    let mut u = match Url::parse(&href) {
         Ok(u) => u,
         Err(_) => {
             rv.set_null();
             return;
         }
     };
-    match prop.as_str() {
-        "protocol" => {
-            let scheme = value.trim_end_matches(':');
-            let _ = u.set_scheme(scheme);
-        }
-        "username" => {
-            let _ = u.set_username(&value);
-        }
-        "password" => {
-            let _ = u.set_password(if value.is_empty() { None } else { Some(&value) });
-        }
-        "hostname" => {
-            let _ = u.set_host(if value.is_empty() { None } else { Some(&value) });
-        }
-        "host" => {
-            // host = hostname[:port]; let the parser handle both by splitting once.
-            let (h, p) = match value.split_once(':') {
-                Some((h, p)) => (h, Some(p)),
-                None => (value.as_str(), None),
-            };
-            if u.set_host(if h.is_empty() { None } else { Some(h) })
-                .is_ok()
-            {
-                if let Some(p) = p {
-                    let _ = u.set_port(p.parse::<u16>().ok());
-                }
-            }
-        }
-        "port" => {
-            if value.is_empty() {
-                let _ = u.set_port(None);
-            } else {
-                // The port state consumes leading ASCII digits and stops at the first non-digit
-                // ("90\0..00" -> 90). No leading digit, or an out-of-range value, is a no-op.
-                let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
-                if let Ok(p) = digits.parse::<u16>() {
-                    let _ = u.set_port(Some(p));
-                }
-            }
-        }
-        "pathname" => u.set_path(&value),
-        "search" => {
-            let q = value.strip_prefix('?').unwrap_or(&value);
-            u.set_query(if q.is_empty() { None } else { Some(q) });
-        }
-        "hash" => {
-            let f = value.strip_prefix('#').unwrap_or(&value);
-            u.set_fragment(if f.is_empty() { None } else { Some(f) });
-        }
-        "href" => {
-            // href setter reparses from scratch; failure throws (signalled by null).
-            match url::Url::parse(&value) {
-                Ok(nu) => u = nu,
-                Err(_) => {
-                    rv.set_null();
-                    return;
-                }
-            }
-        }
-        _ => {}
+    // The href setter signals an invalid value (which the JS layer turns into a throw) by failing.
+    if prop == "href" && Url::parse(&value).is_err() {
+        rv.set_null();
+        return;
     }
+    u.set(&prop, &value);
     let rec = url_to_record(&u);
     let v = js_str(scope, &rec);
     rv.set(v);
@@ -1874,11 +1812,7 @@ pub(crate) fn prim_fetch(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                // Join failed: fall back to the raw URL (likely already absolute).
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };
@@ -1918,11 +1852,7 @@ pub(crate) fn prim_request(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                // Join failed: fall back to the raw URL (likely already absolute).
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };
@@ -1964,10 +1894,7 @@ pub(crate) fn prim_start_fetch(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };
@@ -2016,10 +1943,7 @@ pub(crate) fn prim_ws_connect(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => match url::Url::parse(&b).and_then(|u| u.join(&raw)) {
-                Ok(u) => u.to_string(),
-                Err(_) => raw.clone(),
-            },
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };
@@ -2109,6 +2033,52 @@ pub(crate) fn install_console_sink(scope: &mut v8::PinScope, global: v8::Local<v
 
 /// `__observersActive(bool)` — JS sets this true when the first `MutationObserver` is registered
 /// and false when the last disconnects. Gates whether the mutation primitives record anything.
+/// `__commitSelection(startEl, startOff, endEl, endOff)` — record the active programmatic text
+/// selection (boundary *elements* + char offsets, document order) so the engine can paint the
+/// `::selection` highlight. Called by `getSelection()` mutators. Any missing/invalid boundary clears
+/// the selection.
+pub(crate) fn prim_commit_selection(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let sel = match (arg_node(scope, &args, 0), arg_node(scope, &args, 2)) {
+        (Some(s), Some(e)) => {
+            let so = args.get(1).number_value(scope).unwrap_or(0.0).max(0.0) as u32;
+            let eo = args.get(3).number_value(scope).unwrap_or(0.0).max(0.0) as u32;
+            Some((s.0, so, e.0, eo))
+        }
+        _ => None,
+    };
+    crate::eval_loop::set_active_selection(sel);
+}
+
+/// `__clearHighlights()` — drop all CSS Custom Highlight registrations (the JS worker rebuilds them
+/// from scratch on every `CSS.highlights`/`Highlight` change).
+pub(crate) fn prim_clear_highlights(
+    _scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    crate::eval_loop::clear_active_highlights();
+}
+
+/// `__addHighlight(name, nodeId)` — register that `nodeId` is covered by the highlight `name`
+/// (its `::highlight(name)` pseudo applies). Called once per node in each registered highlight's
+/// ranges.
+pub(crate) fn prim_add_highlight(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let name = arg_str(scope, &args, 0);
+    if let Some(node) = arg_node(scope, &args, 1) {
+        if !name.is_empty() {
+            crate::eval_loop::add_active_highlight(node.0, name);
+        }
+    }
+}
+
 pub(crate) fn prim_observers_active(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
@@ -2289,6 +2259,9 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__wsSend", prim_ws_send);
     set_fn(scope, global, "__wsClose", prim_ws_close);
     set_fn(scope, global, "__observersActive", prim_observers_active);
+    set_fn(scope, global, "__commitSelection", prim_commit_selection);
+    set_fn(scope, global, "__clearHighlights", prim_clear_highlights);
+    set_fn(scope, global, "__addHighlight", prim_add_highlight);
     set_fn(scope, global, "__drainMutations", prim_drain_mutations);
     set_fn(
         scope,

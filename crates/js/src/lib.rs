@@ -4678,6 +4678,414 @@ mod tests {
     }
 
     #[test]
+    fn dom_exception_webidl_constants_and_branding() {
+        // DOMException exposes the legacy code constants (enumerable, on the interface object) and
+        // reads message/name/code through branding-checked prototype getters.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                var e = new DOMException("m", "SyntaxError");
+                out.push(e.name === "SyntaxError" && e.code === 12 && e.message === "m");
+                out.push(DOMException.INDEX_SIZE_ERR === 1 && DOMException.DATA_CLONE_ERR === 25);
+                try { Object.getOwnPropertyDescriptor(DOMException.prototype, "code").get.call({}); out.push(false); }
+                catch (err) { out.push(err instanceof TypeError); }
+                out.push(new URLSearchParams(DOMException).toString().indexOf("INDEX_SIZE_ERR=1") === 0);
+                try { new URLSearchParams(DOMException.prototype); out.push(false); }
+                catch (err) { out.push(err instanceof TypeError); }
+                document.body.setAttribute('data-out', out.join(","));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(attr.as_deref(), Some("true,true,true,true,true"));
+    }
+
+    #[test]
+    fn url_parse_file_drive_letter_pipe() {
+        // An absolute file: URL's drive-letter `X|` normalizes to `X:`.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                out.push(new URL("file:///w|/m").href);
+                out.push(new URL("file:C|/m/").href);
+                document.body.setAttribute('data-out', out.join("|"));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(attr.as_deref(), Some("file:///w:/m|file:///C:/m/"));
+    }
+
+    #[test]
+    fn url_parse_opaque_and_slash_edges() {
+        // Opaque-path trailing space encodes the last as %20; for a non-file special base a relative
+        // input with 3+ leading slashes collapses to the authority's host; file keeps the slashes.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                out.push(new URL("non-special:opaque  ?hi").href);
+                out.push(new URL("///test", "http://example.org/").href);
+                out.push(new URL("///example.org/path", "http://example.org/").href);
+                out.push(new URL("///test", "file:///tmp/x").href);
+                document.body.setAttribute('data-out', out.join("|"));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr.as_deref(),
+            Some("non-special:opaque %20?hi|http://test/|http://example.org/path|file:///test"),
+        );
+    }
+
+    #[test]
+    fn url_webidl_conformance() {
+        // URL/URLSearchParams are proper WebIDL interfaces: members on the prototype, @@toStringTag,
+        // constructors throw without `new`, and methods enforce required arguments.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var out = [];
+                out.push(Object.getOwnPropertyDescriptor(URL.prototype, "href") != null); // on prototype
+                out.push(Object.prototype.toString.call(new URL("http://h/")) === "[object URL]");
+                out.push(URL.length === 1);
+                try { URL("http://h/"); out.push(false); } catch (e) { out.push(e instanceof TypeError); }
+                out.push(Object.getOwnPropertyDescriptor(URLSearchParams.prototype, "append") != null);
+                try { URLSearchParams(); out.push(false); } catch (e) { out.push(e instanceof TypeError); }
+                var p = new URLSearchParams("a=1&b=2");
+                try { p.get(); out.push(false); } catch (e) { out.push(e instanceof TypeError); }
+                out.push(p.size === 2 && p[Symbol.iterator] === p.entries);
+                document.body.setAttribute('data-out', out.join(","));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get("data-out").cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr.as_deref(),
+            Some("true,true,true,true,true,true,true,true")
+        );
+    }
+
+    #[test]
+    fn window_open_throws_on_invalid_url() {
+        // window.open() with an unparseable URL throws a SyntaxError DOMException; a valid URL
+        // returns a window.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var bad = '';
+                try { self.open('file://example:1/'); } catch (e) { bad = e.name; }
+                document.body.setAttribute('data-bad', bad);
+                document.body.setAttribute('data-good', String(self.open('https://ok.example/') != null));
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-bad").as_deref(),
+            Some("SyntaxError"),
+            "invalid URL throws SyntaxError"
+        );
+        assert_eq!(
+            attr("data-good").as_deref(),
+            Some("true"),
+            "valid URL returns a window"
+        );
+    }
+
+    #[test]
+    fn urlsearchparams_usvstring_record_init() {
+        // Object init builds a record<USVString,USVString>: lone surrogates -> U+FFFD, and coerced
+        // keys collapse (later value wins, first position kept).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var a = new URLSearchParams({ "x\uDC53": "1", "x\uDC5C": "2", "x\uDC65": "3" });
+                var b = new URLSearchParams({ "\uD835x": "1", "xx": "2", "\uD83Dx": "3" });
+                document.body.setAttribute('data-a', a.toString());
+                document.body.setAttribute('data-b', b.toString());
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        // U+FFFD encodes to %EF%BF%BD in application/x-www-form-urlencoded.
+        assert_eq!(
+            attr("data-a").as_deref(),
+            Some("x%EF%BF%BD=3"),
+            "3 keys collapse to one, last value"
+        );
+        assert_eq!(
+            attr("data-b").as_deref(),
+            Some("%EF%BF%BDx=3&xx=2"),
+            "first position kept, value updated"
+        );
+    }
+
+    #[test]
+    fn anchor_click_executes_javascript_url() {
+        // Clicking <a href="javascript:..."> runs the script in the page realm; a javascript: URL
+        // that fails to parse (invalid host) does not execute.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var a = document.body.appendChild(document.createElement('a'));
+                a.href = 'javascript:globalThis.ranGood = 7';
+                a.click();
+                a.href = 'javascript://test:test/%0aglobalThis.ranBad = 1';
+                a.click();
+                // javascript: URLs run in a queued task, so read after them.
+                setTimeout(function () {
+                  document.body.setAttribute('data-good', String(globalThis.ranGood));
+                  document.body.setAttribute('data-bad', String(globalThis.ranBad));
+                }, 0);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-good").as_deref(),
+            Some("7"),
+            "valid javascript: URL executes"
+        );
+        assert_eq!(
+            attr("data-bad").as_deref(),
+            Some("undefined"),
+            "invalid-host javascript: URL does not execute"
+        );
+    }
+
+    #[test]
+    fn srcless_iframe_has_window_and_location_throws_on_invalid() {
+        // A srcless <iframe> still has an about:blank browsing context: contentWindow exposes the
+        // frame realm's globals (e.g. DOMException), and assigning contentWindow.location an invalid
+        // URL throws the frame's SyntaxError DOMException (PutForwards=href).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.body.appendChild(document.createElement('iframe'));
+                document.body.setAttribute('data-de', typeof f.contentWindow.DOMException);
+                var threw = '';
+                try { f.contentWindow.location = 'file://example:1/'; }
+                catch (e) { threw = e.name + ':' + (e instanceof f.contentWindow.DOMException); }
+                document.body.setAttribute('data-throw', threw);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-de").as_deref(),
+            Some("function"),
+            "frame has DOMException"
+        );
+        assert_eq!(
+            attr("data-throw").as_deref(),
+            Some("SyntaxError:true"),
+            "invalid location throws frame's SyntaxError"
+        );
+    }
+
+    #[test]
+    fn url_host_setter_conformance() {
+        // host setter: a file URL can't have a port, so `host = 'x:123'` is rejected (no-op); a
+        // special URL's host setter splits host:port; an opaque-path query removal keeps trailing
+        // spaces (encoding the final one).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var b = document.body;
+                var f = new URL('file://y/'); f.host = 'x:123';
+                b.setAttribute('data-file', f.href);
+                var h = new URL('http://y/'); h.host = 'z:8080';
+                b.setAttribute('data-http', h.host + '|' + h.href);
+                var u = new URL('data:space    ?test'); u.search = '';
+                b.setAttribute('data-opaque', u.href);
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-file").as_deref(),
+            Some("file://y/"),
+            "file host with port is rejected"
+        );
+        assert_eq!(
+            attr("data-http").as_deref(),
+            Some("z:8080|http://z:8080/"),
+            "host splits host:port"
+        );
+        assert_eq!(
+            attr("data-opaque").as_deref(),
+            Some("data:space   %20"),
+            "opaque trailing space kept"
+        );
+    }
+
+    #[test]
     fn url_searchparams_conformance() {
         // URLSearchParams/URL conformance: set() updates the first occurrence in place + removes the
         // rest; url.search setter clears searchParams; lenient form percent-decode keeps invalid `%`
@@ -4722,8 +5130,8 @@ mod tests {
         );
         assert_eq!(
             attr("data-clear").as_deref(),
-            Some("0|http://h/"),
-            "url.search='?' clears query"
+            Some("0|http://h/?"),
+            "url.search='?' -> empty (non-null) query: 0 params, href keeps the '?'"
         );
         assert_eq!(
             attr("data-dec").as_deref(),
@@ -4801,6 +5209,114 @@ mod tests {
             attr("data-reply").as_deref(),
             Some("echo:hi"),
             "cross-frame postMessage round-trip"
+        );
+    }
+
+    #[test]
+    fn iframe_data_url_decodes_and_runs() {
+        // An <iframe> with a data: src decodes the URL inline (no fetch), parses it as the frame
+        // document, runs its script, and posts to the parent.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                window.addEventListener('message', function (e) {
+                  document.body.setAttribute('data-msg', e.data);
+                });
+                var f = document.body.appendChild(document.createElement('iframe'));
+                f.onload = function () {
+                  document.body.setAttribute('data-q', f.contentDocument.querySelector('a').search);
+                };
+                f.src = "data:text/html,<a href='http://h/?q=1'>x</a><script>parent.postMessage('ran','*')<\/script>";
+            "#
+            .to_string(),
+        );
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-msg").as_deref(),
+            Some("ran"),
+            "data: frame script runs + posts"
+        );
+        assert_eq!(
+            attr("data-q").as_deref(),
+            Some("?q=1"),
+            "frame anchor decomposition"
+        );
+    }
+
+    #[test]
+    fn iframe_contentdocument_queries_loaded_realm() {
+        // Setting iframe.src navigates the frame; contentDocument exposes the loaded realm's parsed
+        // document, so querySelector finds its content and the anchor decomposition works.
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.body.appendChild(document.createElement('iframe'));
+                f.onload = function () {
+                  var a = f.contentDocument.querySelector('a');
+                  document.body.setAttribute('data-hash', a.hash);
+                  document.body.setAttribute('data-search', a.search);
+                };
+                f.src = 'page.html';
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("page.html") {
+                    let body = "<!doctype html><html><body><a href='http://h/p?q=1#frag'>x</a></body></html>";
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{body}"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-hash").as_deref(),
+            Some("#frag"),
+            "frame anchor hash"
+        );
+        assert_eq!(
+            attr("data-search").as_deref(),
+            Some("?q=1"),
+            "frame anchor search"
         );
     }
 

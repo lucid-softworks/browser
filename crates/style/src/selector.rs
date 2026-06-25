@@ -101,7 +101,10 @@ pub(crate) enum Pseudo {
     Enabled,
     Required,
     Optional,
-    Link, // <a href> (also :any-link / :visited→never matches, see parse)
+    Link, // <a href> (also :any-link)
+    /// `:visited` — a link to a page in history. We treat a link to the current page (empty or
+    /// pure-fragment href) as visited (history has no other entries in our model).
+    Visited,
     // State (interaction)
     Hover,
     Focus,
@@ -1004,16 +1007,15 @@ pub(crate) fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spe
         "required" => Pseudo::Required,
         "optional" => Pseudo::Optional,
         "link" | "any-link" => Pseudo::Link,
+        "visited" => Pseudo::Visited,
         "hover" => Pseudo::Hover,
         "focus" => Pseudo::Focus,
         "active" => Pseudo::Active,
         "focus-within" => Pseudo::FocusWithin,
         "focus-visible" => Pseudo::FocusVisible,
         // Best-effort never-match (parse cleanly, never match).
-        "visited" | "target" | "default" | "placeholder-shown" | "read-only" | "read-write"
-        | "in-range" | "out-of-range" | "valid" | "invalid" | "indeterminate" | "autofill" => {
-            Pseudo::NeverMatch
-        }
+        "target" | "default" | "placeholder-shown" | "read-only" | "read-write" | "in-range"
+        | "out-of-range" | "valid" | "invalid" | "indeterminate" | "autofill" => Pseudo::NeverMatch,
         "lang" => {
             let a = arg?.trim().trim_matches(|c| c == '"' || c == '\'').trim();
             if a.is_empty() {
@@ -1451,6 +1453,14 @@ pub(crate) fn pseudo_matches(
         Pseudo::Required => is_form_control(&el.tag) && has_attr(el, "required"),
         Pseudo::Optional => is_form_control(&el.tag) && !has_attr(el, "required"),
         Pseudo::Link => el.tag.eq_ignore_ascii_case("a") && has_attr(el, "href"),
+        // A link to the current page (empty / pure-fragment href) is in history → visited.
+        Pseudo::Visited => {
+            el.tag.eq_ignore_ascii_case("a")
+                && el.attrs.get("href").is_some_and(|h| {
+                    let h = h.trim();
+                    h.is_empty() || h.starts_with('#')
+                })
+        }
         Pseudo::Hover => {
             let h = interaction_hovered();
             h == Some(id.0)
@@ -1605,6 +1615,7 @@ pub(crate) fn user_agent_stylesheet() -> css::Stylesheet {
          h5 { font-size: 15px; font-weight: bold; display: block; margin: 1.67em 0 }
          h6 { font-size: 13px; font-weight: bold; display: block; margin: 2.33em 0 }
          p { display: block; margin: 1em 0 }
+         svg { forced-color-adjust: none }
          div { display: block }
          section { display: block }
          article { display: block }
@@ -1653,7 +1664,7 @@ pub(crate) fn user_agent_stylesheet() -> css::Stylesheet {
          u, ins { text-decoration: underline }
          s, del, strike { text-decoration: line-through }
          abbr[title] { text-decoration: underline }
-         mark { background-color: #ffff00; color: #000 }
+         mark { background-color: Mark; color: MarkText }
          cite, var, dfn, address { font-style: italic }
          small { font-size: smaller }
          sub, sup { font-size: smaller }

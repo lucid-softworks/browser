@@ -10,6 +10,20 @@ impl Default for ComputedStyle {
             writing_mode: WritingMode::HorizontalTb,
             color: ua_default_text_color(),
             background_color: None,
+            background_alpha: 255,
+            bg_is_currentcolor: false,
+            visited_link: false,
+            forced_color_adjust_off: false,
+            font_variant_emoji_emoji: false,
+            accent_color: None,
+            pre_forced: None,
+            extra_colors: None,
+            svg_fill_current: false,
+            svg_stroke_current: false,
+            color_explicit: false,
+            color_is_system: false,
+            bg_is_system: false,
+            border_is_system: false,
             font_size: 16.0,
             font_family: None,
             bold: false,
@@ -138,6 +152,32 @@ pub(crate) fn rgb_str((r, g, b): (u8, u8, u8)) -> String {
     format!("rgb({r}, {g}, {b})")
 }
 
+/// The CSSOM serialization of an 8-bit alpha: the shortest 1–3 place decimal that round-trips to the
+/// same byte (e.g. 77 → "0.3"). 255 is full opacity (caller uses `rgb()` then).
+pub(crate) fn alpha_str(a: u8) -> String {
+    for places in 1..=3u32 {
+        let scale = 10f32.powi(places as i32);
+        let d = (a as f32 / 255.0 * scale).round() / scale;
+        if (d * 255.0).round() as u8 == a {
+            let mut s = format!("{:.*}", places as usize, d);
+            while s.ends_with('0') {
+                s.pop();
+            }
+            return s;
+        }
+    }
+    format!("{}", a as f32 / 255.0)
+}
+
+/// Format a color with alpha: `rgb(r, g, b)` when opaque, else `rgba(r, g, b, a)`.
+pub(crate) fn rgba_str((r, g, b): (u8, u8, u8), a: u8) -> String {
+    if a == 255 {
+        rgb_str((r, g, b))
+    } else {
+        format!("rgba({r}, {g}, {b}, {})", alpha_str(a))
+    }
+}
+
 impl ComputedStyle {
     /// Return the *computed* value of CSS property `name` (kebab-case) as the string
     /// [`getComputedStyle`](https://developer.mozilla.org/en-US/docs/Web/API/Window/getComputedStyle)
@@ -217,6 +257,31 @@ impl ComputedStyle {
         })
     }
 
+    /// Like [`get_property`](Self::get_property) but reports the *computed* value — for the color
+    /// properties the forced-colors override replaced, the author value captured in `pre_forced`.
+    /// `computedStyleMap` uses this (forced colors are a used-value, not computed-value, transform).
+    pub fn get_property_computed(&self, name: &str) -> String {
+        if let Some((color, bg, border)) = self.pre_forced {
+            match name.trim().to_ascii_lowercase().as_str() {
+                "color" | "caret-color" | "outline-color" => return rgb_str(color),
+                "background-color" => {
+                    return bg.map_or_else(|| "rgba(0, 0, 0, 0)".to_string(), rgb_str)
+                }
+                "border-top-color"
+                | "border-right-color"
+                | "border-bottom-color"
+                | "border-left-color"
+                | "border-color"
+                | "border-block-start-color"
+                | "border-block-end-color"
+                | "border-inline-start-color"
+                | "border-inline-end-color" => return rgb_str(border),
+                _ => {}
+            }
+        }
+        self.get_property(name)
+    }
+
     pub fn get_property(&self, name: &str) -> String {
         // Custom properties are case-sensitive and read straight from the resolved environment.
         let trimmed = name.trim();
@@ -225,6 +290,12 @@ impl ComputedStyle {
         }
         // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
         let name = trimmed.to_ascii_lowercase();
+        // Color-valued properties we only store opaquely (fill, stroke, …): serialize from the map.
+        if let Some(extra) = &self.extra_colors {
+            if let Some(&c) = extra.get(&name) {
+                return rgb_str(c);
+            }
+        }
         // Logical longhands resolve to a physical property for this element's writing mode.
         if let Some(phys) = self.physical_for_logical(&name) {
             return self.get_property(&phys);
@@ -269,7 +340,7 @@ impl ComputedStyle {
             // --- color / paint ---
             "color" => rgb_str(self.color),
             "background-color" => match self.background_color {
-                Some(c) => rgb_str(c),
+                Some(c) => rgba_str(c, self.background_alpha),
                 None => "rgba(0, 0, 0, 0)".to_string(), // CSS transparent
             },
             "background-image" => match &self.background_image_url {
@@ -294,6 +365,24 @@ impl ComputedStyle {
                 ColorScheme::LightDark => "light dark",
             }
             .to_string(),
+            // Forced colors forces these to their UA-controlled value at computed time. We don't
+            // otherwise model them, so report them only while forced colors is active.
+            // Forced colors computes accent-color to `auto` unless this element opted out
+            // (forced-color-adjust:none) or the author used a system color.
+            "accent-color" => match self.accent_color {
+                _ if crate::forced_colors_active()
+                    && !self.forced_color_adjust_off
+                    && !matches!(self.accent_color, Some((_, true))) =>
+                {
+                    "auto".to_string()
+                }
+                Some((c, _)) => rgb_str(c),
+                None => "auto".to_string(),
+            },
+            "scrollbar-color" if crate::forced_colors_active() => "auto".to_string(),
+            "font-variant-emoji" if crate::forced_colors_active() => {
+                if self.font_variant_emoji_emoji { "emoji" } else { "text" }.to_string()
+            }
             "opacity" => num(self.opacity),
             "border-radius" => px(self.border_radius),
 

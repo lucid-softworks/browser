@@ -626,7 +626,7 @@ dependencies = [
  "net",
  "paint",
  "style",
- "url",
+ "wurl",
 ]
 
 [[package]]
@@ -1176,8 +1176,8 @@ dependencies = [
  "html",
  "paint",
  "style",
- "url",
  "v8",
+ "wurl",
 ]
 
 [[package]]
@@ -1502,8 +1502,8 @@ dependencies = [
  "rustls-pemfile",
  "tungstenite",
  "ureq",
- "url",
  "webpki-roots 0.26.11",
+ "wurl",
 ]
 
 [[package]]
@@ -2209,7 +2209,7 @@ dependencies = [
  "css",
  "dom",
  "html",
- "url",
+ "wurl",
 ]
 
 [[package]]
@@ -2959,6 +2959,13 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "wurl"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "y4m"

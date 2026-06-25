@@ -21,6 +21,7 @@ pub(crate) fn paint_box(
     bg_bitmaps: &HashMap<dom::NodeId, DecodedImage>,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
+    sel_styles: &HashMap<dom::NodeId, SelStyle>,
 ) {
     // The base device-space transform is a pure translation by the scroll offset. CSS `transform`
     // declarations compose additional affines on top per-box.
@@ -40,6 +41,107 @@ pub(crate) fn paint_box(
         1.0,
         sel_ranges,
         run_idx,
+        (0.0, fb.width as f32),
+        sel_styles,
+    );
+}
+
+/// A highlighted run's resolved (forced-colors-aware) highlight-pseudo colors — `(background, text,
+/// underline)` — for a `::selection` or `::highlight(name)`, keyed by the originating element's node
+/// id. `None` components are absent (e.g. no underline; a `::selection` never carries one). Empty for
+/// a plain mouse-drag selection, which paints the default highlight.
+pub(crate) type SelStyle = (
+    Option<(u8, u8, u8)>,
+    Option<(u8, u8, u8)>,
+    Option<(u8, u8, u8)>,
+);
+
+/// Forced-colors backplate pre-pass: paint each text line's Canvas backplate spanning the full line
+/// box (the nearest block ancestor's content width), BEFORE any glyphs are drawn. A single line can
+/// hold several inline fragments (each its own text box); painting per-fragment in the main pass
+/// would let a later fragment's full-width backplate erase an earlier fragment's text. Running this
+/// first puts every backplate beneath all glyphs. Only active in forced colors mode; a no-op
+/// otherwise. Axis-aligned (scroll-translated) boxes only — CSS-transformed subtrees are skipped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_backplates(
+    fb: &mut Framebuffer,
+    b: &layout::LayoutBox,
+    ox: f32,
+    oy: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    line_x: (f32, f32),
+    has_bg_image: bool,
+) {
+    // The backplate exists to keep text legible over a background IMAGE. With no image the canvas is
+    // a flat system color and a Canvas backplate would be invisible (and the WPT refs only simulate
+    // backplates for the image cases), so skip the pre-pass entirely.
+    if !style::forced_colors_active() || !has_bg_image {
+        return;
+    }
+    fn walk(
+        fb: &mut Framebuffer,
+        b: &layout::LayoutBox,
+        xf: &Affine,
+        clip_top: f32,
+        clip_bottom: f32,
+        line_x: (f32, f32),
+    ) {
+        // A CSS transform makes the mapping non-axis-aligned; backplates under one are rare — skip
+        // the subtree rather than mis-place them.
+        if b.style
+            .extras
+            .as_deref()
+            .and_then(|e| e.transform)
+            .is_some()
+        {
+            return;
+        }
+        let border = b.dimensions.border_box();
+        let content = b.dimensions.content;
+        // A block establishes the line-box extent for its inline descendants.
+        let line_x = if b.style.display_block {
+            let (lx, _) = xf.apply(content.x, content.y);
+            let (rx, _) = xf.apply(content.x + content.width, content.y);
+            (lx.min(rx), lx.max(rx))
+        } else {
+            line_x
+        };
+        let is_backplate = b.style.visible
+            && matches!(b.content, layout::BoxContent::Text(_))
+            && b.style.background_color == Some((255, 255, 255));
+        if is_backplate {
+            let (_, dy0) = xf.apply(border.x, border.y);
+            let (_, dy1) = xf.apply(border.x + border.width, border.y + border.height);
+            let (y0, y1) = (dy0.min(dy1), dy0.max(dy1));
+            if y1 > clip_top && y0 < clip_bottom {
+                fb.fill_rect(
+                    Rect {
+                        x: line_x.0.round() as i32,
+                        y: y0.round() as i32,
+                        w: (line_x.1 - line_x.0).round().max(0.0) as i32,
+                        h: (y1 - y0).round().max(1.0) as i32,
+                    },
+                    Color {
+                        r: 255,
+                        g: 255,
+                        b: 255,
+                        a: 255,
+                    },
+                );
+            }
+        }
+        for child in &b.children {
+            walk(fb, child, xf, clip_top, clip_bottom, line_x);
+        }
+    }
+    walk(
+        fb,
+        b,
+        &Affine::translate(ox, oy),
+        clip_top,
+        clip_bottom,
+        line_x,
     );
 }
 
@@ -136,12 +238,25 @@ pub(crate) fn paint_box_opacity(
     parent_opacity: f32,
     sel_ranges: &[Option<(usize, usize)>],
     run_idx: &mut usize,
+    // Device-px content left/right of the nearest block ancestor — the line-box extent a forced
+    // colors backplate spans (the WPT refs paint a full-width Canvas block behind each text line,
+    // not just the glyph run).
+    line_x: (f32, f32),
+    sel_styles: &HashMap<dom::NodeId, SelStyle>,
 ) {
     // This box's opacity multiplies into the inherited (effective) opacity for itself + subtree.
     let opacity = parent_opacity * b.style.opacity.clamp(0.0, 1.0);
 
     let border = b.dimensions.border_box();
     let content = b.dimensions.content;
+    // A block establishes the line-box extent for its inline descendants (used by the backplate).
+    let line_x = if b.style.display_block {
+        let (lx, _) = xf.apply(content.x, content.y);
+        let (rx, _) = xf.apply(content.x + content.width, content.y);
+        (lx.min(rx), lx.max(rx))
+    } else {
+        line_x
+    };
     let radius = b.style.border_radius();
     let extras = b.style.extras.as_deref();
 
@@ -213,6 +328,15 @@ pub(crate) fn paint_box_opacity(
     // run counter still advances below) but paints none of its OWN content. Children are recursed
     // regardless — `visibility` inherits, but a descendant can opt back in with `visibility: visible`.
     if !offscreen && opacity > 0.0 && b.style.visible {
+        // In forced colors mode the cascade keeps a visited link's color/border as LinkText (so
+        // getComputedStyle can't leak visited state); map that LinkText to VisitedText for painting.
+        let vlink = |c: (u8, u8, u8)| {
+            if b.style.visited_link && c == (0, 0, 238) {
+                (85, 26, 139)
+            } else {
+                c
+            }
+        };
         // (0) OUTER box-shadows: painted BEFORE the background so the box sits on top.
         if let Some(ex) = extras {
             for sh in &ex.box_shadows {
@@ -250,17 +374,26 @@ pub(crate) fn paint_box_opacity(
                 b: bl,
                 a: scale_alpha(255, opacity),
             };
-            fill_box(
-                fb,
-                xf,
-                border.x,
-                border.y,
-                border.width,
-                border.height,
-                radius,
-                c,
-                axis,
-            );
+            // Forced-colors backplate: a per-line text fragment's Canvas background is painted by the
+            // separate `paint_backplates` pre-pass (full line-box width, before any glyphs), so skip
+            // it here — re-painting it now would overwrite an earlier inline fragment's glyphs.
+            let _ = line_x;
+            let is_backplate = matches!(b.content, layout::BoxContent::Text(_))
+                && (r, g, bl) == (255, 255, 255)
+                && style::forced_colors_active();
+            if !is_backplate {
+                fill_box(
+                    fb,
+                    xf,
+                    border.x,
+                    border.y,
+                    border.width,
+                    border.height,
+                    radius,
+                    c,
+                    axis,
+                );
+            }
         }
 
         // (a2) `background-image: url(...)`: composed per-box into a border-box-sized bitmap (image
@@ -289,10 +422,11 @@ pub(crate) fn paint_box_opacity(
         // not a doubled/gapped pair). Otherwise: the normal four filled edge rects.
         let e = b.dimensions.border;
         let ba = scale_alpha(255, opacity);
+        let bcol = vlink(b.style.border_color);
         let bc = Color {
-            r: b.style.border_color.0,
-            g: b.style.border_color.1,
-            b: b.style.border_color.2,
+            r: bcol.0,
+            g: bcol.1,
+            b: bcol.2,
             a: ba,
         };
         let collapsed_cell = b.style.is_table_cell
@@ -427,54 +561,86 @@ pub(crate) fn paint_box_opacity(
                 let scale = ((sx + sy) * 0.5).max(0.01);
                 let fs = b.style.font_size * scale;
                 let ta = scale_alpha(255, opacity);
+                let tc = vlink(b.style.color);
+                // A run covered by a resolved `::selection` (a programmatic getSelection() highlight,
+                // keyed by the originating element) carries its own background + text colors. When the
+                // whole run is selected, repaint its glyphs in the `::selection` text color.
+                let sel_style = b.node.and_then(|n| sel_styles.get(&n)).copied();
+                let sel_range = sel_ranges.get(*run_idx).copied().flatten();
+                let fully_selected =
+                    matches!(sel_range, Some((0, ce)) if ce > 0 && ce >= s.chars().count());
+                let glyph = match (fully_selected, sel_style) {
+                    (true, Some((_, Some(fg), _))) => fg,
+                    _ => tc,
+                };
                 let color = Color {
-                    r: b.style.color.0,
-                    g: b.style.color.1,
-                    b: b.style.color.2,
+                    r: glyph.0,
+                    g: glyph.1,
+                    b: glyph.2,
                     a: ta,
                 };
                 let x = dx;
                 let baseline = dy + fs * 0.8;
                 // Selection highlight: if this run (identified by its DFS index) has a selected
-                // character sub-range, fill a translucent rect behind those glyphs BEFORE drawing
-                // the text so the glyphs stay legible on top. Advance widths use the SAME scaled
-                // font size + letter-spacing the glyph painter uses, so the band lines up exactly.
+                // character sub-range, fill a rect behind those glyphs BEFORE drawing the text so the
+                // glyphs stay legible on top. Advance widths use the SAME scaled font size +
+                // letter-spacing the glyph painter uses, so the band lines up exactly. A `::selection`
+                // background (opaque) overrides the default translucent mouse-selection blue; a
+                // transparent `::selection` background paints no box.
                 if !s.is_empty() {
-                    if let Some(Some((cs, ce))) = sel_ranges.get(*run_idx) {
+                    if let Some((cs, ce)) = sel_range {
                         let ls = b.style.letter_spacing * scale;
                         let mut hx0 = x;
                         let mut pen = x;
                         for (i, ch) in s.chars().enumerate() {
-                            if i == *cs {
+                            if i == cs {
                                 hx0 = pen;
                             }
                             pen += font.advance(ch, fs) + ls;
-                            if i + 1 == *ce {
+                            if i + 1 == ce {
                                 break;
                             }
                         }
                         // If the range starts at 0, hx0 stays at the run's left edge.
                         let hx1 = pen;
                         let top = dy.round() as i32;
-                        let h = (fs * 1.25).round().max(1.0) as i32;
+                        // A `::selection` highlight spans the run's full line box (matching an
+                        // element background — the WPT refs simulate it with one); the default
+                        // mouse-selection band uses the glyph-ish `1.25em`.
+                        let h = if sel_style.is_some() {
+                            let (_, by) = xf.apply(content.x, content.y + content.height);
+                            (by - dy).round().max(1.0) as i32
+                        } else {
+                            (fs * 1.25).round().max(1.0) as i32
+                        };
                         let w = (hx1 - hx0).round() as i32;
-                        if w > 0 {
-                            // A translucent macOS-ish selection blue, composited over the text bg.
-                            let hl = Color {
+                        let hl = match sel_style {
+                            Some((Some(bg), _, _)) => Some(Color {
+                                r: bg.0,
+                                g: bg.1,
+                                b: bg.2,
+                                a: ta,
+                            }),
+                            Some((None, _, _)) => None, // transparent highlight background
+                            None => Some(Color {
                                 r: 74,
                                 g: 144,
                                 b: 255,
                                 a: scale_alpha(102, opacity),
-                            };
-                            fb.fill_rect(
-                                Rect {
-                                    x: hx0.round() as i32,
-                                    y: top,
-                                    w,
-                                    h,
-                                },
-                                hl,
-                            );
+                            }),
+                        };
+                        if w > 0 {
+                            if let Some(hl) = hl {
+                                fb.fill_rect(
+                                    Rect {
+                                        x: hx0.round() as i32,
+                                        y: top,
+                                        w,
+                                        h,
+                                    },
+                                    hl,
+                                );
+                            }
                         }
                     }
                 }
@@ -490,6 +656,26 @@ pub(crate) fn paint_box_opacity(
                     b.style.letter_spacing * scale,
                 );
                 let run_w = (end_x - x).max(0.0);
+                // A highlight pseudo (`::highlight(name)`/`::selection`) may carry its own underline.
+                if run_w > 0.0 {
+                    if let (true, Some((_, _, Some(uc)))) = (fully_selected, sel_style) {
+                        let thickness = (fs / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
+                        fb.fill_rect(
+                            Rect {
+                                x: x.round() as i32,
+                                y: (baseline + 1.0).round() as i32,
+                                w: run_w.round() as i32,
+                                h: thickness,
+                            },
+                            Color {
+                                r: uc.0,
+                                g: uc.1,
+                                b: uc.2,
+                                a: ta,
+                            },
+                        );
+                    }
+                }
                 if run_w > 0.0 {
                     let thickness = (fs / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
                     if b.style.underline {
@@ -701,6 +887,8 @@ pub(crate) fn paint_box_opacity(
             opacity,
             sel_ranges,
             run_idx,
+            line_x,
+            sel_styles,
         );
     }
     fb.clip = saved_clip;
@@ -1574,15 +1762,25 @@ pub(crate) fn paint_box_shadow(
 /// to white when neither sets one. Walks the first-child chain (html → body) so it never picks up a
 /// content element's background.
 pub(crate) fn page_background(root: &layout::LayoutBox, root_scheme_dark: bool) -> Color {
+    // In forced colors mode the viewport background comes only from the root element (`<html>`) —
+    // `<body>`'s background (and its `forced-color-adjust`) does NOT propagate to the viewport — and
+    // defaults to Canvas (white) otherwise.
+    let forced = style::forced_colors_active();
     let mut node = root;
     for _ in 0..3 {
         if let Some((r, g, b)) = node.style.background_color {
             return Color::rgb(r, g, b);
         }
+        if forced {
+            break;
+        }
         match node.children.first() {
             Some(c) => node = c,
             None => break,
         }
+    }
+    if forced {
+        return Color::WHITE; // Canvas
     }
     // No explicit html/body background: default canvas is white, or dark (`#1e1e1e`) when the page
     // opted into a dark `color-scheme` (resolved during the cascade and stored on the layout cache).

@@ -274,10 +274,10 @@ pub fn resolve_url(base: &str, href: &str) -> Option<String> {
             return None;
         }
     }
-    let base = url::Url::parse(base).ok()?;
-    let joined = base.join(trimmed).ok()?;
+    let base = wurl::Url::parse(base).ok()?;
+    let joined = wurl::Url::parse_with_base(trimmed, &base).ok()?;
     match joined.scheme() {
-        "http" | "https" | "file" => Some(joined.into()),
+        "http" | "https" | "file" => Some(joined.href()),
         _ => None,
     }
 }
@@ -698,9 +698,11 @@ pub(crate) fn resolve_favicon_url(doc: &dom::Document, base: &str) -> Option<Str
         return Some(u);
     }
     // Fallback to <origin>/favicon.ico, but only for http(s) pages.
-    let parsed = url::Url::parse(base).ok()?;
+    let parsed = wurl::Url::parse(base).ok()?;
     match parsed.scheme() {
-        "http" | "https" => parsed.join("/favicon.ico").ok().map(Into::into),
+        "http" | "https" => wurl::Url::parse_with_base("/favicon.ico", &parsed)
+            .ok()
+            .map(|u| u.href()),
         _ => None,
     }
 }
@@ -798,7 +800,7 @@ fn decode_svg_sized(
     let markup = String::from_utf8_lossy(bytes);
     let doc = html::parse(&markup);
     let svg_id = find_svg_root(&doc, doc.root())?;
-    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, font))
+    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, font, None))
 }
 
 /// Parse standalone SVG markup and rasterize it at its intrinsic size (from width/height/viewBox),
@@ -813,7 +815,7 @@ fn decode_svg_image(bytes: &[u8]) -> Option<DecodedImage> {
     };
     let w = (iw.round() as u32).clamp(1, 1024);
     let h = (ih.round() as u32).clamp(1, 1024);
-    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, None))
+    Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, None, None))
 }
 
 /// Whether `bytes` look like a JPEG XL stream: either the raw codestream marker (`FF 0A`) or the

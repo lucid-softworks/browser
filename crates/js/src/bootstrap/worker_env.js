@@ -15,6 +15,8 @@ var __wDocStub = globalThis.document;
 var __wWinStub = globalThis;
 try { delete globalThis.document; } catch (e) {}
 try { delete globalThis.window; } catch (e) {}
+// `webkitURL` is a legacy *Window* alias for URL; it must not exist in a worker scope.
+try { delete globalThis.webkitURL; } catch (e) {}
 let document = __wDocStub;
 let window = __wWinStub;
 
@@ -39,8 +41,17 @@ let window = __wWinStub;
   defScopeClass("DedicatedWorkerGlobalScope");
   g.self = g;
 
-  // WorkerLocation: the script URL.
-  try { Object.defineProperty(g, "location", { value: new g.URL(href), writable: true, configurable: true }); } catch (e) {}
+  // WorkerLocation: the script URL's components. NOT a URL object — WorkerLocation has no
+  // searchParams (a plain object reflecting the parsed URL's read-only components).
+  try {
+    var __lu = new g.URL(href);
+    var __loc = {};
+    ["href", "protocol", "host", "hostname", "port", "pathname", "search", "hash", "origin"].forEach(function (k) {
+      Object.defineProperty(__loc, k, { get: function () { return __lu[k]; }, enumerable: true, configurable: true });
+    });
+    __loc.toString = function () { return __lu.href; };
+    Object.defineProperty(g, "location", { value: __loc, writable: true, configurable: true });
+  } catch (e) {}
   if (typeof g.name !== "string") { try { g.name = ""; } catch (e) {} }
   g.onmessage = null; g.onmessageerror = null; g.onerror = null;
 

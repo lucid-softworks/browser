@@ -98,7 +98,158 @@ pub(crate) fn cascade_locked(
         &index,
         &mut out,
     );
+    if forced_colors_active() {
+        apply_forced_colors(doc, doc.root(), false, (0, 0, 0), false, &mut out);
+    }
     (out, root_used_scheme_dark())
+}
+
+/// Map one style's colors to system colors. `text_color` is the forced text color (LinkText for
+/// links, else CanvasText); `paint_bg` requests a Canvas background (a painted box, or a text
+/// backplate). Border → CanvasText; a transparent box stays transparent; box shadows are dropped;
+/// background images/gradients are preserved (text reads over them).
+fn force_style_colors(
+    s: &mut ComputedStyle,
+    text_color: (u8, u8, u8),
+    paint_bg: bool,
+    drop_img: bool,
+) {
+    // Capture the author colors so `computedStyleMap` can still report the computed value (forced
+    // colors are a used-value transform, not a computed-value one).
+    s.pre_forced = Some((s.color, s.background_color, s.border_color));
+    // Author-specified system colors are preserved (not re-mapped).
+    if !s.color_is_system {
+        s.color = text_color;
+    }
+    if !s.border_is_system {
+        s.border_color = (0, 0, 0); // CanvasText
+    }
+    if (s.background_color.is_some() || paint_bg) && !s.bg_is_system {
+        s.background_color = Some((255, 255, 255)); // Canvas
+    }
+    // On regular elements (not the root/body, whose image propagates to the viewport): a
+    // non-url() background image — a gradient — is always dropped; a url() image is dropped only
+    // when the backplate covers it (i.e. the box has text). A url() image on a box with no text
+    // stays visible.
+    if drop_img {
+        s.background_gradient = None;
+        if paint_bg {
+            s.background_image_url = None;
+        }
+    }
+    s.box_shadows.clear();
+    // Forced colors resolves `color-scheme` to `light dark` (the UA controls the actual colors).
+    s.color_scheme = ColorScheme::LightDark;
+}
+
+/// In forced colors mode, replace author text/background/border colors with system colors
+/// (CanvasText / Canvas), skipping any element (or descendant of an element) with
+/// `forced-color-adjust: none`. `forced-color-adjust` inherits, hence the `ancestor_off` flag.
+pub(crate) fn apply_forced_colors(
+    doc: &dom::Document,
+    id: dom::NodeId,
+    ancestor_off: bool,
+    parent_color: (u8, u8, u8),
+    visited_ancestor: bool,
+    out: &mut HashMap<dom::NodeId, ComputedStyle>,
+) {
+    let off = ancestor_off || out.get(&id).is_some_and(|s| s.forced_color_adjust_off);
+    // A descendant of a visited link is itself "visited" for the painter's VisitedText mapping.
+    let this_visited = visited_ancestor
+        || matches!(&doc.get(id).data,
+            dom::NodeData::Element(e) if e.tag == "a"
+                && e.attrs.get("href").is_some_and(|h| { let h = h.trim(); h.is_empty() || h.starts_with('#') }));
+    // The forced color this element contributes to `currentColor`/inheritance for its descendants.
+    let mut my_color = parent_color;
+    if off {
+        // forced-color-adjust:none/preserve: keep author colors, BUT an inherited `color` (or
+        // `currentColor`/`inherit`) still follows the forced ancestor — so currentColor resolves to
+        // the forced color even inside a `none` subtree.
+        if let Some(s) = out.get_mut(&id) {
+            if !s.color_explicit {
+                s.color = parent_color;
+            }
+            // `background: currentColor` follows the (now forced) color.
+            if s.bg_is_currentcolor {
+                s.background_color = Some(s.color);
+            }
+            my_color = s.color;
+        }
+    }
+    if !off {
+        // A hyperlink's text takes LinkText, or VisitedText when the link is visited; everything
+        // else takes CanvasText. A link whose href is empty or a pure fragment targets the current
+        // page, which is in history — i.e. visited.
+        let link_kind = match &doc.get(id).data {
+            dom::NodeData::Element(e) if e.tag == "a" => e.attrs.get("href").map(|h| {
+                let h = h.trim();
+                h.is_empty() || h.starts_with('#') // visited (current page) vs unvisited
+            }),
+            _ => None,
+        };
+        let is_link = link_kind.is_some();
+        // The *computed* link color is always LinkText, even for visited links — getComputedStyle
+        // must not leak visited state. The painter maps a flagged visited link's LinkText to
+        // VisitedText at paint time (see `this_visited`).
+        // A link's text takes LinkText. Otherwise the forced color INHERITS: an element with its own
+        // explicit color is forced to CanvasText, but one that inherits its color follows the forced
+        // ancestor (e.g. an SVG shape inside a link uses the link's color via currentColor).
+        let text_color = if is_link {
+            (0, 0, 238) // LinkText
+        } else if out.get(&id).is_some_and(|s| !s.color_explicit) {
+            parent_color
+        } else {
+            (0, 0, 0) // CanvasText
+        };
+        // The backplate: an element directly containing *visible* non-whitespace text paints a
+        // Canvas block behind it so the text stays readable over images. We approximate the per-line
+        // backplate with a Canvas background on the text box — exactly how the WPT refs simulate it.
+        // No backplate for visibility:hidden/collapse text (it isn't painted).
+        let visible = out
+            .get(&id)
+            .is_none_or(|s| matches!(s.visibility, Visibility::Visible));
+        let has_text = visible
+            && doc.get(id).children.iter().any(
+                |&c| matches!(&doc.get(c).data, dom::NodeData::Text(t) if !t.trim().is_empty()),
+            );
+        // Keep the background image on the root/body (it propagates to the viewport); drop it
+        // elsewhere.
+        let is_root_or_body = matches!(&doc.get(id).data,
+            dom::NodeData::Element(e) if e.tag == "html" || e.tag == "body");
+        // `<mark>` is a highlight: forced colors maps it to the Mark/MarkText system colors (its
+        // default highlight), not Canvas/CanvasText.
+        let is_mark = matches!(&doc.get(id).data, dom::NodeData::Element(e) if e.tag == "mark");
+        if let Some(s) = out.get_mut(&id) {
+            force_style_colors(s, text_color, has_text, !is_root_or_body);
+            if is_mark {
+                s.background_color = Some((255, 255, 0)); // Mark
+            }
+            if s.bg_is_currentcolor && !s.bg_is_system {
+                s.background_color = Some(s.color);
+            }
+            // A link's border takes its link color (LinkText/VisitedText), not CanvasText. Its
+            // outline-color and caret-color resolve to `color`, so they follow automatically.
+            if is_link && !s.border_is_system {
+                s.border_color = text_color;
+            }
+            s.visited_link = this_visited;
+            // ::before / ::after generated boxes are forced too (a pseudo with `content` is text).
+            if let Some(b) = s.before.as_mut() {
+                let txt = b.content.is_some();
+                force_style_colors(b, (0, 0, 0), txt, true);
+            }
+            if let Some(a) = s.after.as_mut() {
+                let txt = a.content.is_some();
+                force_style_colors(a, (0, 0, 0), txt, true);
+            }
+        }
+        // This element's forced color (LinkText/VisitedText/CanvasText, or a preserved system color)
+        // is what its descendants inherit for `currentColor`.
+        my_color = out.get(&id).map_or(text_color, |s| s.color);
+    }
+    for child in doc.get(id).children.clone() {
+        apply_forced_colors(doc, child, off, my_color, this_visited, out);
+    }
 }
 
 /// Cascade only the subtree rooted at `root_id` (e.g. an `<iframe>` facade document's body),
@@ -428,6 +579,22 @@ pub fn set_color_scheme_dark(is_dark: bool) {
     COLOR_SCHEME_DARK.store(is_dark, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether forced colors mode is active (drives `@media (forced-colors)` and the cascade's
+/// system-color override). Set by the engine (e.g. from an OS high-contrast setting / test config).
+pub(crate) static FORCED_COLORS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_forced_colors(active: bool) {
+    FORCED_COLORS.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn forced_colors_active() -> bool {
+    // Honour the LUCID_FORCED_COLORS env var (read once) so a test run can enable forced colors for
+    // the whole process without per-call engine plumbing.
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    FORCED_COLORS.load(std::sync::atomic::Ordering::Relaxed)
+        || *ENV.get_or_init(|| std::env::var("LUCID_FORCED_COLORS").is_ok())
+}
+
 /// Whether the effective OS appearance is currently Dark (drives `prefers-color-scheme`).
 pub(crate) fn color_scheme_dark() -> bool {
     COLOR_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
@@ -656,7 +823,21 @@ pub(crate) fn compute_element_style<'a>(
         direction: parent.direction,       // inherited
         writing_mode: parent.writing_mode, // inherited
         color: parent.color,
+        forced_color_adjust_off: parent.forced_color_adjust_off, // inherited
+        font_variant_emoji_emoji: parent.font_variant_emoji_emoji, // inherited
+        accent_color: parent.accent_color,                       // inherited
+        extra_colors: parent.extra_colors.clone(), // fill/stroke etc. inherit; others reset on set
+        svg_fill_current: parent.svg_fill_current, // inherited
+        svg_stroke_current: parent.svg_stroke_current, // inherited
+        pre_forced: None,                          // not inherited; set by the forced-colors pass
+        color_explicit: false, // not inherited; set when color is set explicitly
+        color_is_system: parent.color_is_system, // tracks `color`, which inherits
+        bg_is_system: false,   // not inherited
+        border_is_system: false, // not inherited
         background_color: None, // not inherited
+        background_alpha: 255, // not inherited
+        bg_is_currentcolor: false, // not inherited
+        visited_link: false,   // not inherited; set by the forced-colors pass
         font_size: parent.font_size,
         font_family: parent.font_family.clone(),
         bold: parent.bold,

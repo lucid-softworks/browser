@@ -183,12 +183,16 @@
     return out;
   }
 
-  var __invalidURLRecord = { href: "", protocol: "", host: "", hostname: "", port: "", pathname: "", search: "", hash: "", origin: "null", username: "", password: "", __invalid: true };
+  // A null/unparseable URL: the HTMLHyperlinkElementUtils protocol getter returns ":" (scheme ""
+  // + ":"); every other component getter returns "" (origin "null").
+  var __invalidURLRecord = { href: "", protocol: ":", host: "", hostname: "", port: "", pathname: "", search: "", hash: "", origin: "null", username: "", password: "", __invalid: true };
   // Parse in Rust via the `url` crate (the authoritative WHATWG implementation). `base` may be a
   // string or an already-parsed record (use its href). A null native result is a parse failure.
   function parseURL(input, base) {
     var baseStr = (base == null) ? null : (typeof base === "string" ? base : (base.href || null));
-    var json = __urlParse(String(input == null ? "" : input), baseStr);
+    // The document's character encoding (non-UTF-8 documents encode a URL's query with it).
+    var enc = (typeof globalThis.__documentCharset === "string") ? globalThis.__documentCharset : null;
+    var json = __urlParse(String(input == null ? "" : input), baseStr, enc);
     if (json == null) { return __invalidURLRecord; }
     try { var rec = JSON.parse(json); rec.__invalid = false; return rec; } catch (e) { return __invalidURLRecord; }
   }
@@ -427,7 +431,14 @@
     childSync(parseURL(url == null ? "about:blank" : String(url), location.href));
     return { location: childLoc, document: childDoc, close: fn, closed: false };
   }
-  globalThis.open = function (url) { return __makeDetachedWindow(url); };
+  globalThis.open = function (url) {
+    // window.open() parses the URL against the entry document's base; an invalid URL is a
+    // SyntaxError (matching other browsers / the URL standard).
+    if (url !== undefined && url !== null && String(url) !== "" && parseURL(String(url), location.href).__invalid) {
+      throw new globalThis.DOMException("Failed to execute 'open' on 'Window': Unable to open a window with invalid URL '" + String(url) + "'.", "SyntaxError");
+    }
+    return __makeDetachedWindow(url);
+  };
   if (typeof document !== "undefined") {
     document.open = function (url) {
       if (arguments.length) { return __makeDetachedWindow(url); }
@@ -957,14 +968,42 @@
       TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25
     };
     var DOMExceptionCtor = function (message, name) {
-      this.message = message === undefined ? "" : String(message);
-      this.name = name === undefined ? "Error" : String(name);
-      this.code = __domCodes[this.name] || 0;
-      try { this.stack = new Error(this.message).stack; } catch (e) {}
+      var nm = name === undefined ? "Error" : String(name);
+      // WebIDL: message/name/code are readonly attributes (prototype getters); the real values live
+      // in an internal slot, so reading them on a non-branded object (e.g. DOMException.prototype)
+      // throws — which `new URLSearchParams(DOMException.prototype)` relies on.
+      Object.defineProperty(this, "__dom", {
+        value: { message: message === undefined ? "" : String(message), name: nm, code: __domCodes[nm] || 0 },
+        configurable: true
+      });
+      try { this.stack = new Error(this.__dom.message).stack; } catch (e) {}
     };
     DOMExceptionCtor.prototype = Object.create(Error.prototype);
-    DOMExceptionCtor.prototype.constructor = DOMExceptionCtor;
-    DOMExceptionCtor.prototype.toString = function () { return this.name + ": " + this.message; };
+    Object.defineProperty(DOMExceptionCtor.prototype, "constructor", { value: DOMExceptionCtor, writable: true, configurable: true });
+    function __domAttr(attr) {
+      Object.defineProperty(DOMExceptionCtor.prototype, attr, {
+        get: function () { if (!this || !this.__dom) { throw new TypeError("Illegal invocation"); } return this.__dom[attr]; },
+        enumerable: true, configurable: true
+      });
+    }
+    __domAttr("message"); __domAttr("name"); __domAttr("code");
+    Object.defineProperty(DOMExceptionCtor.prototype, "toString", { value: function () { return this.name + ": " + this.message; }, writable: true, configurable: true });
+    // Legacy error-code constants, on both the interface object and its prototype, enumerable per
+    // WebIDL (so `new URLSearchParams(DOMException)` enumerates them).
+    var __domConsts = [
+      ["INDEX_SIZE_ERR", 1], ["DOMSTRING_SIZE_ERR", 2], ["HIERARCHY_REQUEST_ERR", 3],
+      ["WRONG_DOCUMENT_ERR", 4], ["INVALID_CHARACTER_ERR", 5], ["NO_DATA_ALLOWED_ERR", 6],
+      ["NO_MODIFICATION_ALLOWED_ERR", 7], ["NOT_FOUND_ERR", 8], ["NOT_SUPPORTED_ERR", 9],
+      ["INUSE_ATTRIBUTE_ERR", 10], ["INVALID_STATE_ERR", 11], ["SYNTAX_ERR", 12],
+      ["INVALID_MODIFICATION_ERR", 13], ["NAMESPACE_ERR", 14], ["INVALID_ACCESS_ERR", 15],
+      ["VALIDATION_ERR", 16], ["TYPE_MISMATCH_ERR", 17], ["SECURITY_ERR", 18], ["NETWORK_ERR", 19],
+      ["ABORT_ERR", 20], ["URL_MISMATCH_ERR", 21], ["QUOTA_EXCEEDED_ERR", 22], ["TIMEOUT_ERR", 23],
+      ["INVALID_NODE_TYPE_ERR", 24], ["DATA_CLONE_ERR", 25]
+    ];
+    __domConsts.forEach(function (kv) {
+      Object.defineProperty(DOMExceptionCtor, kv[0], { value: kv[1], enumerable: true, writable: false, configurable: false });
+      Object.defineProperty(DOMExceptionCtor.prototype, kv[0], { value: kv[1], enumerable: true, writable: false, configurable: false });
+    });
     // The constructor's own .name must be "DOMException" (it's inferred as the variable name
     // otherwise): testharness's assert_throws_dom checks `constructor.name === "DOMException"` to
     // detect the explicit-constructor overload, so a wrong name silently misroutes its arguments.
@@ -1092,6 +1131,18 @@
         if (__lk.__loadFired || !__href || __href.slice(0, 5) !== "data:" || __lk.disabled) { continue; }
         def(__lk, "__loadFired", true);
         try { __lk.dispatchEvent(new Event("load")); } catch (e) {}
+      }
+    } catch (e) {}
+    // Fire `load` on each <link rel=preload> (e.g. a preloaded image) once the page's resources have
+    // been fetched. Reftests commonly gate takeScreenshot() on a preload's onload, so without this
+    // the `reftest-wait` class never clears and the test times out.
+    try {
+      var __pls = document.querySelectorAll("link[rel~=preload]");
+      for (var __k = 0; __k < __pls.length; __k++) {
+        var __pl = __pls[__k];
+        if (__pl.__loadFired || !(__pl.getAttribute && __pl.getAttribute("href"))) { continue; }
+        def(__pl, "__loadFired", true);
+        try { __pl.dispatchEvent(new Event("load")); } catch (e) {}
       }
     } catch (e) {}
     // <style> elements fire `load` once their style block is processed (synchronously available).
@@ -3997,25 +4048,14 @@
   }
   function __reflResolveURL(v) {
     v = String(v);
-    var base = __effectiveBaseURL();
-    var resolved;
+    // Resolve against the document base via the URL parser. An unparseable result (e.g. an empty or
+    // fragment-only ref against an opaque-path base, which fails per the URL standard) reflects the
+    // raw input — matching what the reflection harness expects.
     try {
-      if (v === "") {
-        // Empty relative URL: resolve to the base, but keep the base's path/query (drop its fragment).
-        var bp = parseURL(base);
-        resolved = bp.protocol + (bp.host ? "//" + bp.host : "") + bp.pathname + bp.search;
-      } else if (v.charCodeAt(0) === 35 /* '#' */) {
-        var bp2 = parseURL(base);
-        resolved = bp2.protocol + (bp2.host ? "//" + bp2.host : "") + bp2.pathname + bp2.search + v;
-      } else {
-        resolved = new URL(v, base).href;
-      }
-    } catch (e) { return v; }
-    var p = parseURL(resolved);
-    // Serialize the resolved record. Only special/authority URLs get the `//` separator — a
-    // non-special scheme with an opaque path (e.g. `data:`, `mailto:`) must never gain one.
-    if (p.__invalid || p.href === "") { return v; }
-    return p.href;
+      return new URL(v, __effectiveBaseURL()).href;
+    } catch (e) {
+      return v;
+    }
   }
   var __refl = (function () {
     var maxInt = 2147483647, minInt = -2147483648;
@@ -5180,6 +5220,26 @@
           });
         };
         __reflectURL("src", { img: 1, script: 1, iframe: 1, source: 1, video: 1, audio: 1, embed: 1, track: 1, input: 1, frame: 1 });
+        // Setting an <iframe>'s src navigates its nested browsing context: re-run the frame loader so
+        // a connected frame (re)loads the new document.
+        if (__formTag === "iframe") {
+          var __srcDesc = Object.getOwnPropertyDescriptor(el, "src");
+          if (__srcDesc && __srcDesc.set) {
+            var __srcSet = __srcDesc.set;
+            Object.defineProperty(el, "src", {
+              get: __srcDesc.get,
+              set: function (v) {
+                __srcSet.call(this, v);
+                var self = this;
+                if (typeof globalThis.__loadFrameEl === "function") {
+                  self.__frameLoadedKey = undefined; self.__cwinReal = undefined;
+                  try { globalThis.__loadFrameEl(self); } catch (e) {}
+                }
+              },
+              enumerable: true, configurable: true
+            });
+          }
+        }
         __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 });
         // HTMLHyperlinkElementUtils URL-decomposition accessors on <a>/<area>: protocol/host/...
         // derived from the resolved href. These also make the WPT reflection harness' resolveUrl()
@@ -5229,6 +5289,27 @@
           __defUrlPart("pathname", "pathname"); __defUrlPart("search", "search");
           __defUrlPart("hash", "hash"); __defUrlPart("origin", "origin");
           __defUserInfoPart("username"); __defUserInfoPart("password");
+          // Activation behaviour: click() fires a cancelable click event, and if it isn't
+          // prevented, follows the link. We don't navigate documents, but a `javascript:` href is
+          // executed in the page realm (per HTML) — its side effects run; a string result would
+          // navigate (ignored here). An invalid URL does nothing.
+          def(el, "click", function () {
+            var notPrevented = true;
+            try {
+              var ev = new globalThis.MouseEvent("click", { bubbles: true, cancelable: true, composed: true });
+              notPrevented = el.dispatchEvent(ev);
+            } catch (e) {}
+            if (!notPrevented) { return; }
+            var raw = __getAttr(node, "href");
+            if (raw == null) { return; }
+            var rec = parseURL(raw, (globalThis.location && globalThis.location.href) || null);
+            if (rec.__invalid) { return; }
+            if (rec.protocol === "javascript:") {
+              var code; try { code = decodeURIComponent(rec.href.slice("javascript:".length)); } catch (e) { code = rec.href.slice("javascript:".length); }
+              // Navigating to a javascript: URL runs in a queued task, not synchronously.
+              setTimeout(function () { try { (0, eval)(code); } catch (e) {} }, 0);
+            }
+          });
         }
         // <img>.naturalWidth / naturalHeight: the decoded intrinsic size from the engine
         // (0 when the image is missing/broken/not yet decoded). `width`/`height` reflect the
@@ -5348,6 +5429,23 @@
       if (!r) { return makeRect(); }
       r.toJSON = function () { return this; };
       return r;
+    });
+    // computedStyleMap(): a minimal CSS Typed OM StylePropertyMapReadOnly backed by
+    // getComputedStyle — `.get(prop)` returns a value whose toString() is the computed value string.
+    def(el, "computedStyleMap", function () {
+      // Report the COMPUTED value (4th arg true), not the resolved value getComputedStyle returns —
+      // they differ for colors the forced-colors override replaced at used-value time.
+      var id = this.__node;
+      function computed(prop) {
+        try { return __computedStyleProp(id, String(prop).toLowerCase(), "", true); } catch (e) { return ""; }
+      }
+      return {
+        get: function (prop) {
+          var v = computed(prop);
+          return { toString: function () { return v; }, value: v };
+        },
+        has: function (prop) { return computed(prop) !== ""; },
+      };
     });
     def(el, "getClientRects", function () {
       var id = this.__node;
@@ -8157,6 +8255,16 @@
     return sel;
   }
   function __selStart(sel) { return sel._ranges.length ? sel._ranges[0] : null; }
+  // Push the current selection (its single range's boundaries, in document order) to the engine so it
+  // can paint the ::selection highlight. The boundary node ids are passed as-is (the engine indexes
+  // painted text runs by their node id, which is the text node); cleared when there is no range.
+  function __syncSelection(sel) {
+    try {
+      var r = __selStart(sel);
+      if (!r || (r._sc === r._ec && r._so === r._eo)) { globalThis.__commitSelection(-1, 0, -1, 0); return; }
+      globalThis.__commitSelection(__idOf(r._sc), r._so, __idOf(r._ec), r._eo);
+    } catch (e) { try { globalThis.__commitSelection(-1, 0, -1, 0); } catch (e2) {} }
+  }
   Object.defineProperty(__selectionProto, "rangeCount", { get: function () { return this._ranges.length; }, enumerable: true, configurable: true });
   Object.defineProperty(__selectionProto, "isCollapsed", {
     get: function () { var r = __selStart(this); return r ? (r._sc === r._ec && r._so === r._eo) : true; },
@@ -8183,14 +8291,16 @@
     if (globalThis.__rootId(__idOf(range._sc)) !== __idOf(globalThis.document)) { return; }
     if (this._ranges.length) { return; }
     this._ranges = [range];
+    __syncSelection(this);
   });
   def(__selectionProto, "removeRange", function (range) {
     var i = this._ranges.indexOf(range);
     if (i < 0) { throw new globalThis.DOMException("Could not find the given range.", "NotFoundError"); }
     this._ranges.splice(i, 1);
+    __syncSelection(this);
   });
-  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; });
-  def(__selectionProto, "empty", function () { this._ranges = []; });
+  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; __syncSelection(this); });
+  def(__selectionProto, "empty", function () { this._ranges = []; __syncSelection(this); });
   // setBaseAndExtent: select from (anchorNode, anchorOffset) to (focusNode, focusOffset). We don't
   // track selection direction, so a backward selection's anchor/focus getters may read swapped; the
   // selected range itself is correct.
@@ -8199,14 +8309,16 @@
     try { range.setStart(anchorNode, anchorOffset); range.setEnd(focusNode, focusOffset); }
     catch (e) { try { range.setStart(focusNode, focusOffset); range.setEnd(anchorNode, anchorOffset); } catch (e2) { return; } }
     this._ranges = [range];
+    __syncSelection(this);
   });
   // Caret/selection movement built on the Range model (one range per selection). collapse places a
   // caret; extend moves the focus keeping the anchor; selectAllChildren selects a node's contents.
   def(__selectionProto, "collapse", function (node, offset) {
-    if (node == null) { this._ranges = []; return; }
+    if (node == null) { this._ranges = []; __syncSelection(this); return; }
     var range = globalThis.document.createRange();
     range.setStart(node, offset || 0); range.collapse(true);
     this._ranges = [range];
+    __syncSelection(this);
   });
   def(__selectionProto, "setPosition", __selectionProto.collapse);
   def(__selectionProto, "collapseToStart", function () {
@@ -8225,6 +8337,7 @@
   });
   def(__selectionProto, "selectAllChildren", function (node) {
     var range = globalThis.document.createRange(); range.selectNodeContents(node); this._ranges = [range];
+    __syncSelection(this);
   });
   def(__selectionProto, "containsNode", function (node) {
     var r = this._ranges[0];
@@ -8575,6 +8688,13 @@
       var IFP = globalThis.HTMLIFrameElement.prototype;
       Object.defineProperty(IFP, "contentDocument", {
         get: function () {
+          // A loaded frame (real nested realm) exposes its own parsed document.
+          if (this.__frameLoadedKey && typeof __frameGet === "function") {
+            try {
+              var rdoc = __frameGet(this.__node, "document");
+              if (rdoc) { return rdoc; }
+            } catch (e) {}
+          }
           if (!this.__cdoc) {
             var body = document.createElement("body");
             var doc = {
@@ -8662,6 +8782,8 @@
         var url = null;
         if (rawSrc != null && rawSrc !== "") {
           try { url = new globalThis.URL(rawSrc, globalThis.location.href).href; } catch (e) { url = rawSrc; }
+        } else if (srcdoc == null) {
+          url = "about:blank"; // a srcless iframe still gets an about:blank browsing context
         }
         var key = (srcdoc != null) ? ("srcdoc:" + srcdoc) : (url || "");
         if (key === "") { return; }
@@ -8698,6 +8820,11 @@
       var __cwFacade = Object.getOwnPropertyDescriptor(IFP2, "contentWindow");
       Object.defineProperty(IFP2, "contentWindow", {
         get: function () {
+          // A srcless iframe still has a window: lazily give it an about:blank realm on first access.
+          if (!this.__frameLoadedKey) {
+            var hasSrc = this.getAttribute && (this.getAttribute("src") || (this.hasAttribute && this.hasAttribute("srcdoc")));
+            if (!hasSrc) { __loadFrame(this); }
+          }
           if (this.__frameLoadedKey) {
             var el = this;
             if (!el.__cwinReal) {
@@ -8710,13 +8837,31 @@
               base.self = base; base.window = base;
               try { base.parent = globalThis; base.top = globalThis; } catch (e) {}
               // Reads not on `base` (performance, location, document, globals the frame's scripts
-              // set, …) reach into the frame realm via __frameGet.
+              // set, …) reach into the frame realm via __frameGet. Assigning `location` forwards to
+              // the frame's Location href setter (PutForwards=href): an invalid URL throws the
+              // frame's SyntaxError DOMException, a valid one navigates the frame.
               if (typeof globalThis.Proxy === "function" && typeof __frameGet === "function") {
                 el.__cwinReal = new globalThis.Proxy(base, {
                   get: function (t, prop) {
                     if (prop in t) { return t[prop]; }
                     if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
                     return undefined;
+                  },
+                  set: function (t, prop, v) {
+                    if (prop === "location") {
+                      var loc; try { loc = __frameGet(el.__node, "location"); } catch (e) {}
+                      var fbase = (loc && loc.href) || "about:blank";
+                      if (globalThis.__urlParse(String(v), fbase) == null) {
+                        var DE; try { DE = __frameGet(el.__node, "DOMException"); } catch (e) {}
+                        if (typeof DE !== "function") { DE = globalThis.DOMException; }
+                        throw new DE("Failed to set the 'href' property on 'Location': '" + v + "' is not a valid URL.", "SyntaxError");
+                      }
+                      // Valid: navigate the frame to the new URL.
+                      try { el.setAttribute("src", String(v)); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el); } catch (e) {}
+                      return true;
+                    }
+                    t[prop] = v;
+                    return true;
                   }
                 });
               } else {
@@ -10119,27 +10264,46 @@
   // application/x-www-form-urlencoded decode in Rust (handles invalid UTF-8 -> U+FFFD per spec).
   // (`globalThis.__formDecode` is the native; this IIFE-local wrapper just coerces to string.)
   function __formDecode(s) { return globalThis.__formDecode(String(s)); }
+  // USVString coercion shared by the URLSearchParams constructor and its prototype methods: a
+  // lone (unpaired) surrogate is replaced with U+FFFD.
+  function __uspUsv(s) {
+    s = String(s);
+    var out = "", i = 0, n = s.length;
+    while (i < n) {
+      var c = s.charCodeAt(i);
+      if (c >= 0xD800 && c <= 0xDBFF) {
+        var d = (i + 1 < n) ? s.charCodeAt(i + 1) : 0;
+        if (d >= 0xDC00 && d <= 0xDFFF) { out += s[i] + s[i + 1]; i += 2; continue; }
+        out += "�"; i++; continue;
+      }
+      if (c >= 0xDC00 && c <= 0xDFFF) { out += "�"; i++; continue; }
+      out += s[i]; i++;
+    }
+    return out;
+  }
+  // Parse an application/x-www-form-urlencoded string into the given pairs array.
+  function __uspParseInto(pairs, s) {
+    if (s.charAt(0) === "?") { s = s.slice(1); }
+    if (!s) { return; }
+    var segs = s.split("&");
+    for (var i = 0; i < segs.length; i++) {
+      if (segs[i] === "") { continue; }
+      var eq = segs[i].indexOf("=");
+      var k = eq < 0 ? segs[i] : segs[i].slice(0, eq);
+      var v = eq < 0 ? "" : segs[i].slice(eq + 1);
+      pairs.push([__formDecode(k), __formDecode(v)]);
+    }
+  }
   if (typeof globalThis.URLSearchParams !== "function") {
     def(globalThis, "URLSearchParams", function (init) {
+      // WebIDL interface object: not callable without `new`.
+      if (!new.target) { throw new TypeError("Failed to construct 'URLSearchParams': Please use the 'new' operator, this DOM object constructor cannot be called as a function."); }
       var pairs = [];
-      var self = this;
-      // `__onChange` lets a URL keep its href/search in sync with mutations (set in the URL ctor).
-      function changed() { if (typeof self.__onChange === "function") { try { self.__onChange(); } catch (e) {} } }
-      function add(k, v) { pairs.push([String(k), String(v)]); }
-      function parseQuery(s) {
-        if (s.charAt(0) === "?") { s = s.slice(1); }
-        if (!s) { return; }
-        var segs = s.split("&");
-        for (var i = 0; i < segs.length; i++) {
-          if (segs[i] === "") { continue; }
-          var eq = segs[i].indexOf("=");
-          var k = eq < 0 ? segs[i] : segs[i].slice(0, eq);
-          var v = eq < 0 ? "" : segs[i].slice(eq + 1);
-          add(__formDecode(k), __formDecode(v));
-        }
-      }
+      // Per-instance state in a holder; the (shared, WebIDL-conformant) prototype methods reach it
+      // via `this.__sp`. `__onChange` lets a URL keep its href/search in sync (set in the URL ctor).
+      Object.defineProperty(this, "__sp", { value: { pairs: pairs }, writable: true, configurable: true });
       if (init == null) { /* empty */ }
-      else if (typeof init === "string") { parseQuery(init); }
+      else if (typeof init === "string") { __uspParseInto(pairs, init); }
       else if (typeof init[Symbol.iterator] === "function") {
         // Sequence of two-element sequences (covers arrays AND another URLSearchParams).
         var it = init[Symbol.iterator](), step;
@@ -10147,83 +10311,114 @@
           var pair = step.value, a = [], pit = pair[Symbol.iterator](), ps;
           while (!(ps = pit.next()).done) { a.push(ps.value); }
           if (a.length !== 2) { throw new TypeError("Failed to construct 'URLSearchParams': Sequence initializer must only contain pair elements"); }
-          add(a[0], a[1]);
+          pairs.push([__uspUsv(a[0]), __uspUsv(a[1])]);
         }
-      } else if (typeof init === "object") {
-        // Record: own enumerable string-keyed properties.
+      } else if (typeof init === "object" || typeof init === "function") {
+        // record<USVString, USVString>: own enumerable string keys, USVString-coerced (a callable
+        // object — e.g. the DOMException interface object — is a record too). Duplicate
+        // coerced keys collapse (a later entry overwrites the value but keeps the first position).
         var keys = Object.keys(init);
-        for (var j = 0; j < keys.length; j++) { add(keys[j], init[keys[j]]); }
+        var rec = new Map();
+        for (var j = 0; j < keys.length; j++) { rec.set(__uspUsv(keys[j]), __uspUsv(init[keys[j]])); }
+        rec.forEach(function (v, k) { pairs.push([k, v]); });
       }
-      // Methods are non-enumerable (so `new URLSearchParams(usp)` / record init never see them).
-      def(this, "append", function (k, v) { add(k, v); changed(); });
-      def(this, "set", function (k, v) { k = String(k); v = String(v); var found = false; for (var i = 0; i < pairs.length;) { if (pairs[i][0] === k) { if (!found) { pairs[i][1] = v; found = true; i++; } else { pairs.splice(i, 1); } } else { i++; } } if (!found) { add(k, v); } changed(); });
-      def(this, "get", function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; });
-      def(this, "getAll", function (k) { k = String(k); var out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; });
-      def(this, "has", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; });
-      def(this, "delete", function (k, v) { k = String(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = String(v); } for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { pairs.splice(i, 1); } } changed(); });
-      // forEach + the iterators are LIVE: they read `pairs` by index on each step, so mutations made
-      // during iteration are observed (per the URLSearchParams spec / WPT "For-of Check").
-      def(this, "forEach", function (cb, thisArg) { for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } });
-      function liveIter(pick) {
-        var i = 0;
-        var it = { next: function () { if (i >= pairs.length) { return { value: undefined, done: true }; } var p = pairs[i++]; return { value: pick(p), done: false }; } };
-        it[Symbol.iterator] = function () { return this; };
-        return it;
-      }
-      def(this, "keys", function () { return liveIter(function (p) { return p[0]; }); });
-      def(this, "values", function () { return liveIter(function (p) { return p[1]; }); });
-      def(this, "entries", function () { return liveIter(function (p) { return [p[0], p[1]]; }); });
-      def(this, "sort", function () { pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); changed(); });
-      def(this, Symbol.iterator, function () { return this.entries(); });
-      def(this, "toString", function () { return pairs.map(function (p) { return __formEncode(p[0]) + "=" + __formEncode(p[1]); }).join("&"); });
-      // Internal: replace contents from a query string (used by URL when .search/.href changes).
-      def(this, "__setFromQuery", function (q) { pairs.length = 0; parseQuery(q == null ? "" : String(q)); });
-      Object.defineProperty(this, "size", { get: function () { return pairs.length; }, enumerable: false, configurable: true });
     });
+    // WebIDL members on the prototype (idlharness checks the prototype, not the instance).
+    (function () {
+      var P = globalThis.URLSearchParams.prototype;
+      function pr(self) { return self.__sp.pairs; }
+      function ch(self) { if (typeof self.__onChange === "function") { try { self.__onChange(); } catch (e) {} } }
+      function defOp(name, fn, len) {
+        try { Object.defineProperty(fn, "name", { value: name, configurable: true }); } catch (e) {}
+        if (len != null) { try { Object.defineProperty(fn, "length", { value: len, configurable: true }); } catch (e) {} }
+        Object.defineProperty(P, name, { value: fn, writable: true, enumerable: true, configurable: true });
+      }
+      // WebIDL: a missing required argument is a TypeError.
+      function req(name, n, count) { if (count < n) { throw new TypeError("Failed to execute '" + name + "' on 'URLSearchParams': " + n + " argument" + (n === 1 ? "" : "s") + " required, but only " + count + " present."); } }
+      defOp("append", function (k, v) { req("append", 2, arguments.length); pr(this).push([__uspUsv(k), __uspUsv(v)]); ch(this); }, 2);
+      defOp("set", function (k, v) { req("set", 2, arguments.length); k = __uspUsv(k); v = __uspUsv(v); var pairs = pr(this), found = false; for (var i = 0; i < pairs.length;) { if (pairs[i][0] === k) { if (!found) { pairs[i][1] = v; found = true; i++; } else { pairs.splice(i, 1); } } else { i++; } } if (!found) { pairs.push([k, v]); } ch(this); }, 2);
+      defOp("get", function (k) { req("get", 1, arguments.length); k = __uspUsv(k); var pairs = pr(this); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return pairs[i][1]; } } return null; }, 1);
+      defOp("getAll", function (k) { req("getAll", 1, arguments.length); k = __uspUsv(k); var pairs = pr(this), out = []; for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { out.push(pairs[i][1]); } } return out; }, 1);
+      defOp("has", function (k, v) { req("has", 1, arguments.length); k = __uspUsv(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = __uspUsv(v); } var pairs = pr(this); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { return true; } } return false; }, 1);
+      defOp("delete", function (k, v) { req("delete", 1, arguments.length); k = __uspUsv(k); var checkV = arguments.length > 1 && v !== undefined; if (checkV) { v = __uspUsv(v); } var pairs = pr(this); for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k && (!checkV || pairs[i][1] === v)) { pairs.splice(i, 1); } } ch(this); }, 1);
+      defOp("forEach", function (cb, thisArg) { var pairs = pr(this); for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } }, 1);
+      function liveIter(self, pick) { var pairs = pr(self), i = 0; var it = { next: function () { if (i >= pairs.length) { return { value: undefined, done: true }; } var p = pairs[i++]; return { value: pick(p), done: false }; } }; it[Symbol.iterator] = function () { return this; }; return it; }
+      defOp("keys", function () { return liveIter(this, function (p) { return p[0]; }); }, 0);
+      defOp("values", function () { return liveIter(this, function (p) { return p[1]; }); }, 0);
+      defOp("entries", function () { return liveIter(this, function (p) { return [p[0], p[1]]; }); }, 0);
+      defOp("sort", function () { pr(this).sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); ch(this); }, 0);
+      defOp("toString", function () { return pr(this).map(function (p) { return __formEncode(p[0]) + "=" + __formEncode(p[1]); }).join("&"); }, 0);
+      // The default iterator is entries.
+      Object.defineProperty(P, Symbol.iterator, { value: P.entries, writable: true, enumerable: false, configurable: true });
+      // size: read-only attribute.
+      var sizeGetter = function () { return pr(this).length; };
+      try { Object.defineProperty(sizeGetter, "name", { value: "get size", configurable: true }); } catch (e) {}
+      Object.defineProperty(P, "size", { get: sizeGetter, enumerable: true, configurable: true });
+      // Internal (non-enumerable): replace contents from a query string (used by URL on .search/.href).
+      def(P, "__setFromQuery", function (q) { var pairs = pr(this); pairs.length = 0; __uspParseInto(pairs, q == null ? "" : String(q)); });
+    })();
+    // WebIDL conformance: name/prototype/@@toStringTag; constructor arity 0 (init is optional).
+    defClass("URLSearchParams");
+    try { Object.defineProperty(globalThis.URLSearchParams, "length", { value: 0, configurable: true }); } catch (e) {}
   }
 
   // --- URL ---------------------------------------------------------------------------------
   if (typeof globalThis.URL !== "function") {
     def(globalThis, "URL", function (url, base) {
+      // WebIDL interface object: not callable without `new`.
+      if (!new.target) { throw new TypeError("Failed to construct 'URL': Please use the 'new' operator, this DOM object constructor cannot be called as a function."); }
       var p = parseURL(url, base != null ? String(base) : null);
       // Per the URL standard, `new URL(...)` throws a TypeError for an invalid URL.
       if (p.__invalid) {
         throw new TypeError("Failed to construct 'URL': Invalid URL");
       }
-      var self = this;
       var sp = new globalThis.URLSearchParams(p.search);
-      Object.defineProperty(this, "searchParams", { value: sp, enumerable: true, configurable: true });
-      // Apply a fresh parsed record (after a setter) and re-sync searchParams from the new query.
-      function applyRec(r) { p = r; sp.__setFromQuery(p.search); }
+      // Per-instance mutable state lives in a holder so the prototype accessors (shared, WebIDL-
+      // conformant) can read/write it via `this`.
+      Object.defineProperty(this, "__url", { value: { rec: p, sp: sp }, writable: true, configurable: true });
+      var st = this.__url;
+      // Keep the URL in sync when searchParams is mutated (append/set/delete/sort/…): reserialize the
+      // query through __urlSet and adopt the new record (without re-syncing searchParams from it).
+      sp.__onChange = function () {
+        var json = __urlSet(st.rec.href, "search", sp.toString());
+        if (json != null) { try { st.rec = JSON.parse(json); } catch (e) {} }
+      };
+    });
+    // WebIDL: members live on URL.prototype (idlharness checks the prototype, not the instance).
+    (function () {
+      var P = globalThis.URL.prototype;
+      // WebIDL requires an attribute's accessor functions to be named "get <attr>"/"set <attr>" and
+      // operations to be enumerable on the prototype.
+      function named(fn, name) { try { Object.defineProperty(fn, "name", { value: name, configurable: true }); } catch (e) {} return fn; }
       // Each WHATWG URL attribute is live: the setter runs the spec setter in Rust (__urlSet) on the
       // current href and adopts the reserialized record; an invalid value is a no-op (per spec),
       // except href which throws.
       function defAttr(name) {
-        Object.defineProperty(self, name, {
-          get: function () { return p[name]; },
-          set: function (v) {
-            var json = __urlSet(p.href, name, String(v));
-            if (json == null) {
-              if (name === "href") { throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); }
-              return;
-            }
-            try { applyRec(JSON.parse(json)); } catch (e) {}
-          },
-          enumerable: true, configurable: true
-        });
+        var getter = named(function () { return this.__url.rec[name]; }, "get " + name);
+        var setter = named(function (v) {
+          var st = this.__url;
+          var json = __urlSet(st.rec.href, name, String(v));
+          if (json == null) {
+            if (name === "href") { throw new TypeError("Failed to set the 'href' property on 'URL': Invalid URL"); }
+            return;
+          }
+          try { st.rec = JSON.parse(json); st.sp.__setFromQuery(st.rec.search); } catch (e) {}
+        }, "set " + name);
+        Object.defineProperty(P, name, { get: getter, set: setter, enumerable: true, configurable: true });
       }
       ["href", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"].forEach(defAttr);
-      // origin is read-only.
-      Object.defineProperty(this, "origin", { get: function () { return p.origin; }, enumerable: true, configurable: true });
-      this.toString = function () { return p.href; };
-      this.toJSON = function () { return p.href; };
-      // Keep the URL in sync when searchParams is mutated (append/set/delete/sort/…): reserialize the
-      // query through __urlSet and adopt the new record (without re-syncing searchParams from it).
-      sp.__onChange = function () {
-        var json = __urlSet(p.href, "search", sp.toString());
-        if (json != null) { try { p = JSON.parse(json); } catch (e) {} }
-      };
-    });
+      // origin + searchParams are read-only ([SameObject] for searchParams).
+      Object.defineProperty(P, "origin", { get: named(function () { return this.__url.rec.origin; }, "get origin"), enumerable: true, configurable: true });
+      Object.defineProperty(P, "searchParams", { get: named(function () { return this.__url.sp; }, "get searchParams"), enumerable: true, configurable: true });
+      // Stringifier + toJSON are enumerable operations.
+      Object.defineProperty(P, "toString", { value: named(function () { return this.__url.rec.href; }, "toString"), writable: true, enumerable: true, configurable: true });
+      Object.defineProperty(P, "toJSON", { value: named(function () { return this.__url.rec.href; }, "toJSON"), writable: true, enumerable: true, configurable: true });
+    })();
+    // WebIDL conformance: interface name/prototype/@@toStringTag, and constructor arity 1 (url is
+    // required, base optional). `webkitURL` is the legacy window alias.
+    defClass("URL");
+    try { Object.defineProperty(globalThis.URL, "length", { value: 1, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+    def(globalThis, "webkitURL", globalThis.URL);
     // Static parsers (WHATWG URL): canParse(url[, base]) -> boolean; parse(url[, base]) -> URL|null.
     globalThis.URL.canParse = function (url, base) {
       if (arguments.length < 1) { throw new TypeError("Failed to execute 'canParse' on 'URL': 1 argument required, but only 0 present."); }
@@ -10233,6 +10428,11 @@
       if (arguments.length < 1) { throw new TypeError("Failed to execute 'parse' on 'URL': 1 argument required, but only 0 present."); }
       try { return new globalThis.URL(url, base); } catch (e) { return null; }
     };
+    // WebIDL: `url` is required, `base` optional -> static operation arity 1; named after the op.
+    try { Object.defineProperty(globalThis.URL.canParse, "length", { value: 1, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(globalThis.URL.parse, "length", { value: 1, configurable: true }); } catch (e) {}
+    try { Object.defineProperty(globalThis.URL.canParse, "name", { value: "canParse", configurable: true }); } catch (e) {}
+    try { Object.defineProperty(globalThis.URL.parse, "name", { value: "parse", configurable: true }); } catch (e) {}
     // Encode the Blob's bytes as a self-contained data: URL so it actually works as an <img> src /
     // fetch target (we don't keep a blob: registry). revoke is a no-op (data: needs no cleanup).
     globalThis.URL.createObjectURL = function (obj) {
@@ -10435,6 +10635,70 @@
     try { Object.defineProperty(CSSns, Symbol.toStringTag, { value: "CSS", writable: false, enumerable: false, configurable: true }); } catch (e) {}
     def(globalThis, "CSS", CSSns);
   }
+
+  // CSS Custom Highlight API: a Highlight is a setlike of Ranges; CSS.highlights is a maplike registry
+  // of named highlights. Whenever the registry or any highlight's ranges change we recompute the set
+  // of covered nodes and push them to the engine, which paints the matching ::highlight(name) pseudo.
+  (function () {
+    function Highlight() {
+      this._ranges = [];
+      for (var i = 0; i < arguments.length; i++) { this._ranges.push(arguments[i]); }
+      this.priority = 0;
+      this.type = "highlight";
+    }
+    Highlight.prototype.add = function (r) { if (this._ranges.indexOf(r) < 0) { this._ranges.push(r); } __syncHighlights(); return this; };
+    Highlight.prototype.delete = function (r) { var i = this._ranges.indexOf(r); if (i >= 0) { this._ranges.splice(i, 1); } __syncHighlights(); return i >= 0; };
+    Highlight.prototype.has = function (r) { return this._ranges.indexOf(r) >= 0; };
+    Highlight.prototype.clear = function () { this._ranges = []; __syncHighlights(); };
+    Highlight.prototype.forEach = function (cb, t) { var self = this; this._ranges.forEach(function (r) { cb.call(t, r, r, self); }); };
+    Object.defineProperty(Highlight.prototype, "size", { get: function () { return this._ranges.length; }, configurable: true });
+    try { Highlight.prototype[Symbol.iterator] = function () { return this._ranges[Symbol.iterator](); }; } catch (e) {}
+    def(globalThis, "Highlight", Highlight);
+
+    var __registry = new Map();
+    // Node ids covered by a range. Element-offset ranges (the common `setStart(el,0)/setEnd(el,n)`
+    // form) cover childNodes[start..end] inclusive of descendants; a text-offset range covers its
+    // text node. Cross-container ranges are approximated by their two endpoints' subtrees.
+    function __highlightNodes(r) {
+      var out = [];
+      try {
+        var sc = r._sc, so = r._so | 0, ec = r._ec, eo = r._eo | 0;
+        function pushAll(n) { if (!n) { return; } out.push(__idOf(n)); var ch = n.childNodes; if (ch) { for (var i = 0; i < ch.length; i++) { pushAll(ch[i]); } } }
+        if (sc === ec) {
+          if (sc.nodeType === 1) { var ch = sc.childNodes; for (var i = so; i < eo && i < ch.length; i++) { pushAll(ch[i]); } }
+          else { out.push(__idOf(sc)); }
+        } else { pushAll(sc); pushAll(ec); }
+      } catch (e) {}
+      return out;
+    }
+    function __syncHighlights() {
+      try {
+        globalThis.__clearHighlights();
+        __registry.forEach(function (hl, name) {
+          if (!hl || !hl._ranges) { return; }
+          hl._ranges.forEach(function (r) {
+            __highlightNodes(r).forEach(function (id) { if (id >= 0) { globalThis.__addHighlight(String(name), id); } });
+          });
+        });
+      } catch (e) {}
+    }
+    globalThis.__syncHighlights = __syncHighlights;
+
+    var highlights = {
+      set: function (name, hl) { __registry.set(String(name), hl); __syncHighlights(); return this; },
+      get: function (name) { return __registry.get(String(name)); },
+      has: function (name) { return __registry.has(String(name)); },
+      delete: function (name) { var r = __registry.delete(String(name)); __syncHighlights(); return r; },
+      clear: function () { __registry.clear(); __syncHighlights(); },
+      forEach: function (cb, t) { __registry.forEach(function (v, k) { cb.call(t, v, k, highlights); }); },
+      keys: function () { return __registry.keys(); },
+      values: function () { return __registry.values(); },
+      entries: function () { return __registry.entries(); }
+    };
+    Object.defineProperty(highlights, "size", { get: function () { return __registry.size; }, configurable: true });
+    try { highlights[Symbol.iterator] = function () { return __registry.entries(); }; } catch (e) {}
+    try { globalThis.CSS.highlights = highlights; } catch (e) {}
+  })();
 
   // NodeFilter constants (used with createTreeWalker / createNodeIterator below).
   if (typeof globalThis.NodeFilter === "undefined") {

@@ -14,7 +14,7 @@ dom = { path = "../dom" }
 style = { path = "../style" }
 layout = { path = "../layout" }
 js = { path = "../js" }
-url = "2.5"
+wurl = { path = "../wurl" }
 image = "0.25"
 jxl-oxide = "0.12.6"
 brotli = "8.0.4"

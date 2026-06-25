@@ -29,6 +29,7 @@ impl Engine {
             favicon: None,
             bg_sources: HashMap::new(),
             bg_bitmaps: HashMap::new(),
+            canvas_bg: None,
         }
     }
 
@@ -130,6 +131,8 @@ impl Engine {
         self.prev_size.clear();
         self.session = None; // drop the previous page's runtime (stops its thread)
         self.selection = None; // a new page starts with nothing selected
+        js::set_active_selection(None); // and no programmatic (::selection) selection
+        js::clear_active_highlights(); // and no CSS Custom Highlight registrations
         self.inspect_node = None; // and nothing highlighted in the Elements inspector
         self.favicon = None; // and no site icon until this page's loads
         net::clear_network_log(); // devtools Network tab tracks this navigation's requests
@@ -508,17 +511,22 @@ impl Engine {
             // device-px cursor, `getBoundingClientRect` divides back to CSS px).
             scale_layout_tree(&mut root, self.scale);
             let content_h = root.dimensions.margin_box().height;
-            Some((root, content_h, root_scheme_dark))
+            Some((root, content_h, root_scheme_dark, computed, styles.clone()))
         } else {
             None
         };
-        self.layout_cache = computed.map(|(root, content_h, root_scheme_dark)| LayoutCache {
-            dw,
-            dh,
-            root,
-            content_h,
-            root_scheme_dark,
-        });
+        self.layout_cache =
+            computed.map(
+                |(root, content_h, root_scheme_dark, styles, sheets)| LayoutCache {
+                    dw,
+                    dh,
+                    root,
+                    content_h,
+                    root_scheme_dark,
+                    styles,
+                    sheets,
+                },
+            );
         true
     }
 
@@ -610,6 +618,7 @@ impl Engine {
             collect_content_rects(&cache.root, &mut rects);
         }
         let font = self.font.as_ref();
+        let svg_styles = self.layout_cache.as_ref().map(|c| &c.styles);
         let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         for id in svg_ids {
             let el = match &doc.get(id).data {
@@ -624,7 +633,7 @@ impl Engine {
             };
             w = w.round().clamp(1.0, 4096.0);
             h = h.round().clamp(1.0, 4096.0);
-            let bmp = svg::rasterize_svg(doc, id, w as u32, h as u32, font);
+            let bmp = svg::rasterize_svg(doc, id, w as u32, h as u32, font, svg_styles);
             next.insert(id, bmp);
         }
         self.svg_bitmaps = next;
@@ -708,6 +717,7 @@ impl Engine {
             if !self.bg_sources.is_empty() {
                 self.bg_sources.clear();
             }
+            self.canvas_bg = None;
             return;
         }
 
@@ -728,6 +738,40 @@ impl Engine {
         let live: std::collections::HashSet<&String> =
             targets.iter().map(|(_, _, b)| &b.url).collect();
         self.bg_sources.retain(|k, _| live.contains(k));
+
+        // CSS background propagation: the root (`<html>`) background image — or the `<body>`'s when
+        // html has none — is painted on the canvas at the viewport size, not on its own box. (Without
+        // this, a body image tiles to the body box's height, which varies with content.)
+        self.canvas_bg = None;
+        let prop = self.layout_cache.as_ref().and_then(|cache| {
+            // Walk the first-child chain (root → html → body) for the first element with a background
+            // image — that's the one whose background propagates to the canvas.
+            let mut node = &cache.root;
+            for _ in 0..3 {
+                if let Some(nid) = node.node {
+                    if targets.iter().any(|(n, _, _)| *n == nid) {
+                        return Some((nid, cache.content_h));
+                    }
+                }
+                match node.children.first() {
+                    Some(c) => node = c,
+                    None => break,
+                }
+            }
+            None
+        });
+        if let Some((pid, content_h)) = prop {
+            if let Some(pos) = targets.iter().position(|(n, _, _)| *n == pid) {
+                let (_, _, bg) = targets.remove(pos);
+                let vw = (self.vp_w as f32 * self.scale).round().clamp(1.0, 8192.0) as u32;
+                let vh = ((self.vp_h as f32 * self.scale).max(content_h))
+                    .round()
+                    .clamp(1.0, 8192.0) as u32;
+                if let Some(src) = self.bg_sources.get(&bg.url) {
+                    self.canvas_bg = Some(compose_background(src, vw, vh, &bg));
+                }
+            }
+        }
 
         let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         for (id, rect, bg) in targets {
@@ -841,7 +885,18 @@ impl Engine {
         // background). The splash / non-HTML / error states (no layout tree) keep the chrome gradient.
         match (&self.state, &self.layout_cache) {
             (LoadState::Loaded { .. }, Some(cache)) => {
-                fb.clear(page_background(&cache.root, cache.root_scheme_dark))
+                fb.clear(page_background(&cache.root, cache.root_scheme_dark));
+                // Then the propagated root/body background image (CSS background propagation), at the
+                // canvas origin, scrolled with the page.
+                if let Some(bg) = &self.canvas_bg {
+                    let dst = Rect {
+                        x: 0,
+                        y: -(self.scroll_y.round() as i32),
+                        w: bg.w as i32,
+                        h: bg.h as i32,
+                    };
+                    fb.blit_rgba(dst, &bg.rgba, bg.w, bg.h);
+                }
             }
             _ => paint_gradient(&mut fb),
         }
@@ -885,13 +940,64 @@ impl Engine {
                         // Resolve the selection (if any) into a per-text-run highlight range, in the
                         // same DFS order the painter visits text runs. A running counter in the
                         // painter indexes into this so each run highlights its selected sub-range.
-                        let sel_ranges = if self.selection.is_some() {
+                        // A programmatic `getSelection()` selection (committed by page JS) takes
+                        // precedence and carries per-element `::selection` colors; otherwise the
+                        // mouse-drag selection paints the default highlight.
+                        let active_sel = js::active_selection();
+                        let highlights = js::active_highlights();
+                        let (mut sel_ranges, mut sel_styles) = if let Some((sn, so, en, eo)) =
+                            active_sel
+                        {
                             let runs = collect_text_runs(&cache.root);
-                            self.selection_ranges(&runs)
+                            let ranges = js_selection_ranges(&runs, sn, so, en, eo);
+                            let styles =
+                                selection_styles(&runs, &ranges, doc, &cache.styles, &cache.sheets);
+                            (ranges, styles)
+                        } else if self.selection.is_some() {
+                            let runs = collect_text_runs(&cache.root);
+                            (
+                                self.selection_ranges(&runs),
+                                std::collections::HashMap::new(),
+                            )
                         } else {
-                            Vec::new()
+                            (Vec::new(), std::collections::HashMap::new())
                         };
+                        // CSS Custom Highlight API: each registered `::highlight(name)` paints its
+                        // highlighted runs on top of any selection (later-registered wins on overlap).
+                        if !highlights.is_empty() {
+                            let runs = collect_text_runs(&cache.root);
+                            let (hr, hs) = highlight_styles(
+                                &runs,
+                                &highlights,
+                                doc,
+                                &cache.styles,
+                                &cache.sheets,
+                            );
+                            if sel_ranges.len() < hr.len() {
+                                sel_ranges.resize(hr.len(), None);
+                            }
+                            for (i, r) in hr.into_iter().enumerate() {
+                                if r.is_some() {
+                                    sel_ranges[i] = r;
+                                }
+                            }
+                            sel_styles.extend(hs);
+                        }
                         let mut run_idx = 0usize;
+                        // Forced-colors backplate pre-pass: paint every line's Canvas backplate
+                        // BEFORE any glyphs, so adjacent inline fragments on one line don't overwrite
+                        // each other's text. Spans the full line box (the WPT refs use block bgs).
+                        let has_bg_image = self.canvas_bg.is_some() || !self.bg_bitmaps.is_empty();
+                        paint_backplates(
+                            &mut fb,
+                            &cache.root,
+                            left,
+                            header_h - scroll_y,
+                            header_h,
+                            page_max_y,
+                            (0.0, dw as f32),
+                            has_bg_image,
+                        );
                         paint_box(
                             &mut fb,
                             Fonts {
@@ -910,6 +1016,7 @@ impl Engine {
                             &self.bg_bitmaps,
                             &sel_ranges,
                             &mut run_idx,
+                            &sel_styles,
                         );
                         // Overlay scrollbar on the right edge when the page overflows the viewport.
                         paint_scrollbar(
@@ -1068,4 +1175,162 @@ impl Engine {
         }
         find(doc, doc.root())
     }
+}
+
+/// `::selection` background/text color for a selected run's element.
+use crate::painter::SelStyle;
+
+/// Resolve a highlight pseudo's (`::selection` / `::highlight(name)`) painted colors for an
+/// originating element: its background, text, and (if it underlines) decoration colors. Forced
+/// colors map the highlight to Highlight/HighlightText unless the ORIGINATING element opted out with
+/// `forced-color-adjust: none` (the pseudo's own value is ignored, per css-pseudo-4 — a highlight
+/// follows its originating element). Returns `None` if the pseudo has no style.
+fn resolve_highlight_style(
+    d: &dom::Document,
+    sheets: &[css::Stylesheet],
+    el_id: dom::NodeId,
+    el: &style::ComputedStyle,
+    pseudo_key: &str,
+) -> Option<SelStyle> {
+    let ps = style::compute_pseudo_style(d, sheets, el_id, el, pseudo_key)?;
+    let (mut bg, mut fg) = (ps.background_color, Some(ps.color));
+    if style::forced_colors_active() && !el.forced_color_adjust_off {
+        bg = style::system_color("highlight");
+        fg = style::system_color("highlighttext");
+    }
+    // The painter draws text-decoration lines in the text color (it doesn't honor a separate
+    // text-decoration-color), so the highlight's underline takes the resolved text color too — this
+    // keeps it consistent with how the WPT refs (a styled inline span) render their own underline.
+    let underline = if ps.underline { fg } else { None };
+    Some((bg, fg, underline))
+}
+
+/// Resolve the element a text run belongs to: a run's node is the text node, but highlight pseudos
+/// cascade on its nearest ancestor element (the one with a computed style).
+fn run_element(
+    d: &dom::Document,
+    styles: &std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
+    node: dom::NodeId,
+) -> Option<dom::NodeId> {
+    let mut el = node;
+    while !styles.contains_key(&el) {
+        el = d.get(el).parent?;
+    }
+    Some(el)
+}
+
+/// Map a programmatic selection's element boundaries `(startEl, startOff, endEl, endOff)` to a
+/// per-run selected char range in DFS run order — the same shape `Engine::selection_ranges`
+/// produces for a mouse selection. Offsets are clamped to each run's length.
+fn js_selection_ranges(
+    runs: &[TextRun],
+    sn: usize,
+    so: u32,
+    en: usize,
+    eo: u32,
+) -> Vec<Option<(usize, usize)>> {
+    let mut out = vec![None; runs.len()];
+    let start = runs.iter().position(|r| r.node == Some(dom::NodeId(sn)));
+    let end = runs.iter().rposition(|r| r.node == Some(dom::NodeId(en)));
+    let (Some(s0), Some(e0)) = (start, end) else {
+        return out;
+    };
+    // Order the boundaries in run order, carrying each one's char offset.
+    let (sr, soff, er, eoff) = if s0 <= e0 {
+        (s0, so as usize, e0, eo as usize)
+    } else {
+        (e0, eo as usize, s0, so as usize)
+    };
+    for (i, slot) in out.iter_mut().enumerate() {
+        if i < sr || i > er {
+            continue;
+        }
+        let len = runs[i].text.chars().count();
+        let s = if i == sr { soff } else { 0 }.min(len);
+        let e = if i == er { eoff } else { len }.min(len);
+        if s < e {
+            *slot = Some((s, e));
+        }
+    }
+    out
+}
+
+/// Resolve the `::selection` background/text colors for each selected run's element. Applies forced
+/// colors: the highlight becomes Highlight/HighlightText unless the ORIGINATING element opted out
+/// with `forced-color-adjust: none` (the pseudo's own `forced-color-adjust` is ignored, per
+/// css-pseudo-4 — a highlight follows its originating element's value).
+fn selection_styles(
+    runs: &[TextRun],
+    ranges: &[Option<(usize, usize)>],
+    doc: &Option<dom::Document>,
+    styles: &std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
+    sheets: &[css::Stylesheet],
+) -> std::collections::HashMap<dom::NodeId, SelStyle> {
+    let mut out = std::collections::HashMap::new();
+    let Some(d) = doc else {
+        return out;
+    };
+    for (i, r) in runs.iter().enumerate() {
+        if ranges.get(i).copied().flatten().is_none() {
+            continue;
+        }
+        let Some(node) = r.node else { continue };
+        if out.contains_key(&node) {
+            continue;
+        }
+        let Some(el_id) = run_element(d, styles, node) else {
+            continue;
+        };
+        let Some(el) = styles.get(&el_id) else {
+            continue;
+        };
+        if let Some(st) = resolve_highlight_style(d, sheets, el_id, el, "selection") {
+            out.insert(node, st);
+        }
+    }
+    out
+}
+
+/// Resolve the Custom Highlight registrations (node id → highlight name) into per-run selected
+/// ranges (each fully highlighted) and the resolved `::highlight(name)` colors per element.
+fn highlight_styles(
+    runs: &[TextRun],
+    highlights: &[(usize, String)],
+    doc: &Option<dom::Document>,
+    styles: &std::collections::HashMap<dom::NodeId, style::ComputedStyle>,
+    sheets: &[css::Stylesheet],
+) -> (
+    Vec<Option<(usize, usize)>>,
+    std::collections::HashMap<dom::NodeId, SelStyle>,
+) {
+    let mut ranges = vec![None; runs.len()];
+    let mut out = std::collections::HashMap::new();
+    let Some(d) = doc else {
+        return (ranges, out);
+    };
+    for (i, r) in runs.iter().enumerate() {
+        let Some(node) = r.node else { continue };
+        // The run is highlighted if its text node (or its element) is in any highlight's node set.
+        let Some(el_id) = run_element(d, styles, node) else {
+            continue;
+        };
+        let Some((_, name)) = highlights
+            .iter()
+            .find(|(id, _)| *id == node.0 || *id == el_id.0)
+        else {
+            continue;
+        };
+        ranges[i] = Some((0, runs[i].text.chars().count()));
+        if out.contains_key(&node) {
+            continue;
+        }
+        let Some(el) = styles.get(&el_id) else {
+            continue;
+        };
+        let key = format!("highlight({name})");
+        if let Some(st) = resolve_highlight_style(d, sheets, el_id, el, &key) {
+            out.insert(node, st);
+        }
+    }
+    (ranges, out)
 }

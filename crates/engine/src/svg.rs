@@ -130,6 +130,9 @@ struct PaintState {
     /// Group/element `opacity` accumulates multiplicatively down the tree.
     opacity: f32,
     evenodd: bool,
+    /// In forced colors mode (and not forced-color-adjust:none), the element's forced `currentColor`
+    /// — gradient stops authored with non-system colors resolve to it (so the gradient goes solid).
+    force_stops: Option<(u8, u8, u8)>,
 }
 
 impl Default for PaintState {
@@ -148,6 +151,7 @@ impl Default for PaintState {
             stroke_opacity: 1.0,
             opacity: 1.0,
             evenodd: false,
+            force_stops: None,
         }
     }
 }
@@ -973,12 +977,16 @@ fn style_prop(style: &str, name: &str) -> Option<String> {
 }
 
 /// Resolve a paint value (`fill`/`stroke`): `none` → None paint; otherwise parse the color.
-fn resolve_paint(val: &str, inherited: Option<Color>) -> Option<Color> {
+fn resolve_paint(val: &str, inherited: Option<Color>, current: Option<Color>) -> Option<Color> {
     let v = val.trim();
     if v.eq_ignore_ascii_case("none") {
         return None;
     }
-    if v.eq_ignore_ascii_case("currentcolor") || v.eq_ignore_ascii_case("inherit") {
+    // `currentColor` resolves to the element's `color` property (not the inherited fill/stroke).
+    if v.eq_ignore_ascii_case("currentcolor") {
+        return current.or(inherited);
+    }
+    if v.eq_ignore_ascii_case("inherit") {
         return inherited;
     }
     // url(#...) gradients/patterns are unsupported → fall back to a mid-gray so the shape is visible.
@@ -993,9 +1001,27 @@ fn resolve_paint(val: &str, inherited: Option<Color>) -> Option<Color> {
     parse_css_color(v).or(inherited)
 }
 
-/// Apply this element's presentation attributes/style onto an inherited paint state.
-fn apply_paint(el: &dom::ElementData, mut st: PaintState) -> PaintState {
+type StyleMap = std::collections::HashMap<NodeId, style::ComputedStyle>;
+
+/// Apply this element's presentation attributes/style onto an inherited paint state. `cs` is the
+/// element's cascaded style (CSS `fill`/`stroke` override presentation attributes; forced colors
+/// maps a painted fill/stroke to the element's `currentColor`, which the cascade already forced).
+fn apply_paint(
+    el: &dom::ElementData,
+    cs: Option<&style::ComputedStyle>,
+    mut st: PaintState,
+) -> PaintState {
     let style = attr(el, "style").map(|s| s.to_string());
+    // SVG `currentColor` resolves to the element's CSS `color` property. Inside a visited link, the
+    // computed LinkText is mapped to VisitedText for painting (matching the painter's text mapping).
+    let cur_rgb = cs.map(|c| {
+        if c.visited_link && c.color == (0, 0, 238) {
+            (85, 26, 139) // VisitedText
+        } else {
+            c.color
+        }
+    });
+    let current = cur_rgb.map(|(r, g, b)| Color { r, g, b, a: 255 });
     if let Some(v) = prop(el, "fill", &style) {
         if let Some(id) = paint_url_id(&v) {
             // A `url(#id)` paint (gradient/pattern): remember the ref; keep a gray solid fallback in
@@ -1009,11 +1035,11 @@ fn apply_paint(el: &dom::ElementData, mut st: PaintState) -> PaintState {
             });
         } else {
             st.fill_url = None;
-            st.fill = resolve_paint(&v, st.fill);
+            st.fill = resolve_paint(&v, st.fill, current);
         }
     }
     if let Some(v) = prop(el, "stroke", &style) {
-        st.stroke = resolve_paint(&v, st.stroke);
+        st.stroke = resolve_paint(&v, st.stroke, current);
     }
     if let Some(v) = prop(el, "stroke-width", &style) {
         if let Some(w) = parse_len(&v) {
@@ -1037,6 +1063,59 @@ fn apply_paint(el: &dom::ElementData, mut st: PaintState) -> PaintState {
     }
     if let Some(v) = prop(el, "fill-rule", &style) {
         st.evenodd = v.trim().eq_ignore_ascii_case("evenodd");
+    }
+    // CSS `fill`/`stroke` (from author `<style>` rules / inline `style`, resolved by the cascade)
+    // override the SVG presentation attributes above.
+    if let Some(cs) = cs {
+        let (cr, cg, cb) = cur_rgb.unwrap_or(cs.color);
+        if let Some(extra) = &cs.extra_colors {
+            if let Some(&(r, g, b)) = extra.get("fill") {
+                st.fill = Some(Color { r, g, b, a: 255 });
+                st.fill_url = None;
+            }
+            if let Some(&(r, g, b)) = extra.get("stroke") {
+                st.stroke = Some(Color { r, g, b, a: 255 });
+            }
+        }
+        // `fill/stroke: currentColor` follows the element's (possibly forced) color, not the value
+        // frozen at cascade time.
+        if cs.svg_fill_current {
+            st.fill = Some(Color {
+                r: cr,
+                g: cg,
+                b: cb,
+                a: 255,
+            });
+            st.fill_url = None;
+        }
+        if cs.svg_stroke_current {
+            st.stroke = Some(Color {
+                r: cr,
+                g: cg,
+                b: cb,
+                a: 255,
+            });
+        }
+        // Forced colors: a painted fill/stroke resolves to the element's (already-forced)
+        // currentColor, unless the element opted out with forced-color-adjust:none. A `url()` paint
+        // (gradient/pattern) is left alone — its own stops carry the forced/system colors.
+        if style::forced_colors_active() && !cs.forced_color_adjust_off {
+            let cc = Color {
+                r: cr,
+                g: cg,
+                b: cb,
+                a: 255,
+            };
+            if st.fill.is_some() && st.fill_url.is_none() {
+                st.fill = Some(cc);
+            }
+            if st.stroke.is_some() {
+                st.stroke = Some(cc);
+            }
+            st.force_stops = Some((cr, cg, cb));
+        } else {
+            st.force_stops = None;
+        }
     }
     st
 }
@@ -1072,6 +1151,7 @@ pub fn rasterize_svg(
     out_w: u32,
     out_h: u32,
     font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
 ) -> DecodedImage {
     let out_w = out_w.clamp(1, MAX_DIM);
     let out_h = out_h.clamp(1, MAX_DIM);
@@ -1091,8 +1171,12 @@ pub fn rasterize_svg(
     // viewBox → device: uniform scale-to-fit (xMidYMid meet), centered.
     let base = viewbox_affine(el, out_w as f32, out_h as f32);
 
-    let root_state = apply_paint(el, PaintState::default());
-    render_children(doc, svg_id, base, &root_state, &mut surf, font, 0);
+    let root_state = apply_paint(
+        el,
+        styles.and_then(|m| m.get(&svg_id)),
+        PaintState::default(),
+    );
+    render_children(doc, svg_id, base, &root_state, &mut surf, font, styles, 0);
 
     DecodedImage {
         rgba: surf.px,
@@ -1135,13 +1219,14 @@ fn render_children(
     state: &PaintState,
     surf: &mut Surface,
     font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
     depth: usize,
 ) {
     if depth > 256 {
         return;
     }
     for &child in &doc.get(parent).children {
-        render_element(doc, child, m, state, surf, font, depth);
+        render_element(doc, child, m, state, surf, font, styles, depth);
     }
 }
 
@@ -1153,6 +1238,7 @@ fn render_element(
     state: &PaintState,
     surf: &mut Surface,
     font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
     depth: usize,
 ) {
     if depth > 256 {
@@ -1186,11 +1272,20 @@ fn render_element(
             Some(t) => m.then(parse_transform(t)),
             None => m,
         };
-        let child_state = apply_paint(el, state.clone());
+        let child_state = apply_paint(el, styles.and_then(|mm| mm.get(&child)), state.clone());
 
         match tag.as_str() {
             "g" | "a" => {
-                render_children(doc, child, child_m, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    child_m,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
             // A nested `<svg>` / `<symbol>` establishes its own viewport at (x,y) with its own
             // viewBox — the structure SVG sprite sheets use (one inner <svg> per icon).
@@ -1212,7 +1307,16 @@ fn render_element(
                 } else {
                     child_m.then(Affine::translate(x, y))
                 };
-                render_children(doc, child, inner, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    inner,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
             // `<use xlink:href="#id">`: render the referenced element at this use's (x,y).
             "use" => {
@@ -1224,7 +1328,16 @@ fn render_element(
                             let ux = num_attr(el, "x", 0.0);
                             let uy = num_attr(el, "y", 0.0);
                             let use_m = child_m.then(Affine::translate(ux, uy));
-                            render_element(doc, target, use_m, &child_state, surf, font, depth + 1);
+                            render_element(
+                                doc,
+                                target,
+                                use_m,
+                                &child_state,
+                                surf,
+                                font,
+                                styles,
+                                depth + 1,
+                            );
                         }
                     }
                 }
@@ -1311,11 +1424,29 @@ fn render_element(
                     draw_text(doc, child, el, &child_m, &child_state, surf, font);
                 }
                 // Recurse for nested tspans.
-                render_children(doc, child, child_m, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    child_m,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
             _ => {
                 // Unknown element: recurse in case it wraps shapes (defensive, e.g. <switch>).
-                render_children(doc, child, child_m, &child_state, surf, font, depth + 1);
+                render_children(
+                    doc,
+                    child,
+                    child_m,
+                    &child_state,
+                    surf,
+                    font,
+                    styles,
+                    depth + 1,
+                );
             }
         }
     }
@@ -1340,6 +1471,8 @@ fn paint_url_id(v: &str) -> Option<String> {
 struct GradStop {
     offset: f32, // 0..1
     color: Color,
+    /// Whether `stop-color` was a CSS system color keyword — forced colors preserves it.
+    is_system: bool,
 }
 
 enum GradKind {
@@ -1472,7 +1605,11 @@ fn collect_stops(doc: &Document, grad: NodeId) -> Vec<GradStop> {
                 }
                 None => 0.0,
             };
-        let mut color = prop(el, "stop-color", &style)
+        let stop_color_str = prop(el, "stop-color", &style);
+        let is_system = stop_color_str
+            .as_deref()
+            .is_some_and(|c| style::is_system_color_keyword(&c.trim().to_ascii_lowercase()));
+        let mut color = stop_color_str
             .and_then(|c| parse_css_color(c.trim()))
             .unwrap_or(Color {
                 r: 0,
@@ -1487,6 +1624,7 @@ fn collect_stops(doc: &Document, grad: NodeId) -> Vec<GradStop> {
         out.push(GradStop {
             offset: offset.clamp(0.0, 1.0),
             color,
+            is_system,
         });
     }
     out
@@ -1657,11 +1795,39 @@ fn paint_shape(
     m: &Affine,
 ) {
     // Gradient fill takes precedence over the solid fallback when the ref resolves.
-    let gradient = state
+    let mut gradient = state
         .fill_url
         .as_deref()
         .and_then(|id| resolve_gradient(doc, id));
-    if let Some(g) = gradient {
+    // Forced colors: a non-system gradient stop resolves to the shape's forced currentColor (so a
+    // gradient of author colors collapses to solid); system-color stops are preserved.
+    if let (Some(g), Some((r, gn, b))) = (gradient.as_mut(), state.force_stops) {
+        for stop in &mut g.stops {
+            if !stop.is_system {
+                stop.color = Color {
+                    r,
+                    g: gn,
+                    b,
+                    a: stop.color.a,
+                };
+            }
+        }
+    }
+    // A gradient whose stops are all the same color (e.g. after the forced-colors collapse above)
+    // renders as a SOLID fill, so its edge anti-aliasing matches a plain solid rect (the WPT refs
+    // use one) rather than the gradient rasterizer's.
+    let solid_stop = gradient.as_ref().and_then(|g| {
+        let first = g.stops.first()?.color;
+        g.stops.iter().all(|s| s.color == first).then_some(first)
+    });
+    if let Some(col) = solid_stop {
+        fill_subpaths(
+            surf,
+            subpaths,
+            apply_alpha(col, state.fill_opacity * state.opacity),
+            state.evenodd,
+        );
+    } else if let Some(g) = gradient {
         fill_subpaths_gradient(
             surf,
             subpaths,
@@ -1820,7 +1986,7 @@ mod tests {
     fn render(html: &str, w: u32, h: u32) -> DecodedImage {
         let doc = html::parse(html);
         let id = svg_id(&doc);
-        rasterize_svg(&doc, id, w, h, None)
+        rasterize_svg(&doc, id, w, h, None, None)
     }
 
     #[test]

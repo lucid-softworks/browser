@@ -1021,17 +1021,15 @@ fn ws_connect(
 {
     use std::net::{TcpStream, ToSocketAddrs};
 
-    let parsed = url::Url::parse(url).map_err(|e| format!("invalid WebSocket URL: {e}"))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "WebSocket URL has no host".to_string())?
-        .to_string();
-    let port = parsed
-        .port_or_known_default()
-        .unwrap_or(match parsed.scheme() {
-            "wss" => 443,
-            _ => 80,
-        });
+    let parsed = wurl::Url::parse(url).map_err(|()| "invalid WebSocket URL".to_string())?;
+    let host = parsed.hostname();
+    if host.is_empty() {
+        return Err("WebSocket URL has no host".to_string());
+    }
+    let port = parsed.port_or_default().unwrap_or(match parsed.scheme() {
+        "wss" => 443,
+        _ => 80,
+    });
 
     // Resolve + connect with a timeout so a dead host can't hang the thread indefinitely.
     let addrs: Vec<_> = (host.as_str(), port)

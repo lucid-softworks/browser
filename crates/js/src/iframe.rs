@@ -122,8 +122,8 @@ fn collect_classic_scripts(doc: &dom::Document, base: &str) -> Vec<(bool, String
                     && is_js_type(ty)
                 {
                     if let Some(src) = e.attrs.get("src") {
-                        if let Ok(abs) = url::Url::parse(base).and_then(|u| u.join(src)) {
-                            out.push((true, abs.to_string()));
+                        if let Some(abs) = wurl::resolve(src, base) {
+                            out.push((true, abs));
                         } else {
                             out.push((true, src.clone()));
                         }
@@ -172,17 +172,19 @@ fn prim_iframe_load(
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
 
-    // Resolve the frame's document HTML + its base URL.
-    let (html_src, frame_url) = match &srcdoc {
-        Some(s) => (s.clone(), url.clone()),
+    // Resolve the frame's document HTML + its base URL (+ the response's charset, if any).
+    let (html_src, frame_url, frame_charset) = match &srcdoc {
+        Some(s) => (s.clone(), url.clone(), None),
         None => {
-            if url.is_empty() || url == "about:blank" {
-                (String::new(), "about:blank".to_string())
+            if let Some((html, charset)) = decode_data_url(&url) {
+                (html, url.clone(), charset)
+            } else if url.is_empty() || url == "about:blank" {
+                (String::new(), "about:blank".to_string(), None)
             } else {
                 // Fetch the document HTML via the host fetcher (envelope JSON: {ok,status,body,...}).
                 match request_fetcher("GET", &url, "", "{}") {
                     Some(env) => match extract_envelope_body(&env) {
-                        Some(body) => (body, url.clone()),
+                        Some(body) => (body, url.clone(), extract_envelope_charset(&env)),
                         None => {
                             rv.set(v8::Boolean::new(scope, false).into());
                             return;
@@ -226,6 +228,13 @@ fn prim_iframe_load(
         let kid = v8::String::new(cscope, "__frameNodeId").unwrap();
         let vid = v8::Number::new(cscope, node_id as f64);
         g.set(cscope, kid.into(), vid.into());
+        // Seed the document's charset so the frame's URL parsing encodes queries with it.
+        if let Some(cs) = &frame_charset {
+            if let Some(kcs) = v8::String::new(cscope, "__documentCharset") {
+                let vcs = crate::js_str(cscope, cs);
+                g.set(cscope, kcs.into(), vcs);
+            }
+        }
         eval_internal(cscope, FRAME_ENV_BOOTSTRAP, "<frame-env>");
 
         // Run the document's classic scripts in order (external ones fetched synchronously).
@@ -363,6 +372,109 @@ pub fn pump_frames(scope: &mut v8::PinScope) -> (bool, usize) {
 
 /// Pull the `body` field out of a request envelope JSON (`{"ok":..,"body":"..."}`) without a JSON
 /// dependency: find `"body"`, then decode the following JSON string literal.
+/// Decode a `data:` URL into its document text + charset (None for a non-data URL). Handles the
+/// `data:[<mediatype>][;base64],<data>` form; the fragment is the document's, not part of the body.
+fn decode_data_url(url: &str) -> Option<(String, Option<String>)> {
+    let rest = url
+        .strip_prefix("data:")
+        .or_else(|| url.strip_prefix("DATA:"))?;
+    // The fragment is not part of the data.
+    let rest = rest.split('#').next().unwrap_or(rest);
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let data = &rest[comma + 1..];
+    let meta_l = meta.to_ascii_lowercase();
+    let charset = meta_l
+        .find("charset=")
+        .map(|i| {
+            meta_l[i + "charset=".len()..]
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|s| !s.is_empty());
+    let bytes = if meta_l.trim_end().ends_with(";base64") {
+        base64_decode(data)?
+    } else {
+        // application/x-www-form-urlencoded-style spaces aren't special here; just percent-decode.
+        percent_decode_bytes(data)
+    };
+    Some((String::from_utf8_lossy(&bytes).into_owned(), charset))
+}
+
+fn percent_decode_bytes(input: &str) -> Vec<u8> {
+    let b = input.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && (b[i + 1] as char).is_ascii_hexdigit()
+            && (b[i + 2] as char).is_ascii_hexdigit()
+        {
+            let h = (b[i + 1] as char).to_digit(16).unwrap() as u8;
+            let l = (b[i + 2] as char).to_digit(16).unwrap() as u8;
+            out.push(h * 16 + l);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for &c in input.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let v = val(c)?;
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Pull `charset=<label>` out of the envelope's `contentType` field (e.g. "text/html;charset=big5").
+fn extract_envelope_charset(env: &str) -> Option<String> {
+    let key = "\"contentType\"";
+    let after = &env[env.find(key)? + key.len()..];
+    let start = after.find('"')? + 1;
+    let value = &after[start..];
+    let end = value.find('"')?;
+    let ct = &value[..end];
+    let cs = ct.to_ascii_lowercase();
+    let idx = cs.find("charset=")? + "charset=".len();
+    let label: String = cs[idx..]
+        .chars()
+        .take_while(|&c| c != ';' && c != ' ')
+        .collect();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
 fn extract_envelope_body(env: &str) -> Option<String> {
     let key = "\"body\"";
     let mut i = env.find(key)? + key.len();

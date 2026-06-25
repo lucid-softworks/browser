@@ -447,6 +447,12 @@ pub(crate) fn ancestor_table(
 
 /// Apply a single declaration to `style`. Unknown properties/values are ignored silently.
 #[allow(clippy::too_many_arguments)]
+/// Whether any whitespace/punctuation-separated token in a CSS value is a system color keyword.
+pub(crate) fn has_system_color(val: &str) -> bool {
+    val.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | ';'))
+        .any(|t| crate::colors::is_system_color_keyword(&t.to_ascii_lowercase()))
+}
+
 pub(crate) fn apply_declaration(
     style: &mut ComputedStyle,
     prop: &str,
@@ -468,14 +474,67 @@ pub(crate) fn apply_declaration(
         other => other,
     };
     match prop {
+        "font-variant-emoji" => {
+            style.font_variant_emoji_emoji = val.trim().eq_ignore_ascii_case("emoji");
+        }
+        // Color-valued properties the engine doesn't otherwise model: store the computed color so
+        // getComputedStyle / computedStyleMap can report it (e.g. forced-colors computed-value tests).
+        "fill"
+        | "stroke"
+        | "flood-color"
+        | "lighting-color"
+        | "stop-color"
+        | "column-rule-color"
+        | "text-decoration-color"
+        | "-webkit-tap-highlight-color"
+        | "-webkit-text-emphasis-color" => {
+            let is_current = val.trim().eq_ignore_ascii_case("currentcolor");
+            match prop {
+                "fill" => style.svg_fill_current = is_current,
+                "stroke" => style.svg_stroke_current = is_current,
+                _ => {}
+            }
+            if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
+                style
+                    .extra_colors
+                    .get_or_insert_with(Default::default)
+                    .insert(prop.to_string(), c);
+            }
+        }
+        "accent-color" => {
+            let t = val.trim();
+            if t.eq_ignore_ascii_case("auto") {
+                style.accent_color = None;
+            } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
+                let is_sys = crate::colors::is_system_color_keyword(&t.to_ascii_lowercase());
+                style.accent_color = Some((c, is_sys));
+            }
+        }
+        "forced-color-adjust" => {
+            // `none`/`preserve-parent-color` opt out of the forced-colors override; `auto` opts in.
+            match val.trim().to_ascii_lowercase().as_str() {
+                "none" | "preserve-parent-color" => style.forced_color_adjust_off = true,
+                "auto" => style.forced_color_adjust_off = false,
+                "inherit" => style.forced_color_adjust_off = parent.forced_color_adjust_off,
+                _ => {}
+            }
+        }
         "color" => {
             let trimmed = val.trim().to_ascii_lowercase();
             if trimmed == "inherit" {
                 style.color = inherited_color;
+                // `inherit` follows the cascade, so it's not an explicit color (keep the flags).
+                style.color_explicit = false;
             } else if trimmed == "initial" || trimmed == "unset" {
                 style.color = ComputedStyle::default().color;
+                style.color_is_system = false;
+                style.color_explicit = false;
             } else if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.color = c;
+                style.color_is_system = has_system_color(&trimmed);
+                // `currentColor` resolves to the inherited color, so it isn't an explicit value
+                // either — under forced-color-adjust:none it must follow the forced ancestor color.
+                style.color_explicit = trimmed != "currentcolor";
             }
         }
         "background-color" | "background" => {
@@ -497,7 +556,14 @@ pub(crate) fn apply_declaration(
                 }
                 if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                     // Solid color interpretation; `transparent`/`none` leave it unchanged.
-                    style.background_color = Some(c);
+                    let alpha = crate::colors::parse_rgba_ctx(val, current_color, inherited_color)
+                        .map_or(255, |rgba| rgba.a);
+                    // A fully transparent color (e.g. `rgba(0,0,0,0)`) paints nothing — treat it as
+                    // no background, not opaque black (the painter fills `background_color` opaquely).
+                    style.background_color = if alpha == 0 { None } else { Some(c) };
+                    style.bg_is_system = has_system_color(val);
+                    style.bg_is_currentcolor = val.trim().eq_ignore_ascii_case("currentcolor");
+                    style.background_alpha = alpha;
                 }
             }
         }
@@ -914,7 +980,8 @@ pub(crate) fn apply_declaration(
 
         // --- Box model: border ---
         "border" => {
-            apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color)
+            apply_border_shorthand(style, val, EdgeSide::All, current_color, inherited_color);
+            style.border_is_system = has_system_color(val);
         }
         "border-top" => {
             apply_border_shorthand(style, val, EdgeSide::Top, current_color, inherited_color)
@@ -942,6 +1009,7 @@ pub(crate) fn apply_declaration(
         "border-color" => {
             if let Some(c) = parse_color_ctx(val, current_color, inherited_color) {
                 style.border_color = c;
+                style.border_is_system = has_system_color(val);
             }
         }
 
