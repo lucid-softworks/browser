@@ -22,10 +22,8 @@ html = { path = "../html" }
 # The software canvas 2D rasterizer (a leaf crate, no internal deps), so OffscreenCanvas can
 # synchronously rasterize its display list for getImageData/convertToBlob/transferToImageBitmap.
 paint = { path = "../paint" }
-
-[dev-dependencies]
-# Drive the WHATWG URL parser conformance tests off the WPT JSON fixtures.
-serde_json = "1"
+# Our from-scratch WHATWG URL parser (no external url/idna dependency).
+wurl = { path = "../wurl" }
 
 [lints]
 workspace = true

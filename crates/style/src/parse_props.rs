@@ -325,10 +325,7 @@ pub(crate) fn resolve_css_url(url: &str, base: Option<&str>) -> String {
     let Some(base) = base else {
         return trimmed.to_string();
     };
-    match url::Url::parse(base).and_then(|b| b.join(trimmed)) {
-        Ok(joined) => joined.into(),
-        Err(_) => trimmed.to_string(),
-    }
+    wurl::resolve(trimmed, base).unwrap_or_else(|| trimmed.to_string())
 }
 
 /// Parse a `mask` / `mask-image` value into a [`MaskImage`]. Extracts the first `url(...)` source

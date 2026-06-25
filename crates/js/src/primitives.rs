@@ -360,7 +360,7 @@ pub(crate) fn prim_get_attr(
 /// then runs with just the UA sheet + inline `style=""` attributes).
 /// Join `href` onto `base` (both treated as URLs); returns `base` if either fails to parse.
 pub(crate) fn join_url(base: &str, href: &str) -> String {
-    crate::whatwg_url::resolve(href.trim(), base).unwrap_or_else(|| base.to_string())
+    wurl::resolve(href.trim(), base).unwrap_or_else(|| base.to_string())
 }
 
 /// The document's base URL: the first `<base href>` resolved against the page URL, else the page URL.
@@ -1659,7 +1659,7 @@ fn json_escape_into(s: &str, out: &mut String) {
 }
 
 /// Serialize a parsed URL into the component record the JS `URL`/`parseURL` layer expects.
-fn url_to_record(u: &crate::whatwg_url::Url) -> String {
+fn url_to_record(u: &wurl::Url) -> String {
     let mut s = String::from("{");
     json_field(&mut s, "href", &u.href());
     json_field(&mut s, "protocol", &format!("{}:", u.scheme()));
@@ -1678,14 +1678,14 @@ fn url_to_record(u: &crate::whatwg_url::Url) -> String {
 }
 
 /// `__urlParse(input, base|null) -> recordJSON | null`. WHATWG URL parsing via our spec-compliant
-/// parser ([`crate::whatwg_url`]). Returns the component record as JSON, or null on a parse failure
+/// parser ([`wurl`]). Returns the component record as JSON, or null on a parse failure
 /// (the JS `URL` constructor then throws).
 pub(crate) fn prim_url_parse(
     scope: &mut v8::PinScope,
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    use crate::whatwg_url::Url;
+    use wurl::Url;
     let input = arg_str(scope, &args, 0);
     let base_arg = args.get(1);
     let parsed = if base_arg.is_string() {
@@ -1716,7 +1716,7 @@ pub(crate) fn prim_url_set(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    use crate::whatwg_url::Url;
+    use wurl::Url;
     let href = arg_str(scope, &args, 0);
     let prop = arg_str(scope, &args, 1);
     // WHATWG: the parser-based setters remove ASCII tab/newline from the value; username/password
@@ -1802,9 +1802,7 @@ pub(crate) fn prim_fetch(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => {
-                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
-            }
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };
@@ -1844,9 +1842,7 @@ pub(crate) fn prim_request(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => {
-                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
-            }
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };
@@ -1888,9 +1884,7 @@ pub(crate) fn prim_start_fetch(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => {
-                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
-            }
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };
@@ -1939,9 +1933,7 @@ pub(crate) fn prim_ws_connect(
             .filter(|v| v.is_string())
             .map(|v| v.to_rust_string_lossy(scope));
         match base {
-            Some(b) if !b.is_empty() => {
-                crate::whatwg_url::resolve(&raw, &b).unwrap_or_else(|| raw.clone())
-            }
+            Some(b) if !b.is_empty() => wurl::resolve(&raw, &b).unwrap_or_else(|| raw.clone()),
             _ => raw.clone(),
         }
     };

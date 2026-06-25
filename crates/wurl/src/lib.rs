@@ -738,9 +738,13 @@ impl Url {
 
     // --- public parse entry points ---
 
+    /// Parse `input` as an absolute URL. `Err(())` (no detail — a spec parse failure carries none).
+    #[allow(clippy::result_unit_err)]
     pub fn parse(input: &str) -> Result<Url, ()> {
         basic_parse(input, None, None)
     }
+    /// Parse `input` against `base`. `Err(())` on failure (a spec parse failure carries no detail).
+    #[allow(clippy::result_unit_err)]
     pub fn parse_with_base(input: &str, base: &Url) -> Result<Url, ()> {
         basic_parse(input, Some(base), None)
     }
@@ -755,6 +759,10 @@ impl Url {
     }
     pub fn password(&self) -> &str {
         &self.password
+    }
+    /// The explicit port, or the scheme's default port for a special scheme.
+    pub fn port_or_default(&self) -> Option<u16> {
+        self.port.or_else(|| special_default_port(&self.scheme))
     }
     pub fn hostname(&self) -> String {
         match &self.host {
