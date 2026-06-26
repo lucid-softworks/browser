@@ -209,6 +209,7 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
     let mut path_attr: Option<String> = None;
     let mut secure = false;
     let mut http_only = false;
+    let mut same_site: Option<String> = None;
     let mut max_age: Option<i64> = None;
     let mut expires_attr: Option<u64> = None;
 
@@ -239,6 +240,7 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
                 }
             }
             "expires" => expires_attr = parse_cookie_date(val),
+            "samesite" => same_site = Some(val.to_ascii_lowercase()),
             _ => {}
         }
     }
@@ -271,6 +273,10 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
     let secure_origin = is_secure_context(&u);
     // A `Secure` cookie may only be set over a secure transport.
     if secure && !secure_origin {
+        return false;
+    }
+    // `SameSite=None` requires the `Secure` attribute (RFC 6265bis §5.4).
+    if same_site.as_deref() == Some("none") && !secure {
         return false;
     }
     // Cookie name prefixes (RFC 6265bis §4.1.3, plus the __Http-/__Host-Http- prefixes which also
@@ -1797,6 +1803,20 @@ mod tests {
         clear_cookies();
         assert!(set_cookie(page, "j=1; Path=/; HttpOnly"));
         assert!(has(&cookies_for_document(page), "j=1")); // visible → not HttpOnly
+    }
+
+    #[test]
+    fn cookie_samesite_none_requires_secure() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // SameSite=None without Secure is rejected; with Secure it is stored.
+        assert!(!set_cookie_from_http(secure, "n=1; Path=/; SameSite=None"));
+        assert!(set_cookie_from_http(secure, "n=1; Path=/; SameSite=None; Secure"));
+        assert!(has(&cookies_for_document(secure), "n=1"));
+        // SameSite=Lax without Secure is fine.
+        assert!(set_cookie_from_http(secure, "l=1; Path=/; SameSite=Lax"));
+        assert!(has(&cookies_for_document(secure), "l=1"));
     }
 
     #[test]
