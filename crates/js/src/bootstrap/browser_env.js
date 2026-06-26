@@ -11395,9 +11395,28 @@
     if (!__httpToken.test(subtype)) { return null; }
     return (type + "/" + subtype).toLowerCase();
   }
+  // A low-entropy client-hint request header is CORS-safelisted (no preflight) only when its value
+  // is *extractable* as the hint's structured type — an empty or malformed value is NOT safelisted
+  // (it must trigger a preflight). device-memory/dpr/downlink are non-negative numbers;
+  // width/viewport-width/rtt are non-negative integers; ect is one of a fixed set; save-data a token.
+  function __isSafelistedClientHint(name, value) {
+    value = String(value);
+    switch (name) {
+      case "save-data": return value !== "";
+      case "device-memory":
+      case "dpr":
+      case "downlink": return /^\d+(\.\d+)?$/.test(value);
+      case "width":
+      case "viewport-width":
+      case "rtt": return /^\d+$/.test(value);
+      case "ect": return value === "slow-2g" || value === "2g" || value === "3g" || value === "4g";
+    }
+    return false;
+  }
   function __isSafelistedRequestHeader(name, value) {
     name = String(name).toLowerCase();
     if (name === "accept" || name === "accept-language" || name === "content-language") { return true; }
+    if (__isSafelistedClientHint(name, value)) { return true; }
     if (name === "range") {
       // A simple range: `bytes=` immediately followed by an integer start, `-`, optional integer
       // end, nothing else; start required, start <= end, both within JS safe-integer range.
@@ -11528,10 +11547,12 @@
   function __preflightCacheKey(absUrl, plan) {
     return plan.origin + " " + (plan.credentialed ? "1" : "0") + " " + absUrl;
   }
+  // The loop clock (consistent with setTimeout) for cache TTLs; falls back to Date.now().
+  function __corsNow() { try { return globalThis.__loopNow(); } catch (e) { return Date.now(); } }
   // True when a live cache entry already authorizes this request (so no preflight is needed).
   function __preflightCacheHit(absUrl, method, plan) {
     var e = globalThis.__corsPreflightCache[__preflightCacheKey(absUrl, plan)];
-    if (!e || Date.now() >= e.expires) { return false; }
+    if (!e || __corsNow() >= e.expires) { return false; }
     var m = String(method).toUpperCase();
     if (m !== "GET" && m !== "HEAD" && m !== "POST" && !e.methods[m]) { return false; }
     for (var i = 0; i < plan.nonSafelisted.length; i++) {
@@ -11549,7 +11570,7 @@
     var e = globalThis.__corsPreflightCache[key] || { methods: {}, headers: {}, expires: 0 };
     e.methods[String(method).toUpperCase()] = true;
     for (var i = 0; i < plan.nonSafelisted.length; i++) { e.headers[plan.nonSafelisted[i].toLowerCase()] = true; }
-    e.expires = Date.now() + age * 1000;
+    e.expires = __corsNow() + age * 1000;
     globalThis.__corsPreflightCache[key] = e;
   }
   // Issue the synchronous CORS preflight via the blocking `__request` primitive (unless a live cache

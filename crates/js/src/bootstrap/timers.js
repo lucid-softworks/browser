@@ -12,6 +12,11 @@
   Object.defineProperty(globalThis, "__timerErrors", { value: [], enumerable: false, configurable: true, writable: true });
   function nowMs() { try { return Date.now(); } catch (e) { return 0; } }
   function currentTime() { return loop.realtime ? (loop.now + (nowMs() - loop.realBase)) : loop.now; }
+  // The event loop's current time (ms), the same clock `setTimeout` schedules against — virtual
+  // (fast-forwarded) during load, real once realtime. Callers that must measure durations
+  // consistently with `setTimeout` (e.g. the CORS preflight cache TTL vs a `setTimeout`-based wait)
+  // use this rather than `Date.now()`, which would diverge under the load-time fast-forward.
+  Object.defineProperty(globalThis, "__loopNow", { value: currentTime, enumerable: false, configurable: true, writable: true });
 
   function schedule(fn, delay, args, repeat) {
     if (typeof fn !== "function") { return 0; }
