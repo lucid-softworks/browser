@@ -5635,21 +5635,11 @@
     if (!("offsetHeight" in el)) { el.offsetHeight = 0; }
     if (!("clientWidth" in el)) { el.clientWidth = 0; }
     if (!("clientHeight" in el)) { el.clientHeight = 0; }
-    // SVG geometry properties expose SVGAnimatedLength / SVGAnimatedRect objects whose `.baseVal`
-    // pages read (e.g. favicon generators do `svg.width.baseVal.value`). Provide zeroed stubs so
-    // those reads don't throw. Gated on SVG tags so HTML elements keep their own width/height attrs.
+    // SVG DOM: animated-attribute reflection (SVGAnimatedLength baseVal/animVal), the SMIL timeline
+    // controls on the <svg> root, and the animation-element API. Implemented in <svg> bootstrap;
+    // acts only on SVG-namespace elements, leaving HTML elements untouched.
     try {
-      var __svgTag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : "";
-      if (svgTags[__svgTag]) {
-        var __len = ["width", "height", "x", "y"];
-        for (var __si = 0; __si < __len.length; __si++) {
-          (function (p) {
-            if (!(p in el)) { def(el, p, { baseVal: { value: 0, valueAsString: "0", valueInSpecifiedUnits: 0 }, animVal: { value: 0 } }); }
-          })(__len[__si]);
-        }
-        if (!("viewBox" in el)) { def(el, "viewBox", { baseVal: { x: 0, y: 0, width: 0, height: 0 }, animVal: { x: 0, y: 0, width: 0, height: 0 } }); }
-        if (!("preserveAspectRatio" in el)) { def(el, "preserveAspectRatio", { baseVal: { align: 0, meetOrSlice: 0 }, animVal: { align: 0, meetOrSlice: 0 } }); }
-      }
+      if (typeof globalThis.__svgEnrich === "function") { globalThis.__svgEnrich(el); }
     } catch (e) {}
     // <canvas>: a REAL 2D context that records a display list of resolved drawing commands.
     // The JS side maintains drawing state (styles + a 2D affine transform + path) and pushes

@@ -186,6 +186,8 @@ pub(crate) fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
     eval_internal(scope, INDEXEDDB_BOOTSTRAP, "<indexeddb>");
     // Web Crypto SubtleCrypto (digest + HMAC) — depends on `crypto` from browser-env.
     eval_internal(scope, WEBCRYPTO_BOOTSTRAP, "<webcrypto>");
+    // SVG DOM (SVG* interfaces, animated-attribute reflection, SMIL) — depends on browser-env.
+    eval_internal(scope, SVG_BOOTSTRAP, "<svg>");
     // Expose elements with an `id` as named globals (HTML named-properties-on-window). The DOM is
     // already fully parsed by the time the environment is installed (the engine batches scripts
     // after `parser.finish()`), so every static-markup id is visible to author scripts that follow.
@@ -227,6 +229,11 @@ pub(crate) const INDEXEDDB_BOOTSTRAP: &str = include_str!("bootstrap/indexeddb.j
 /// export), a pure-JS implementation layered onto the `crypto` object from browser-env (whose
 /// getRandomValues already uses the OS CSPRNG via the `__cryptoRandom` native).
 pub(crate) const WEBCRYPTO_BOOTSTRAP: &str = include_str!("bootstrap/webcrypto.js");
+
+/// SVG DOM: the SVG* IDL interface constructors, animated-attribute reflection
+/// (SVGAnimatedLength.baseVal/animVal), and a SMIL animation engine. Depends on the element
+/// wrapper machinery + DOMException from <browser-env>; enrichElement calls into `__svgEnrich`.
+pub(crate) const SVG_BOOTSTRAP: &str = include_str!("bootstrap/svg.js");
 
 // ---------------------------------------------------------------------------------------------
 // Event loop drain + script evaluation against a V8 context.
