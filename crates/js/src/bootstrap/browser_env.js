@@ -11640,14 +11640,26 @@
       var curOrigin = __urlOrigin(st.url), nextOrigin = __urlOrigin(next.href);
       if (st.corsActive && curOrigin !== nextOrigin && st.reqOrigin !== curOrigin) { st.reqOrigin = "null"; }
       if (nextOrigin !== st.pageOrigin) { st.corsActive = true; }
-      // 303 (and 301/302 on POST) become a bodyless GET.
-      if (status === 303 || ((status === 301 || status === 302) && st.method === "POST")) { st.method = "GET"; st.body = ""; }
+      // 301/302 on POST, or 303 on any non-GET/HEAD method, become a bodyless GET (HEAD stays HEAD).
+      // Dropping the body also strips the request-body headers (Content-Encoding/Language/Location/
+      // Type — Content-Length is added by the host, not the author).
+      if (((status === 301 || status === 302) && st.method === "POST") ||
+          (status === 303 && st.method !== "GET" && st.method !== "HEAD")) {
+        st.method = "GET"; st.body = "";
+        var drop = ["content-encoding", "content-language", "content-location", "content-type", "content-length"];
+        for (var hk in st.headers) {
+          if (Object.prototype.hasOwnProperty.call(st.headers, hk) && drop.indexOf(hk.toLowerCase()) >= 0) {
+            delete st.headers[hk];
+          }
+        }
+      }
       st.url = next.href; st.hops++;
       return { kind: "redirect" };
     }
     var cors = (st.corsActive && st.mode === "cors") ? { crossOrigin: true, origin: st.reqOrigin, credentialed: st.credentialed } : null;
     var p = __processEnvelope(parsed, st.url, cors);
     if (p.networkError) { return { kind: "error" }; }
+    p.redirected = st.hops > 0;
     return { kind: "final", processed: p };
   }
   // Synchronous CORS fetch (XHR sync). Returns { networkError } or { networkError:false, processed }.
@@ -11851,7 +11863,7 @@
         function finish(p) {
           if (settled) { return; } settled = true;
           resolve(new globalThis.Response(p.body, {
-            status: p.status, statusText: p.statusText, headers: p.headers, url: p.url, type: p.type
+            status: p.status, statusText: p.statusText, headers: p.headers, url: p.url, type: p.type, redirected: !!p.redirected
           }));
         }
         function fail() { if (settled) { return; } settled = true; reject(new TypeError("Failed to fetch")); }
