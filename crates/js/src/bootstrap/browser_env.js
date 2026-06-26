@@ -2077,6 +2077,12 @@
     var vl = v.toLowerCase();
     if (/(^|[^a-z-])(var|env)\s*\(/i.test(v)) return true; // can't validate around substitutions
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
+    // inline-size / block-size: auto | content keywords | non-negative <length-percentage>
+    // (NOT none / border-width keywords, unlike the generic NONNEG set) — checked first.
+    if (name === "inline-size" || name === "block-size") {
+      if (vl === "auto" || vl === "min-content" || vl === "max-content" || vl === "fit-content" || /^fit-content\(/i.test(v)) { return true; }
+      return isValidLengthLike(v, false);
+    }
     if (hasOwn(NONNEG_LENGTH_LONGHANDS, name)) {
       if (vl === "auto" || vl === "none" || vl === "min-content" || vl === "max-content" ||
           vl === "fit-content" || vl === "thin" || vl === "medium" || vl === "thick" || /^fit-content\(/i.test(v)) return true;
@@ -2175,8 +2181,23 @@
   // the cascade within a declaration block resolves on importance, not source order. The CSSOM
   // `setProperty` path leaves this false so an explicit set always replaces.
   var __blockImportanceCascade = false;
+  // Length-valued longhands serialize a bare `0` with a unit ("0px"), per CSS.
+  var LENGTH_VALUED = (function () {
+    var o = Object.create(null);
+    var names = Object.keys(NONNEG_LENGTH_LONGHANDS).concat(["shape-margin",
+      "margin-top", "margin-right", "margin-bottom", "margin-left",
+      "top", "right", "bottom", "left", "inset-block-start", "inset-block-end",
+      "inset-inline-start", "inset-inline-end", "text-indent", "letter-spacing", "word-spacing",
+      "column-gap", "row-gap", "border-top-left-radius", "border-top-right-radius",
+      "border-bottom-left-radius", "border-bottom-right-radius", "flex-basis"]);
+    for (var i = 0; i < names.length; i++) { o[names[i]] = 1; }
+    return o;
+  })();
   function setDecl(out, name, val, important) {
     important = !!important;
+    if (val != null && hasOwn(LENGTH_VALUED, name) && /^[+-]?0(?:\.0*)?$/.test(String(val).trim())) {
+      val = "0px";
+    }
     var i = findDecl(out, name);
     if (val == null || val === "") { if (i >= 0) out.splice(i, 1); return; }
     if (i >= 0) {
