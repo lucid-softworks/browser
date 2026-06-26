@@ -1291,10 +1291,10 @@
     "stroke-linecap": ["butt", true], "stroke-linejoin": ["miter", true], "fill-rule": ["nonzero", true],
     "clip-rule": ["nonzero", true], "color-interpolation": ["srgb", true], "color-interpolation-filters": ["linearrgb", true],
     "image-rendering": ["auto", true], "shape-rendering": ["auto", true], "text-rendering": ["auto", true],
-    "paint-order": ["normal", true]
+    "paint-order": ["normal", true], "pointer-events": ["auto", true]
   };
   // camelCase aliases used for direct property access on the declaration.
-  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color", strokeLinecap: "stroke-linecap", strokeLinejoin: "stroke-linejoin", fillRule: "fill-rule", clipRule: "clip-rule", colorInterpolation: "color-interpolation", colorInterpolationFilters: "color-interpolation-filters", imageRendering: "image-rendering", shapeRendering: "shape-rendering", textRendering: "text-rendering", strokeMiterlimit: "stroke-miterlimit", markerStart: "marker-start", markerMid: "marker-mid", markerEnd: "marker-end", strokeDasharray: "stroke-dasharray", strokeDashoffset: "stroke-dashoffset", paintOrder: "paint-order", clipRule: "clip-rule" };
+  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color", strokeLinecap: "stroke-linecap", strokeLinejoin: "stroke-linejoin", fillRule: "fill-rule", clipRule: "clip-rule", colorInterpolation: "color-interpolation", colorInterpolationFilters: "color-interpolation-filters", imageRendering: "image-rendering", shapeRendering: "shape-rendering", textRendering: "text-rendering", strokeMiterlimit: "stroke-miterlimit", markerStart: "marker-start", markerMid: "marker-mid", markerEnd: "marker-end", strokeDasharray: "stroke-dasharray", strokeDashoffset: "stroke-dashoffset", paintOrder: "paint-order", clipRule: "clip-rule", pointerEvents: "pointer-events" };
   function svgAbsUrl(u) { try { return new URL(u, document.baseURI).href; } catch (e) { return u; } }
   // fill / stroke <paint>: none | <color> | <url> [none|<color>]? — computed serialization.
   function paintComputed(el, name) {
@@ -1376,6 +1376,7 @@
     "color-interpolation": { i: "srgb", h: true }, "color-interpolation-filters": { i: "linearrgb", h: true },
     "image-rendering": { i: "auto", h: true }, "shape-rendering": { i: "auto", h: true }, "text-rendering": { i: "auto", h: true },
     "paint-order": { i: "normal", h: true }, "visibility": { i: "visible", h: true },
+    "pointer-events": { i: "auto", h: true },
     "stroke-dasharray": { i: "none", h: true }, "stroke-dashoffset": { i: "0px", h: true },
     "x": { i: "0px", h: false }, "y": { i: "0px", h: false }, "cx": { i: "0px", h: false },
     "cy": { i: "0px", h: false }, "r": { i: "0px", h: false }, "rx": { i: "auto", h: false }, "ry": { i: "auto", h: false }
