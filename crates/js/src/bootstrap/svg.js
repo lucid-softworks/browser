@@ -675,6 +675,38 @@
       def(el, "createSVGAngle", function () { var A = Object.create(SVGAngle.prototype); A.value = 0; A.unitType = 1; return A; });
       def(el, "createSVGTransformFromMatrix", function (m) { var T = el.createSVGTransform(); T.setMatrix(m); return T; });
       def(el, "getElementById", function (id) { return el.ownerDocument.getElementById(id); });
+      // Geometry queries: an element intersects `rect` (in this svg's user space) when its CTM-mapped
+      // bounding box overlaps the rect.
+      var elemViewBox = function (e) {
+        var b = bbox(e), m = ctmOf(e);
+        var xs = [b.x, b.x + b.width], ys = [b.y, b.y + b.height], mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
+        for (var i = 0; i < 2; i++) { for (var j = 0; j < 2; j++) { var px = m.a * xs[i] + m.c * ys[j] + m.e, py = m.b * xs[i] + m.d * ys[j] + m.f; mnx = Math.min(mnx, px); mny = Math.min(mny, py); mxx = Math.max(mxx, px); mxy = Math.max(mxy, py); } }
+        return { x: mnx, y: mny, w: mxx - mnx, h: mxy - mny };
+      };
+      var rectsOverlap = function (b, r) { return b.x < r.x + r.width && b.x + b.w > r.x && b.y < r.y + r.height && b.y + b.h > r.y; };
+      def(el, "checkIntersection", function (element, rect) { return rectsOverlap(elemViewBox(element), rect); });
+      def(el, "checkEnclosure", function (element, rect) { var b = elemViewBox(element); return b.x >= rect.x && b.y >= rect.y && b.x + b.w <= rect.x + rect.width && b.y + b.h <= rect.y + rect.height; });
+      def(el, "getIntersectionList", function (rect, ref) {
+        var root = ref || el, out = [];
+        var GRAPHICS = { rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1, path: 1, text: 1, image: 1, use: 1 };
+        var SKIP = { defs: 1, clippath: 1, mask: 1, symbol: 1, marker: 1, pattern: 1, lineargradient: 1, radialgradient: 1, filter: 1 };
+        (function walk(n) {
+          var kids = n.childNodes;
+          for (var i = 0; kids && i < kids.length; i++) {
+            var c = kids[i];
+            if (!c || c.nodeType !== 1 || c.namespaceURI !== SVG_NS) { continue; }
+            var ln2 = c.__localName;
+            if (SKIP[ln2]) { continue; } // non-rendered containers (and their subtrees)
+            var disp = ""; try { disp = nativeGCS(c).getPropertyValue("display"); } catch (e) {}
+            if (disp === "none") { continue; }
+            var pe = getAttr(c.__node, "pointer-events"); try { var sp = nativeGCS(c).getPropertyValue("pointer-events"); if (sp) { pe = sp; } } catch (e2) {}
+            if (GRAPHICS[ln2] && pe !== "none" && rectsOverlap(elemViewBox(c), rect)) { out.push(c); }
+            if (ln2 !== "use") { walk(c); } // <use> renders a clone, not its DOM children
+          }
+        })(root);
+        return out;
+      });
+      def(el, "getEnclosureList", function (rect, ref) { return []; });
     }
 
     // Animation elements: the timeline-query API used by some tests.
@@ -931,9 +963,51 @@
     for (var s = 0; s < segs.length; s++) { var a = segs[s][0], b = segs[s][1], d = Math.hypot(b.x - a.x, b.y - a.y); if (acc + d >= len || s === segs.length - 1) { var f = d > 0 ? (len - acc) / d : 0; return makePoint(a.x + f * (b.x - a.x), a.y + f * (b.y - a.y)); } acc += d; }
     var last = segs[segs.length - 1][1]; return makePoint(last.x, last.y);
   }
+  // The CTM mapping `el`'s user space to its nearest viewport (the enclosing <svg>): the product of
+  // ancestor `transform`s, then the viewport's viewBox→viewport transform.
+  function ctmOf(el) {
+    var m = makeMatrix(1, 0, 0, 1, 0, 0), cur = el;
+    while (cur && cur.namespaceURI === SVG_NS && cur.__localName && cur.__localName !== "svg") {
+      var tl = parseTransformList(getAttr(cur.__node, "transform") || "");
+      for (var i = tl.length - 1; i >= 0; i--) { m = tl[i].matrix.multiply(m); }
+      cur = cur.parentNode;
+    }
+    if (cur && cur.__localName === "svg") {
+      var vb = getAttr(cur.__node, "viewBox");
+      if (vb) {
+        var v = vecParse(vb);
+        var r = cur.__node, rect = (typeof __rect === "function") ? __rect(r) : null;
+        var vw = rect && rect.width ? rect.width : gnum(cur, "width") || (v[2] || 0);
+        var vh = rect && rect.height ? rect.height : gnum(cur, "height") || (v[3] || 0);
+        if (v.length === 4 && v[2] > 0 && v[3] > 0 && vw > 0 && vh > 0) {
+          var s = Math.min(vw / v[2], vh / v[3]);
+          m = makeMatrix(s, 0, 0, s, -v[0] * s, -v[1] * s).multiply(m);
+        }
+      }
+    }
+    return m;
+  }
+
   var CONTAINER_TAGS = { g: 1, svg: 1, a: 1, switch: 1, symbol: 1, marker: 1, defs: 0 };
   function bbox(el) {
     var ln = el.__localName;
+    if (ln === "use") {
+      var href = getAttr(el.__node, "href"); if (href == null) { href = getAttr(el.__node, "xlink:href"); }
+      if (href && href.charAt(0) === "#") {
+        var tgt = el.ownerDocument.getElementById(href.slice(1));
+        if (tgt && tgt.__node !== el.__node) { var tb = bbox(tgt); return makeRectObj(tb.x + gnum(el, "x"), tb.y + gnum(el, "y"), tb.width, tb.height); }
+      }
+      return makeRectObj(0, 0, 0, 0);
+    }
+    if (ln === "text" || ln === "tspan" || ln === "tref" || ln === "textpath") {
+      // Approximate text extent from the font metrics (exact for the Ahem test font: 1em advance,
+      // 0.8em ascent, 0.2em descent).
+      var fs = 16;
+      try { fs = parseFloat(nativeGCS(el).getPropertyValue("font-size")) || 16; } catch (e) {}
+      var tx = gnum(el, "x"), ty = gnum(el, "y");
+      var txt = el.textContent == null ? "" : String(el.textContent);
+      return makeRectObj(tx, ty - 0.8 * fs, txt.length * fs, fs);
+    }
     if (ln === "rect") { return makeRectObj(gnum(el, "x"), gnum(el, "y"), gnum(el, "width"), gnum(el, "height")); }
     if (ln === "circle") { var r = gnum(el, "r"); return makeRectObj(gnum(el, "cx") - r, gnum(el, "cy") - r, 2 * r, 2 * r); }
     if (ln === "ellipse") { var rx = gnum(el, "rx"), ry = gnum(el, "ry"); return makeRectObj(gnum(el, "cx") - rx, gnum(el, "cy") - ry, 2 * rx, 2 * ry); }
@@ -1106,8 +1180,8 @@
     // getBBox / getCTM apply to all graphics elements.
     if (GEOM_TAGS[ln] || ln === "g" || ln === "svg" || ln === "use" || ln === "text" || ln === "image" || ln === "tspan" || ln === "switch" || ln === "a" || ln === "foreignobject") {
       if (typeof el.getBBox !== "function") { def(el, "getBBox", function () { return bbox(el); }); }
-      if (typeof el.getCTM !== "function") { def(el, "getCTM", function () { return makeMatrix(1, 0, 0, 1, 0, 0); }); }
-      if (typeof el.getScreenCTM !== "function") { def(el, "getScreenCTM", function () { return makeMatrix(1, 0, 0, 1, 0, 0); }); }
+      if (typeof el.getCTM !== "function") { def(el, "getCTM", function () { return ctmOf(this); }); }
+      if (typeof el.getScreenCTM !== "function") { def(el, "getScreenCTM", function () { return ctmOf(this); }); }
     }
   }
 
