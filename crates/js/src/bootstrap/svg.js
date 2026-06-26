@@ -1252,7 +1252,8 @@
     var raw = rawStyleOrAttr(el, "text-decoration-color");
     if (raw == null) { return nativeColor(el); } // initial currentColor
     var r = raw.trim().toLowerCase();
-    if (r === "currentcolor") { return nativeColor(el); }
+    // initial / unset / revert (not inherited) all resolve to the initial currentColor.
+    if (r === "currentcolor" || r === "initial" || r === "unset" || r === "revert") { return nativeColor(el); }
     if (r === "inherit") {
       var p = svgParent(el);
       if (p) {
@@ -1308,7 +1309,8 @@
   }
   function svgComputed(el, name) {
     // Resolve the CSS-wide keywords (initial | inherit | unset | revert) when set explicitly.
-    var meta = SVG_PROP_META[name];
+    // (text-decoration-color has its own currentColor-aware resolution in decoColor.)
+    var meta = name === "text-decoration-color" ? null : SVG_PROP_META[name];
     if (meta) {
       var rawk = rawStyleOrAttr(el, name);
       if (rawk != null) {
