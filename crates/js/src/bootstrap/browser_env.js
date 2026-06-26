@@ -11360,15 +11360,75 @@
   }
   // A request header is CORS-safelisted (no preflight needed) when it is accept / accept-language /
   // content-language, or a content-type whose essence is one of the three form/​plain MIME types.
+  // An HTTP token (tchar+) — the grammar for a MIME type/subtype.
+  var __httpToken = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+  // True if `value` contains a CORS-unsafe request-header byte (controls except HT, and a set of
+  // separators/quote/DEL) — such a byte disqualifies a content-type from being safelisted.
+  function __hasCorsUnsafeByte(value) {
+    var s = String(value);
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c < 0x20 && c !== 0x09) { return true; }
+      if (c === 0x22 || c === 0x28 || c === 0x29 || c === 0x3A || c === 0x3C || c === 0x3E ||
+          c === 0x3F || c === 0x40 || c === 0x5B || c === 0x5C || c === 0x5D || c === 0x7B ||
+          c === 0x7D || c === 0x7F) { return true; }
+    }
+    return false;
+  }
+  // Parse a MIME type per the MIME Sniffing standard, returning its lowercased essence
+  // ("type/subtype") or null on failure. Parameters are ignored (essence only).
+  function __mimeEssence(input) {
+    var s = String(input).replace(/^[\t\n\r ]+/, "").replace(/[\t\n\r ]+$/, "");
+    var slash = s.indexOf("/");
+    if (slash < 0) { return null; }
+    var type = s.slice(0, slash);
+    if (!__httpToken.test(type)) { return null; }
+    var rest = s.slice(slash + 1);
+    var semi = rest.indexOf(";");
+    var subtype = (semi < 0 ? rest : rest.slice(0, semi)).replace(/[\t\n\r ]+$/, "");
+    if (!__httpToken.test(subtype)) { return null; }
+    return (type + "/" + subtype).toLowerCase();
+  }
   function __isSafelistedRequestHeader(name, value) {
     name = String(name).toLowerCase();
     if (name === "accept" || name === "accept-language" || name === "content-language") { return true; }
+    if (name === "range") {
+      // A simple range: `bytes=` immediately followed by an integer start, `-`, optional integer
+      // end, nothing else; start required, start <= end, both within JS safe-integer range.
+      var v = String(value);
+      if (v.slice(0, 6) !== "bytes=") { return false; }
+      var m = /^(\d*)-(\d*)$/.exec(v.slice(6));
+      if (!m || m[1] === "") { return false; }
+      var start = Number(m[1]);
+      if (!Number.isSafeInteger(start)) { return false; }
+      if (m[2] !== "") {
+        var end = Number(m[2]);
+        if (!Number.isSafeInteger(end) || start > end) { return false; }
+      }
+      return true;
+    }
     if (name === "content-type") {
-      var essence = String(value).split(";")[0].trim().toLowerCase();
+      if (__hasCorsUnsafeByte(value)) { return false; }
+      var essence = __mimeEssence(value);
       return essence === "application/x-www-form-urlencoded" ||
              essence === "multipart/form-data" || essence === "text/plain";
     }
     return false;
+  }
+  // Parse Access-Control-Expose-Headers strictly: a comma-separated list whose every non-empty
+  // element (OWS = SP/HT only) must be a valid HTTP token. Returns lowercased names, or null if any
+  // element is malformed (the whole header then fails — nothing beyond the safelist is exposed).
+  function __parseExposeList(value) {
+    if (value == null) { return []; }
+    var parts = String(value).split(",");
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i].replace(/^[ \t]+/, "").replace(/[ \t]+$/, "");
+      if (t === "") { continue; }
+      if (!__httpToken.test(t)) { return null; }
+      out.push(t.toLowerCase());
+    }
+    return out;
   }
   // Split an Access-Control-Allow/Expose list header into trimmed, lowercased, non-empty tokens.
   function __splitTokens(value) {
@@ -11416,7 +11476,10 @@
   // credentialed).
   function __exposedHeaders(raw, crossOrigin, credentialed) {
     var out = new globalThis.Headers();
-    var exposeList = __splitTokens(raw.get("access-control-expose-headers"));
+    // Access-Control-Expose-Headers is a strict comma-separated list of HTTP tokens (OWS = SP/HT
+    // only). If any element is not a valid token the whole list fails to parse and nothing extra is
+    // exposed (only the safelisted set), per the Fetch standard's "extract header list values".
+    var exposeList = __parseExposeList(raw.get("access-control-expose-headers")) || [];
     var exposeAll = crossOrigin && !credentialed && exposeList.indexOf("*") >= 0;
     raw.forEach(function (value, name) {
       name = String(name).toLowerCase();
