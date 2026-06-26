@@ -11605,6 +11605,9 @@
     for (var k in st.headers) { if (Object.prototype.hasOwnProperty.call(st.headers, k)) { h[k] = st.headers[k]; } }
     h[__noRedirectHeader] = "1";
     if (st.corsActive && st.mode !== "no-cors") { h["Origin"] = st.reqOrigin; }
+    // Cookies follow the credentials mode: a cross-origin request sends/stores them only when
+    // credentialed (XHR withCredentials / fetch credentials:"include"). Same-origin always does.
+    if (st.corsActive && !st.credentialed) { h["X-Lucid-No-Credentials"] = "1"; }
     return h;
   }
   // Run this hop's preflight if CORS is active and the request isn't "simple". Returns false on

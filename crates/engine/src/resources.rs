@@ -56,19 +56,24 @@ pub(crate) fn build_request_fetcher(
         // must NOT be auto-followed with an internal `X-Lucid-No-Redirect` sentinel. Strip it here so
         // it never reaches the network, and use it to disable redirect-following for that request.
         let mut no_redirect = false;
+        let mut no_credentials = false;
         headers.retain(|(name, _)| {
             if name.eq_ignore_ascii_case("x-lucid-no-redirect") {
                 no_redirect = true;
+                false
+            } else if name.eq_ignore_ascii_case("x-lucid-no-credentials") {
+                no_credentials = true;
                 false
             } else {
                 true
             }
         });
         // Fetch semantics: a 4xx/5xx is a real response (`ok:false`), not a transport error. A CORS
-        // preflight (OPTIONS) likewise must not follow redirects.
+        // preflight (OPTIONS) likewise must not follow redirects, and is always uncredentialed.
         let opts = net::RequestOpts {
             allow_error_status: true,
             follow_redirects: !no_redirect && !method.eq_ignore_ascii_case("OPTIONS"),
+            credentials: !no_credentials && !method.eq_ignore_ascii_case("OPTIONS"),
         };
         let resp = net::request_ext(method, url, body_opt, &headers, opts).ok()?;
         let ok = (200..300).contains(&resp.status);

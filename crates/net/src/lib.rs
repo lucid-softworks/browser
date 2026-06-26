@@ -976,6 +976,10 @@ pub struct RequestOpts {
     /// Follow 3xx redirects (the default). A CORS preflight sets this false so a redirected
     /// preflight surfaces as a 3xx response the caller can reject.
     pub follow_redirects: bool,
+    /// Send the shared jar's cookies and store the response's `Set-Cookie` (the default). A
+    /// non-credentialed CORS request (XHR `withCredentials=false` / fetch credentials != include,
+    /// cross-origin) sets this false so it neither sends nor stores cookies.
+    pub credentials: bool,
 }
 
 impl Default for RequestOpts {
@@ -983,6 +987,7 @@ impl Default for RequestOpts {
         RequestOpts {
             allow_error_status: false,
             follow_redirects: true,
+            credentials: true,
         }
     }
 }
@@ -1160,8 +1165,13 @@ fn request_streaming_inner(
     let has_body = matches!(method_uc.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
 
     // Inject cookies for this request URL from our shared jar (document.cookie and HTTP share it).
-    // The HTTP Cookie header includes HttpOnly cookies (unlike document.cookie).
-    let cookie_header = cookies_for_request(url);
+    // The HTTP Cookie header includes HttpOnly cookies (unlike document.cookie). A non-credentialed
+    // request (`opts.credentials == false`) sends none.
+    let cookie_header = if opts.credentials {
+        cookies_for_request(url)
+    } else {
+        String::new()
+    };
     let has_cookie_header = !cookie_header.is_empty();
 
     // Present a mainstream browser User-Agent. Many sites (Google, etc.) serve a stripped
@@ -1263,11 +1273,14 @@ fn request_streaming_inner(
     };
 
     // Store any Set-Cookie headers from the final response into our shared jar so that
-    // document.cookie can see them (and subsequent requests will send them).
-    for sc in resp.all("set-cookie") {
-        // A Set-Cookie response header (HttpOnly honoured), against the URL that sent it
-        // (final_url after redirects).
-        let _ = set_cookie_from_http(&final_url, sc);
+    // document.cookie can see them (and subsequent requests will send them). A non-credentialed
+    // request (`opts.credentials == false`) ignores them.
+    if opts.credentials {
+        for sc in resp.all("set-cookie") {
+            // A Set-Cookie response header (HttpOnly honoured), against the URL that sent it
+            // (final_url after redirects).
+            let _ = set_cookie_from_http(&final_url, sc);
+        }
     }
 
     let content_type = resp
