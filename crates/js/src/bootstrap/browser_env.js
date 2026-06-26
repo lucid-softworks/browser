@@ -2104,8 +2104,19 @@
       if (vl === "auto") return true;
       return /^[-+]?\d+$/.test(v);
     }
-    if (name === "opacity") {
-      return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(v);
+    // <alpha-value>: <number> | <percentage> (single token, no trailing dot). The value is not
+    // clamped at parse time (computed value clamps).
+    if (name === "opacity" || name === "fill-opacity" || name === "stroke-opacity" ||
+        name === "stop-opacity" || name === "flood-opacity" || name === "shape-image-threshold") {
+      return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(v) && !/\.(?:%|$)/.test(v);
+    }
+    // fill / stroke <paint>: none | <color> | <url> [none | <color>]?.
+    if (name === "fill" || name === "stroke") {
+      if (vl === "none" || vl === "currentcolor" || vl === "context-fill" || vl === "context-stroke") { return true; }
+      if (isValidColor(v)) { return true; }
+      var pm = /^url\(\s*(?:"[^"]*"|'[^']*'|[^)\s]*)\s*\)\s*([\s\S]*)$/i.exec(v);
+      if (pm) { var pfb = pm[1].trim(); return pfb === "" || pfb.toLowerCase() === "none" || isValidColor(pfb); }
+      return false;
     }
     // SVG keyword (enumerated) presentation properties: a single keyword from a fixed set.
     if (hasOwn(SVG_ENUM_VALUES, name)) { return SVG_ENUM_VALUES[name].indexOf(vl) >= 0; }
@@ -2230,10 +2241,16 @@
     for (var i = 0; i < names.length; i++) { o[names[i]] = 1; }
     return o;
   })();
+  var OPACITY_VALUED = { "opacity": 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "flood-opacity": 1, "shape-image-threshold": 1 };
   function setDecl(out, name, val, important) {
     important = !!important;
     if (val != null && hasOwn(LENGTH_VALUED, name) && /^[+-]?0(?:\.0*)?$/.test(String(val).trim())) {
       val = "0px";
+    }
+    // <alpha-value> properties serialize a percentage as its number ratio (50% -> 0.5).
+    if (val != null && hasOwn(OPACITY_VALUED, name)) {
+      var am = /^([-+]?(?:\d+\.?\d*|\.\d+))%$/.exec(String(val).trim());
+      if (am) { val = String(parseFloat(am[1]) / 100); }
     }
     var i = findDecl(out, name);
     if (val == null || val === "") { if (i >= 0) out.splice(i, 1); return; }

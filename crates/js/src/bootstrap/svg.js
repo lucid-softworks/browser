@@ -1276,7 +1276,12 @@
       if (rw != null && /%\s*$/.test(rw.trim())) { return rw.trim(); }
       return numOf(el, "stroke-width") + "px";
     }
-    if (SVG_NUM_PROPS[name]) { return String(numOf(el, name)); }
+    if (SVG_NUM_PROPS[name]) {
+      var nv = numOf(el, name);
+      // <alpha-value> properties clamp to [0,1] in the computed value.
+      if (name === "opacity" || name === "fill-opacity" || name === "stroke-opacity" || name === "stop-opacity") { nv = Math.max(0, Math.min(1, nv)); }
+      return String(nv);
+    }
     if (name === "stroke-miterlimit") {
       var rm = rawStyleOrAttr(el, "stroke-miterlimit");
       if (rm == null || rm === "inherit") { var pm = svgParent(el); return pm ? svgComputed(pm, "stroke-miterlimit") : "4"; }
