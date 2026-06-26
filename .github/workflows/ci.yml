@@ -63,9 +63,11 @@ jobs:
         with:
           shared-key: release-deps
       - uses: mozilla-actions/sccache-action@v0.0.9
-      # Engine font tests need a system TTF; Linux runners ship none by default.
-      - name: Install fonts
-        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
+      # fonts-*: engine font tests need a system TTF (Linux runners ship none). pkg-config +
+      # libglib2.0-dev: only needed when V8 is built from source (the fallback in "Build + test") —
+      # GN's pkg_config probes glib during `gn gen`.
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation pkg-config libglib2.0-dev
       # The `ffi` crate is a cdylib that statically embeds V8; on Linux the V8 static lib's
       # thread-locals can't be linked into a shared object (R_X86_64_TPOFF32 against -shared). It's
       # the macOS-shell-only C ABI anyway (Linux/Windows shells link the engine crate directly),

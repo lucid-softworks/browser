@@ -80,6 +80,9 @@ jobs:
         with:
           shared-key: release-deps
       - uses: mozilla-actions/sccache-action@v0.0.9
+      # Only needed when V8 is built from source (the fallback below): GN's pkg_config probes glib.
+      - name: Install V8 source-build deps
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libglib2.0-dev
       - name: Build WebDriver server
         run: |
           # See ci.yml: the prebuilt V8 static lib is carried in the shared cache; if it's missing,
