@@ -11515,9 +11515,42 @@
       nonSafelisted: nonSafelisted, credentialed: credentialed
     };
   }
-  // Issue the synchronous CORS preflight via the blocking `__request` primitive. Returns true when it
-  // passes. Used by both sync XHR and (blockingly, before the async actual request) async callers.
+  // The CORS-preflight result cache (per page realm): key -> { methods, headers, expires(ms) }.
+  // A subsequent request whose method and non-safelisted header names are already covered by a live
+  // entry skips the preflight, per the Fetch standard's "CORS-preflight cache".
+  globalThis.__corsPreflightCache = globalThis.__corsPreflightCache || {};
+  function __preflightCacheKey(absUrl, plan) {
+    return plan.origin + " " + (plan.credentialed ? "1" : "0") + " " + absUrl;
+  }
+  // True when a live cache entry already authorizes this request (so no preflight is needed).
+  function __preflightCacheHit(absUrl, method, plan) {
+    var e = globalThis.__corsPreflightCache[__preflightCacheKey(absUrl, plan)];
+    if (!e || Date.now() >= e.expires) { return false; }
+    var m = String(method).toUpperCase();
+    if (m !== "GET" && m !== "HEAD" && m !== "POST" && !e.methods[m]) { return false; }
+    for (var i = 0; i < plan.nonSafelisted.length; i++) {
+      if (!e.headers[plan.nonSafelisted[i].toLowerCase()]) { return false; }
+    }
+    return true;
+  }
+  // Store a successful preflight: cache the method + non-safelisted header names with a TTL from
+  // Access-Control-Max-Age (absent/blank -> a 5s default; <= 0 -> not cached).
+  function __preflightCacheStore(absUrl, method, plan, headers) {
+    var raw = headers.get("access-control-max-age");
+    var age = (raw == null || raw.trim() === "") ? 5 : parseInt(raw.trim(), 10);
+    if (!isFinite(age) || age <= 0) { return; }
+    var key = __preflightCacheKey(absUrl, plan);
+    var e = globalThis.__corsPreflightCache[key] || { methods: {}, headers: {}, expires: 0 };
+    e.methods[String(method).toUpperCase()] = true;
+    for (var i = 0; i < plan.nonSafelisted.length; i++) { e.headers[plan.nonSafelisted[i].toLowerCase()] = true; }
+    e.expires = Date.now() + age * 1000;
+    globalThis.__corsPreflightCache[key] = e;
+  }
+  // Issue the synchronous CORS preflight via the blocking `__request` primitive (unless a live cache
+  // entry already covers it). Returns true when the request may proceed. Used by both sync XHR and
+  // (blockingly, before the async actual request) async callers.
   function __runPreflightSync(method, absUrl, plan) {
+    if (__preflightCacheHit(absUrl, method, plan)) { return true; }
     var pre = { "Origin": plan.origin, "Access-Control-Request-Method": String(method).toUpperCase() };
     if (plan.nonSafelisted.length > 0) { pre["Access-Control-Request-Headers"] = plan.nonSafelisted.join(","); }
     var env = globalThis.__request("OPTIONS", absUrl, "", JSON.stringify(pre));
@@ -11530,7 +11563,9 @@
         var p = parsed.headers[i]; if (p && p.length >= 2) { h.set(String(p[0]), String(p[1])); }
       }
     }
-    return __preflightOk(h, parsed.status | 0, method, plan.nonSafelisted, plan.origin, plan.credentialed);
+    if (!__preflightOk(h, parsed.status | 0, method, plan.nonSafelisted, plan.origin, plan.credentialed)) { return false; }
+    __preflightCacheStore(absUrl, method, plan, h);
+    return true;
   }
 
   // Async fetch plumbing. `fetch()` calls the non-blocking native `__startFetch`, which spawns a
