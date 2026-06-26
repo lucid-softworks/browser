@@ -350,6 +350,36 @@
     return { value: v, additive: additive };
   }
 
+  // The simple-duration fraction (and repeat iteration) of an animation at time `t`, or null when
+  // it has no effect. Shared by the scalar/vector and path animation paths.
+  function animTiming(a, t) {
+    var ga = function (n) { var v = getAttr(a.__node, n); return v == null ? null : v; };
+    var begin = parseBegin(ga("begin"));
+    var dur = parseClock(ga("dur"));
+    if (dur == null || dur <= 0) { dur = Infinity; }
+    var rc = ga("repeatCount");
+    var reps = rc === "indefinite" ? Infinity : (rc != null ? num(rc) : 1);
+    if (!(reps > 0)) { reps = 1; }
+    var activeDur = dur === Infinity ? Infinity : dur * reps;
+    var repeatDur = parseClock(ga("repeatDur"));
+    if (repeatDur != null && repeatDur < activeDur) { activeDur = repeatDur; }
+    var fill = ga("fill") || "remove";
+    var local = t - begin;
+    if (local < 0) { return null; }
+    var simpleDur = dur === Infinity ? activeDur : dur;
+    var iteration, fraction;
+    if (activeDur !== Infinity && local >= activeDur) {
+      if (fill !== "freeze") { return null; }
+      iteration = simpleDur === Infinity ? 0 : Math.floor(activeDur / simpleDur);
+      if (simpleDur !== Infinity && Math.abs(iteration * simpleDur - activeDur) < 1e-9 && iteration > 0) { iteration -= 1; }
+      fraction = 1;
+    } else {
+      iteration = simpleDur === Infinity ? 0 : Math.floor(local / simpleDur);
+      fraction = simpleDur === Infinity ? 0 : (local - iteration * simpleDur) / simpleDur;
+    }
+    return { fraction: fraction, iteration: iteration };
+  }
+
   function isAnimEl(el) {
     var ln = el && el.__localName;
     return ln === "animate" || ln === "set" || ln === "animatecolor" || ln === "animatetransform" || ln === "animatemotion";
@@ -905,19 +935,90 @@
   function makePoint(x, y) { var P = Object.create(globalThis.SVGPoint.prototype); P.x = x; P.y = y; def(P, "matrixTransform", function (m) { return makePoint(m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f); }); return P; }
   function makeRectObj(x, y, w, h) { var R = Object.create(globalThis.SVGRect.prototype); R.x = x; R.y = y; R.width = w; R.height = h; return R; }
 
-  // Parse `d` into SVGPathData-style segments and serialize back.
-  function getPathData(el) {
-    var d = getAttr(el.__node, "d") || ""; var out = [];
-    var toks = d.match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || []; var i = 0, prev = "";
-    var ARGS = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 };
+  // Parse a `d` string into SVGPathData-style segments [{type, values}].
+  var PATH_ARGS = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 };
+  function parsePathDataStr(d) {
+    var out = [];
+    var toks = String(d).match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || []; var i = 0, prev = "";
     while (i < toks.length) {
       var t = toks[i]; var cmd;
       if (/[a-zA-Z]/.test(t)) { cmd = t; i++; } else { cmd = (prev === "M") ? "L" : (prev === "m") ? "l" : prev; if (!cmd) { i++; continue; } }
-      var n = ARGS[cmd.toLowerCase()]; if (n == null) { continue; }
+      var n = PATH_ARGS[cmd.toLowerCase()]; if (n == null) { continue; }
       var vals = []; for (var k = 0; k < n; k++) { vals.push(parseFloat(toks[i++])); }
       out.push({ type: cmd, values: vals }); prev = cmd;
     }
     return out;
+  }
+  function getPathData(el) { return parsePathDataStr(getAttr(el.__node, "d") || ""); }
+
+  // SVGPathSeg-style objects (the deprecated pathSegList API, used by path-animation tests). We do
+  // not expose a global SVGPathSeg interface (historical.html requires it stay removed) — just plain
+  // objects with `pathSegTypeAsLetter` and the per-command coordinate fields.
+  var PATH_FIELDS = {
+    M: ["x", "y"], L: ["x", "y"], C: ["x1", "y1", "x2", "y2", "x", "y"], Q: ["x1", "y1", "x", "y"],
+    S: ["x2", "y2", "x", "y"], T: ["x", "y"], A: ["r1", "r2", "angle", "largeArcFlag", "sweepFlag", "x", "y"],
+    H: ["x"], V: ["y"], Z: []
+  };
+  function segToObj(seg) {
+    var o = { pathSegTypeAsLetter: seg.type };
+    var f = PATH_FIELDS[seg.type.toUpperCase()] || [];
+    for (var i = 0; i < f.length; i++) { o[f[i]] = seg.values[i]; }
+    return o;
+  }
+  function segListFromString(d) { return parsePathDataStr(d).map(segToObj); }
+
+  // Add per-coordinate b*scale onto a (segment lists must share command structure).
+  function addScaledSegs(a, b, scale) {
+    if (!structureMatches(a, b)) { return a; }
+    return a.map(function (s, i) { return { type: s.type, values: s.values.map(function (v, k) { return v + scale * b[i].values[k]; }) }; });
+  }
+  function lerpSegs(a, b, f) {
+    if (!structureMatches(a, b)) { return f < 0.5 ? a : b; }
+    return a.map(function (s, i) { return { type: s.type, values: s.values.map(function (v, k) { return v + f * (b[i].values[k] - v); }) }; });
+  }
+  function structureMatches(a, b) {
+    if (a.length !== b.length) { return false; }
+    for (var i = 0; i < a.length; i++) { if (a[i].type !== b[i].type) { return false; } }
+    return true;
+  }
+  // The animated `d` segments at the current time (base when no `d` animation is active).
+  function pathAnimSegs(el) {
+    var node = el.__node;
+    var baseSegs = parsePathDataStr(getAttr(node, "d") || "");
+    var anims = collectAnimations(el, "d");
+    if (!anims.length) { return baseSegs; }
+    var t = currentTime(); var segs = baseSegs;
+    for (var i = 0; i < anims.length; i++) {
+      var a = anims[i]; var tm = animTiming(a, t); if (tm == null) { continue; }
+      var ga = function (nm) { var v = getAttr(a.__node, nm); return v == null ? null : v; };
+      var from = ga("from"), to = ga("to"), by = ga("by"), values = ga("values");
+      var calc = ga("calcMode") || "linear";
+      if (a.__localName === "set") { calc = "discrete"; }
+      if (values != null) {
+        var lists = splitList(values).map(parsePathDataStr);
+        if (!lists.length) { continue; }
+        segs = interpSegLists(lists, tm.fraction, calc);
+      } else if (by != null && from == null) {
+        segs = addScaledSegs(baseSegs, parsePathDataStr(by), tm.fraction);
+      } else if (from != null && by != null) {
+        segs = addScaledSegs(parsePathDataStr(from), parsePathDataStr(by), tm.fraction);
+      } else if (from != null && to != null) {
+        segs = calc === "discrete" ? (tm.fraction < 1 ? parsePathDataStr(from) : parsePathDataStr(to)) : lerpSegs(parsePathDataStr(from), parsePathDataStr(to), tm.fraction);
+      } else if (to != null) {
+        segs = calc === "discrete" ? (tm.fraction < 1 ? baseSegs : parsePathDataStr(to)) : lerpSegs(baseSegs, parsePathDataStr(to), tm.fraction);
+      } else if (from != null) {
+        segs = parsePathDataStr(from);
+      }
+    }
+    return segs;
+  }
+  function interpSegLists(lists, f, calc) {
+    var n = lists.length;
+    if (n === 1) { return lists[0]; }
+    if (calc === "discrete") { return lists[Math.min(Math.floor(f * n), n - 1)]; }
+    var seg = Math.min(Math.floor(f * (n - 1)), n - 2);
+    var local = f * (n - 1) - seg;
+    return lerpSegs(lists[seg], lists[seg + 1], local);
   }
   function setPathData(el, segs) {
     var d = (segs || []).map(function (s) { return s.type + (s.values && s.values.length ? " " + s.values.join(" ") : ""); }).join(" ");
@@ -939,6 +1040,9 @@
       if (ln === "path") {
         def(el, "getPathData", function () { return getPathData(el); });
         def(el, "setPathData", function (segs) { setPathData(el, segs); });
+        // Deprecated pathSegList API (still used by path-animation tests): base + animated seg lists.
+        Object.defineProperty(el, "pathSegList", { get: function () { return parsePathDataStr(getAttr(el.__node, "d") || "").map(segToObj); }, configurable: true, enumerable: true });
+        Object.defineProperty(el, "animatedPathSegList", { get: function () { return pathAnimSegs(el).map(segToObj); }, configurable: true, enumerable: true });
       }
     }
     // getBBox / getCTM apply to all graphics elements.
