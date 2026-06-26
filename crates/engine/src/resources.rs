@@ -563,18 +563,26 @@ pub(crate) fn collect_images(
         doc: &dom::Document,
         id: dom::NodeId,
         base: &str,
-        out: &mut Vec<(dom::NodeId, String)>,
+        out: &mut Vec<(dom::NodeId, String, bool)>,
     ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("img") {
-                if let Some(src) = e.attrs.get("src") {
-                    let src = src.trim();
-                    // Keep `data:` URLs verbatim (decoded inline below); resolve the rest.
-                    if src.starts_with("data:") {
-                        out.push((id, src.to_string()));
-                    } else if let Some(abs) = resolve_url(base, src) {
-                        out.push((id, abs));
-                    }
+            // `<img src>`, and `<object data>` / `<embed src>` (an SVG document context that, unlike
+            // an image, loads its external resources — tracked by the `is_object` flag).
+            let (attr_url, is_object) = if e.tag.eq_ignore_ascii_case("img") {
+                (e.attrs.get("src"), false)
+            } else if e.tag.eq_ignore_ascii_case("object") {
+                (e.attrs.get("data"), true)
+            } else if e.tag.eq_ignore_ascii_case("embed") {
+                (e.attrs.get("src"), true)
+            } else {
+                (None, false)
+            };
+            if let Some(src) = attr_url {
+                let src = src.trim();
+                if src.starts_with("data:") {
+                    out.push((id, src.to_string(), is_object));
+                } else if let Some(abs) = resolve_url(base, src) {
+                    out.push((id, abs, is_object));
                 }
             }
         }
@@ -585,10 +593,21 @@ pub(crate) fn collect_images(
     let mut targets = Vec::new();
     walk(doc, doc.root(), base, &mut targets);
     if targets.len() > MAX_IMAGES {
-        for (_, url) in targets.drain(MAX_IMAGES..) {
+        for (_, url, _) in targets.drain(MAX_IMAGES..) {
             console.push(format!(
                 "[skipped image (limit {MAX_IMAGES} reached): {url}]"
             ));
+        }
+    }
+
+    // An object/embed SVG (vs a raster/img source) is decoded with its background applied.
+    fn decode_src(bytes: &[u8], ctype: &str, url: &str, is_object: bool, base: &str) -> Option<DecodedImage> {
+        let ct = ctype.to_ascii_lowercase();
+        let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+        if is_object && is_svg_source(&ct, &path, bytes) {
+            decode_svg_object(bytes, base)
+        } else {
+            decode_any_image(bytes, ctype, url)
         }
     }
 
@@ -596,14 +615,14 @@ pub(crate) fn collect_images(
     // small pool of scoped threads, since they're independent and order doesn't matter.
     let (data_targets, net_targets): (Vec<_>, Vec<_>) = targets
         .into_iter()
-        .partition(|(_, url)| url.starts_with("data:"));
+        .partition(|(_, url, _)| url.starts_with("data:"));
 
     let mut results: Vec<(dom::NodeId, String, Result<DecodedImage, String>)> = Vec::new();
-    for (node, url) in data_targets {
+    for (node, url, is_object) in data_targets {
         let r = decode_data_url(&url)
             .ok_or_else(|| "malformed data: URL".to_string())
             .and_then(|b| {
-                decode_any_image(&b, "", &url).ok_or_else(|| "decode failed".to_string())
+                decode_src(&b, "", &url, is_object, base).ok_or_else(|| "decode failed".to_string())
             });
         results.push((node, url, r));
     }
@@ -613,7 +632,7 @@ pub(crate) fn collect_images(
         // CDN rate limits (e.g. Wikimedia returns 429). At most `MAX_CONCURRENT_IMAGE_FETCHES` are
         // in flight; each worker drains its chunk sequentially.
         let n_threads = net_targets.len().clamp(1, MAX_CONCURRENT_IMAGE_FETCHES);
-        let chunks: Vec<Vec<(dom::NodeId, String)>> = {
+        let chunks: Vec<Vec<(dom::NodeId, String, bool)>> = {
             let mut cs: Vec<Vec<_>> = (0..n_threads).map(|_| Vec::new()).collect();
             for (i, t) in net_targets.into_iter().enumerate() {
                 cs[i % n_threads].push(t);
@@ -627,9 +646,9 @@ pub(crate) fn collect_images(
                     s.spawn(move || {
                         chunk
                             .into_iter()
-                            .map(|(node, url)| {
+                            .map(|(node, url, is_object)| {
                                 let r = net::fetch(&url).and_then(|resp| {
-                                    decode_any_image(&resp.body, &resp.content_type, &url)
+                                    decode_src(&resp.body, &resp.content_type, &url, is_object, base)
                                         .ok_or_else(|| "decode failed".to_string())
                                 });
                                 (node, url, r)
@@ -885,6 +904,135 @@ fn decode_svg_image(bytes: &[u8]) -> Option<DecodedImage> {
     let w = (iw.round() as u32).clamp(1, 1024);
     let h = (ih.round() as u32).clamp(1, 1024);
     Some(crate::svg::rasterize_svg(&doc, svg_id, w, h, None, None))
+}
+
+/// Parse standalone SVG markup for an `<object>`/`<embed>` (a document context, unlike `<img>`):
+/// rasterize the SVG and composite the CSS `background-color` / `background-image` declared by its
+/// inline `<style>` underneath it (SVG-as-document loads external resources; SVG-as-image does not).
+/// `base` resolves a relative `background-image` URL.
+fn decode_svg_object(bytes: &[u8], base: &str) -> Option<DecodedImage> {
+    let markup = String::from_utf8_lossy(bytes);
+    let doc = html::parse(&markup);
+    let svg_id = find_svg_root(&doc, doc.root())?;
+    let (iw, ih) = match &doc.get(svg_id).data {
+        dom::NodeData::Element(e) => crate::svg::intrinsic_size(e),
+        _ => return None,
+    };
+    let w = (iw.round() as u32).clamp(1, 1024);
+    let h = (ih.round() as u32).clamp(1, 1024);
+    let fg = crate::svg::rasterize_svg(&doc, svg_id, w, h, None, None);
+
+    // Inline stylesheet → the SVG root's background. We don't run a full cascade here; scan the
+    // collected `<style>` text for `background-color` / `background-image` declarations.
+    let css = collect_svg_style_text(&doc, svg_id);
+    let mut backdrop = vec![0u8; (w as usize) * (h as usize) * 4];
+    if let Some((r, g, b, a)) = css_background_color(&css) {
+        for px in backdrop.chunks_exact_mut(4) {
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+            px[3] = a;
+        }
+    }
+    if let Some(url) = css_background_image_url(&css) {
+        if let Some(abs) = resolve_url(base, &url) {
+            if let Ok(resp) = net::fetch(&abs) {
+                if let Some(bg) = decode_any_image(&resp.body, &resp.content_type, &abs) {
+                    // background-position 0 0, natural size (background-size auto), drawn once.
+                    for y in 0..h.min(bg.h) {
+                        for x in 0..w.min(bg.w) {
+                            let s = ((y * bg.w + x) * 4) as usize;
+                            let d = ((y * w + x) * 4) as usize;
+                            let sa = bg.rgba[s + 3] as u32;
+                            if sa == 0 {
+                                continue;
+                            }
+                            // Source-over onto the (possibly colored) backdrop.
+                            for c in 0..3 {
+                                let sc = bg.rgba[s + c] as u32;
+                                let dc = backdrop[d + c] as u32;
+                                let da = backdrop[d + 3] as u32;
+                                let out = (sc * sa + dc * da * (255 - sa) / 255) / 255;
+                                backdrop[d + c] = out.min(255) as u8;
+                            }
+                            let da = backdrop[d + 3] as u32;
+                            backdrop[d + 3] = (sa + da * (255 - sa) / 255).min(255) as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Composite the rasterized SVG foreground over the backdrop.
+    for i in 0..(w as usize * h as usize) {
+        let o = i * 4;
+        let fa = fg.rgba[o + 3] as u32;
+        if fa == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let fc = fg.rgba[o + c] as u32;
+            let bc = backdrop[o + c] as u32;
+            let ba = backdrop[o + 3] as u32;
+            backdrop[o + c] = ((fc * fa + bc * ba * (255 - fa) / 255) / 255).min(255) as u8;
+        }
+        let ba = backdrop[o + 3] as u32;
+        backdrop[o + 3] = (fa + ba * (255 - fa) / 255).min(255) as u8;
+    }
+    Some(DecodedImage {
+        rgba: backdrop,
+        w,
+        h,
+    })
+}
+
+/// Concatenate the text of every `<style>` element within the SVG subtree (Text + CDATA bodies).
+fn collect_svg_style_text(doc: &dom::Document, root: dom::NodeId) -> String {
+    let mut out = String::new();
+    fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("style") {
+                for &c in &doc.get(id).children {
+                    match &doc.get(c).data {
+                        dom::NodeData::Text(t) | dom::NodeData::Cdata(t) => out.push_str(t),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for &c in &doc.get(id).children {
+            walk(doc, c, out);
+        }
+    }
+    walk(doc, root, &mut out);
+    out
+}
+
+/// Extract the first `background-image: url(...)` URL from a CSS string (quotes/whitespace stripped).
+fn css_background_image_url(css: &str) -> Option<String> {
+    let lower = css.to_ascii_lowercase();
+    let i = lower.find("background-image")?;
+    let rest = &css[i..];
+    let u = rest.find("url(")?;
+    let inner = &rest[u + 4..];
+    let end = inner.find(')')?;
+    let url = inner[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+/// Extract a `background-color` value from a CSS string as RGBA (named/hex/rgb only).
+fn css_background_color(css: &str) -> Option<(u8, u8, u8, u8)> {
+    let lower = css.to_ascii_lowercase();
+    let i = lower.find("background-color")?;
+    let rest = &css[i + "background-color".len()..];
+    let colon = rest.find(':')?;
+    let val = &rest[colon + 1..];
+    let end = val.find([';', '}']).unwrap_or(val.len());
+    crate::canvas::parse_css_color_pub(val[..end].trim()).map(|c| (c.r, c.g, c.b, c.a))
 }
 
 /// Whether `bytes` look like a JPEG XL stream: either the raw codestream marker (`FF 0A`) or the
