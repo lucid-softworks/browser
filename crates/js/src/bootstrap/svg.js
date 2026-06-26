@@ -572,6 +572,72 @@
     return anim;
   }
 
+  // A writable SVGAnimatedEnumeration backed by an attribute via a keyword<->number map. Setting an
+  // out-of-range value throws (per the IDL). `def` is the keyword used when the attribute is absent.
+  function makeEnumProp(el, attr, map, def) {
+    var node = el.__node;
+    var rev = {};
+    for (var k in map) { if (map.hasOwnProperty(k)) { rev[map[k]] = k; } }
+    function base() { var v = getAttr(node, attr); if (v == null) { return map[def]; } return map[v] != null ? map[v] : 0; }
+    var anim = Object.create(globalThis.SVGAnimatedEnumeration.prototype);
+    Object.defineProperty(anim, "baseVal", {
+      get: base,
+      set: function (n) { n = n | 0; if (n <= 0 || rev[n] == null) { throw new TypeError("invalid enumeration value"); } setAttr(node, attr, rev[n]); },
+      enumerable: true
+    });
+    Object.defineProperty(anim, "animVal", { get: base, enumerable: true });
+    return anim;
+  }
+  var ENUM_UNITS = { userSpaceOnUse: 1, objectBoundingBox: 2 };
+  // Per-element enumerated properties: [attr, keyword->number map, default keyword].
+  var ENUM_PROPS = {
+    fecolormatrix: [["type", { matrix: 1, saturate: 2, hueRotate: 3, luminanceToAlpha: 4 }, "matrix"]],
+    fecomposite: [["operator", { over: 1, "in": 2, out: 3, atop: 4, xor: 5, arithmetic: 6 }, "over"]],
+    feconvolvematrix: [["edgeMode", { duplicate: 1, wrap: 2, none: 3 }, "duplicate"]],
+    fedisplacementmap: [["xChannelSelector", { R: 1, G: 2, B: 3, A: 4 }, "A"], ["yChannelSelector", { R: 1, G: 2, B: 3, A: 4 }, "A"]],
+    femorphology: [["operator", { erode: 1, dilate: 2 }, "erode"]],
+    feturbulence: [["type", { fractalNoise: 1, turbulence: 2 }, "turbulence"], ["stitchTiles", { stitch: 1, noStitch: 2 }, "noStitch"]],
+    filter: [["filterUnits", ENUM_UNITS, "objectBoundingBox"], ["primitiveUnits", ENUM_UNITS, "userSpaceOnUse"]],
+    lineargradient: [["gradientUnits", ENUM_UNITS, "objectBoundingBox"], ["spreadMethod", { pad: 1, reflect: 2, repeat: 3 }, "pad"]],
+    radialgradient: [["gradientUnits", ENUM_UNITS, "objectBoundingBox"], ["spreadMethod", { pad: 1, reflect: 2, repeat: 3 }, "pad"]],
+    clippath: [["clipPathUnits", ENUM_UNITS, "userSpaceOnUse"]],
+    mask: [["maskUnits", ENUM_UNITS, "objectBoundingBox"], ["maskContentUnits", ENUM_UNITS, "userSpaceOnUse"]],
+    pattern: [["patternUnits", ENUM_UNITS, "objectBoundingBox"], ["patternContentUnits", ENUM_UNITS, "userSpaceOnUse"]],
+    fefuncr: [["type", { identity: 1, table: 2, discrete: 3, linear: 4, gamma: 5 }, "identity"]],
+    fefuncg: [["type", { identity: 1, table: 2, discrete: 3, linear: 4, gamma: 5 }, "identity"]],
+    fefuncb: [["type", { identity: 1, table: 2, discrete: 3, linear: 4, gamma: 5 }, "identity"]],
+    fefunca: [["type", { identity: 1, table: 2, discrete: 3, linear: 4, gamma: 5 }, "identity"]],
+    textpath: [["method", { align: 1, stretch: 2 }, "align"], ["spacing", { auto: 1, exact: 2 }, "exact"]],
+    marker: [["markerUnits", { userSpaceOnUse: 1, strokeWidth: 2 }, "strokeWidth"]]
+  };
+  var LENGTHADJUST_MAP = { spacing: 1, spacingAndGlyphs: 2 };
+  // Interface constants for the enumerated properties.
+  var ENUM_CONSTS = {
+    SVGFEColorMatrixElement: { SVG_FECOLORMATRIX_TYPE_UNKNOWN: 0, SVG_FECOLORMATRIX_TYPE_MATRIX: 1, SVG_FECOLORMATRIX_TYPE_SATURATE: 2, SVG_FECOLORMATRIX_TYPE_HUEROTATE: 3, SVG_FECOLORMATRIX_TYPE_LUMINANCETOALPHA: 4 },
+    SVGFECompositeElement: { SVG_FECOMPOSITE_OPERATOR_UNKNOWN: 0, SVG_FECOMPOSITE_OPERATOR_OVER: 1, SVG_FECOMPOSITE_OPERATOR_IN: 2, SVG_FECOMPOSITE_OPERATOR_OUT: 3, SVG_FECOMPOSITE_OPERATOR_ATOP: 4, SVG_FECOMPOSITE_OPERATOR_XOR: 5, SVG_FECOMPOSITE_OPERATOR_ARITHMETIC: 6 },
+    SVGFEConvolveMatrixElement: { SVG_EDGEMODE_UNKNOWN: 0, SVG_EDGEMODE_DUPLICATE: 1, SVG_EDGEMODE_WRAP: 2, SVG_EDGEMODE_NONE: 3 },
+    SVGFEDisplacementMapElement: { SVG_CHANNEL_UNKNOWN: 0, SVG_CHANNEL_R: 1, SVG_CHANNEL_G: 2, SVG_CHANNEL_B: 3, SVG_CHANNEL_A: 4 },
+    SVGFEMorphologyElement: { SVG_MORPHOLOGY_OPERATOR_UNKNOWN: 0, SVG_MORPHOLOGY_OPERATOR_ERODE: 1, SVG_MORPHOLOGY_OPERATOR_DILATE: 2 },
+    SVGFETurbulenceElement: { SVG_TURBULENCE_TYPE_UNKNOWN: 0, SVG_TURBULENCE_TYPE_FRACTALNOISE: 1, SVG_TURBULENCE_TYPE_TURBULENCE: 2, SVG_STITCHTYPE_UNKNOWN: 0, SVG_STITCHTYPE_STITCH: 1, SVG_STITCHTYPE_NOSTITCH: 2 },
+    SVGGradientElement: { SVG_SPREADMETHOD_UNKNOWN: 0, SVG_SPREADMETHOD_PAD: 1, SVG_SPREADMETHOD_REFLECT: 2, SVG_SPREADMETHOD_REPEAT: 3 },
+    SVGComponentTransferFunctionElement: { SVG_FECOMPONENTTRANSFER_TYPE_UNKNOWN: 0, SVG_FECOMPONENTTRANSFER_TYPE_IDENTITY: 1, SVG_FECOMPONENTTRANSFER_TYPE_TABLE: 2, SVG_FECOMPONENTTRANSFER_TYPE_DISCRETE: 3, SVG_FECOMPONENTTRANSFER_TYPE_LINEAR: 4, SVG_FECOMPONENTTRANSFER_TYPE_GAMMA: 5 },
+    SVGTextPathElement: { SVG_TEXTPATH_METHODTYPE_UNKNOWN: 0, SVG_TEXTPATH_METHODTYPE_ALIGN: 1, SVG_TEXTPATH_METHODTYPE_STRETCH: 2, SVG_TEXTPATH_SPACINGTYPE_UNKNOWN: 0, SVG_TEXTPATH_SPACINGTYPE_AUTO: 1, SVG_TEXTPATH_SPACINGTYPE_EXACT: 2 },
+    SVGTextContentElement: { LENGTHADJUST_UNKNOWN: 0, LENGTHADJUST_SPACING: 1, LENGTHADJUST_SPACINGANDGLYPHS: 2 }
+  };
+  (function () {
+    for (var iface in ENUM_CONSTS) {
+      if (!ENUM_CONSTS.hasOwnProperty(iface)) { continue; }
+      var ctor = globalThis[iface];
+      if (typeof ctor !== "function") { continue; }
+      var cs = ENUM_CONSTS[iface];
+      for (var key in cs) { if (cs.hasOwnProperty(key)) { ctor[key] = cs[key]; ctor.prototype[key] = cs[key]; } }
+    }
+    // Constructors for the fe* light/func and other interfaces referenced by name in tests.
+    ["SVGComponentTransferFunctionElement", "SVGFEFuncRElement", "SVGFEFuncGElement", "SVGFEFuncBElement", "SVGFEFuncAElement", "SVGFEPointLightElement", "SVGFESpotLightElement", "SVGFEDistantLightElement", "SVGFEMergeNodeElement", "SVGFETileElement", "SVGFEFloodElement", "SVGFEDropShadowElement"].forEach(function (n) { if (typeof globalThis[n] !== "function") { globalThis[n] = new Function("return function " + n + "(){}")(); } });
+    // The component-transfer constants live on SVGComponentTransferFunctionElement (created above).
+    (function () { var c = globalThis.SVGComponentTransferFunctionElement, cs = ENUM_CONSTS.SVGComponentTransferFunctionElement; if (c && cs) { for (var k in cs) { if (cs.hasOwnProperty(k)) { c[k] = cs[k]; c.prototype[k] = cs[k]; } } } })();
+  })();
+
   // -------------------------------------------------------------------------------------------
   // Per-element decoration entry point (called by browser_env's enrichElement).
   // -------------------------------------------------------------------------------------------
@@ -580,6 +646,11 @@
     var ln = "";
     try { ln = (el.localName || el.tagName || "").toLowerCase(); } catch (e) {}
     def(el, "__localName", ln);
+
+    // Enumerated presentation properties (SVGAnimatedEnumeration: type/operator/gradientUnits/…).
+    if (ENUM_PROPS[ln]) {
+      ENUM_PROPS[ln].forEach(function (s) { def(el, s[0], makeEnumProp(el, s[0], s[1], s[2])); });
+    }
 
     // Set the specific SVG element interface prototype (so `instanceof SVGRectElement` works); its
     // chain ends at SVGElement.prototype set by browser-env's applyNodePrototype.
@@ -620,7 +691,7 @@
       def(el, "getCharNumAtPosition", function (p) { var b = bbox(this); var len = this.getNumberOfChars() || 1; if (!p || b.width === 0) { return -1; } var idx = Math.floor((p.x - b.x) / (b.width / len)); return idx >= 0 && idx < len ? idx : -1; });
       def(el, "selectSubString", function () {});
       if (!("textLength" in el)) { (function () { var tc = null; Object.defineProperty(el, "textLength", { get: function () { if (!tc) { tc = makeAnimatedLength(el, "textLength"); } return tc; }, configurable: true, enumerable: true }); })(); }
-      def(el, "lengthAdjust", makeAnimatedEnum(function () { return getAttr(el.__node, "lengthAdjust") === "spacingAndGlyphs" ? 2 : 1; }));
+      def(el, "lengthAdjust", makeEnumProp(el, "lengthAdjust", LENGTHADJUST_MAP, "spacing"));
     }
     // Text-positioning elements: x/y/dx/dy are length lists, rotate is a number list.
     if (ln === "text" || ln === "tspan" || ln === "tref" || ln === "textpath" || ln === "altglyph") {
@@ -750,7 +821,6 @@
       Object.defineProperty(orientType, "baseVal", { get: orientTypeVal, set: function (v) { v = v | 0; if (v === 1) { setAttr(node, "orient", "auto"); } else if (v === 2) { setAttr(node, "orient", String(angleNum())); } }, enumerable: true });
       Object.defineProperty(orientType, "animVal", { get: orientTypeVal, enumerable: true });
       def(el, "orientType", orientType);
-      def(el, "markerUnits", makeAnimatedEnum(function () { var u = getAttr(node, "markerUnits"); return u === "userSpaceOnUse" ? 1 : 2; }));
       def(el, "setOrientToAuto", function () { setAttr(node, "orient", "auto"); });
       def(el, "setOrientToAngle", function (a) { setAttr(node, "orient", String(a && a.value != null ? a.value : a)); });
       def(el, "SVG_MARKER_ORIENT_UNKNOWN", 0); def(el, "SVG_MARKER_ORIENT_AUTO", 1); def(el, "SVG_MARKER_ORIENT_ANGLE", 2);
@@ -765,13 +835,10 @@
     if (ln === "lineargradient" || ln === "radialgradient") {
       var gtCache = null;
       Object.defineProperty(el, "gradientTransform", { get: function () { return gtCache || (gtCache = makeAnimatedTransformListAttr(el, "gradientTransform")); }, configurable: true, enumerable: true });
-      def(el, "gradientUnits", makeAnimatedEnum(function () { return getAttr(el.__node, "gradientUnits") === "userSpaceOnUse" ? 1 : 2; }));
-      def(el, "spreadMethod", makeAnimatedEnum(function () { var s = getAttr(el.__node, "spreadMethod"); return s === "reflect" ? 2 : s === "repeat" ? 3 : 1; }));
     }
     if (ln === "pattern") {
       var ptCache = null;
       Object.defineProperty(el, "patternTransform", { get: function () { return ptCache || (ptCache = makeAnimatedTransformListAttr(el, "patternTransform")); }, configurable: true, enumerable: true });
-      def(el, "patternUnits", makeAnimatedEnum(function () { return getAttr(el.__node, "patternUnits") === "userSpaceOnUse" ? 1 : 2; }));
     }
     (function () {
       var cCache = null;
