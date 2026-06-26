@@ -11888,6 +11888,12 @@
     xhr.onreadystatechange = null; xhr.onload = null; xhr.onerror = null;
     xhr.onloadstart = null; xhr.onloadend = null; xhr.onprogress = null;
     xhr.onabort = null; xhr.ontimeout = null;
+    // The upload object is a real EventTarget so handlers can be registered; we don't surface upload
+    // progress, so it simply never fires (which is observable and correct for late-added listeners).
+    xhr.upload = {};
+    installEvents(xhr.upload);
+    xhr.upload.onloadstart = xhr.upload.onprogress = xhr.upload.onload = null;
+    xhr.upload.onloadend = xhr.upload.onerror = xhr.upload.onabort = xhr.upload.ontimeout = null;
 
     function fire(type) {
       var ev; try { ev = new globalThis.Event(type); } catch (e) { ev = null; }
