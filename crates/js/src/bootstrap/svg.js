@@ -1189,12 +1189,51 @@
     return svgAnimNum(el, name, base);
   }
 
-  var SVG_COLOR_PROPS = { fill: 1, stroke: 1, color: 1, "stop-color": 1, "flood-color": 1, "lighting-color": 1, "text-decoration-color": 1 };
+  var SVG_COLOR_PROPS = { color: 1, "stop-color": 1, "flood-color": 1, "lighting-color": 1 };
+  var SVG_PAINT_PROPS = { fill: 1, stroke: 1 };
+  var SVG_MARKER_PROPS = { "marker-start": 1, "marker-mid": 1, "marker-end": 1 };
   var SVG_NUM_PROPS = { opacity: 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "stroke-width": 1 };
-  // SVG text keyword properties: [initial, inherited].
-  var SVG_KEYWORD_PROPS = { "text-anchor": ["start", true], "text-decoration-style": ["solid", false], "text-decoration-line": ["none", false] };
+  // SVG keyword properties: [initial, inherited].
+  var SVG_KEYWORD_PROPS = {
+    "text-anchor": ["start", true], "text-decoration-style": ["solid", false], "text-decoration-line": ["none", false],
+    "stroke-linecap": ["butt", true], "stroke-linejoin": ["miter", true], "fill-rule": ["nonzero", true],
+    "clip-rule": ["nonzero", true], "color-interpolation": ["srgb", true], "color-interpolation-filters": ["linearrgb", true],
+    "image-rendering": ["auto", true], "shape-rendering": ["auto", true], "text-rendering": ["auto", true]
+  };
   // camelCase aliases used for direct property access on the declaration.
-  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color" };
+  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color", strokeLinecap: "stroke-linecap", strokeLinejoin: "stroke-linejoin", fillRule: "fill-rule", clipRule: "clip-rule", colorInterpolation: "color-interpolation", colorInterpolationFilters: "color-interpolation-filters", imageRendering: "image-rendering", shapeRendering: "shape-rendering", textRendering: "text-rendering", strokeMiterlimit: "stroke-miterlimit", markerStart: "marker-start", markerMid: "marker-mid", markerEnd: "marker-end" };
+  function svgAbsUrl(u) { try { return new URL(u, document.baseURI).href; } catch (e) { return u; } }
+  // fill / stroke <paint>: none | <color> | <url> [none|<color>]? — computed serialization.
+  function paintComputed(el, name) {
+    var initial = name === "fill" ? "rgb(0, 0, 0)" : "none";
+    var raw = rawStyleOrAttr(el, name);
+    if (raw == null) { var pp = svgParent(el); return pp ? paintComputed(pp, name) : initial; }
+    var r = raw.trim(), lc = r.toLowerCase();
+    if (lc === "inherit") { var pi = svgParent(el); return pi ? paintComputed(pi, name) : initial; }
+    if (lc === "none") { return "none"; }
+    if (lc === "currentcolor") { return fmtColor(nativeColor(el)); }
+    if (/^url\(/i.test(r)) {
+      var m = /^url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)\s*([\s\S]*)$/i.exec(r);
+      if (m) {
+        var u = m[1] != null ? m[1] : (m[2] != null ? m[2] : (m[3] || ""));
+        var out = 'url("' + svgAbsUrl(u) + '")', fb = (m[4] || "").trim();
+        if (fb) { out += " " + (fb.toLowerCase() === "none" ? "none" : (fb.toLowerCase() === "currentcolor" ? fmtColor(nativeColor(el)) : fmtColor(parseColor(fb, el) || [0, 0, 0, 1]))); }
+        return out;
+      }
+    }
+    var c = parseColor(r, el); return c ? fmtColor(c) : r;
+  }
+  // marker-start/mid/end: none | <url> (inherited, initial none).
+  function markerComputed(el, name) {
+    var raw = rawStyleOrAttr(el, name);
+    if (raw == null) { var pm = svgParent(el); return pm ? markerComputed(pm, name) : "none"; }
+    var r = raw.trim(), lc = r.toLowerCase();
+    if (lc === "inherit") { var pi = svgParent(el); return pi ? markerComputed(pi, name) : "none"; }
+    if (lc === "none") { return "none"; }
+    var m = /^url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)/i.exec(r);
+    if (m) { var u = m[1] != null ? m[1] : (m[2] != null ? m[2] : (m[3] || "")); return 'url("' + svgAbsUrl(u) + '")'; }
+    return r;
+  }
   function canonDecorationLine(v) {
     v = v.toLowerCase().trim();
     if (v === "none" || v === "spelling-error" || v === "grammar-error") { return v; }
@@ -1228,8 +1267,21 @@
   }
   function svgComputed(el, name) {
     if (name === "text-decoration-color") { return fmtColor(decoColor(el)); }
+    if (SVG_PAINT_PROPS[name]) { return paintComputed(el, name); }
+    if (SVG_MARKER_PROPS[name]) { return markerComputed(el, name); }
     if (SVG_COLOR_PROPS[name]) { var c = colorOf(el, name); return c == null ? "none" : fmtColor(c); }
-    if (SVG_NUM_PROPS[name]) { var v = numOf(el, name); return name === "stroke-width" ? v + "px" : String(v); }
+    if (name === "stroke-width") {
+      // % is kept as a percentage; otherwise resolve to px.
+      var rw = rawStyleOrAttr(el, "stroke-width");
+      if (rw != null && /%\s*$/.test(rw.trim())) { return rw.trim(); }
+      return numOf(el, "stroke-width") + "px";
+    }
+    if (SVG_NUM_PROPS[name]) { return String(numOf(el, name)); }
+    if (name === "stroke-miterlimit") {
+      var rm = rawStyleOrAttr(el, "stroke-miterlimit");
+      if (rm == null || rm === "inherit") { var pm = svgParent(el); return pm ? svgComputed(pm, "stroke-miterlimit") : "4"; }
+      return String(parseFloat(rm));
+    }
     if (SVG_KEYWORD_PROPS[name]) {
       var spec = SVG_KEYWORD_PROPS[name], raw2 = rawStyleOrAttr(el, name);
       if (raw2 == null || raw2 === "inherit") {
@@ -1246,7 +1298,7 @@
     }
     return null;
   }
-  function svgHandles(kebab) { return !!(SVG_COLOR_PROPS[kebab] || SVG_NUM_PROPS[kebab] || SVG_KEYWORD_PROPS[kebab] || kebab === "visibility"); }
+  function svgHandles(kebab) { return !!(SVG_COLOR_PROPS[kebab] || SVG_PAINT_PROPS[kebab] || SVG_MARKER_PROPS[kebab] || SVG_NUM_PROPS[kebab] || SVG_KEYWORD_PROPS[kebab] || kebab === "stroke-miterlimit" || kebab === "visibility"); }
   var nativeGCS = globalThis.getComputedStyle;
   if (typeof nativeGCS === "function") {
     globalThis.getComputedStyle = function (el, pseudo) {

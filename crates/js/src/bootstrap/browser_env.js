@@ -2069,6 +2069,18 @@
     "padding-top":1, "padding-right":1, "padding-bottom":1, "padding-left":1,
     "border-top-width":1, "border-right-width":1, "border-bottom-width":1, "border-left-width":1,
     "outline-width":1, "column-rule-width":1, "column-width":1 };
+  // SVG enumerated presentation properties → their permitted keyword set (lowercased).
+  var SVG_ENUM_VALUES = {
+    "stroke-linecap": ["butt", "round", "square"],
+    "stroke-linejoin": ["miter", "round", "bevel", "miter-clip", "arcs"],
+    "fill-rule": ["nonzero", "evenodd"],
+    "clip-rule": ["nonzero", "evenodd"],
+    "color-interpolation": ["auto", "srgb", "linearrgb"],
+    "color-interpolation-filters": ["auto", "srgb", "linearrgb"],
+    "image-rendering": ["auto", "smooth", "high-quality", "pixelated", "crisp-edges", "optimizespeed", "optimizequality"],
+    "shape-rendering": ["auto", "optimizespeed", "crispedges", "geometricprecision"],
+    "text-rendering": ["auto", "optimizespeed", "optimizelegibility", "geometricprecision"]
+  };
   function isValidValue(name, value) {
     var v = String(value).trim();
     if (v === "") return false;
@@ -2094,6 +2106,16 @@
     }
     if (name === "opacity") {
       return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(v);
+    }
+    // SVG keyword (enumerated) presentation properties: a single keyword from a fixed set.
+    if (hasOwn(SVG_ENUM_VALUES, name)) { return SVG_ENUM_VALUES[name].indexOf(vl) >= 0; }
+    // stroke-miterlimit: a single non-negative <number> (no trailing dot, no second value).
+    if (name === "stroke-miterlimit") {
+      return /^\+?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i.test(v) && !/\.$/.test(v) && parseFloat(v) >= 0;
+    }
+    // marker-start/mid/end: none | <url>.
+    if (name === "marker-start" || name === "marker-mid" || name === "marker-end") {
+      return vl === "none" || /^url\(/i.test(v);
     }
     // SVG text presentation properties with a small keyword/length grammar.
     if (name === "text-anchor") { return vl === "start" || vl === "middle" || vl === "end"; }
