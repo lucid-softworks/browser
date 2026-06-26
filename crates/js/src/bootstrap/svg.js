@@ -440,22 +440,29 @@
   // -------------------------------------------------------------------------------------------
   function makeLength(getNum, getStr, getType, setNum) {
     var L = Object.create(SVGLength.prototype);
-    Object.defineProperty(L, "value", {
-      get: getNum,
-      set: setNum || function () { throw new globalThis.DOMException("read-only", "NoModificationAllowedError"); },
-      enumerable: true, configurable: true
-    });
-    Object.defineProperty(L, "valueInSpecifiedUnits", { get: function () { return parseLen(getStr()).num; }, enumerable: true, configurable: true });
-    Object.defineProperty(L, "valueAsString", {
-      get: function () { var s = getStr(); return s == null || s === "" ? "0" : s; },
-      set: setNum ? function (v) { setStrRaw(v); } : undefined, enumerable: true, configurable: true
-    });
-    Object.defineProperty(L, "unitType", { get: getType, enumerable: true, configurable: true });
-    var setStrRaw = setNum;
-    def(L, "newValueSpecifiedUnits", function (unit, v) { if (setNum) { setNum(v); } });
-    def(L, "convertToSpecifiedUnits", function () {});
+    L.__g = getNum; L.__gs = getStr; L.__gt = getType; L.__s = setNum || null;
     return L;
   }
+  // Absolute-unit conversion factors to CSS px (em/ex resolved against `ctxEm`; % is unsupported for a
+  // detached length and stays as the raw number).
+  var LEN_SUFFIX = { 1: "", 2: "%", 3: "em", 4: "ex", 5: "px", 6: "cm", 7: "mm", 8: "in", 9: "pt", 10: "pc" };
+  function lenToPx(n, u, ctxEm) { switch (u) { case 6: return n * 96 / 2.54; case 7: return n * 96 / 25.4; case 8: return n * 96; case 9: return n * 96 / 72; case 10: return n * 16; case 3: return n * ctxEm; case 4: return n * ctxEm / 2; default: return n; } }
+  function pxToLen(px, u, ctxEm) { switch (u) { case 6: return px * 2.54 / 96; case 7: return px * 25.4 / 96; case 8: return px / 96; case 9: return px * 72 / 96; case 10: return px / 16; case 3: return px / ctxEm; case 4: return px / (ctxEm / 2); default: return px; } }
+  // A standalone, mutable SVGLength (createSVGLength). `ctxEm` is the font-size used to resolve em/ex.
+  function makeMutableLength(ctxEm) {
+    ctxEm = ctxEm || 16;
+    var st = { n: 0, u: 1 }; // valueInSpecifiedUnits, unitType (initial: NUMBER 0)
+    var L = Object.create(SVGLength.prototype);
+    L.__g = function () { return lenToPx(st.n, st.u, ctxEm); };
+    L.__gs = function () { return numStr(st.n) + LEN_SUFFIX[st.u]; };
+    L.__gt = function () { return st.u; };
+    L.__s = function (px) { st.n = pxToLen(px, st.u, ctxEm); };
+    L.__sn = function (n) { st.n = +n; };
+    L.__sstr = function (v) { var p = parseLen(v); st.n = p.num; st.u = p.type || 1; };
+    L.__st = st; L.__em = ctxEm;
+    return L;
+  }
+  function numStr(n) { return (n === (n | 0)) ? String(n | 0) : String(n); }
 
   function makeAnimatedLength(el, attr, dflt) {
     var node = el.__node;
@@ -474,8 +481,7 @@
       function () { return parseLen(raw()).type; },
       null
     );
-    Object.defineProperty(anim, "baseVal", { value: baseVal, enumerable: true });
-    Object.defineProperty(anim, "animVal", { value: animVal, enumerable: true });
+    anim.__base = baseVal; anim.__anim = animVal;
     return anim;
   }
   // Spec initial values for length attributes that aren't "0", keyed by "tag.attr".
@@ -489,41 +495,42 @@
     "marker.markerWidth": "3", "marker.markerHeight": "3"
   };
 
-  // SVGRect (live, backed by a 4-number attribute) and SVGAnimatedRect (viewBox).
+  // SVGRect (live, backed by a 4-number getter) and SVGAnimatedRect (viewBox).
   function makeRect(getVec) {
     var R = Object.create(globalThis.SVGRect.prototype);
-    ["x", "y", "width", "height"].forEach(function (k, i) {
-      Object.defineProperty(R, k, { get: function () { return getVec()[i] || 0; }, set: function () {}, enumerable: true, configurable: true });
-    });
+    R.__get = getVec;
     return R;
   }
   function makeAnimatedRect(el, attr) {
     var node = el.__node;
     function baseVec() { var s = getAttr(node, attr); return s == null ? [0, 0, 0, 0] : vecParse(s); }
     var anim = Object.create(globalThis.SVGAnimatedRect.prototype);
-    Object.defineProperty(anim, "baseVal", { value: makeRect(baseVec), enumerable: true });
-    Object.defineProperty(anim, "animVal", { value: makeRect(function () { return svgAnimVec(el, attr, baseVec()); }), enumerable: true });
+    anim.__base = makeRect(baseVec);
+    anim.__anim = makeRect(function () { return svgAnimVec(el, attr, baseVec()); });
     return anim;
   }
 
-  // SVGNumberList / SVGLengthList (live) and their SVGAnimated* wrappers (x/y/dx/dy/rotate on text).
+  // SVGNumberList / SVGLengthList (live, read-only items) and their SVGAnimated* wrappers.
   function makeItemList(getVec, listProto, itemProto) {
     var L = Object.create(listProto.prototype);
-    Object.defineProperty(L, "numberOfItems", { get: function () { return getVec().length; }, enumerable: true, configurable: true });
-    Object.defineProperty(L, "length", { get: function () { return getVec().length; }, enumerable: true, configurable: true });
-    def(L, "getItem", function (i) {
-      var v = getVec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); }
-      var it = Object.create(itemProto.prototype); it.value = v[i]; it.valueInSpecifiedUnits = v[i]; it.valueAsString = String(v[i]); it.unitType = 1; return it;
-    });
-    def(L, "initialize", function () {}); def(L, "clear", function () {}); def(L, "appendItem", function (x) { return x; });
+    L.__l = {
+      len: function () { return getVec().length; },
+      get: function (i) {
+        var v = getVec();
+        if (itemProto === globalThis.SVGNumber) { var n = Object.create(globalThis.SVGNumber.prototype); n.__v = v[i]; return n; }
+        return makeLength(function () { return v[i]; }, function () { return String(v[i]); }, function () { return 1; }, null);
+      },
+      clear: function () {}, init: function (x) { return x; }, append: function (x) { return x; },
+      insert: function (x) { return x; }, remove: function (x) { return x; }, replace: function (x) { return x; }
+    };
     return L;
   }
   function makeAnimatedItemList(el, attr, listProto, itemProto) {
     var node = el.__node;
     function baseVec() { var s = getAttr(node, attr); return s == null || s === "" ? [] : vecParse(s); }
     var anim = Object.create((listProto === globalThis.SVGNumberList ? globalThis.SVGAnimatedNumberList : globalThis.SVGAnimatedLengthList).prototype);
-    Object.defineProperty(anim, "baseVal", { value: makeItemList(baseVec, listProto, itemProto), enumerable: true });
-    Object.defineProperty(anim, "animVal", { value: makeItemList(function () { return svgAnimVec(el, attr, baseVec()); }, listProto, itemProto), enumerable: true });
+    anim.__base = makeItemList(baseVec, listProto, itemProto);
+    anim.__anim = makeItemList(function () { return svgAnimVec(el, attr, baseVec()); }, listProto, itemProto);
     return anim;
   }
 
@@ -556,19 +563,18 @@
     if (m[2] === "rad") { n = n * 180 / Math.PI; } else if (m[2] === "grad") { n = n * 0.9; }
     return { value: n, type: m[2] === "rad" ? 3 : m[2] === "grad" ? 4 : 2 };
   }
-  function makeAngle(getVal) { var A = Object.create(SVGAngle.prototype); Object.defineProperty(A, "value", { get: getVal, enumerable: true }); Object.defineProperty(A, "valueInSpecifiedUnits", { get: getVal, enumerable: true }); Object.defineProperty(A, "valueAsString", { get: function () { return String(getVal()); }, enumerable: true }); A.unitType = 2; return A; }
+  function makeAngle(getVal) { var A = Object.create(SVGAngle.prototype); A.__g = getVal; A.__gt = function () { return 2; }; A.__s = null; return A; }
   function makeAnimatedAngle(el, attr) {
     var node = el.__node;
     function base() { var o = getAttr(node, attr); if (o == null || o === "auto" || o === "auto-start-reverse") { return 0; } return parseAngle(o).value; }
     var anim = Object.create(globalThis.SVGAnimatedAngle.prototype);
-    Object.defineProperty(anim, "baseVal", { value: makeAngle(base), enumerable: true });
-    Object.defineProperty(anim, "animVal", { value: makeAngle(function () { return svgAnimNum(el, attr, base(), angleVec); }), enumerable: true });
+    anim.__base = makeAngle(base);
+    anim.__anim = makeAngle(function () { return svgAnimNum(el, attr, base(), angleVec); });
     return anim;
   }
   function makeAnimatedEnum(getBase) {
     var anim = Object.create(globalThis.SVGAnimatedEnumeration.prototype);
-    Object.defineProperty(anim, "baseVal", { get: getBase, set: function () {}, enumerable: true });
-    Object.defineProperty(anim, "animVal", { get: getBase, enumerable: true });
+    anim.__bget = getBase; anim.__bset = function () {}; anim.__aget = getBase;
     return anim;
   }
 
@@ -580,12 +586,9 @@
     for (var k in map) { if (map.hasOwnProperty(k)) { rev[map[k]] = k; } }
     function base() { var v = getAttr(node, attr); if (v == null) { return map[def]; } return map[v] != null ? map[v] : 0; }
     var anim = Object.create(globalThis.SVGAnimatedEnumeration.prototype);
-    Object.defineProperty(anim, "baseVal", {
-      get: base,
-      set: function (n) { n = n | 0; if (n <= 0 || rev[n] == null) { throw new TypeError("invalid enumeration value"); } setAttr(node, attr, rev[n]); },
-      enumerable: true
-    });
-    Object.defineProperty(anim, "animVal", { get: base, enumerable: true });
+    anim.__bget = base;
+    anim.__bset = function (n) { n = n | 0; if (n <= 0 || rev[n] == null) { throw new TypeError("invalid enumeration value"); } setAttr(node, attr, rev[n]); };
+    anim.__aget = base;
     return anim;
   }
   var ENUM_UNITS = { userSpaceOnUse: 1, objectBoundingBox: 2 };
@@ -673,15 +676,11 @@
   function makeTransform(type, v) {
     var T = Object.create(SVGTransform.prototype);
     var lt = String(type).toLowerCase();
-    T.type = TTYPE[lt] || 0;
-    T.angle = (lt === "rotate" || lt === "skewx" || lt === "skewy") ? (v[0] || 0) : 0;
-    T.matrix = transformMatrix(lt, v);
-    def(T, "setMatrix", function (m) { T.matrix = m; T.type = 1; T.angle = 0; });
-    def(T, "setTranslate", function (x, y) { T.matrix = transformMatrix("translate", [x, y]); T.type = 2; T.angle = 0; });
-    def(T, "setScale", function (x, y) { T.matrix = transformMatrix("scale", [x, y]); T.type = 3; T.angle = 0; });
-    def(T, "setRotate", function (a, cx, cy) { T.matrix = transformMatrix("rotate", [a, cx, cy]); T.type = 4; T.angle = a; });
-    def(T, "setSkewX", function (a) { T.matrix = transformMatrix("skewx", [a]); T.type = 5; T.angle = a; });
-    def(T, "setSkewY", function (a) { T.matrix = transformMatrix("skewy", [a]); T.type = 6; T.angle = a; });
+    T.__t = {
+      type: TTYPE[lt] || 0,
+      angle: (lt === "rotate" || lt === "skewx" || lt === "skewy") ? (v[0] || 0) : 0,
+      matrix: transformMatrix(lt, v)
+    };
     return T;
   }
   function parseTransformList(str) {
@@ -695,17 +694,17 @@
   }
   function makeTransformList(items) {
     var L = Object.create(globalThis.SVGTransformList.prototype);
-    Object.defineProperty(L, "numberOfItems", { get: function () { return items.length; }, enumerable: true });
-    Object.defineProperty(L, "length", { get: function () { return items.length; }, enumerable: true });
-    def(L, "getItem", function (i) { if (i < 0 || i >= items.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } return items[i]; });
-    def(L, "clear", function () { items.length = 0; });
-    def(L, "initialize", function (t) { items.length = 0; items.push(t); return t; });
-    def(L, "appendItem", function (t) { items.push(t); return t; });
-    def(L, "insertItemBefore", function (t, i) { items.splice(i, 0, t); return t; });
-    def(L, "removeItem", function (i) { return items.splice(i, 1)[0]; });
-    def(L, "replaceItem", function (t, i) { items[i] = t; return t; });
-    def(L, "consolidate", function () { if (!items.length) { return null; } var m = items[0].matrix; for (var k = 1; k < items.length; k++) { m = m.multiply(items[k].matrix); } var t = makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); items.length = 0; items.push(t); return t; });
-    def(L, "createSVGTransformFromMatrix", function (m) { return makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); });
+    L.__l = {
+      len: function () { return items.length; },
+      get: function (i) { return items[i]; },
+      clear: function () { items.length = 0; },
+      init: function (t) { items.length = 0; items.push(t); return t; },
+      append: function (t) { items.push(t); return t; },
+      insert: function (t, i) { items.splice(i, 0, t); return t; },
+      remove: function (i) { return items.splice(i, 1)[0]; },
+      replace: function (t, i) { items[i] = t; return t; },
+      consolidate: function () { if (!items.length) { return null; } var m = items[0].matrix; for (var k = 1; k < items.length; k++) { m = m.multiply(items[k].matrix); } var t = makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); items.length = 0; items.push(t); return t; }
+    };
     return L;
   }
   function transformAnimVal(el, attr) {
@@ -737,32 +736,30 @@
   function makeAnimatedString(el, attr) {
     var node = el.__node;
     var anim = Object.create(globalThis.SVGAnimatedString.prototype);
-    Object.defineProperty(anim, "baseVal", { get: function () { var v = getAttr(node, attr); return v == null ? "" : v; }, set: function (v) { setAttr(node, attr, v == null ? "" : String(v)); }, enumerable: true });
-    Object.defineProperty(anim, "animVal", { get: function () { var v = getAttr(node, attr); return v == null ? "" : v; }, enumerable: true });
+    anim.__bget = function () { var v = getAttr(node, attr); return v == null ? "" : v; };
+    anim.__bset = function (v) { setAttr(node, attr, v == null ? "" : String(v)); };
+    anim.__aget = anim.__bget;
     return anim;
   }
   function makeAnimatedNumber(el, attr, dflt) {
     var node = el.__node; dflt = dflt == null ? 0 : dflt;
     function base() { var v = getAttr(node, attr); return v == null || v === "" ? dflt : (parseFloat(v) || 0); }
     var a = Object.create(globalThis.SVGAnimatedNumber.prototype);
-    Object.defineProperty(a, "baseVal", { get: base, set: function (v) { setAttr(node, attr, String(+v)); }, enumerable: true });
-    Object.defineProperty(a, "animVal", { get: function () { return svgAnimNum(el, attr, base()); }, enumerable: true });
+    a.__bget = base; a.__bset = function (v) { setAttr(node, attr, String(+v)); }; a.__aget = function () { return svgAnimNum(el, attr, base()); };
     return a;
   }
   function makeAnimatedInteger(el, attr, dflt) {
     var node = el.__node; dflt = dflt == null ? 0 : dflt;
     function base() { var v = getAttr(node, attr); return v == null || v === "" ? dflt : (parseInt(v, 10) || 0); }
     var a = Object.create(globalThis.SVGAnimatedInteger.prototype);
-    Object.defineProperty(a, "baseVal", { get: base, set: function (v) { setAttr(node, attr, String(v | 0)); }, enumerable: true });
-    Object.defineProperty(a, "animVal", { get: base, enumerable: true });
+    a.__bget = base; a.__bset = function (v) { setAttr(node, attr, String(v | 0)); }; a.__aget = base;
     return a;
   }
   function makeAnimatedBoolean(el, attr) {
     var node = el.__node;
     function base() { return getAttr(node, attr) === "true"; }
     var a = Object.create(globalThis.SVGAnimatedBoolean.prototype);
-    Object.defineProperty(a, "baseVal", { get: base, set: function (v) { setAttr(node, attr, v ? "true" : "false"); }, enumerable: true });
-    Object.defineProperty(a, "animVal", { get: base, enumerable: true });
+    a.__bget = base; a.__bset = function (v) { setAttr(node, attr, v ? "true" : "false"); }; a.__aget = base;
     return a;
   }
   // SVGStringList (requiredExtensions / systemLanguage / requiredFeatures): a live list backed by a
@@ -772,15 +769,16 @@
     function vec() { var s = getAttr(node, attr); return s == null || s === "" ? [] : String(s).trim().split(/[\s,]+/).filter(function (x) { return x.length; }); }
     function put(v) { setAttr(node, attr, v.join(" ")); }
     var L = Object.create(globalThis.SVGStringList.prototype);
-    Object.defineProperty(L, "numberOfItems", { get: function () { return vec().length; }, enumerable: true });
-    Object.defineProperty(L, "length", { get: function () { return vec().length; }, enumerable: true });
-    def(L, "clear", function () { setAttr(node, attr, ""); });
-    def(L, "initialize", function (s) { put([String(s)]); return s; });
-    def(L, "getItem", function (i) { var v = vec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } return v[i]; });
-    def(L, "insertItemBefore", function (s, i) { var v = vec(); v.splice(Math.max(0, Math.min(i, v.length)), 0, String(s)); put(v); return s; });
-    def(L, "replaceItem", function (s, i) { var v = vec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } v[i] = String(s); put(v); return s; });
-    def(L, "removeItem", function (i) { var v = vec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } var r = v.splice(i, 1)[0]; put(v); return r; });
-    def(L, "appendItem", function (s) { var v = vec(); v.push(String(s)); put(v); return s; });
+    L.__l = {
+      len: function () { return vec().length; },
+      get: function (i) { return vec()[i]; },
+      clear: function () { setAttr(node, attr, ""); },
+      init: function (s) { put([String(s)]); return s; },
+      append: function (s) { var v = vec(); v.push(String(s)); put(v); return s; },
+      insert: function (s, i) { var v = vec(); v.splice(Math.max(0, Math.min(i, v.length)), 0, String(s)); put(v); return s; },
+      replace: function (s, i) { var v = vec(); v[i] = String(s); put(v); return s; },
+      remove: function (i) { var v = vec(); var r = v.splice(i, 1)[0]; put(v); return r; }
+    };
     return L;
   }
   function makeAnimatedPAR() {
@@ -896,15 +894,12 @@
     var isAuto = function () { var o = getAttr(node, "orient"); return o === "auto" || o === "auto-start-reverse"; };
     var angleNum = function () { var o = getAttr(node, "orient"); return (o == null || isAuto()) ? 0 : parseAngle(o).value; };
     var oa = Object.create(SVGAngle.prototype);
-    Object.defineProperty(oa, "value", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
-    Object.defineProperty(oa, "valueInSpecifiedUnits", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
-    Object.defineProperty(oa, "valueAsString", { get: function () { return String(angleNum()); }, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
-    Object.defineProperty(oa, "unitType", { get: function () { var o = getAttr(node, "orient"); return (o == null || isAuto()) ? 1 : parseAngle(o).type; }, enumerable: true });
-    def(oa, "newValueSpecifiedUnits", function (u, v) { setAttr(node, "orient", String(v)); });
-    def(oa, "convertToSpecifiedUnits", function () { setAttr(node, "orient", String(angleNum())); });
+    oa.__g = angleNum;
+    oa.__gt = function () { var o = getAttr(node, "orient"); return (o == null || isAuto()) ? 1 : parseAngle(o).type; };
+    oa.__s = function (v) { setAttr(node, "orient", String(v)); };
     var orientAngle = Object.create(globalThis.SVGAnimatedAngle.prototype);
-    Object.defineProperty(orientAngle, "baseVal", { value: oa, enumerable: true });
-    Object.defineProperty(orientAngle, "animVal", { value: makeAngle(function () { return svgAnimNum(el, "orient", angleNum(), angleVec); }), enumerable: true });
+    orientAngle.__base = oa;
+    orientAngle.__anim = makeAngle(function () { return svgAnimNum(el, "orient", angleNum(), angleVec); });
     return orientAngle;
   }
   function makeOrientType(el) {
@@ -935,13 +930,13 @@
     def(proto, "unsuspendRedrawAll", function () {});
     def(proto, "forceRedraw", function () {});
     def(proto, "deselectAll", function () {});
-    def(proto, "createSVGLength", function () { var L = Object.create(SVGLength.prototype); L.value = 0; L.valueInSpecifiedUnits = 0; L.valueAsString = "0"; L.unitType = 1; def(L, "newValueSpecifiedUnits", function (u, v) { this.value = v; this.valueInSpecifiedUnits = v; }); def(L, "convertToSpecifiedUnits", function () {}); return L; });
-    def(proto, "createSVGNumber", function () { var N = Object.create(globalThis.SVGNumber.prototype); N.value = 0; return N; });
-    def(proto, "createSVGPoint", function () { var P = Object.create(globalThis.SVGPoint.prototype); P.x = 0; P.y = 0; def(P, "matrixTransform", function (m) { return P; }); return P; });
-    def(proto, "createSVGRect", function () { var R = Object.create(globalThis.SVGRect.prototype); R.x = 0; R.y = 0; R.width = 0; R.height = 0; return R; });
+    def(proto, "createSVGLength", function () { return makeMutableLength(); });
+    def(proto, "createSVGNumber", function () { var N = Object.create(globalThis.SVGNumber.prototype); N.__v = 0; return N; });
+    def(proto, "createSVGPoint", function () { return makePoint(0, 0); });
+    def(proto, "createSVGRect", function () { return makeRectObj(0, 0, 0, 0); });
     def(proto, "createSVGMatrix", function () { return makeMatrix(1, 0, 0, 1, 0, 0); });
-    def(proto, "createSVGTransform", function () { var T = Object.create(SVGTransform.prototype); T.type = 0; T.angle = 0; T.matrix = makeMatrix(1, 0, 0, 1, 0, 0); def(T, "setMatrix", function (m) { this.matrix = m; this.type = 1; }); def(T, "setTranslate", function (x, y) { this.matrix = makeMatrix(1, 0, 0, 1, x, y); this.type = 2; }); def(T, "setScale", function (sx, sy) { this.matrix = makeMatrix(sx, 0, 0, sy, 0, 0); this.type = 3; }); def(T, "setRotate", function (ang) { this.angle = ang; this.type = 4; }); return T; });
-    def(proto, "createSVGAngle", function () { var A = Object.create(SVGAngle.prototype); A.value = 0; A.unitType = 1; return A; });
+    def(proto, "createSVGTransform", function () { return makeTransform("matrix", [1, 0, 0, 1, 0, 0]); });
+    def(proto, "createSVGAngle", function () { var st = { v: 0, u: 1 }; var A = Object.create(SVGAngle.prototype); A.__g = function () { return st.v; }; A.__gt = function () { return st.u; }; A.__s = function (x) { st.v = +x; }; return A; });
     def(proto, "createSVGTransformFromMatrix", function (m) { var T = this.createSVGTransform(); T.setMatrix(m); return T; });
     def(proto, "getElementById", function (id) { return this.ownerDocument.getElementById(id); });
     var elemViewBox = function (e) {
@@ -1002,6 +997,88 @@
     "SVGFEFuncRElement", "SVGFEFuncGElement", "SVGFEFuncBElement", "SVGFEFuncAElement",
     "SVGFEPointLightElement", "SVGFESpotLightElement", "SVGFEDistantLightElement", "SVGFEMergeNodeElement"
   ];
+  // Members of the SVG value / SVGAnimated* types live on their PROTOTYPES, reading per-instance state
+  // from `__`-prefixed backing slots (which idlharness ignores). Run once at bootstrap.
+  function installValueProtos() {
+    var G = globalThis;
+    function A(proto, name, get, set) { var d = { get: get, enumerable: true, configurable: true }; if (set) { d.set = set; } Object.defineProperty(proto, name, d); }
+    var RO = function () { throw new G.DOMException("read-only", "NoModificationAllowedError"); };
+
+    A(SVGLength.prototype, "value", function () { return this.__g(); }, function (v) { if (this.__s) { this.__s(v); } else { RO(); } });
+    A(SVGLength.prototype, "valueInSpecifiedUnits", function () { return parseLen(this.__gs()).num; }, function (v) { if (this.__sn) { this.__sn(v); } else if (this.__s) { this.__s(v); } else { RO(); } });
+    A(SVGLength.prototype, "valueAsString", function () { var s = this.__gs(); return s == null || s === "" ? "0" : s; }, function (v) { if (this.__sstr) { this.__sstr(v); } else if (this.__s) { this.__s(v); } else { RO(); } });
+    A(SVGLength.prototype, "unitType", function () { return this.__gt(); });
+    def(SVGLength.prototype, "newValueSpecifiedUnits", function (u, v) { if (this.__st) { this.__st.u = u; this.__st.n = v; } else if (this.__s) { this.__s(v); } });
+    def(SVGLength.prototype, "convertToSpecifiedUnits", function (u) { if (this.__st) { var px = this.__g(); this.__st.u = u; this.__st.n = pxToLen(px, u, this.__em || 16); } });
+
+    A(G.SVGNumber.prototype, "value", function () { return this.__v || 0; }, function (v) { this.__v = +v; });
+
+    A(SVGAngle.prototype, "value", function () { return this.__g(); }, function (v) { if (this.__s) { this.__s(v); } });
+    A(SVGAngle.prototype, "valueInSpecifiedUnits", function () { return this.__g(); }, function (v) { if (this.__s) { this.__s(v); } });
+    A(SVGAngle.prototype, "valueAsString", function () { return String(this.__g()); }, function (v) { if (this.__s) { this.__s(v); } });
+    A(SVGAngle.prototype, "unitType", function () { return this.__gt ? this.__gt() : 2; });
+    def(SVGAngle.prototype, "newValueSpecifiedUnits", function (u, v) { if (this.__s) { this.__s(v); } });
+    def(SVGAngle.prototype, "convertToSpecifiedUnits", function (u) {});
+
+    ["x", "y", "width", "height"].forEach(function (k, i) { A(G.SVGRect.prototype, k, function () { return this.__d ? this.__d[i] : (this.__get ? (this.__get()[i] || 0) : 0); }, function (v) { if (this.__d) { this.__d[i] = +v; } }); });
+    ["x", "y"].forEach(function (k, i) { A(G.SVGPoint.prototype, k, function () { return this.__d ? this.__d[i] : 0; }, function (v) { if (this.__d) { this.__d[i] = +v; } }); });
+    def(G.SVGPoint.prototype, "matrixTransform", function (m) { var x = this.x, y = this.y; return makePoint(m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f); });
+
+    ["a", "b", "c", "d", "e", "f"].forEach(function (k, i) { A(G.SVGMatrix.prototype, k, function () { return this.__m[i]; }, function (v) { this.__m[i] = +v; }); });
+    var mm = G.SVGMatrix.prototype;
+    def(mm, "multiply", function (o) { var m = this.__m; return makeMatrix(m[0] * o.a + m[2] * o.b, m[1] * o.a + m[3] * o.b, m[0] * o.c + m[2] * o.d, m[1] * o.c + m[3] * o.d, m[0] * o.e + m[2] * o.f + m[4], m[1] * o.e + m[3] * o.f + m[5]); });
+    def(mm, "translate", function (x, y) { return this.multiply(makeMatrix(1, 0, 0, 1, x, y)); });
+    def(mm, "scale", function (s) { return this.multiply(makeMatrix(s, 0, 0, s, 0, 0)); });
+    def(mm, "scaleNonUniform", function (sx, sy) { return this.multiply(makeMatrix(sx, 0, 0, sy, 0, 0)); });
+    def(mm, "rotate", function (deg) { var a = deg * Math.PI / 180, c = Math.cos(a), s = Math.sin(a); return this.multiply(makeMatrix(c, s, -s, c, 0, 0)); });
+    def(mm, "rotateFromVector", function (x, y) { var a = Math.atan2(y, x), c = Math.cos(a), s = Math.sin(a); return this.multiply(makeMatrix(c, s, -s, c, 0, 0)); });
+    def(mm, "flipX", function () { return this.multiply(makeMatrix(-1, 0, 0, 1, 0, 0)); });
+    def(mm, "flipY", function () { return this.multiply(makeMatrix(1, 0, 0, -1, 0, 0)); });
+    def(mm, "skewX", function (deg) { return this.multiply(makeMatrix(1, 0, Math.tan(deg * Math.PI / 180), 1, 0, 0)); });
+    def(mm, "skewY", function (deg) { return this.multiply(makeMatrix(1, Math.tan(deg * Math.PI / 180), 0, 1, 0, 0)); });
+    def(mm, "inverse", function () { var m = this.__m, det = m[0] * m[3] - m[1] * m[2]; if (!det) { throw new G.DOMException("non-invertible", "InvalidStateError"); } var id = 1 / det; return makeMatrix(m[3] * id, -m[1] * id, -m[2] * id, m[0] * id, (m[2] * m[5] - m[3] * m[4]) * id, (m[1] * m[4] - m[0] * m[5]) * id); });
+
+    A(SVGTransform.prototype, "type", function () { return this.__t.type; });
+    A(SVGTransform.prototype, "angle", function () { return this.__t.angle; });
+    A(SVGTransform.prototype, "matrix", function () { return this.__t.matrix; });
+    def(SVGTransform.prototype, "setMatrix", function (m) { this.__t.matrix = m; this.__t.type = 1; this.__t.angle = 0; });
+    def(SVGTransform.prototype, "setTranslate", function (x, y) { this.__t.matrix = transformMatrix("translate", [x, y]); this.__t.type = 2; this.__t.angle = 0; });
+    def(SVGTransform.prototype, "setScale", function (x, y) { this.__t.matrix = transformMatrix("scale", [x, y]); this.__t.type = 3; this.__t.angle = 0; });
+    def(SVGTransform.prototype, "setRotate", function (a, cx, cy) { this.__t.matrix = transformMatrix("rotate", [a, cx, cy]); this.__t.type = 4; this.__t.angle = a; });
+    def(SVGTransform.prototype, "setSkewX", function (a) { this.__t.matrix = transformMatrix("skewx", [a]); this.__t.type = 5; this.__t.angle = a; });
+    def(SVGTransform.prototype, "setSkewY", function (a) { this.__t.matrix = transformMatrix("skewy", [a]); this.__t.type = 6; this.__t.angle = a; });
+
+    A(SVGPreserveAspectRatio.prototype, "align", function () { return this.__align; }, function (v) { this.__align = v | 0; });
+    A(SVGPreserveAspectRatio.prototype, "meetOrSlice", function () { return this.__mos; }, function (v) { this.__mos = v | 0; });
+
+    // Lists share a backing interface stored in `__l`: { len, get, clear, init, append, insert, remove, replace }.
+    [G.SVGLengthList, G.SVGNumberList, G.SVGStringList, G.SVGPointList, G.SVGTransformList].forEach(function (C) {
+      var p = C.prototype;
+      A(p, "numberOfItems", function () { return this.__l.len(); });
+      A(p, "length", function () { return this.__l.len(); });
+      def(p, "getItem", function (i) { var n = this.__l.len(); if (i < 0 || i >= n) { throw new G.DOMException("index", "IndexSizeError"); } return this.__l.get(i); });
+      def(p, "clear", function () { this.__l.clear(); });
+      def(p, "initialize", function (x) { return this.__l.init(x); });
+      def(p, "appendItem", function (x) { return this.__l.append(x); });
+      def(p, "insertItemBefore", function (x, i) { return this.__l.insert(x, i); });
+      def(p, "removeItem", function (i) { var n = this.__l.len(); if (i < 0 || i >= n) { throw new G.DOMException("index", "IndexSizeError"); } return this.__l.remove(i); });
+      def(p, "replaceItem", function (x, i) { var n = this.__l.len(); if (i < 0 || i >= n) { throw new G.DOMException("index", "IndexSizeError"); } return this.__l.replace(x, i); });
+    });
+    def(G.SVGTransformList.prototype, "consolidate", function () { return this.__l.consolidate ? this.__l.consolidate() : null; });
+    def(G.SVGTransformList.prototype, "createSVGTransformFromMatrix", function (m) { return makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); });
+
+    // SVGAnimated* wrappers: object-valued (baseVal/animVal are stored objects).
+    [G.SVGAnimatedLength, G.SVGAnimatedRect, G.SVGAnimatedAngle, G.SVGAnimatedPreserveAspectRatio, G.SVGAnimatedTransformList, G.SVGAnimatedLengthList, G.SVGAnimatedNumberList].forEach(function (C) {
+      A(C.prototype, "baseVal", function () { return this.__base; });
+      A(C.prototype, "animVal", function () { return this.__anim; });
+    });
+    // SVGAnimated* wrappers: primitive-valued (baseVal/animVal via getter/setter closures).
+    [G.SVGAnimatedNumber, G.SVGAnimatedInteger, G.SVGAnimatedBoolean, G.SVGAnimatedString, G.SVGAnimatedEnumeration].forEach(function (C) {
+      A(C.prototype, "baseVal", function () { return this.__bget(); }, function (v) { this.__bset(v); });
+      A(C.prototype, "animVal", function () { return this.__aget(); });
+    });
+  }
+
   // Give every SVG interface object the WebIDL interface-object semantics idlharness checks: calling
   // it (with or without `new`) throws TypeError, `prototype` is non-writable/-enumerable/-configurable
   // with `constructor` pointing back, and the object's [[Prototype]] is its parent interface object.
@@ -1217,8 +1294,8 @@
     }
     return makeRectObj(0, 0, 0, 0);
   }
-  function makePoint(x, y) { var P = Object.create(globalThis.SVGPoint.prototype); P.x = x; P.y = y; def(P, "matrixTransform", function (m) { return makePoint(m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f); }); return P; }
-  function makeRectObj(x, y, w, h) { var R = Object.create(globalThis.SVGRect.prototype); R.x = x; R.y = y; R.width = w; R.height = h; return R; }
+  function makePoint(x, y) { var P = Object.create(globalThis.SVGPoint.prototype); P.__d = [x, y]; return P; }
+  function makeRectObj(x, y, w, h) { var R = Object.create(globalThis.SVGRect.prototype); R.__d = [x, y, w, h]; return R; }
 
   // Parse a `d` string into SVGPathData-style segments [{type, values}].
   var PATH_ARGS = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 };
@@ -1364,11 +1441,7 @@
 
   function makeMatrix(a, b, c, d, e, f) {
     var M = Object.create(globalThis.SVGMatrix.prototype);
-    M.a = a; M.b = b; M.c = c; M.d = d; M.e = e; M.f = f;
-    def(M, "multiply", function (o) { return makeMatrix(M.a * o.a + M.c * o.b, M.b * o.a + M.d * o.b, M.a * o.c + M.c * o.d, M.b * o.c + M.d * o.d, M.a * o.e + M.c * o.f + M.e, M.b * o.e + M.d * o.f + M.f); });
-    def(M, "translate", function (x, y) { return M.multiply(makeMatrix(1, 0, 0, 1, x, y)); });
-    def(M, "scale", function (s) { return M.multiply(makeMatrix(s, 0, 0, s, 0, 0)); });
-    def(M, "inverse", function () { var det = M.a * M.d - M.b * M.c; if (!det) { throw new globalThis.DOMException("not invertible", "InvalidStateError"); } return makeMatrix(M.d / det, -M.b / det, -M.c / det, M.a / det, (M.c * M.f - M.d * M.e) / det, (M.b * M.e - M.a * M.f) / det); });
+    M.__m = [a, b, c, d, e, f];
     return M;
   }
   globalThis.__svgMakeMatrix = makeMatrix;
@@ -1712,6 +1785,7 @@
   }
   globalThis.__svgColorOf = function (el, name) { return fmtColor(colorOf(el, name)); };
 
+  installValueProtos();
   installGeometryProtos();
   installSvgProtos();
   finalizeInterfaces();
