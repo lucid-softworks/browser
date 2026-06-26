@@ -82,6 +82,17 @@ fn default_path(req_path: &str) -> String {
     }
 }
 
+/// Whether `u` is a potentially-trustworthy (secure) context for cookie purposes: a secure scheme,
+/// or a loopback host (so local dev over `http://localhost` still gets Secure cookies).
+fn is_secure_context(u: &wurl::Url) -> bool {
+    let s = u.scheme();
+    if s.eq_ignore_ascii_case("https") || s.eq_ignore_ascii_case("wss") {
+        return true;
+    }
+    let h = u.hostname();
+    h == "localhost" || h.ends_with(".localhost") || h == "127.0.0.1" || h == "::1"
+}
+
 /// The request path (no query/fragment), defaulting an empty path to "/".
 fn request_path(u: &wurl::Url) -> String {
     let p = u.path_str();
@@ -239,6 +250,22 @@ pub fn set_cookie(url: &str, cookie_str: &str) -> bool {
         None => (host, true),
     };
     let path = path_attr.unwrap_or_else(|| default_path(&req_path));
+
+    // Cookie security rules (RFC 6265bis §4.1.3 + strict-secure).
+    let secure_origin = is_secure_context(&u);
+    // A `Secure` cookie may only be set over a secure transport.
+    if secure && !secure_origin {
+        return false;
+    }
+    let lname = name.to_ascii_lowercase();
+    // `__Secure-` requires the Secure attribute.
+    if lname.starts_with("__secure-") && !secure {
+        return false;
+    }
+    // `__Host-` requires Secure, a host-only cookie (no Domain), and Path=/.
+    if lname.starts_with("__host-") && (!secure || !host_only || path != "/") {
+        return false;
+    }
 
     let mut guard = match jar().lock() {
         Ok(g) => g,
@@ -1649,6 +1676,53 @@ mod tests {
         assert_eq!(parse_cookie_date("Tue, 01 Jan 1963 00:00:00 GMT"), Some(0));
         // Garbage => no date.
         assert_eq!(parse_cookie_date("not a date"), None);
+    }
+
+    #[test]
+    fn cookie_secure_only_over_secure_transport() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let insecure = "http://web-platform.test:8000/x.html";
+        // A Secure cookie set from a non-secure origin is rejected.
+        assert!(!set_cookie(insecure, "s=1; Path=/; Secure"));
+        assert!(cookies_for_document(insecure).is_empty());
+        // From a secure origin it is stored.
+        let secure = "https://web-platform.test:8443/x.html";
+        assert!(set_cookie(secure, "s=1; Path=/; Secure"));
+        assert!(has(&cookies_for_document(secure), "s=1"));
+    }
+
+    #[test]
+    fn cookie_secure_prefix() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // __Secure- requires the Secure attribute (case-insensitive prefix).
+        assert!(!set_cookie(secure, "__Secure-a=1; Path=/"));
+        assert!(!set_cookie(secure, "__SeCuRe-a=1; Path=/"));
+        assert!(set_cookie(secure, "__Secure-a=1; Path=/; Secure"));
+        assert!(has(&cookies_for_document(secure), "__Secure-a=1"));
+        // From a non-secure origin, even with Secure it cannot be set (strict-secure).
+        clear_cookies();
+        let insecure = "http://web-platform.test:8000/x.html";
+        assert!(!set_cookie(insecure, "__Secure-a=1; Path=/; Secure"));
+        assert!(cookies_for_document(insecure).is_empty());
+    }
+
+    #[test]
+    fn cookie_host_prefix() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // __Host- requires Secure + Path=/ + no Domain.
+        assert!(!set_cookie(secure, "__Host-a=1; Path=/")); // not Secure
+        assert!(!set_cookie(
+            secure,
+            "__Host-a=1; Secure; Path=/; Domain=web-platform.test"
+        )); // has Domain
+        assert!(!set_cookie(secure, "__Host-a=1; Secure; Path=/foo")); // path not /
+        assert!(set_cookie(secure, "__Host-a=1; Secure; Path=/"));
+        assert!(has(&cookies_for_document(secure), "__Host-a=1"));
     }
 
     #[test]
