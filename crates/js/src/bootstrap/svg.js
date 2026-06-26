@@ -976,6 +976,65 @@
     def(proto, "getEnclosureList", function (rect, ref) { return []; });
   }
 
+  // All SVG interface object names, so the finalize pass can give each the required interface-object
+  // semantics (throw when called, locked `prototype`, `prototype.constructor`, parent-interface chain).
+  var SVG_IFACE_NAMES = [
+    "SVGLength", "SVGAngle", "SVGTransform", "SVGPreserveAspectRatio", "SVGNumber", "SVGRect", "SVGPoint",
+    "SVGMatrix", "SVGTransformList", "SVGPointList", "SVGLengthList", "SVGNumberList", "SVGStringList",
+    "SVGAnimatedLength", "SVGAnimatedLengthList", "SVGAnimatedNumber", "SVGAnimatedNumberList",
+    "SVGAnimatedInteger", "SVGAnimatedEnumeration", "SVGAnimatedBoolean", "SVGAnimatedString",
+    "SVGAnimatedRect", "SVGAnimatedAngle", "SVGAnimatedPreserveAspectRatio", "SVGAnimatedTransformList",
+    "SVGUnitTypes", "SVGElement", "SVGGraphicsElement", "SVGSVGElement", "SVGGeometryElement",
+    "SVGPathElement", "SVGRectElement", "SVGCircleElement", "SVGEllipseElement", "SVGLineElement",
+    "SVGPolylineElement", "SVGPolygonElement", "SVGGElement", "SVGDefsElement", "SVGImageElement",
+    "SVGUseElement", "SVGSwitchElement", "SVGAElement", "SVGForeignObjectElement", "SVGTextContentElement",
+    "SVGTextPositioningElement", "SVGTextElement", "SVGTSpanElement", "SVGTextPathElement",
+    "SVGGradientElement", "SVGLinearGradientElement", "SVGRadialGradientElement", "SVGStopElement",
+    "SVGPatternElement", "SVGMarkerElement", "SVGClipPathElement", "SVGMaskElement", "SVGFilterElement",
+    "SVGSymbolElement", "SVGViewElement", "SVGDescElement", "SVGTitleElement", "SVGMetadataElement",
+    "SVGStyleElement", "SVGScriptElement", "SVGAnimationElement", "SVGAnimateElement", "SVGSetElement",
+    "SVGAnimateTransformElement", "SVGAnimateMotionElement", "SVGMPathElement",
+    "SVGFEBlendElement", "SVGFEColorMatrixElement", "SVGFEComponentTransferElement", "SVGFECompositeElement",
+    "SVGFEConvolveMatrixElement", "SVGFEDiffuseLightingElement", "SVGFEDisplacementMapElement",
+    "SVGFEDropShadowElement", "SVGFEFloodElement", "SVGFEGaussianBlurElement", "SVGFEImageElement",
+    "SVGFEMergeElement", "SVGFEMorphologyElement", "SVGFEOffsetElement", "SVGFESpecularLightingElement",
+    "SVGFETileElement", "SVGFETurbulenceElement", "SVGComponentTransferFunctionElement",
+    "SVGFEFuncRElement", "SVGFEFuncGElement", "SVGFEFuncBElement", "SVGFEFuncAElement",
+    "SVGFEPointLightElement", "SVGFESpotLightElement", "SVGFEDistantLightElement", "SVGFEMergeNodeElement"
+  ];
+  // Give every SVG interface object the WebIDL interface-object semantics idlharness checks: calling
+  // it (with or without `new`) throws TypeError, `prototype` is non-writable/-enumerable/-configurable
+  // with `constructor` pointing back, and the object's [[Prototype]] is its parent interface object.
+  function finalizeInterfaces() {
+    var parentOf = {};
+    SVG_IFACE_NAMES.forEach(function (n) { var f = globalThis[n]; if (typeof f === "function") { var p = Object.getPrototypeOf(f); parentOf[n] = (typeof p === "function") ? p.name : null; } });
+    var rebuilt = {};
+    SVG_IFACE_NAMES.forEach(function (n) {
+      var old = globalThis[n]; if (typeof old !== "function") { return; }
+      var proto = old.prototype;
+      var fn = new Function('return function ' + n + '(){ throw new TypeError("Illegal constructor"); }')();
+      // Statics are all WebIDL constants: enumerable, but non-writable / non-configurable, on both the
+      // interface object and its prototype.
+      Object.getOwnPropertyNames(old).forEach(function (k) {
+        if (k === "length" || k === "name" || k === "prototype" || k === "arguments" || k === "caller") { return; }
+        var d = { value: old[k], writable: false, enumerable: true, configurable: false };
+        try { Object.defineProperty(fn, k, d); } catch (e) {}
+        try { Object.defineProperty(proto, k, { value: old[k], writable: false, enumerable: true, configurable: false }); } catch (e) {}
+      });
+      fn.prototype = proto;
+      Object.defineProperty(proto, "constructor", { value: fn, writable: true, enumerable: false, configurable: true });
+      Object.defineProperty(globalThis, n, { value: fn, writable: true, enumerable: false, configurable: true });
+      rebuilt[n] = fn;
+    });
+    SVG_IFACE_NAMES.forEach(function (n) {
+      var fn = globalThis[n]; if (typeof fn !== "function") { return; }
+      var pn = parentOf[n];
+      var parent = pn ? (rebuilt[pn] || globalThis[pn]) : null;
+      if (parent) { try { Object.setPrototypeOf(fn, parent); } catch (e) {} }
+      try { Object.defineProperty(fn, "prototype", { writable: false, enumerable: false, configurable: false }); } catch (e) {}
+    });
+  }
+
   function installAnimationProto(proto) {
     def(proto, "getStartTime", function () { return parseBegin(getAttr(this.__node, "begin")); });
     def(proto, "getCurrentTime", function () { return clock.time; });
@@ -1655,5 +1714,6 @@
 
   installGeometryProtos();
   installSvgProtos();
+  finalizeInterfaces();
   globalThis.__svgEnrich = svgEnrich;
 })();
