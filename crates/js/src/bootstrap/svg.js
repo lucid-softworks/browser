@@ -1376,7 +1376,9 @@
     "color-interpolation": { i: "srgb", h: true }, "color-interpolation-filters": { i: "linearrgb", h: true },
     "image-rendering": { i: "auto", h: true }, "shape-rendering": { i: "auto", h: true }, "text-rendering": { i: "auto", h: true },
     "paint-order": { i: "normal", h: true }, "visibility": { i: "visible", h: true },
-    "stroke-dasharray": { i: "none", h: true }, "stroke-dashoffset": { i: "0px", h: true }
+    "stroke-dasharray": { i: "none", h: true }, "stroke-dashoffset": { i: "0px", h: true },
+    "x": { i: "0px", h: false }, "y": { i: "0px", h: false }, "cx": { i: "0px", h: false },
+    "cy": { i: "0px", h: false }, "r": { i: "0px", h: false }, "rx": { i: "auto", h: false }, "ry": { i: "auto", h: false }
   };
   // Validate + minimally serialize paint-order (an invalid value computes to the initial `normal`).
   function canonPaintOrderJs(v) {
@@ -1457,6 +1459,21 @@
       var rpo = rawStyleOrAttr(el, "paint-order");
       if (rpo == null) { var ppo = svgParent(el); return ppo ? svgComputed(ppo, name) : "normal"; }
       return canonPaintOrderJs(rpo);
+    }
+    // SVG geometry CSS properties: <length-percentage> resolved to px/% (x/y/cx/cy allow negatives;
+    // r non-negative; rx/ry keep the `auto` keyword).
+    if (name === "x" || name === "y" || name === "cx" || name === "cy") {
+      var rxy = rawStyleOrAttr(el, name);
+      return rxy == null ? "0px" : computeStrokeLen(el, rxy.trim(), false);
+    }
+    if (name === "r") {
+      var rrad = rawStyleOrAttr(el, "r");
+      return rrad == null ? "0px" : computeStrokeLen(el, rrad.trim(), true);
+    }
+    if (name === "rx" || name === "ry") {
+      var rrx = rawStyleOrAttr(el, name);
+      if (rrx == null || rrx.trim().toLowerCase() === "auto") { return "auto"; }
+      return computeStrokeLen(el, rrx.trim(), true);
     }
     if (name === "stroke-dashoffset") {
       var rd = rawStyleOrAttr(el, "stroke-dashoffset");

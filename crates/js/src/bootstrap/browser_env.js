@@ -2040,6 +2040,7 @@
       "font-size-adjust font-synthesis font-display src unicode-range ascent-override descent-override " +
       "line-gap-override size-adjust contain content-visibility container container-type container-name " +
       "counter-set inset gap row-gap column-gap place-items place-content place-self justify-items " +
+      "x y cx cy r rx ry " +
       "image-rendering image-orientation shape-outside shape-inside shape-subtract shape-margin shape-image-threshold " +
       "mix-blend-mode isolation backdrop-filter filter clip-path mask-clip mask-composite mask-mode " +
       "mask-origin mask-position mask-repeat mask-size mask-type mask-border " +
@@ -2178,6 +2179,11 @@
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
     // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
     // non-negative; stroke-dashoffset allows negatives.
+    // SVG geometry CSS properties (<length-percentage>; x/y/cx/cy allow negatives; r non-negative;
+    // rx/ry add the `auto` keyword).
+    if (name === "x" || name === "y" || name === "cx" || name === "cy") { return /^calc\(/i.test(v) ? __calc.valid(v) : isLenPct(v, true); }
+    if (name === "r") { return /^calc\(/i.test(v) ? __calc.valid(v) : isLenPct(v, false); }
+    if (name === "rx" || name === "ry") { return vl === "auto" || (/^calc\(/i.test(v) ? __calc.valid(v) : isLenPct(v, false)); }
     if (name === "stroke-width") { return /^calc\(/i.test(v) ? __calc.valid(v) : isStrokeLen(v, false); }
     if (name === "stroke-dashoffset") { return /^calc\(/i.test(v) ? __calc.valid(v) : isStrokeLen(v, true); }
     if (name === "stroke-dasharray") {
@@ -2295,6 +2301,16 @@
   }
   globalThis.__splitDashList = splitDashList;
   var STROKE_LEN_UNITS = /^(px|em|ex|ch|rem|vw|vh|vmin|vmax|cm|mm|q|in|pt|pc|cap|ic|vi|vb|lh|rlh)$/;
+  // A single CSS <length-percentage> token: a unit is required (a unitless non-zero is not a length;
+  // only `0` is allowed unitless), no trailing dot.
+  function isLenPct(v, allowNegative) {
+    var m = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z%]*)$/i.exec(String(v).trim());
+    if (!m || /\.$/.test(m[1])) { return false; }
+    var num = parseFloat(m[1]), unit = m[2].toLowerCase();
+    if (!allowNegative && num < 0) { return false; }
+    if (unit === "") { return num === 0; }
+    return unit === "%" || STROKE_LEN_UNITS.test(unit);
+  }
   // A single <length-percentage> | <number> token (no trailing dot, optional sign).
   function isStrokeLen(v, allowNegative) {
     var m = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z%]*)$/i.exec(String(v).trim());
@@ -2365,7 +2381,8 @@
       "top", "right", "bottom", "left", "inset-block-start", "inset-block-end",
       "inset-inline-start", "inset-inline-end", "text-indent", "letter-spacing", "word-spacing",
       "column-gap", "row-gap", "border-top-left-radius", "border-top-right-radius",
-      "border-bottom-left-radius", "border-bottom-right-radius", "flex-basis"]);
+      "border-bottom-left-radius", "border-bottom-right-radius", "flex-basis",
+      "x", "y", "cx", "cy", "r", "rx", "ry"]);
     for (var i = 0; i < names.length; i++) { o[names[i]] = 1; }
     return o;
   })();
