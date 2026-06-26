@@ -133,6 +133,9 @@ struct PaintState {
     /// In forced colors mode (and not forced-color-adjust:none), the element's forced `currentColor`
     /// — gradient stops authored with non-system colors resolve to it (so the gradient goes solid).
     force_stops: Option<(u8, u8, u8)>,
+    /// The inherited `color` (for `currentColor` resolution) set via the `color` presentation
+    /// attribute — which the CSS cascade does not currently carry into SVG painting.
+    current_color: Option<Color>,
 }
 
 impl Default for PaintState {
@@ -152,6 +155,7 @@ impl Default for PaintState {
             opacity: 1.0,
             evenodd: false,
             force_stops: None,
+            current_color: None,
         }
     }
 }
@@ -1021,18 +1025,32 @@ fn apply_paint(
             c.color
         }
     });
-    let current = cur_rgb.map(|(r, g, b)| Color { r, g, b, a: 255 });
+    let cascade_current = cur_rgb.map(|(r, g, b)| Color { r, g, b, a: 255 });
+    // The `color` presentation attribute updates the inherited current color (the cascade doesn't
+    // carry SVG presentation attributes). Track it through the PaintState so `currentColor` on this
+    // element and its descendants resolves correctly.
+    if let Some(v) = prop(el, "color", &style) {
+        let base = st.current_color.or(cascade_current);
+        if let Some(c) = resolve_paint(&v, base, base) {
+            st.current_color = Some(c);
+        }
+    }
+    let current = st.current_color.or(cascade_current);
     if let Some(v) = prop(el, "fill", &style) {
         if let Some(id) = paint_url_id(&v) {
-            // A `url(#id)` paint (gradient/pattern): remember the ref; keep a gray solid fallback in
-            // case it doesn't resolve to a gradient we support.
+            // A `url(#id)` paint (gradient/pattern): remember the ref. If it doesn't resolve to a
+            // gradient we support, use the explicit fallback paint when given (e.g.
+            // `url(#x) currentColor`), else a gray solid so the shape stays visible.
             st.fill_url = Some(id);
-            st.fill = Some(Color {
-                r: 128,
-                g: 128,
-                b: 128,
-                a: 255,
-            });
+            st.fill = match paint_url_fallback(&v) {
+                Some(fb) => resolve_paint(&fb, st.fill, current),
+                None => Some(Color {
+                    r: 128,
+                    g: 128,
+                    b: 128,
+                    a: 255,
+                }),
+            };
         } else {
             st.fill_url = None;
             st.fill = resolve_paint(&v, st.fill, current);
@@ -1449,6 +1467,21 @@ fn render_element(
                 );
             }
         }
+    }
+}
+
+/// Extract the fallback paint after a `url(...)` reference (e.g. the `currentColor` in
+/// `fill="url(#x) currentColor"`), or `None` when only the reference is given.
+fn paint_url_fallback(v: &str) -> Option<String> {
+    let t = v.trim();
+    if !t.starts_with("url(") {
+        return None;
+    }
+    let after = t.split_once(')')?.1.trim();
+    if after.is_empty() {
+        None
+    } else {
+        Some(after.to_string())
     }
 }
 
