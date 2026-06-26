@@ -1266,7 +1266,142 @@ fn conditional_ok(el: &dom::ElementData) -> bool {
     true
 }
 
+/// Render an element, applying `clip-path` / `mask` if present: the element's output is rendered to
+/// a temporary surface, intersected with the clip coverage / mask luminance, then composited.
 fn render_element(
+    doc: &Document,
+    child: NodeId,
+    m: Affine,
+    state: &PaintState,
+    surf: &mut Surface,
+    font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
+    depth: usize,
+) {
+    if depth > 256 {
+        return;
+    }
+    let (clip_id, mask_id, child_m) = match &doc.get(child).data {
+        NodeData::Element(el) => {
+            let style = attr(el, "style").map(|s| s.to_string());
+            let url_of = |name: &str| {
+                prop(el, name, &style).and_then(|v| {
+                    if v.trim().eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        paint_url_id(&v)
+                    }
+                })
+            };
+            let cm = match attr(el, "transform") {
+                Some(t) => m.then(parse_transform(t)),
+                None => m,
+            };
+            (url_of("clip-path"), url_of("mask"), cm)
+        }
+        _ => (None, None, m),
+    };
+    if clip_id.is_none() && mask_id.is_none() {
+        render_element_body(doc, child, m, state, surf, font, styles, depth);
+        return;
+    }
+    let mut temp = Surface::new(surf.w, surf.h);
+    render_element_body(doc, child, m, state, &mut temp, font, styles, depth);
+    if let Some(id) = clip_id {
+        apply_clip(&mut temp, doc, &id, child_m, font, styles);
+    }
+    if let Some(id) = mask_id {
+        apply_mask(&mut temp, doc, &id, child_m, font, styles);
+    }
+    composite_over(surf, &temp);
+}
+
+/// Multiply each pixel's alpha in `temp` by the coverage of a `<clipPath>` (rendered in white).
+fn apply_clip(
+    temp: &mut Surface,
+    doc: &Document,
+    clip_id: &str,
+    m: Affine,
+    font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
+) {
+    let cid = match find_by_id(doc, clip_id) {
+        Some(n) => n,
+        None => return,
+    };
+    if !matches!(&doc.get(cid).data, NodeData::Element(e) if e.tag.eq_ignore_ascii_case("clippath")) {
+        // An invalid clip-path reference makes the element not render at all.
+        for i in (3..temp.px.len()).step_by(4) {
+            temp.px[i] = 0;
+        }
+        return;
+    }
+    let mut mask = Surface::new(temp.w, temp.h);
+    let white = PaintState {
+        fill: Some(Color { r: 255, g: 255, b: 255, a: 255 }),
+        stroke: None,
+        fill_url: None,
+        ..PaintState::default()
+    };
+    render_children(doc, cid, m, &white, &mut mask, font, styles, 0);
+    for i in (0..temp.px.len()).step_by(4) {
+        let cov = mask.px[i + 3] as u32;
+        temp.px[i + 3] = (temp.px[i + 3] as u32 * cov / 255) as u8;
+    }
+}
+
+/// Multiply each pixel's alpha in `temp` by the luminance×alpha of a `<mask>`.
+fn apply_mask(
+    temp: &mut Surface,
+    doc: &Document,
+    mask_id: &str,
+    m: Affine,
+    font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
+) {
+    let mid = match find_by_id(doc, mask_id) {
+        Some(n) => n,
+        None => return,
+    };
+    if !matches!(&doc.get(mid).data, NodeData::Element(e) if e.tag.eq_ignore_ascii_case("mask")) {
+        return;
+    }
+    let mut msurf = Surface::new(temp.w, temp.h);
+    render_children(doc, mid, m, &PaintState::default(), &mut msurf, font, styles, 0);
+    for i in (0..temp.px.len()).step_by(4) {
+        let r = msurf.px[i] as u32;
+        let g = msurf.px[i + 1] as u32;
+        let b = msurf.px[i + 2] as u32;
+        let a = msurf.px[i + 3] as u32;
+        // sRGB luminance × alpha (per the SVG mask luminance formula, ×1000 fixed-point).
+        let lum = (2126 * r + 7152 * g + 722 * b) / 10000;
+        let cov = lum * a / 255;
+        temp.px[i + 3] = (temp.px[i + 3] as u32 * cov / 255) as u8;
+    }
+}
+
+/// Source-over composite `src` onto `dst` (both straight-alpha RGBA, same dimensions).
+fn composite_over(dst: &mut Surface, src: &Surface) {
+    let w = dst.w as i32;
+    for i in (0..src.px.len()).step_by(4) {
+        if src.px[i + 3] == 0 {
+            continue;
+        }
+        let p = (i / 4) as i32;
+        dst.blend(
+            p % w,
+            p / w,
+            Color {
+                r: src.px[i],
+                g: src.px[i + 1],
+                b: src.px[i + 2],
+                a: src.px[i + 3],
+            },
+        );
+    }
+}
+
+fn render_element_body(
     doc: &Document,
     child: NodeId,
     m: Affine,
