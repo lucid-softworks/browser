@@ -52,7 +52,14 @@ pub(crate) fn build_request_fetcher(
         } else {
             Some(body.as_bytes())
         };
-        let resp = net::request(method, url, body_opt, &headers).ok()?;
+        // Fetch semantics: a 4xx/5xx is a real response (`ok:false`), not a transport error. A CORS
+        // preflight (OPTIONS) must not follow redirects — a redirected preflight is a failure, which
+        // the JS layer detects from the 3xx status.
+        let opts = net::RequestOpts {
+            allow_error_status: true,
+            follow_redirects: !method.eq_ignore_ascii_case("OPTIONS"),
+        };
+        let resp = net::request_ext(method, url, body_opt, &headers, opts).ok()?;
         let ok = (200..300).contains(&resp.status);
         // The server's verbatim reason phrase; fall back to a synthesized one only when absent.
         let status_text = if resp.status_text.is_empty() {
