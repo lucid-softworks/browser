@@ -73,6 +73,89 @@
   // -------------------------------------------------------------------------------------------
   // Length parsing. Returns the value in user units (px), the specified number, and the unit type.
   // -------------------------------------------------------------------------------------------
+  // SVG element interface hierarchy. browser-env already defines SVGElement / SVGGraphicsElement /
+  // SVGSVGElement; we extend it with the per-element interfaces so `instanceof SVGRectElement` etc.
+  // work. Each interface's prototype chains to its parent's prototype.
+  function subClass(name, parentName) {
+    var parent = globalThis[parentName];
+    var fn = globalThis[name];
+    if (typeof fn !== "function") { fn = new Function("return function " + name + "(){}")(); globalThis[name] = fn; }
+    if (parent && parent.prototype && Object.getPrototypeOf(fn.prototype) !== parent.prototype) {
+      Object.setPrototypeOf(fn.prototype, parent.prototype);
+      Object.setPrototypeOf(fn, parent);
+    }
+    return fn;
+  }
+  subClass("SVGGeometryElement", "SVGGraphicsElement");
+  subClass("SVGPathElement", "SVGGeometryElement");
+  subClass("SVGRectElement", "SVGGeometryElement");
+  subClass("SVGCircleElement", "SVGGeometryElement");
+  subClass("SVGEllipseElement", "SVGGeometryElement");
+  subClass("SVGLineElement", "SVGGeometryElement");
+  subClass("SVGPolylineElement", "SVGGeometryElement");
+  subClass("SVGPolygonElement", "SVGGeometryElement");
+  subClass("SVGGElement", "SVGGraphicsElement");
+  subClass("SVGDefsElement", "SVGGraphicsElement");
+  subClass("SVGImageElement", "SVGGraphicsElement");
+  subClass("SVGUseElement", "SVGGraphicsElement");
+  subClass("SVGSwitchElement", "SVGGraphicsElement");
+  subClass("SVGAElement", "SVGGraphicsElement");
+  subClass("SVGForeignObjectElement", "SVGGraphicsElement");
+  subClass("SVGTextContentElement", "SVGGraphicsElement");
+  subClass("SVGTextPositioningElement", "SVGTextContentElement");
+  subClass("SVGTextElement", "SVGTextPositioningElement");
+  subClass("SVGTSpanElement", "SVGTextPositioningElement");
+  subClass("SVGTextPathElement", "SVGTextContentElement");
+  subClass("SVGGradientElement", "SVGElement");
+  subClass("SVGLinearGradientElement", "SVGGradientElement");
+  subClass("SVGRadialGradientElement", "SVGGradientElement");
+  subClass("SVGStopElement", "SVGElement");
+  subClass("SVGPatternElement", "SVGElement");
+  subClass("SVGMarkerElement", "SVGElement");
+  subClass("SVGClipPathElement", "SVGElement");
+  subClass("SVGMaskElement", "SVGElement");
+  subClass("SVGFilterElement", "SVGElement");
+  subClass("SVGSymbolElement", "SVGGraphicsElement");
+  subClass("SVGViewElement", "SVGElement");
+  subClass("SVGDescElement", "SVGElement");
+  subClass("SVGTitleElement", "SVGElement");
+  subClass("SVGMetadataElement", "SVGElement");
+  subClass("SVGStyleElement", "SVGElement");
+  subClass("SVGScriptElement", "SVGElement");
+  subClass("SVGAnimationElement", "SVGElement");
+  subClass("SVGAnimateElement", "SVGAnimationElement");
+  subClass("SVGSetElement", "SVGAnimationElement");
+  subClass("SVGAnimateTransformElement", "SVGAnimationElement");
+  subClass("SVGAnimateMotionElement", "SVGAnimationElement");
+  subClass("SVGAnimateColorElement", "SVGAnimationElement");
+  subClass("SVGMPathElement", "SVGElement");
+  // feImage etc. interfaces (minimal — for instanceof and ReferenceError avoidance).
+  ["SVGFEBlendElement", "SVGFEColorMatrixElement", "SVGFEComponentTransferElement", "SVGFECompositeElement",
+   "SVGFEConvolveMatrixElement", "SVGFEDiffuseLightingElement", "SVGFEDisplacementMapElement", "SVGFEDropShadowElement",
+   "SVGFEFloodElement", "SVGFEGaussianBlurElement", "SVGFEImageElement", "SVGFEMergeElement", "SVGFEMorphologyElement",
+   "SVGFEOffsetElement", "SVGFESpecularLightingElement", "SVGFETileElement", "SVGFETurbulenceElement"].forEach(function (n) { subClass(n, "SVGElement"); });
+
+  // Tag (lowercased local name) -> interface constructor name, used to set each element's prototype.
+  var TAG_IFACE = {
+    svg: "SVGSVGElement", g: "SVGGElement", defs: "SVGDefsElement", path: "SVGPathElement",
+    rect: "SVGRectElement", circle: "SVGCircleElement", ellipse: "SVGEllipseElement",
+    line: "SVGLineElement", polyline: "SVGPolylineElement", polygon: "SVGPolygonElement",
+    image: "SVGImageElement", use: "SVGUseElement", switch: "SVGSwitchElement", a: "SVGAElement",
+    foreignobject: "SVGForeignObjectElement", text: "SVGTextElement", tspan: "SVGTSpanElement",
+    textpath: "SVGTextPathElement", lineargradient: "SVGLinearGradientElement",
+    radialgradient: "SVGRadialGradientElement", stop: "SVGStopElement", pattern: "SVGPatternElement",
+    marker: "SVGMarkerElement", clippath: "SVGClipPathElement", mask: "SVGMaskElement",
+    filter: "SVGFilterElement", symbol: "SVGSymbolElement", view: "SVGViewElement",
+    desc: "SVGDescElement", title: "SVGTitleElement", metadata: "SVGMetadataElement",
+    style: "SVGStyleElement", script: "SVGScriptElement", animate: "SVGAnimateElement",
+    set: "SVGSetElement", animatetransform: "SVGAnimateTransformElement",
+    animatemotion: "SVGAnimateMotionElement", animatecolor: "SVGAnimateColorElement",
+    mpath: "SVGMPathElement", feimage: "SVGFEImageElement", feblend: "SVGFEBlendElement",
+    fegaussianblur: "SVGFEGaussianBlurElement", feflood: "SVGFEFloodElement", femerge: "SVGFEMergeElement",
+    fecolormatrix: "SVGFEColorMatrixElement", fecomposite: "SVGFECompositeElement",
+    feoffset: "SVGFEOffsetElement", feturbulence: "SVGFETurbulenceElement"
+  };
+
   var UNIT_TYPE = { "": 1, "px": 5, "%": 2, "em": 3, "ex": 4, "cm": 6, "mm": 7, "in": 8, "pt": 9, "pc": 10 };
   function unitToPx(n, u) {
     switch (u) {
@@ -416,6 +499,13 @@
     try { ln = (el.localName || el.tagName || "").toLowerCase(); } catch (e) {}
     def(el, "__localName", ln);
 
+    // Set the specific SVG element interface prototype (so `instanceof SVGRectElement` works); its
+    // chain ends at SVGElement.prototype set by browser-env's applyNodePrototype.
+    var ifaceName = TAG_IFACE[ln];
+    if (ifaceName && globalThis[ifaceName] && globalThis[ifaceName].prototype) {
+      try { if (Object.getPrototypeOf(el) !== globalThis[ifaceName].prototype) { Object.setPrototypeOf(el, globalThis[ifaceName].prototype); } } catch (e) {}
+    }
+
     // Scalar length attributes -> SVGAnimatedLength (cached per element+attr).
     var attrs = LEN_ATTRS[ln];
     if (attrs) {
@@ -502,6 +592,154 @@
           return el.parentNode && el.parentNode.nodeType === 1 ? el.parentNode : null;
         }, configurable: true, enumerable: true
       });
+    }
+
+    enrichGeometry(el);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Geometry: path/shape outlines, length, point-at-length, bounding box.
+  // -------------------------------------------------------------------------------------------
+  function gnum(el, attr, dflt) { var v = getAttr(el.__node, attr); if (v == null || v === "") { return dflt || 0; } return parseLen(v).value; }
+
+  // Parse a path `d` string into flattened contours: [{pts:[{x,y}...], closed}]. Curves are
+  // sampled; arcs are converted to their center parameterization and sampled.
+  function parsePathD(d) {
+    var contours = [], cur = null, sx = 0, sy = 0, x = 0, y = 0, px = 0, py = 0, prevCmd = "";
+    var toks = String(d).match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || [];
+    var i = 0;
+    function nextNum() { return parseFloat(toks[i++]); }
+    function start(nx, ny) { sx = nx; sy = ny; cur = { pts: [{ x: nx, y: ny }], closed: false }; contours.push(cur); }
+    function lineTo(nx, ny) { if (!cur) { start(x, y); } cur.pts.push({ x: nx, y: ny }); }
+    function sampleCubic(x0, y0, x1, y1, x2, y2, x3, y3) { var N = 24; for (var k = 1; k <= N; k++) { var t = k / N, u = 1 - t; lineTo(u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3, u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3); } }
+    function sampleQuad(x0, y0, x1, y1, x2, y2) { var N = 18; for (var k = 1; k <= N; k++) { var t = k / N, u = 1 - t; lineTo(u * u * x0 + 2 * u * t * x1 + t * t * x2, u * u * y0 + 2 * u * t * y1 + t * t * y2); } }
+    while (i < toks.length) {
+      var cmd = toks[i];
+      if (/[a-zA-Z]/.test(cmd)) { i++; } else { cmd = prevCmd === "M" ? "L" : prevCmd === "m" ? "l" : prevCmd; }
+      var rel = cmd >= "a";
+      switch (cmd.toLowerCase()) {
+        case "m": { var nx = nextNum() + (rel ? x : 0), ny = nextNum() + (rel ? y : 0); x = nx; y = ny; start(x, y); break; }
+        case "l": { x = nextNum() + (rel ? x : 0); y = nextNum() + (rel ? y : 0); lineTo(x, y); break; }
+        case "h": { x = nextNum() + (rel ? x : 0); lineTo(x, y); break; }
+        case "v": { y = nextNum() + (rel ? y : 0); lineTo(x, y); break; }
+        case "c": { var c1x = nextNum() + (rel ? x : 0), c1y = nextNum() + (rel ? y : 0), c2x = nextNum() + (rel ? x : 0), c2y = nextNum() + (rel ? y : 0), ex = nextNum() + (rel ? x : 0), ey = nextNum() + (rel ? y : 0); sampleCubic(x, y, c1x, c1y, c2x, c2y, ex, ey); px = c2x; py = c2y; x = ex; y = ey; break; }
+        case "s": { var sc1x = (prevCmd.toLowerCase() === "c" || prevCmd.toLowerCase() === "s") ? 2 * x - px : x, sc1y = (prevCmd.toLowerCase() === "c" || prevCmd.toLowerCase() === "s") ? 2 * y - py : y, c2x2 = nextNum() + (rel ? x : 0), c2y2 = nextNum() + (rel ? y : 0), ex2 = nextNum() + (rel ? x : 0), ey2 = nextNum() + (rel ? y : 0); sampleCubic(x, y, sc1x, sc1y, c2x2, c2y2, ex2, ey2); px = c2x2; py = c2y2; x = ex2; y = ey2; break; }
+        case "q": { var q1x = nextNum() + (rel ? x : 0), q1y = nextNum() + (rel ? y : 0), qex = nextNum() + (rel ? x : 0), qey = nextNum() + (rel ? y : 0); sampleQuad(x, y, q1x, q1y, qex, qey); px = q1x; py = q1y; x = qex; y = qey; break; }
+        case "t": { var tq1x = (prevCmd.toLowerCase() === "q" || prevCmd.toLowerCase() === "t") ? 2 * x - px : x, tq1y = (prevCmd.toLowerCase() === "q" || prevCmd.toLowerCase() === "t") ? 2 * y - py : y, tex = nextNum() + (rel ? x : 0), tey = nextNum() + (rel ? y : 0); sampleQuad(x, y, tq1x, tq1y, tex, tey); px = tq1x; py = tq1y; x = tex; y = tey; break; }
+        case "a": { var rx = nextNum(), ry = nextNum(), rot = nextNum(), laf = nextNum(), sf = nextNum(), ax = nextNum() + (rel ? x : 0), ay = nextNum() + (rel ? y : 0); sampleArc(x, y, rx, ry, rot, laf, sf, ax, ay, lineTo); x = ax; y = ay; break; }
+        case "z": { if (cur) { cur.closed = true; cur.pts.push({ x: sx, y: sy }); } x = sx; y = sy; break; }
+        default: i++;
+      }
+      prevCmd = cmd;
+    }
+    return contours;
+  }
+  function sampleArc(x0, y0, rx, ry, rotDeg, laf, sf, x1, y1, lineTo) {
+    if (rx === 0 || ry === 0) { lineTo(x1, y1); return; }
+    rx = Math.abs(rx); ry = Math.abs(ry);
+    var phi = rotDeg * Math.PI / 180, cosp = Math.cos(phi), sinp = Math.sin(phi);
+    var dx = (x0 - x1) / 2, dy = (y0 - y1) / 2;
+    var x1p = cosp * dx + sinp * dy, y1p = -sinp * dx + cosp * dy;
+    var lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry);
+    if (lam > 1) { var s = Math.sqrt(lam); rx *= s; ry *= s; }
+    var sign = laf === sf ? -1 : 1;
+    var num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p;
+    var den = rx * rx * y1p * y1p + ry * ry * x1p * x1p;
+    var co = sign * Math.sqrt(Math.max(0, num / den));
+    var cxp = co * rx * y1p / ry, cyp = -co * ry * x1p / rx;
+    var cx = cosp * cxp - sinp * cyp + (x0 + x1) / 2, cy = sinp * cxp + cosp * cyp + (y0 + y1) / 2;
+    function ang(ux, uy, vx, vy) { var dot = ux * vx + uy * vy, len = Math.sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy)); var a = Math.acos(Math.max(-1, Math.min(1, dot / len))); if (ux * vy - uy * vx < 0) { a = -a; } return a; }
+    var th0 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+    var dth = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+    if (!sf && dth > 0) { dth -= 2 * Math.PI; } else if (sf && dth < 0) { dth += 2 * Math.PI; }
+    var N = Math.max(2, Math.ceil(Math.abs(dth) / (Math.PI / 16)));
+    for (var k = 1; k <= N; k++) { var th = th0 + dth * k / N; var ex = cosp * rx * Math.cos(th) - sinp * ry * Math.sin(th) + cx, ey = sinp * rx * Math.cos(th) + cosp * ry * Math.sin(th) + cy; lineTo(ex, ey); }
+  }
+
+  function shapeContours(el) {
+    var ln = el.__localName;
+    if (ln === "path") { return parsePathD(getAttr(el.__node, "d") || ""); }
+    if (ln === "rect") { var x = gnum(el, "x"), y = gnum(el, "y"), w = gnum(el, "width"), h = gnum(el, "height"); return [{ pts: [{ x: x, y: y }, { x: x + w, y: y }, { x: x + w, y: y + h }, { x: x, y: y + h }, { x: x, y: y }], closed: true }]; }
+    if (ln === "line") { return [{ pts: [{ x: gnum(el, "x1"), y: gnum(el, "y1") }, { x: gnum(el, "x2"), y: gnum(el, "y2") }], closed: false }]; }
+    if (ln === "circle" || ln === "ellipse") { var cx = gnum(el, "cx"), cy = gnum(el, "cy"), rx = ln === "circle" ? gnum(el, "r") : gnum(el, "rx"), ry = ln === "circle" ? gnum(el, "r") : gnum(el, "ry"); var pts = []; var M = 256; for (var k = 0; k <= M; k++) { var t = 2 * Math.PI * k / M; pts.push({ x: cx + rx * Math.cos(t), y: cy + ry * Math.sin(t) }); } return [{ pts: pts, closed: true }]; }
+    if (ln === "polyline" || ln === "polygon") { var nums = vecParse(getAttr(el.__node, "points") || ""); var p = []; for (var j = 0; j + 1 < nums.length; j += 2) { p.push({ x: nums[j], y: nums[j + 1] }); } if (ln === "polygon" && p.length) { p.push({ x: p[0].x, y: p[0].y }); } return [{ pts: p, closed: ln === "polygon" }]; }
+    return [];
+  }
+  function totalLength(el) {
+    var ln = el.__localName;
+    if (ln === "rect") { return 2 * (gnum(el, "width") + gnum(el, "height")); }
+    if (ln === "circle") { return 2 * Math.PI * gnum(el, "r"); }
+    if (ln === "ellipse") { var a = gnum(el, "rx"), b = gnum(el, "ry"); return Math.PI * (3 * (a + b) - Math.sqrt((3 * a + b) * (a + 3 * b))); }
+    if (ln === "line") { return Math.hypot(gnum(el, "x2") - gnum(el, "x1"), gnum(el, "y2") - gnum(el, "y1")); }
+    var total = 0; var cs = shapeContours(el);
+    for (var i = 0; i < cs.length; i++) { var pts = cs[i].pts; for (var k = 1; k < pts.length; k++) { total += Math.hypot(pts[k].x - pts[k - 1].x, pts[k].y - pts[k - 1].y); } }
+    return total;
+  }
+  function pointAtLength(el, len) {
+    var cs = shapeContours(el); var segs = [];
+    for (var i = 0; i < cs.length; i++) { var pts = cs[i].pts; for (var k = 1; k < pts.length; k++) { segs.push([pts[k - 1], pts[k]]); } }
+    if (!segs.length) { return makePoint(0, 0); }
+    var tot = totalLength(el);
+    if (len < 0) { len = 0; } if (len > tot) { len = tot; }
+    var acc = 0;
+    for (var s = 0; s < segs.length; s++) { var a = segs[s][0], b = segs[s][1], d = Math.hypot(b.x - a.x, b.y - a.y); if (acc + d >= len || s === segs.length - 1) { var f = d > 0 ? (len - acc) / d : 0; return makePoint(a.x + f * (b.x - a.x), a.y + f * (b.y - a.y)); } acc += d; }
+    var last = segs[segs.length - 1][1]; return makePoint(last.x, last.y);
+  }
+  function bbox(el) {
+    var ln = el.__localName;
+    if (ln === "rect") { return makeRectObj(gnum(el, "x"), gnum(el, "y"), gnum(el, "width"), gnum(el, "height")); }
+    if (ln === "circle") { var r = gnum(el, "r"); return makeRectObj(gnum(el, "cx") - r, gnum(el, "cy") - r, 2 * r, 2 * r); }
+    if (ln === "ellipse") { var rx = gnum(el, "rx"), ry = gnum(el, "ry"); return makeRectObj(gnum(el, "cx") - rx, gnum(el, "cy") - ry, 2 * rx, 2 * ry); }
+    if (ln === "line") { var x1 = gnum(el, "x1"), y1 = gnum(el, "y1"), x2 = gnum(el, "x2"), y2 = gnum(el, "y2"); return makeRectObj(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1)); }
+    var cs = shapeContours(el); var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    for (var i = 0; i < cs.length; i++) { var pts = cs[i].pts; for (var k = 0; k < pts.length; k++) { minx = Math.min(minx, pts[k].x); miny = Math.min(miny, pts[k].y); maxx = Math.max(maxx, pts[k].x); maxy = Math.max(maxy, pts[k].y); } }
+    if (!isFinite(minx)) { return makeRectObj(0, 0, 0, 0); }
+    return makeRectObj(minx, miny, maxx - minx, maxy - miny);
+  }
+  function makePoint(x, y) { var P = Object.create(globalThis.SVGPoint.prototype); P.x = x; P.y = y; def(P, "matrixTransform", function (m) { return makePoint(m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f); }); return P; }
+  function makeRectObj(x, y, w, h) { var R = Object.create(globalThis.SVGRect.prototype); R.x = x; R.y = y; R.width = w; R.height = h; return R; }
+
+  // Parse `d` into SVGPathData-style segments and serialize back.
+  function getPathData(el) {
+    var d = getAttr(el.__node, "d") || ""; var out = [];
+    var toks = d.match(/[a-zA-Z]|[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || []; var i = 0, prev = "";
+    var ARGS = { m: 2, l: 2, h: 1, v: 1, c: 6, s: 4, q: 4, t: 2, a: 7, z: 0 };
+    while (i < toks.length) {
+      var t = toks[i]; var cmd;
+      if (/[a-zA-Z]/.test(t)) { cmd = t; i++; } else { cmd = (prev === "M") ? "L" : (prev === "m") ? "l" : prev; if (!cmd) { i++; continue; } }
+      var n = ARGS[cmd.toLowerCase()]; if (n == null) { continue; }
+      var vals = []; for (var k = 0; k < n; k++) { vals.push(parseFloat(toks[i++])); }
+      out.push({ type: cmd, values: vals }); prev = cmd;
+    }
+    return out;
+  }
+  function setPathData(el, segs) {
+    var d = (segs || []).map(function (s) { return s.type + (s.values && s.values.length ? " " + s.values.join(" ") : ""); }).join(" ");
+    setAttr(el.__node, "d", d);
+  }
+
+  var GEOM_TAGS = { path: 1, rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1 };
+  function enrichGeometry(el) {
+    var ln = el.__localName;
+    if (GEOM_TAGS[ln]) {
+      def(el, "getTotalLength", function () { return totalLength(el); });
+      def(el, "getPointAtLength", function (len) { return pointAtLength(el, Number(len) || 0); });
+      def(el, "isPointInFill", function () { return false; });
+      def(el, "isPointInStroke", function () { return false; });
+      // pathLength is an SVGAnimatedNumber on every SVGGeometryElement.
+      if (!("pathLength" in el)) {
+        (function () { var c = null; Object.defineProperty(el, "pathLength", { get: function () { if (!c) { c = Object.create(globalThis.SVGAnimatedNumber.prototype); Object.defineProperty(c, "baseVal", { get: function () { return gnum(el, "pathLength"); }, enumerable: true }); Object.defineProperty(c, "animVal", { get: function () { return gnum(el, "pathLength"); }, enumerable: true }); } return c; }, configurable: true, enumerable: true }); })();
+      }
+      if (ln === "path") {
+        def(el, "getPathData", function () { return getPathData(el); });
+        def(el, "setPathData", function (segs) { setPathData(el, segs); });
+      }
+    }
+    // getBBox / getCTM apply to all graphics elements.
+    if (GEOM_TAGS[ln] || ln === "g" || ln === "svg" || ln === "use" || ln === "text" || ln === "image" || ln === "tspan" || ln === "switch" || ln === "a" || ln === "foreignobject") {
+      if (typeof el.getBBox !== "function") { def(el, "getBBox", function () { return bbox(el); }); }
+      if (typeof el.getCTM !== "function") { def(el, "getCTM", function () { return makeMatrix(1, 0, 0, 1, 0, 0); }); }
+      if (typeof el.getScreenCTM !== "function") { def(el, "getScreenCTM", function () { return makeMatrix(1, 0, 0, 1, 0, 0); }); }
     }
   }
 

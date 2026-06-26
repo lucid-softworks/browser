@@ -1575,7 +1575,7 @@ pub(crate) fn prim_get_elements_by_class_name(
     rv.set(arr);
 }
 
-/// `__documentElementId() -> id | -1` (the <html> element)
+/// `__documentElementId() -> id | -1` (the root element: `<html>` for HTML, `<svg>`/… for XML)
 pub(crate) fn prim_document_element_id(
     scope: &mut v8::PinScope,
     _args: v8::FunctionCallbackArguments,
@@ -1584,7 +1584,13 @@ pub(crate) fn prim_document_element_id(
     let state = host_state(scope);
     let found = {
         let d = state.doc.borrow();
-        find_by_tag(&d, d.root(), "html")
+        // The document element is the root element child of the Document node — `<html>` for an HTML
+        // document, but `<svg>`/`<...>` for an XML document. Return the first Element child of root.
+        d.get(d.root())
+            .children
+            .iter()
+            .copied()
+            .find(|&c| matches!(d.get(c).data, dom::NodeData::Element(_)))
     };
     rv.set_double(found.map(|n| n.0 as f64).unwrap_or(-1.0));
 }
