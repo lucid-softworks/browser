@@ -1181,17 +1181,27 @@ fn request_streaming_inner(
         } else {
             agent_no_redirect()
         };
+        // A default header is sent only when the caller did not set one of its own (case-insensitive)
+        // — an author-supplied `Accept` / `Accept-Language` (e.g. an XHR `setRequestHeader`) must be
+        // the only such header on the wire, not be shadowed or duplicated by our default.
+        let has = |n: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
         let mut req = ag
             .request(&method_uc, url)
             // Bound the whole request (DNS + connect + read) so one stalled connection can't
             // hang the engine. Kept modest so a dead sub-resource fails fast.
-            .timeout(std::time::Duration::from_secs(8))
-            .set("User-Agent", BROWSER_USER_AGENT)
-            .set(
+            .timeout(std::time::Duration::from_secs(8));
+        if !has("User-Agent") {
+            req = req.set("User-Agent", BROWSER_USER_AGENT);
+        }
+        if !has("Accept") {
+            req = req.set(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .set("Accept-Language", "en-US,en;q=0.9");
+            );
+        }
+        if !has("Accept-Language") {
+            req = req.set("Accept-Language", "en-US,en;q=0.9");
+        }
         if has_cookie_header {
             req = req.set("Cookie", &cookie_header);
         }
