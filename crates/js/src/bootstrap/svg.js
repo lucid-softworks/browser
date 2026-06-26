@@ -138,7 +138,14 @@
     return curve(t, y1, y2);
   }
 
-  // Interpolate a numeric animation function at simple-duration fraction `f` in [0,1].
+  // Vectors (arrays of numbers) so the same engine drives scalars (dim 1), rects/viewBox (dim 4),
+  // and number/length lists (variable dim).
+  function vecParse(str) { return String(str).trim().split(/[\s,]+/).filter(function (x) { return x.length; }).map(function (x) { return parseLen(x).value; }); }
+  function vecLerp(a, b, p) { var o = [], n = Math.max(a.length, b.length); for (var i = 0; i < n; i++) { var av = a[i] || 0, bv = b[i] || 0; o.push(av + p * (bv - av)); } return o; }
+  function vecDist(a, b) { var s = 0, n = Math.max(a.length, b.length); for (var i = 0; i < n; i++) { var d = (b[i] || 0) - (a[i] || 0); s += d * d; } return Math.sqrt(s); }
+
+  // Interpolate a vector animation function at simple-duration fraction `f` in [0,1].
+  // `values` is an array of vectors (each a number[]).
   function simpleValue(f, values, calcMode, keyTimes, keySplines) {
     var n = values.length;
     if (n === 1) { return values[0]; }
@@ -156,9 +163,9 @@
     var times = keyTimes;
     if (!times || times.length !== n) {
       if (calcMode === "paced") {
-        // Distribute by cumulative absolute distance between values.
+        // Distribute by cumulative vector distance between values.
         var dist = [0]; var total = 0;
-        for (var k = 1; k < n; k++) { total += Math.abs(values[k] - values[k - 1]); dist.push(total); }
+        for (var k = 1; k < n; k++) { total += vecDist(values[k - 1], values[k]); dist.push(total); }
         times = dist.map(function (d) { return total === 0 ? 0 : d / total; });
       } else {
         times = []; for (var j = 0; j < n; j++) { times.push(j / (n - 1)); }
@@ -173,12 +180,15 @@
       var ks = keySplines[seg];
       p = bezierEase(p, ks[0], ks[1], ks[2], ks[3]);
     }
-    return values[seg] + p * (values[seg + 1] - values[seg]);
+    return vecLerp(values[seg], values[seg + 1], p);
   }
 
-  // Compute one animation element's contribution to a scalar attribute at time t.
-  // Returns {value, additive} or null when the animation has no effect at t.
-  function animContribution(a, t, baseNum) {
+  // Compute one animation element's contribution to an attribute at time t. `baseVec` is the
+  // underlying (attribute) value as a vector; `parseFn` turns a from/to/by/values token into a
+  // vector (numbers by default; colors when animating a paint property). Returns {value:number[],
+  // additive} or null when the animation has no effect at t.
+  function animContribution(a, t, baseVec, parseFn) {
+    parseFn = parseFn || vecParse;
     var ga = function (n) { var v = getAttr(a.__node, n); return v == null ? null : v; };
     var begin = parseBegin(ga("begin"));
     var durRaw = ga("dur");
@@ -225,27 +235,29 @@
     var vAttr = ga("values");
     var from = ga("from"), to = ga("to"), by = ga("by");
     if (a.__localName === "set") {
-      values = [num(to != null ? to : (vAttr != null ? vAttr : 0))];
+      values = [parseFn(to != null ? to : (vAttr != null ? vAttr : "0"))];
     } else if (vAttr != null) {
-      values = splitList(vAttr).map(num);
+      values = splitList(vAttr).map(parseFn);
       if (values.length === 0) { return null; }
     } else if (from != null && to != null) {
-      values = [parseLen(from).value, parseLen(to).value];
+      values = [parseFn(from), parseFn(to)];
     } else if (from != null && by != null) {
-      values = [parseLen(from).value, parseLen(from).value + parseLen(by).value];
+      var vf = parseFn(from), vb = parseFn(by);
+      values = [vf, vf.map(function (x, i) { return x + (vb[i] || 0); })];
     } else if (by != null) {
-      values = [0, parseLen(by).value]; additive = true; // pure by-animation is additive
+      var vby = parseFn(by); values = [vby.map(function () { return 0; }), vby]; additive = true; // pure by-animation is additive
     } else if (to != null) {
-      values = [baseNum, parseLen(to).value]; // to-animation: starts from the underlying value
+      values = [baseVec, parseFn(to)]; // to-animation: starts from the underlying value
     } else if (from != null) {
-      values = [parseLen(from).value];
+      values = [parseFn(from)];
     } else {
       return null;
     }
 
     var v = simpleValue(fraction, values, calcMode, keyTimes, keySplines);
     if (accumulate && iteration > 0 && values.length > 0) {
-      v += iteration * values[values.length - 1];
+      var last = values[values.length - 1];
+      v = v.map(function (x, i) { return x + iteration * (last[i] || 0); });
     }
     return { value: v, additive: additive };
   }
@@ -276,20 +288,28 @@
     return ("#" + (getAttr(el.__node, "id") || "")) === href;
   }
 
-  // The animated numeric value of `attr` on `el`, given its base (attribute) value.
-  function svgAnimNum(el, attr, baseNum) {
+  // The animated value vector of `attr` on `el`, given its base value vector. Returns the base when
+  // no animation is active.
+  function svgAnimVec(el, attr, baseVec, parseFn) {
     var anims = collectAnimations(el, attr);
-    if (!anims.length) { return baseNum; }
+    if (!anims.length) { return baseVec; }
     var t = currentTime();
-    var result = baseNum; var any = false;
+    var result = baseVec; var any = false;
     for (var i = 0; i < anims.length; i++) {
-      var c = animContribution(anims[i], t, baseNum);
+      var c = animContribution(anims[i], t, baseVec, parseFn);
       if (c == null) { continue; }
       any = true;
-      result = c.additive ? result + c.value : c.value;
+      if (c.additive && result.length === c.value.length) {
+        result = result.map(function (x, j) { return x + c.value[j]; });
+      } else {
+        result = c.value;
+      }
     }
-    return any ? result : baseNum;
+    return any ? result : baseVec;
   }
+  globalThis.__svgAnimVec = svgAnimVec;
+  // Scalar convenience wrapper.
+  function svgAnimNum(el, attr, baseNum) { return svgAnimVec(el, attr, [baseNum])[0]; }
   globalThis.__svgAnimNum = svgAnimNum;
 
   // -------------------------------------------------------------------------------------------
@@ -334,6 +354,44 @@
     return anim;
   }
 
+  // SVGRect (live, backed by a 4-number attribute) and SVGAnimatedRect (viewBox).
+  function makeRect(getVec) {
+    var R = Object.create(globalThis.SVGRect.prototype);
+    ["x", "y", "width", "height"].forEach(function (k, i) {
+      Object.defineProperty(R, k, { get: function () { return getVec()[i] || 0; }, set: function () {}, enumerable: true, configurable: true });
+    });
+    return R;
+  }
+  function makeAnimatedRect(el, attr) {
+    var node = el.__node;
+    function baseVec() { var s = getAttr(node, attr); return s == null ? [0, 0, 0, 0] : vecParse(s); }
+    var anim = Object.create(globalThis.SVGAnimatedRect.prototype);
+    Object.defineProperty(anim, "baseVal", { value: makeRect(baseVec), enumerable: true });
+    Object.defineProperty(anim, "animVal", { value: makeRect(function () { return svgAnimVec(el, attr, baseVec()); }), enumerable: true });
+    return anim;
+  }
+
+  // SVGNumberList / SVGLengthList (live) and their SVGAnimated* wrappers (x/y/dx/dy/rotate on text).
+  function makeItemList(getVec, listProto, itemProto) {
+    var L = Object.create(listProto.prototype);
+    Object.defineProperty(L, "numberOfItems", { get: function () { return getVec().length; }, enumerable: true, configurable: true });
+    Object.defineProperty(L, "length", { get: function () { return getVec().length; }, enumerable: true, configurable: true });
+    def(L, "getItem", function (i) {
+      var v = getVec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); }
+      var it = Object.create(itemProto.prototype); it.value = v[i]; it.valueInSpecifiedUnits = v[i]; it.valueAsString = String(v[i]); it.unitType = 1; return it;
+    });
+    def(L, "initialize", function () {}); def(L, "clear", function () {}); def(L, "appendItem", function (x) { return x; });
+    return L;
+  }
+  function makeAnimatedItemList(el, attr, listProto, itemProto) {
+    var node = el.__node;
+    function baseVec() { var s = getAttr(node, attr); return s == null || s === "" ? [] : vecParse(s); }
+    var anim = Object.create((listProto === globalThis.SVGNumberList ? globalThis.SVGAnimatedNumberList : globalThis.SVGAnimatedLengthList).prototype);
+    Object.defineProperty(anim, "baseVal", { value: makeItemList(baseVec, listProto, itemProto), enumerable: true });
+    Object.defineProperty(anim, "animVal", { value: makeItemList(function () { return svgAnimVec(el, attr, baseVec()); }, listProto, itemProto), enumerable: true });
+    return anim;
+  }
+
   // Per-tag scalar length-valued attributes (each exposed as an SVGAnimatedLength property).
   var LEN_ATTRS = {
     rect: ["x", "y", "width", "height", "rx", "ry"],
@@ -370,6 +428,40 @@
             configurable: true, enumerable: true
           });
         })(attrs[i]);
+      }
+    }
+
+    // Text-positioning elements: x/y/dx/dy are length lists, rotate is a number list.
+    if (ln === "text" || ln === "tspan" || ln === "tref" || ln === "textpath" || ln === "altglyph") {
+      var listCache = {};
+      [["x", globalThis.SVGLengthList, SVGLength], ["y", globalThis.SVGLengthList, SVGLength],
+       ["dx", globalThis.SVGLengthList, SVGLength], ["dy", globalThis.SVGLengthList, SVGLength],
+       ["rotate", globalThis.SVGNumberList, globalThis.SVGNumber]].forEach(function (spec) {
+        Object.defineProperty(el, spec[0], {
+          get: function () { return listCache[spec[0]] || (listCache[spec[0]] = makeAnimatedItemList(el, spec[0], spec[1], spec[2])); },
+          configurable: true, enumerable: true
+        });
+      });
+    }
+
+    // viewBox -> SVGAnimatedRect (on the elements that take one).
+    if (ln === "svg" || ln === "symbol" || ln === "marker" || ln === "pattern" || ln === "view") {
+      (function () {
+        var vbCache = null;
+        Object.defineProperty(el, "viewBox", {
+          get: function () { return vbCache || (vbCache = makeAnimatedRect(el, "viewBox")); },
+          configurable: true, enumerable: true
+        });
+      })();
+    }
+    // preserveAspectRatio: a minimal SVGAnimatedPreserveAspectRatio (the default xMidYMid meet).
+    if (ln === "svg" || ln === "symbol" || ln === "marker" || ln === "pattern" || ln === "view" || ln === "image" || ln === "feimage") {
+      if (!("preserveAspectRatio" in el)) {
+        var par = Object.create(globalThis.SVGAnimatedPreserveAspectRatio.prototype);
+        function makePar() { var p = Object.create(SVGPreserveAspectRatio.prototype); p.align = 6; p.meetOrSlice = 1; return p; }
+        Object.defineProperty(par, "baseVal", { value: makePar(), enumerable: true });
+        Object.defineProperty(par, "animVal", { value: makePar(), enumerable: true });
+        def(el, "preserveAspectRatio", par);
       }
     }
 
@@ -423,6 +515,128 @@
     return M;
   }
   globalThis.__svgMakeMatrix = makeMatrix;
+
+  // -------------------------------------------------------------------------------------------
+  // Color resolution + getComputedStyle override for SVG presentation properties.
+  // -------------------------------------------------------------------------------------------
+  var NAMED = {
+    black: [0, 0, 0], silver: [192, 192, 192], gray: [128, 128, 128], grey: [128, 128, 128],
+    white: [255, 255, 255], maroon: [128, 0, 0], red: [255, 0, 0], purple: [128, 0, 128],
+    fuchsia: [255, 0, 255], magenta: [255, 0, 255], green: [0, 128, 0], lime: [0, 255, 0],
+    olive: [128, 128, 0], yellow: [255, 255, 0], navy: [0, 0, 128], blue: [0, 0, 255],
+    teal: [0, 128, 128], aqua: [0, 255, 255], cyan: [0, 255, 255], orange: [255, 165, 0],
+    pink: [255, 192, 203], brown: [165, 42, 42], gold: [255, 215, 0], indigo: [75, 0, 130],
+    violet: [238, 130, 238], crimson: [220, 20, 60], coral: [255, 127, 80], salmon: [250, 128, 114],
+    khaki: [240, 230, 140], orchid: [218, 112, 214], plum: [221, 160, 221], tan: [210, 180, 140],
+    beige: [245, 245, 220], ivory: [255, 255, 240], lavender: [230, 230, 250], turquoise: [64, 224, 208],
+    darkred: [139, 0, 0], darkgreen: [0, 100, 0], darkblue: [0, 0, 139], lightgray: [211, 211, 211],
+    lightgrey: [211, 211, 211], darkgray: [169, 169, 169], darkgrey: [169, 169, 169],
+    transparent: [0, 0, 0, 0]
+  };
+  function parseColor(s, el) {
+    if (s == null) { return null; }
+    s = String(s).trim();
+    var lc = s.toLowerCase();
+    if (lc === "none") { return null; }
+    if (lc === "currentcolor") { return el ? colorOf(el, "color") : [0, 0, 0, 1]; }
+    if (NAMED[lc]) { var n = NAMED[lc]; return [n[0], n[1], n[2], n.length > 3 ? n[3] : 1]; }
+    var m;
+    if ((m = /^#([0-9a-f]{3})$/i.exec(s))) { return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16), 1]; }
+    if ((m = /^#([0-9a-f]{4})$/i.exec(s))) { return [parseInt(m[1][0] + m[1][0], 16), parseInt(m[1][1] + m[1][1], 16), parseInt(m[1][2] + m[1][2], 16), parseInt(m[1][3] + m[1][3], 16) / 255]; }
+    if ((m = /^#([0-9a-f]{6})$/i.exec(s))) { return [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16), parseInt(m[1].slice(4, 6), 16), 1]; }
+    if ((m = /^#([0-9a-f]{8})$/i.exec(s))) { return [parseInt(m[1].slice(0, 2), 16), parseInt(m[1].slice(2, 4), 16), parseInt(m[1].slice(4, 6), 16), parseInt(m[1].slice(6, 8), 16) / 255]; }
+    if ((m = /^rgba?\(([^)]*)\)$/i.exec(s))) {
+      var parts = m[1].split(/[\s,\/]+/).filter(function (x) { return x.length; });
+      function ch(x) { x = x.trim(); if (x.indexOf("%") >= 0) { return Math.round(parseFloat(x) * 255 / 100); } return Math.round(parseFloat(x)); }
+      return [ch(parts[0]), ch(parts[1]), ch(parts[2]), parts.length > 3 ? parseFloat(parts[3]) : 1];
+    }
+    return null;
+  }
+  function fmtColor(c) {
+    if (!c) { return "none"; }
+    var r = Math.max(0, Math.min(255, Math.round(c[0]))), g = Math.max(0, Math.min(255, Math.round(c[1]))), b = Math.max(0, Math.min(255, Math.round(c[2])));
+    var a = c.length > 3 ? c[3] : 1;
+    if (a >= 1) { return "rgb(" + r + ", " + g + ", " + b + ")"; }
+    return "rgba(" + r + ", " + g + ", " + b + ", " + (Math.round(a * 100) / 100) + ")";
+  }
+  function svgParent(el) {
+    try { var p = el.parentNode; return (p && p.nodeType === 1 && p.namespaceURI === SVG_NS) ? p : null; } catch (e) { return null; }
+  }
+  function rawStyleOrAttr(el, name) {
+    try { var sv = el.style && el.style.getPropertyValue ? el.style.getPropertyValue(name) : ""; if (sv) { return sv; } } catch (e) {}
+    var a = getAttr(el.__node, name);
+    return a == null || a === "" ? null : a;
+  }
+  // The computed color of a paint/color property, resolving animation, inheritance and currentColor.
+  var PAINT_INIT = { fill: [0, 0, 0, 1], stroke: null, "stop-color": [0, 0, 0, 1], color: [0, 0, 0, 1], "flood-color": [0, 0, 0, 1], "lighting-color": [255, 255, 255, 1] };
+  var PAINT_INHERIT = { fill: true, stroke: true, color: true };
+  function colorOf(el, name) {
+    var anims = collectAnimations(el, name);
+    var raw = rawStyleOrAttr(el, name);
+    if (anims.length) {
+      var base = raw != null ? (parseColor(raw, el) || [0, 0, 0, 1]) : (PAINT_INIT[name] || [0, 0, 0, 1]);
+      var pf = function (s) { return parseColor(s, el) || [0, 0, 0, 1]; };
+      var v = svgAnimVec(el, name, base, pf);
+      return v;
+    }
+    if (raw == null || raw === "inherit") {
+      var p = svgParent(el);
+      if (p && (PAINT_INHERIT[name] || raw === "inherit")) { return colorOf(p, name); }
+      return PAINT_INIT[name] || [0, 0, 0, 1];
+    }
+    if (raw.trim().toLowerCase() === "currentcolor") { return colorOf(el, "color"); }
+    return parseColor(raw, el) || (PAINT_INIT[name] || [0, 0, 0, 1]);
+  }
+  // The computed value of a numeric presentation property (opacity etc.).
+  var NUM_INIT = { opacity: 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "stroke-width": 1 };
+  var NUM_INHERIT = { "fill-opacity": true, "stroke-opacity": true, "stroke-width": true };
+  function numOf(el, name) {
+    var raw = rawStyleOrAttr(el, name);
+    var base = raw != null && raw !== "inherit" ? parseLen(raw).value : null;
+    if (base == null) {
+      var p = svgParent(el);
+      if (p && (NUM_INHERIT[name] || raw === "inherit")) { return numOf(p, name); }
+      base = NUM_INIT[name] != null ? NUM_INIT[name] : 0;
+    }
+    return svgAnimNum(el, name, base);
+  }
+
+  var SVG_COLOR_PROPS = { fill: 1, stroke: 1, color: 1, "stop-color": 1, "flood-color": 1, "lighting-color": 1 };
+  var SVG_NUM_PROPS = { opacity: 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "stroke-width": 1 };
+  // camelCase aliases used for direct property access on the declaration.
+  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility" };
+  function svgComputed(el, name) {
+    if (SVG_COLOR_PROPS[name]) { var c = colorOf(el, name); return c == null ? "none" : fmtColor(c); }
+    if (SVG_NUM_PROPS[name]) { var v = numOf(el, name); return name === "stroke-width" ? v + "px" : String(v); }
+    if (name === "visibility") {
+      var raw = rawStyleOrAttr(el, "visibility");
+      if (raw == null) { var p = svgParent(el); return p ? svgComputed(p, "visibility") : "visible"; }
+      return raw;
+    }
+    return null;
+  }
+  var nativeGCS = globalThis.getComputedStyle;
+  if (typeof nativeGCS === "function") {
+    globalThis.getComputedStyle = function (el, pseudo) {
+      var decl = nativeGCS.call(this, el, pseudo);
+      if (!el || el.namespaceURI !== SVG_NS) { return decl; }
+      return new Proxy(decl, {
+        get: function (target, prop) {
+          if (typeof prop === "string") {
+            if (prop === "getPropertyValue") {
+              return function (n) { var v = svgComputed(el, String(n).toLowerCase()); return v != null ? v : target.getPropertyValue(n); };
+            }
+            if (CAMEL[prop]) { var cv = svgComputed(el, CAMEL[prop]); if (cv != null) { return cv; } }
+            var kebab = prop.replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); });
+            if (SVG_COLOR_PROPS[kebab] || SVG_NUM_PROPS[kebab] || kebab === "visibility") { var kv = svgComputed(el, kebab); if (kv != null) { return kv; } }
+          }
+          var r = target[prop];
+          return typeof r === "function" ? r.bind(target) : r;
+        }
+      });
+    };
+  }
+  globalThis.__svgColorOf = function (el, name) { return fmtColor(colorOf(el, name)); };
 
   globalThis.__svgEnrich = svgEnrich;
 })();
