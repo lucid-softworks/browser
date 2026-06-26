@@ -46,18 +46,29 @@ pub enum StyleSource {
 pub(crate) fn build_request_fetcher(
 ) -> std::sync::Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> {
     std::sync::Arc::new(|method: &str, url: &str, body: &str, headers_json: &str| {
-        let headers = parse_headers_json(headers_json);
+        let mut headers = parse_headers_json(headers_json);
         let body_opt: Option<&[u8]> = if body.is_empty() {
             None
         } else {
             Some(body.as_bytes())
         };
+        // The CORS layer follows redirects itself (per-hop CORS checks), so it marks requests that
+        // must NOT be auto-followed with an internal `X-Lucid-No-Redirect` sentinel. Strip it here so
+        // it never reaches the network, and use it to disable redirect-following for that request.
+        let mut no_redirect = false;
+        headers.retain(|(name, _)| {
+            if name.eq_ignore_ascii_case("x-lucid-no-redirect") {
+                no_redirect = true;
+                false
+            } else {
+                true
+            }
+        });
         // Fetch semantics: a 4xx/5xx is a real response (`ok:false`), not a transport error. A CORS
-        // preflight (OPTIONS) must not follow redirects — a redirected preflight is a failure, which
-        // the JS layer detects from the 3xx status.
+        // preflight (OPTIONS) likewise must not follow redirects.
         let opts = net::RequestOpts {
             allow_error_status: true,
-            follow_redirects: !method.eq_ignore_ascii_case("OPTIONS"),
+            follow_redirects: !no_redirect && !method.eq_ignore_ascii_case("OPTIONS"),
         };
         let resp = net::request_ext(method, url, body_opt, &headers, opts).ok()?;
         let ok = (200..300).contains(&resp.status);

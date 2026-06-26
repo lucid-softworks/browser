@@ -11568,6 +11568,124 @@
     return true;
   }
 
+  // --- CORS request engine (manual redirect following) --------------------------------------
+  // fetch()/XHR follow redirects themselves (not the HTTP client) so each hop runs its own CORS
+  // checks: a per-hop preflight when needed, the Origin header (which becomes "null" after a
+  // tainting cross-origin redirect), the Access-Control-Allow-Origin check, and rejection of a
+  // redirect to a URL bearing credentials. The host request is told not to follow redirects via a
+  // sentinel header the engine strips before the request leaves the process.
+  var __noRedirectHeader = "X-Lucid-No-Redirect";
+
+  function __corsNewState(method, absUrl, body, headersObj, mode, credentialed) {
+    var self = __selfOrigin();
+    var target = __urlOrigin(absUrl);
+    return {
+      method: String(method).toUpperCase(), url: absUrl, body: body, headers: headersObj,
+      mode: mode, credentialed: credentialed, pageOrigin: self, reqOrigin: self,
+      // CORS is "active" (Origin sent, ACAO enforced) once any hop is cross-origin; it stays active
+      // for later same-origin hops (the response is cors-tainted for the rest of the redirect chain).
+      corsActive: (target != null && self != null && target !== self), hops: 0
+    };
+  }
+  // The non-safelisted author header names (sorted, lowercased) for this request.
+  function __corsNonSafelisted(headersObj) {
+    var out = [];
+    for (var k in headersObj) {
+      if (Object.prototype.hasOwnProperty.call(headersObj, k) &&
+          k.toLowerCase() !== "origin" && !__isSafelistedRequestHeader(k, headersObj[k])) {
+        out.push(k.toLowerCase());
+      }
+    }
+    return out.sort();
+  }
+  // Headers to send for the current hop: the author headers, the no-redirect sentinel, and (when
+  // CORS is active) the Origin header carrying the request's current (possibly opaque) origin.
+  function __corsHopHeaders(st) {
+    var h = {};
+    for (var k in st.headers) { if (Object.prototype.hasOwnProperty.call(st.headers, k)) { h[k] = st.headers[k]; } }
+    h[__noRedirectHeader] = "1";
+    if (st.corsActive && st.mode !== "no-cors") { h["Origin"] = st.reqOrigin; }
+    return h;
+  }
+  // Run this hop's preflight if CORS is active and the request isn't "simple". Returns false on
+  // failure (a network error for the whole fetch).
+  function __corsHopPreflight(st) {
+    if (!st.corsActive || st.mode !== "cors") { return true; }
+    var nonSafe = __corsNonSafelisted(st.headers);
+    var m = st.method;
+    if (m === "GET" || m === "HEAD" || m === "POST") { if (nonSafe.length === 0) { return true; } }
+    return __runPreflightSync(st.method, st.url, { origin: st.reqOrigin, credentialed: st.credentialed, nonSafelisted: nonSafe });
+  }
+  // Process a hop's parsed envelope. Returns one of:
+  //   { kind: "error" }                        a CORS / redirect failure (network error)
+  //   { kind: "redirect" }                     st mutated to the next hop; caller loops
+  //   { kind: "final", processed }             the response to deliver (CORS-filtered headers)
+  function __corsHopProcess(st, parsed) {
+    var raw = __rawHeadersFromEnvelope(parsed);
+    if (st.corsActive && st.mode === "cors" && !__allowOriginOk(raw, st.reqOrigin, st.credentialed)) {
+      return { kind: "error" };
+    }
+    var status = parsed.status | 0;
+    var loc = raw.get("location");
+    var isRedirect = (status === 301 || status === 302 || status === 303 || status === 307 || status === 308);
+    if (isRedirect && loc != null && st.hops < 20) {
+      var next;
+      try { next = new globalThis.URL(loc, st.url); } catch (e) { return { kind: "error" }; }
+      // A redirect to a URL bearing credentials (user:pass@) is a network error. Empty userinfo
+      // (":@", "@") is dropped by URL parsing and so is allowed.
+      if (next.username !== "" || next.password !== "") { return { kind: "error" }; }
+      var curOrigin = __urlOrigin(st.url), nextOrigin = __urlOrigin(next.href);
+      if (st.corsActive && curOrigin !== nextOrigin && st.reqOrigin !== curOrigin) { st.reqOrigin = "null"; }
+      if (nextOrigin !== st.pageOrigin) { st.corsActive = true; }
+      // 303 (and 301/302 on POST) become a bodyless GET.
+      if (status === 303 || ((status === 301 || status === 302) && st.method === "POST")) { st.method = "GET"; st.body = ""; }
+      st.url = next.href; st.hops++;
+      return { kind: "redirect" };
+    }
+    var cors = (st.corsActive && st.mode === "cors") ? { crossOrigin: true, origin: st.reqOrigin, credentialed: st.credentialed } : null;
+    var p = __processEnvelope(parsed, st.url, cors);
+    if (p.networkError) { return { kind: "error" }; }
+    return { kind: "final", processed: p };
+  }
+  // Synchronous CORS fetch (XHR sync). Returns { networkError } or { networkError:false, processed }.
+  function __corsRequestSync(method, absUrl, body, headersObj, mode, credentialed) {
+    var st = __corsNewState(method, absUrl, body, headersObj, mode, credentialed);
+    if (st.corsActive && st.mode === "same-origin") { return { networkError: true }; }
+    while (true) {
+      if (!__corsHopPreflight(st)) { return { networkError: true }; }
+      var env = globalThis.__request(st.method, st.url, st.body, JSON.stringify(__corsHopHeaders(st)));
+      if (env == null) { return { networkError: true }; }
+      var parsed;
+      try { parsed = JSON.parse(env); } catch (e) { return { networkError: true }; }
+      var d = __corsHopProcess(st, parsed);
+      if (d.kind === "error") { return { networkError: true }; }
+      if (d.kind === "final") { return { networkError: false, processed: d.processed }; }
+    }
+  }
+  // Asynchronous CORS fetch (XHR async / fetch). Drives the hops over the event loop, invoking
+  // onFinal(processed) or onError() when the chain settles.
+  function __corsRequestAsync(method, absUrl, body, headersObj, mode, credentialed, onFinal, onError) {
+    var st = __corsNewState(method, absUrl, body, headersObj, mode, credentialed);
+    if (st.corsActive && st.mode === "same-origin") { onError(); return; }
+    function step() {
+      if (!__corsHopPreflight(st)) { onError(); return; } // preflight is a blocking sub-request
+      var id = globalThis.__startFetch(st.method, st.url, st.body, JSON.stringify(__corsHopHeaders(st)));
+      globalThis.__pendingFetches[id] = {
+        url: st.url,
+        rawHandler: function (envelope) {
+          if (envelope == null) { onError(); return; }
+          var parsed;
+          try { parsed = JSON.parse(envelope); } catch (e) { onError(); return; }
+          var d = __corsHopProcess(st, parsed);
+          if (d.kind === "error") { onError(); return; }
+          if (d.kind === "final") { onFinal(d.processed); return; }
+          step();
+        }
+      };
+    }
+    step();
+  }
+
   // Async fetch plumbing. `fetch()` calls the non-blocking native `__startFetch`, which spawns a
   // background request thread and returns an id immediately; the page promise is parked in
   // `__pendingFetches[id]` and settled later — on the worker thread, inside the Rust drain — when
@@ -11623,6 +11741,9 @@
     var pending = globalThis.__pendingFetches[id];
     if (!pending) { return; } // already aborted/settled; late completion ignored.
     delete globalThis.__pendingFetches[id];
+    // The CORS engine parks a raw handler: hand it the verbatim envelope (or null) and let it run
+    // the per-hop CORS/redirect logic itself.
+    if (pending.rawHandler) { pending.rawHandler(envelope == null ? null : String(envelope)); return; }
     if (envelope == null) { pending.reject(new TypeError("Failed to fetch")); return; }
     var resp;
     try { resp = __responseFromEnvelope(String(envelope), pending.url, pending.cors); }
@@ -11635,6 +11756,8 @@
     var pending = globalThis.__pendingFetches[id];
     if (!pending) { return; }
     delete globalThis.__pendingFetches[id];
+    // A CORS-engine hop treats a transport error as a null envelope (its own network-error path).
+    if (pending.rawHandler) { pending.rawHandler(null); return; }
     pending.reject(reason || new TypeError("Failed to fetch"));
   });
 
@@ -11713,35 +11836,31 @@
         return Promise.reject(new TypeError("Failed to fetch"));
       }
 
-      // --- CORS: tag the request, add `Origin`, preflight when not "simple". ---
+      // Resolve the request URL against the base, then run the CORS engine (preflight, Origin,
+      // ACAO checks, manual redirect following) over the event loop.
       var fMode = init.mode || (input && input.mode) || "cors";
       var fCreds = init.credentials || (input && input.credentials) || "same-origin";
       var absUrl = url;
       try { absUrl = new globalThis.URL(url, (typeof document !== "undefined" && document.baseURI) || (globalThis.location && globalThis.location.href)).href; } catch (e) {}
-      var fNames = Object.keys(headers);
-      var fPlan = __corsPlan(method, absUrl, fNames, headers, fMode, fCreds === "include");
-      if (fPlan.networkError) { return Promise.reject(new TypeError("Failed to fetch")); }
-      if (fPlan.crossOrigin) {
-        headers["Origin"] = fPlan.origin;
-        if (fMode === "cors" && fPlan.preflight && !__runPreflightSync(method, absUrl, fPlan)) {
-          return Promise.reject(new TypeError("Failed to fetch"));
-        }
-      }
-      var fCors = fPlan.crossOrigin && fMode === "cors"
-        ? { crossOrigin: true, origin: fPlan.origin, credentialed: fPlan.credentialed }
-        : null;
 
-      // Kick off the request on a background thread; settle the promise later via the drain.
-      var id = __startFetch(method, url, bodyStr, JSON.stringify(headers));
       return new Promise(function (resolve, reject) {
-        globalThis.__pendingFetches[id] = { resolve: resolve, reject: reject, url: url, cors: fCors };
-        // AbortSignal: if it aborts while the request is in flight, reject this id with the abort
-        // reason and forget it (a late background completion is then ignored — see __resolveFetch).
+        var settled = false;
+        function finish(p) {
+          if (settled) { return; } settled = true;
+          resolve(new globalThis.Response(p.body, {
+            status: p.status, statusText: p.statusText, headers: p.headers, url: p.url, type: p.type
+          }));
+        }
+        function fail() { if (settled) { return; } settled = true; reject(new TypeError("Failed to fetch")); }
+        // AbortSignal: aborting forgets the request and rejects with the abort reason (a late
+        // background completion is then ignored because `settled` is set).
         if (signal && typeof signal.addEventListener === "function") {
           signal.addEventListener("abort", function () {
-            __rejectFetch(id, signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError"));
+            if (settled) { return; } settled = true;
+            reject(signal.reason || new globalThis.DOMException("The operation was aborted.", "AbortError"));
           });
         }
+        __corsRequestAsync(method, absUrl, bodyStr, headers, fMode, fCreds === "include", finish, fail);
       });
     });
   }
@@ -11878,36 +11997,17 @@
 
       fire("loadstart");
       var credentialed = !!xhr.withCredentials;
-      var plan = __corsPlan(method, absUrl, names, headers, "cors", credentialed);
-      if (plan.networkError) { var e0 = networkError(); if (!isAsync) { throw e0; } return; }
-      if (plan.crossOrigin) {
-        headers["Origin"] = plan.origin;
-        if (plan.preflight && !__runPreflightSync(method, absUrl, plan)) {
-          var e1 = networkError(); if (!isAsync) { throw e1; } return;
-        }
-      }
-      var cors = plan.crossOrigin ? { crossOrigin: true, origin: plan.origin, credentialed: credentialed } : null;
 
       if (!isAsync) {
-        var env = globalThis.__request(method, absUrl, bodyStr, JSON.stringify(headers));
-        if (env == null) { throw networkError(); }
-        var parsed; try { parsed = JSON.parse(env); } catch (e) { throw networkError(); }
-        var p = __processEnvelope(parsed, absUrl, cors);
-        if (p.networkError) { throw networkError(); }
-        deliver(p);
+        var r = __corsRequestSync(method, absUrl, bodyStr, headers, "cors", credentialed);
+        if (r.networkError) { throw networkError(); }
+        deliver(r.processed);
         return;
       }
-      // Async: settle on the event loop via the shared __startFetch / drain mechanism. A Response is
-      // handed back (already CORS-checked through pending.cors); reject means a network error.
-      var id = __startFetch(method, absUrl, bodyStr, JSON.stringify(headers));
-      globalThis.__pendingFetches[id] = {
-        url: absUrl, cors: cors,
-        resolve: function (resp) {
-          if (abortFlag) { return; }
-          deliver({ status: resp.status, statusText: resp.statusText, url: resp.url, body: resp.__body || "", headers: resp.headers });
-        },
-        reject: function () { if (!abortFlag) { networkError(); } }
-      };
+      // Async: the CORS engine drives the redirect chain over the event loop, then delivers.
+      __corsRequestAsync(method, absUrl, bodyStr, headers, "cors", credentialed,
+        function (p) { if (!abortFlag) { deliver(p); } },
+        function () { if (!abortFlag) { networkError(); } });
     };
   });
 
