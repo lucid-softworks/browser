@@ -993,14 +993,13 @@ fn resolve_paint(val: &str, inherited: Option<Color>, current: Option<Color>) ->
     if v.eq_ignore_ascii_case("inherit") {
         return inherited;
     }
-    // url(#...) gradients/patterns are unsupported → fall back to a mid-gray so the shape is visible.
+    // url(#...) paint reference: use the explicit fallback after it when present, else (an
+    // unresolved reference with no fallback) the paint is `none`.
     if v.starts_with("url(") {
-        return Some(Color {
-            r: 128,
-            g: 128,
-            b: 128,
-            a: 255,
-        });
+        return match paint_url_fallback(v) {
+            Some(fb) => resolve_paint(&fb, inherited, current),
+            None => None,
+        };
     }
     parse_css_color(v).or(inherited)
 }
@@ -1042,14 +1041,11 @@ fn apply_paint(
             // gradient we support, use the explicit fallback paint when given (e.g.
             // `url(#x) currentColor`), else a gray solid so the shape stays visible.
             st.fill_url = Some(id);
+            // If the reference doesn't resolve to a gradient we support, use the explicit fallback
+            // paint when given (`url(#x) green`), else `none` (an unresolved reference paints nothing).
             st.fill = match paint_url_fallback(&v) {
                 Some(fb) => resolve_paint(&fb, st.fill, current),
-                None => Some(Color {
-                    r: 128,
-                    g: 128,
-                    b: 128,
-                    a: 255,
-                }),
+                None => None,
             };
         } else {
             st.fill_url = None;
