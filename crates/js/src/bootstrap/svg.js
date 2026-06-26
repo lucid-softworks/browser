@@ -112,6 +112,10 @@
   subClass("SVGStopElement", "SVGElement");
   subClass("SVGPatternElement", "SVGElement");
   subClass("SVGMarkerElement", "SVGElement");
+  (function () {
+    var C = { SVG_MARKERUNITS_UNKNOWN: 0, SVG_MARKERUNITS_USERSPACEONUSE: 1, SVG_MARKERUNITS_STROKEWIDTH: 2, SVG_MARKER_ORIENT_UNKNOWN: 0, SVG_MARKER_ORIENT_AUTO: 1, SVG_MARKER_ORIENT_ANGLE: 2 };
+    for (var k in C) { if (C.hasOwnProperty(k)) { globalThis.SVGMarkerElement[k] = C[k]; globalThis.SVGMarkerElement.prototype[k] = C[k]; } }
+  })();
   subClass("SVGClipPathElement", "SVGElement");
   subClass("SVGMaskElement", "SVGElement");
   subClass("SVGFilterElement", "SVGElement");
@@ -170,9 +174,10 @@
   function parseLen(s) {
     if (s == null) { return { value: 0, num: 0, unit: "", type: 1, str: "" }; }
     s = String(s).trim();
-    var m = /^([+-]?(?:[0-9]*\.[0-9]+|[0-9]+\.?)(?:[eE][+-]?[0-9]+)?)\s*(px|pt|pc|cm|mm|in|em|ex|%)?$/.exec(s);
+    var m = /^([+-]?(?:[0-9]*\.[0-9]+|[0-9]+\.?)(?:[eE][+-]?[0-9]+)?)\s*([a-zA-Z%]*)$/.exec(s);
     if (!m) { return { value: 0, num: 0, unit: "", type: 0, str: s }; }
     var n = parseFloat(m[1]); var u = m[2] || "";
+    // Unknown units (e.g. "deg" on an angle attr) keep the numeric value as-is.
     return { value: unitToPx(n, u), num: n, unit: u, type: UNIT_TYPE[u] || 0, str: s };
   }
   function num(v) { v = parseFloat(v); return isFinite(v) ? v : 0; }
@@ -347,19 +352,20 @@
 
   function isAnimEl(el) {
     var ln = el && el.__localName;
-    return ln === "animate" || ln === "set" || ln === "animateColor" || ln === "animateTransform" || ln === "animateMotion";
+    return ln === "animate" || ln === "set" || ln === "animatecolor" || ln === "animatetransform" || ln === "animatemotion";
   }
 
-  // Collect the animation elements (document order) that target `el`'s attribute `attr`.
+  // Collect the animation elements (document order) that target `el`'s attribute `attr`. Scans the
+  // whole document so both nested animations and `(xlink:)href`-referenced ones are found.
   function collectAnimations(el, attr) {
     var out = [];
-    var kids = el.childNodes;
-    if (kids) {
-      for (var i = 0; i < kids.length; i++) {
-        var c = kids[i];
-        if (c && c.nodeType === 1 && isAnimEl(c) && getAttr(c.__node, "attributeName") === attr && animTargets(c, el)) {
-          out.push(c);
-        }
+    var doc = el.ownerDocument;
+    if (!doc || typeof doc.getElementsByTagName !== "function") { return out; }
+    var all = doc.getElementsByTagName("*");
+    for (var i = 0; i < all.length; i++) {
+      var c = all[i];
+      if (c && c.nodeType === 1 && isAnimEl(c) && getAttr(c.__node, "attributeName") === attr && animTargets(c, el)) {
+        out.push(c);
       }
     }
     return out;
@@ -367,8 +373,11 @@
   function animTargets(a, el) {
     var href = getAttr(a.__node, "href");
     if (href == null) { href = getAttr(a.__node, "xlink:href"); }
-    if (href == null || href === "") { return true; } // targets its parent
-    return ("#" + (getAttr(el.__node, "id") || "")) === href;
+    if (href != null && href.charAt(0) === "#") {
+      return href.slice(1) === (getAttr(el.__node, "id") || "");
+    }
+    // No href: targets its parent element.
+    try { return a.parentNode && a.parentNode.__node === el.__node; } catch (e) { return false; }
   }
 
   // The animated value vector of `attr` on `el`, given its base value vector. Returns the base when
@@ -392,8 +401,9 @@
   }
   globalThis.__svgAnimVec = svgAnimVec;
   // Scalar convenience wrapper.
-  function svgAnimNum(el, attr, baseNum) { return svgAnimVec(el, attr, [baseNum])[0]; }
+  function svgAnimNum(el, attr, baseNum, parseFn) { return svgAnimVec(el, attr, [baseNum], parseFn)[0]; }
   globalThis.__svgAnimNum = svgAnimNum;
+  function angleVec(s) { return [parseAngle(s).value]; }
 
   // -------------------------------------------------------------------------------------------
   // SVGLength factory (live, backed by an attribute) and SVGAnimatedLength.
@@ -487,8 +497,35 @@
     foreignobject: ["x", "y", "width", "height"],
     pattern: ["x", "y", "width", "height"],
     mask: ["x", "y", "width", "height"],
-    filter: ["x", "y", "width", "height"]
+    filter: ["x", "y", "width", "height"],
+    marker: ["refX", "refY", "markerWidth", "markerHeight"]
   };
+
+  // SVGAnimatedAngle (marker orient) and SVGAnimatedEnumeration helpers.
+  function parseAngle(s) {
+    if (s == null) { return { value: 0, type: 1 }; }
+    s = String(s).trim();
+    var m = /^([+-]?[0-9]*\.?[0-9]+)(deg|grad|rad)?$/.exec(s);
+    if (!m) { return { value: 0, type: 0 }; }
+    var n = parseFloat(m[1]);
+    if (m[2] === "rad") { n = n * 180 / Math.PI; } else if (m[2] === "grad") { n = n * 0.9; }
+    return { value: n, type: m[2] === "rad" ? 3 : m[2] === "grad" ? 4 : 2 };
+  }
+  function makeAngle(getVal) { var A = Object.create(SVGAngle.prototype); Object.defineProperty(A, "value", { get: getVal, enumerable: true }); Object.defineProperty(A, "valueInSpecifiedUnits", { get: getVal, enumerable: true }); Object.defineProperty(A, "valueAsString", { get: function () { return String(getVal()); }, enumerable: true }); A.unitType = 2; return A; }
+  function makeAnimatedAngle(el, attr) {
+    var node = el.__node;
+    function base() { var o = getAttr(node, attr); if (o == null || o === "auto" || o === "auto-start-reverse") { return 0; } return parseAngle(o).value; }
+    var anim = Object.create(globalThis.SVGAnimatedAngle.prototype);
+    Object.defineProperty(anim, "baseVal", { value: makeAngle(base), enumerable: true });
+    Object.defineProperty(anim, "animVal", { value: makeAngle(function () { return svgAnimNum(el, attr, base(), angleVec); }), enumerable: true });
+    return anim;
+  }
+  function makeAnimatedEnum(getBase) {
+    var anim = Object.create(globalThis.SVGAnimatedEnumeration.prototype);
+    Object.defineProperty(anim, "baseVal", { get: getBase, set: function () {}, enumerable: true });
+    Object.defineProperty(anim, "animVal", { get: getBase, enumerable: true });
+    return anim;
+  }
 
   // -------------------------------------------------------------------------------------------
   // Per-element decoration entry point (called by browser_env's enrichElement).
@@ -594,7 +631,134 @@
       });
     }
 
+    // Marker: orientAngle / orientType / markerUnits.
+    if (ln === "marker") {
+      var node = el.__node;
+      def(el, "orientAngle", makeAnimatedAngle(el, "orient"));
+      def(el, "orientType", makeAnimatedEnum(function () { var o = getAttr(node, "orient"); if (o === "auto" || o === "auto-start-reverse") { return 1; } return 2; }));
+      def(el, "markerUnits", makeAnimatedEnum(function () { var u = getAttr(node, "markerUnits"); return u === "userSpaceOnUse" ? 1 : 2; }));
+      def(el, "setOrientToAuto", function () { setAttr(node, "orient", "auto"); });
+      def(el, "setOrientToAngle", function (a) { setAttr(node, "orient", (a && a.value != null ? a.value : a) + "deg"); });
+      def(el, "SVG_MARKER_ORIENT_UNKNOWN", 0); def(el, "SVG_MARKER_ORIENT_AUTO", 1); def(el, "SVG_MARKER_ORIENT_ANGLE", 2);
+    }
+
+    // transform -> SVGAnimatedTransformList (cached); className -> SVGAnimatedString.
+    (function () {
+      var tCache = null;
+      Object.defineProperty(el, "transform", { get: function () { return tCache || (tCache = makeAnimatedTransformList(el)); }, configurable: true, enumerable: true });
+    })();
+    // gradientTransform / patternTransform on gradient and pattern elements.
+    if (ln === "lineargradient" || ln === "radialgradient") {
+      var gtCache = null;
+      Object.defineProperty(el, "gradientTransform", { get: function () { return gtCache || (gtCache = makeAnimatedTransformListAttr(el, "gradientTransform")); }, configurable: true, enumerable: true });
+      def(el, "gradientUnits", makeAnimatedEnum(function () { return getAttr(el.__node, "gradientUnits") === "userSpaceOnUse" ? 1 : 2; }));
+      def(el, "spreadMethod", makeAnimatedEnum(function () { var s = getAttr(el.__node, "spreadMethod"); return s === "reflect" ? 2 : s === "repeat" ? 3 : 1; }));
+    }
+    if (ln === "pattern") {
+      var ptCache = null;
+      Object.defineProperty(el, "patternTransform", { get: function () { return ptCache || (ptCache = makeAnimatedTransformListAttr(el, "patternTransform")); }, configurable: true, enumerable: true });
+      def(el, "patternUnits", makeAnimatedEnum(function () { return getAttr(el.__node, "patternUnits") === "userSpaceOnUse" ? 1 : 2; }));
+    }
+    (function () {
+      var cCache = null;
+      Object.defineProperty(el, "className", { get: function () { return cCache || (cCache = makeAnimatedString(el, "class")); }, configurable: true, enumerable: true });
+    })();
+    // href is an SVGAnimatedString on the elements that take one (a, use, image, gradients, …).
+    if (ln === "a" || ln === "use" || ln === "image" || ln === "lineargradient" || ln === "radialgradient" || ln === "pattern" || ln === "textpath" || ln === "mpath" || ln === "feimage" || ln === "tref") {
+      if (!("href" in el) || typeof el.href !== "object") {
+        var hCache = null;
+        Object.defineProperty(el, "href", { get: function () { return hCache || (hCache = makeAnimatedString(el, getAttr(el.__node, "href") != null ? "href" : "xlink:href")); }, configurable: true, enumerable: true });
+      }
+    }
+
     enrichGeometry(el);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // transform / SVGAnimatedTransformList + animateTransform.
+  // -------------------------------------------------------------------------------------------
+  function transformMatrix(type, v) {
+    switch (type) {
+      case "translate": return makeMatrix(1, 0, 0, 1, v[0] || 0, v[1] || 0);
+      case "scale": { var sx = v[0] || 0, sy = v.length > 1 ? v[1] : sx; return makeMatrix(sx, 0, 0, sy, 0, 0); }
+      case "rotate": { var a = (v[0] || 0) * Math.PI / 180, cx = v[1] || 0, cy = v[2] || 0; var cos = Math.cos(a), sin = Math.sin(a); return makeMatrix(1, 0, 0, 1, cx, cy).multiply(makeMatrix(cos, sin, -sin, cos, 0, 0)).multiply(makeMatrix(1, 0, 0, 1, -cx, -cy)); }
+      case "skewx": case "skewX": return makeMatrix(1, 0, Math.tan((v[0] || 0) * Math.PI / 180), 1, 0, 0);
+      case "skewy": case "skewY": return makeMatrix(1, Math.tan((v[0] || 0) * Math.PI / 180), 0, 1, 0, 0);
+      case "matrix": return makeMatrix(v[0] || 0, v[1] || 0, v[2] || 0, v[3] || 0, v[4] || 0, v[5] || 0);
+      default: return makeMatrix(1, 0, 0, 1, 0, 0);
+    }
+  }
+  var TTYPE = { matrix: 1, translate: 2, scale: 3, rotate: 4, skewx: 5, skewX: 5, skewy: 6, skewY: 6 };
+  function makeTransform(type, v) {
+    var T = Object.create(SVGTransform.prototype);
+    var lt = String(type).toLowerCase();
+    T.type = TTYPE[lt] || 0;
+    T.angle = (lt === "rotate" || lt === "skewx" || lt === "skewy") ? (v[0] || 0) : 0;
+    T.matrix = transformMatrix(lt, v);
+    def(T, "setMatrix", function (m) { T.matrix = m; T.type = 1; T.angle = 0; });
+    def(T, "setTranslate", function (x, y) { T.matrix = transformMatrix("translate", [x, y]); T.type = 2; T.angle = 0; });
+    def(T, "setScale", function (x, y) { T.matrix = transformMatrix("scale", [x, y]); T.type = 3; T.angle = 0; });
+    def(T, "setRotate", function (a, cx, cy) { T.matrix = transformMatrix("rotate", [a, cx, cy]); T.type = 4; T.angle = a; });
+    def(T, "setSkewX", function (a) { T.matrix = transformMatrix("skewx", [a]); T.type = 5; T.angle = a; });
+    def(T, "setSkewY", function (a) { T.matrix = transformMatrix("skewy", [a]); T.type = 6; T.angle = a; });
+    return T;
+  }
+  function parseTransformList(str) {
+    var out = [];
+    var re = /(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^)]*)\)/g, m;
+    while ((m = re.exec(str)) !== null) {
+      var vals = m[2].split(/[\s,]+/).filter(function (x) { return x.length; }).map(num);
+      out.push(makeTransform(m[1], vals));
+    }
+    return out;
+  }
+  function makeTransformList(items) {
+    var L = Object.create(globalThis.SVGTransformList.prototype);
+    Object.defineProperty(L, "numberOfItems", { get: function () { return items.length; }, enumerable: true });
+    Object.defineProperty(L, "length", { get: function () { return items.length; }, enumerable: true });
+    def(L, "getItem", function (i) { if (i < 0 || i >= items.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } return items[i]; });
+    def(L, "clear", function () { items.length = 0; });
+    def(L, "initialize", function (t) { items.length = 0; items.push(t); return t; });
+    def(L, "appendItem", function (t) { items.push(t); return t; });
+    def(L, "insertItemBefore", function (t, i) { items.splice(i, 0, t); return t; });
+    def(L, "removeItem", function (i) { return items.splice(i, 1)[0]; });
+    def(L, "replaceItem", function (t, i) { items[i] = t; return t; });
+    def(L, "consolidate", function () { if (!items.length) { return null; } var m = items[0].matrix; for (var k = 1; k < items.length; k++) { m = m.multiply(items[k].matrix); } var t = makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); items.length = 0; items.push(t); return t; });
+    def(L, "createSVGTransformFromMatrix", function (m) { return makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); });
+    return L;
+  }
+  function transformAnimVal(el, attr) {
+    var node = el.__node;
+    var baseList = parseTransformList(getAttr(node, attr) || "");
+    var anims = collectAnimations(el, attr).filter(function (a) { return a.__localName === "animatetransform"; });
+    if (!anims.length) { return baseList; }
+    var t = currentTime(); var animTransforms = []; var additiveAll = true;
+    for (var i = 0; i < anims.length; i++) {
+      var c = animContribution(anims[i], t, [0], vecParse);
+      if (c == null) { continue; }
+      var ty = getAttr(anims[i].__node, "type") || "translate";
+      animTransforms.push(makeTransform(ty, c.value));
+      if (!c.additive) { additiveAll = false; }
+    }
+    if (!animTransforms.length) { return baseList; }
+    return additiveAll ? baseList.concat(animTransforms) : animTransforms;
+  }
+  function makeAnimatedTransformListAttr(el, attr) {
+    var node = el.__node;
+    var anim = Object.create(globalThis.SVGAnimatedTransformList.prototype);
+    Object.defineProperty(anim, "baseVal", { get: function () { return makeTransformList(parseTransformList(getAttr(node, attr) || "")); }, enumerable: true });
+    Object.defineProperty(anim, "animVal", { get: function () { return makeTransformList(transformAnimVal(el, attr)); }, enumerable: true });
+    return anim;
+  }
+  function makeAnimatedTransformList(el) { return makeAnimatedTransformListAttr(el, "transform"); }
+
+  // SVGAnimatedString (className, href, etc.).
+  function makeAnimatedString(el, attr) {
+    var node = el.__node;
+    var anim = Object.create(globalThis.SVGAnimatedString.prototype);
+    Object.defineProperty(anim, "baseVal", { get: function () { var v = getAttr(node, attr); return v == null ? "" : v; }, set: function (v) { setAttr(node, attr, v == null ? "" : String(v)); }, enumerable: true });
+    Object.defineProperty(anim, "animVal", { get: function () { var v = getAttr(node, attr); return v == null ? "" : v; }, enumerable: true });
+    return anim;
   }
 
   // -------------------------------------------------------------------------------------------
