@@ -529,6 +529,24 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
+/// A sibling of [`agent`] configured to NOT follow redirects (`redirects(0)`). ureq's redirect
+/// policy is agent-level, so no-redirect requests (CORS preflights) use this pooled agent instead;
+/// a 3xx then surfaces as a normal 3xx response rather than being transparently followed.
+fn agent_no_redirect() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let mut builder = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(15))
+            .max_idle_connections_per_host(16)
+            .redirects(0);
+        if let Some(cfg) = wpt_tls_config() {
+            builder = builder.tls_config(std::sync::Arc::new(cfg));
+        }
+        builder.build()
+    })
+}
+
 /// A test-only rustls client config, or `None` to leave the agent on its default trust store.
 /// `WPT_INSECURE_TLS` disables certificate verification entirely; otherwise `WPT_CA_FILE` adds an
 /// extra trusted CA on top of the usual webpki roots. A missing/unparseable `WPT_CA_FILE` degrades
@@ -946,6 +964,51 @@ pub fn fetch(url: &str) -> Result<Response, String> {
     request("GET", url, None, &[])
 }
 
+/// Per-request knobs for [`request_ext`]. The defaults reproduce [`request`]'s historical behaviour
+/// (a non-2xx status is an `Err`; redirects are followed), so navigation/subresource callers are
+/// unaffected. The `fetch()`/XHR request fetcher opts into the spec behaviour instead: a 4xx/5xx is
+/// a real response (`ok:false`), and a CORS preflight must NOT follow redirects (a 3xx is a failure).
+#[derive(Clone, Copy)]
+pub struct RequestOpts {
+    /// Return the response for a 4xx/5xx status instead of mapping it to `Err` (no status-based
+    /// retry). The Fetch model treats an HTTP error status as a perfectly good response.
+    pub allow_error_status: bool,
+    /// Follow 3xx redirects (the default). A CORS preflight sets this false so a redirected
+    /// preflight surfaces as a 3xx response the caller can reject.
+    pub follow_redirects: bool,
+}
+
+impl Default for RequestOpts {
+    fn default() -> Self {
+        RequestOpts {
+            allow_error_status: false,
+            follow_redirects: true,
+        }
+    }
+}
+
+/// Like [`request`] but with explicit [`RequestOpts`]. Backs the `fetch()`/XHR request fetcher.
+pub fn request_ext(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(String, String)],
+    opts: RequestOpts,
+) -> Result<Response, String> {
+    let mut buf = Vec::new();
+    let meta = request_streaming_core(method, url, body, headers, true, opts, &mut |chunk| {
+        buf.extend_from_slice(chunk);
+    })?;
+    Ok(Response {
+        status: meta.status,
+        status_text: meta.status_text,
+        content_type: meta.content_type,
+        body: buf,
+        final_url: meta.final_url,
+        headers: meta.headers,
+    })
+}
+
 /// Issue an HTTP request with an arbitrary `method` and return a [`Response`], or an
 /// `Err(String)` describing the failure. Supports GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS over
 /// `http(s)://` (via the reused HTTP client) and `file://` reads (GET-like, body/headers ignored).
@@ -963,18 +1026,7 @@ pub fn request(
     // Accumulate the streamed body into a Vec so the historical buffered `Response` surface is
     // identical. The shared core records the network log exactly once (here), so we pass
     // `log = true` and don't record again.
-    let mut buf = Vec::new();
-    let meta = request_streaming_core(method, url, body, headers, true, &mut |chunk| {
-        buf.extend_from_slice(chunk);
-    })?;
-    Ok(Response {
-        status: meta.status,
-        status_text: meta.status_text,
-        content_type: meta.content_type,
-        body: buf,
-        final_url: meta.final_url,
-        headers: meta.headers,
-    })
+    request_ext(method, url, body, headers, RequestOpts::default())
 }
 
 /// Perform `url` like `request("GET", ...)` but deliver the body INCREMENTALLY: `on_chunk` is
@@ -982,7 +1034,7 @@ pub fn request(
 /// first). Returns the response metadata once the body is fully read, or Err on failure.
 pub fn fetch_streaming(url: &str, on_chunk: &mut dyn FnMut(&[u8])) -> Result<ResponseMeta, String> {
     // GET-only streaming: no request body or custom headers. Records the network log exactly once.
-    request_streaming_core("GET", url, None, &[], true, on_chunk)
+    request_streaming_core("GET", url, None, &[], true, RequestOpts::default(), on_chunk)
 }
 
 /// The single shared request path. Builds + sends the request (with the retry loop), then streams
@@ -995,12 +1047,13 @@ fn request_streaming_core(
     body: Option<&[u8]>,
     headers: &[(String, String)],
     log: bool,
+    opts: RequestOpts,
     on_chunk: &mut dyn FnMut(&[u8]),
 ) -> Result<ResponseMeta, String> {
     let start = std::time::Instant::now();
     // Count the total bytes streamed (sum of chunk lengths) for the network log.
     let mut total: usize = 0;
-    let result = request_streaming_inner(method, url, body, headers, &mut |chunk| {
+    let result = request_streaming_inner(method, url, body, headers, opts, &mut |chunk| {
         total += chunk.len();
         on_chunk(chunk);
     });
@@ -1034,6 +1087,7 @@ fn request_streaming_inner(
     url: &str,
     body: Option<&[u8]>,
     headers: &[(String, String)],
+    opts: RequestOpts,
     on_chunk: &mut dyn FnMut(&[u8]),
 ) -> Result<ResponseMeta, String> {
     let method_uc = method.to_ascii_uppercase();
@@ -1122,7 +1176,12 @@ fn request_streaming_inner(
     //     modest timeout, never the multiply-the-timeout loop.
     let mut attempt = 0;
     let resp = loop {
-        let mut req = agent()
+        let ag = if opts.follow_redirects {
+            agent()
+        } else {
+            agent_no_redirect()
+        };
+        let mut req = ag
             .request(&method_uc, url)
             // Bound the whole request (DNS + connect + read) so one stalled connection can't
             // hang the engine. Kept modest so a dead sub-resource fails fast.
@@ -1153,8 +1212,13 @@ fn request_streaming_inner(
         };
         match result {
             Ok(resp) => break resp,
-            // Fast status failures: retry rate-limit/server statuses with backoff (up to 3×).
-            Err(ureq::Error::Status(code, _)) => {
+            // A 4xx/5xx status. The Fetch model (fetch()/XHR) wants the response itself — return it
+            // verbatim, no status-based retry. Other callers keep the historical Err mapping (with a
+            // backoff retry for rate-limit/server statuses).
+            Err(ureq::Error::Status(code, resp)) => {
+                if opts.allow_error_status {
+                    break resp;
+                }
                 if (code == 403 || code == 429 || code >= 500) && attempt < 3 {
                     attempt += 1;
                     std::thread::sleep(backoff(attempt));
