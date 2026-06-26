@@ -437,6 +437,14 @@
     if (url !== undefined && url !== null && String(url) !== "" && parseURL(String(url), location.href).__invalid) {
       throw new globalThis.DOMException("Failed to execute 'open' on 'Window': Unable to open a window with invalid URL '" + String(url) + "'.", "SyntaxError");
     }
+    // A real auxiliary browsing context when there's a navigable URL: the opened document is loaded
+    // + run, and cross-window postMessage works (so e.g. testharness `fetch_tests_from_window`
+    // collects the child's tests). Falls back to the detached stub for about:blank / no URL / load
+    // failure.
+    if (url != null && String(url) !== "" && String(url) !== "about:blank") {
+      var w = globalThis.__makeOpenedWindow(new globalThis.URL(String(url), location.href).href);
+      if (w) { return w; }
+    }
     return __makeDetachedWindow(url);
   };
   if (typeof document !== "undefined") {
@@ -444,6 +452,12 @@
       if (arguments.length) { return __makeDetachedWindow(url); }
       return document;
     };
+    // document.location aliases window.location (same Location object); assigning it navigates.
+    Object.defineProperty(document, "location", {
+      get: function () { return globalThis.location; },
+      set: function (v) { globalThis.location.href = String(v); },
+      enumerable: true, configurable: true
+    });
   }
 
   // --- history (pushState/replaceState update location so SPA routers see the new URL) -------
@@ -8873,17 +8887,47 @@
         enumerable: true, configurable: true
       });
 
-      // frame -> page message delivery (the native bridge calls this on the page context).
+      // frame -> page message delivery (the native bridge calls this on the page context). The
+      // source is the iframe's contentWindow, or — for a window.open() target — the window object we
+      // handed back from open() (looked up by synthetic id), so the opener's
+      // `event.source === childWindow` checks (e.g. testharness RemoteContext) hold.
       def(globalThis, "__frameDeliverToParent", function (nodeId, value) {
         var el = globalThis.__framesByNode[nodeId];
         var data; try { data = globalThis.structuredClone(value); } catch (e) { data = value; }
-        var src = el ? el.contentWindow : null;
+        var src = el ? el.contentWindow
+          : (globalThis.__openedWindowsById ? globalThis.__openedWindowsById[nodeId] : null);
         setTimeout(function () {
           var ev;
           try { ev = new globalThis.MessageEvent("message", { data: data, origin: "", lastEventId: "", source: src, ports: [] }); }
           catch (e2) { ev = { type: "message", data: data }; }
           try { globalThis.dispatchEvent(ev); } catch (e3) {}
         }, 0);
+      });
+
+      // window.open() target: load a real auxiliary browsing context via the native, and hand back a
+      // window proxy (postMessage into it, property reads reach its realm). Registered by synthetic
+      // id so __frameDeliverToParent can use it as a message `source`.
+      globalThis.__openedWindowsById = {};
+      def(globalThis, "__makeOpenedWindow", function (absUrl) {
+        var nodeId = __windowOpen(absUrl);
+        if (!nodeId) { return null; } // the document failed to load
+        var base = {
+          postMessage: function (data, targetOrigin, transfer) { __framePostToFrame(nodeId, data); },
+          focus: function () {}, blur: function () {},
+          close: function () { __frameUnload(nodeId); base.closed = true; delete globalThis.__openedWindowsById[nodeId]; },
+          closed: false, __openId: nodeId
+        };
+        base.self = base; base.window = base; base.top = base; base.parent = base;
+        // Reads not on `base` (location, document, globals the child set, …) reach the child realm.
+        var win = new globalThis.Proxy(base, {
+          get: function (t, prop) {
+            if (prop in t) { return t[prop]; }
+            return typeof prop === "string" ? __frameGet(nodeId, prop) : undefined;
+          },
+          set: function (t, prop, v) { t[prop] = v; return true; }
+        });
+        globalThis.__openedWindowsById[nodeId] = win;
+        return win;
       });
 
       // Load any static iframes already in the parsed document (those with a src/srcdoc attribute).

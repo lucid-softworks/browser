@@ -5297,6 +5297,61 @@ mod tests {
     }
 
     #[test]
+    fn window_open_runs_child_and_opener_postmessage_roundtrips() {
+        // window.open() loads a real auxiliary browsing context: the child's script runs, and
+        // cross-window postMessage works both ways with correct `event.source` identity (the child
+        // posts to `opener`; the page posts to the returned window and the child echoes back).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var w = window.open('child.html');
+                window.addEventListener('message', function (e) {
+                  if (e.source === w) { document.body.setAttribute('data-reply', String(e.data)); }
+                });
+                w.postMessage('hi', '*');
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("child.html") {
+                    let body = "<!doctype html><html><body><script>self.addEventListener('message', function (e) { e.source.postMessage('echo:' + e.data, '*'); });<\\/script></body></html>";
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{body}"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-reply").as_deref(),
+            Some("echo:hi"),
+            "window.open postMessage round-trip via opener"
+        );
+    }
+
+    #[test]
     fn iframe_data_url_decodes_and_runs() {
         // An <iframe> with a data: src decodes the URL inline (no fetch), parses it as the frame
         // document, runs its script, and posts to the parent.
