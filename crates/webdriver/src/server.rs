@@ -587,7 +587,8 @@ fn add_cookie_cmd(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult 
             s.push_str("; HttpOnly");
         }
         // expiry (seconds since epoch) -> Max-Age or Expires would be more work; ignore for now.
-        let _ = net::set_cookie(url, &s);
+        // WebDriver "Add Cookie" behaves like a Set-Cookie header (may set Secure/HttpOnly).
+        let _ = net::set_cookie_from_http(url, &s);
         Ok(Json::Null)
     })
 }

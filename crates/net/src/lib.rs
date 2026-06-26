@@ -165,12 +165,24 @@ pub fn cookies_for_request(url: &str) -> String {
     collect_cookies(url, true)
 }
 
-/// Parse a cookie string (a `Set-Cookie` header value, or the right-hand side of
-/// `document.cookie = "..."`) and store it against the request `url`, applying RFC 6265 attribute
-/// rules. Returns true unless the input is unusable (bad URL or missing name). A cookie whose
-/// computed expiry is in the past deletes any matching stored cookie (this is how the spec — and
-/// the WPT cleanup callbacks — express deletion).
+/// Store a cookie from `document.cookie = "..."` (a non-HTTP API). The `HttpOnly` attribute is
+/// ignored, and an existing HttpOnly cookie with the same name/domain/path is left untouched.
 pub fn set_cookie(url: &str, cookie_str: &str) -> bool {
+    store_cookie(url, cookie_str, false)
+}
+
+/// Store a cookie received from a `Set-Cookie` HTTP response header (`HttpOnly` is honoured).
+pub fn set_cookie_from_http(url: &str, cookie_str: &str) -> bool {
+    store_cookie(url, cookie_str, true)
+}
+
+/// Parse a cookie string and store it against the request `url`, applying RFC 6265 attribute rules.
+/// `from_http` distinguishes a `Set-Cookie` header (HttpOnly honoured) from a `document.cookie`
+/// write (HttpOnly ignored; can't overwrite an existing HttpOnly cookie). Returns true unless the
+/// input is unusable (bad URL or missing name). A cookie whose computed expiry is in the past
+/// deletes any matching stored cookie (how the spec — and the WPT cleanup callbacks — express
+/// deletion).
+fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
     let u = match wurl::Url::parse(url) {
         Ok(u) => u,
         Err(()) => return false,
@@ -230,6 +242,10 @@ pub fn set_cookie(url: &str, cookie_str: &str) -> bool {
             _ => {}
         }
     }
+    // A `document.cookie` write (non-HTTP API) cannot set the HttpOnly attribute.
+    if !from_http {
+        http_only = false;
+    }
 
     let now = now_secs();
     // Max-Age takes precedence over Expires (RFC 6265 §5.3). Non-positive Max-Age = expired.
@@ -257,13 +273,22 @@ pub fn set_cookie(url: &str, cookie_str: &str) -> bool {
     if secure && !secure_origin {
         return false;
     }
+    // Cookie name prefixes (RFC 6265bis §4.1.3, plus the __Http-/__Host-Http- prefixes which also
+    // require HttpOnly). Checked most-specific first; a `document.cookie` write can't set HttpOnly,
+    // so the __Http- prefixes never apply to it.
     let lname = name.to_ascii_lowercase();
-    // `__Secure-` requires the Secure attribute.
-    if lname.starts_with("__secure-") && !secure {
-        return false;
-    }
-    // `__Host-` requires Secure, a host-only cookie (no Domain), and Path=/.
-    if lname.starts_with("__host-") && (!secure || !host_only || path != "/") {
+    let prefix_violation = if lname.starts_with("__host-http-") {
+        !secure || !http_only || !host_only || path != "/"
+    } else if lname.starts_with("__http-") {
+        !secure || !http_only
+    } else if lname.starts_with("__host-") {
+        !secure || !host_only || path != "/"
+    } else if lname.starts_with("__secure-") {
+        !secure
+    } else {
+        false
+    };
+    if prefix_violation {
         return false;
     }
 
@@ -271,11 +296,15 @@ pub fn set_cookie(url: &str, cookie_str: &str) -> bool {
         Ok(g) => g,
         Err(_) => return false,
     };
-    // Preserve the original creation time on overwrite (RFC 6265 §5.3 step 11.3).
-    let creation = guard
+    let existing = guard
         .iter()
-        .find(|c| c.name == name && c.domain == domain && c.path == path)
-        .map(|c| c.creation);
+        .find(|c| c.name == name && c.domain == domain && c.path == path);
+    // A non-HTTP API (document.cookie) may not overwrite or delete an HttpOnly cookie.
+    if !from_http && existing.is_some_and(|c| c.http_only) {
+        return false;
+    }
+    // Preserve the original creation time on overwrite (RFC 6265 §5.3 step 11.3).
+    let creation = existing.map(|c| c.creation);
     guard.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
 
     // An already-expired cookie just deletes the matching entry (done above) — don't store it.
@@ -1135,9 +1164,9 @@ fn request_streaming_inner(
     // Store any Set-Cookie headers from the final response into our shared jar so that
     // document.cookie can see them (and subsequent requests will send them).
     for sc in resp.all("set-cookie") {
-        // set_cookie accepts the Set-Cookie value (with or without attributes) and the URL
-        // that sent it (final_url after redirects).
-        let _ = set_cookie(&final_url, sc);
+        // A Set-Cookie response header (HttpOnly honoured), against the URL that sent it
+        // (final_url after redirects).
+        let _ = set_cookie_from_http(&final_url, sc);
     }
 
     let content_type = resp
@@ -1723,6 +1752,51 @@ mod tests {
         assert!(!set_cookie(secure, "__Host-a=1; Secure; Path=/foo")); // path not /
         assert!(set_cookie(secure, "__Host-a=1; Secure; Path=/"));
         assert!(has(&cookies_for_document(secure), "__Host-a=1"));
+    }
+
+    #[test]
+    fn cookie_http_prefix_requires_secure_and_httponly() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // __Http- requires Secure + HttpOnly (path may be non-root).
+        assert!(!set_cookie_from_http(secure, "__Http-a=1; Secure; Path=/")); // no HttpOnly
+        assert!(set_cookie_from_http(
+            secure,
+            "__Http-a=1; Secure; Path=/; HttpOnly"
+        ));
+        assert!(set_cookie_from_http(
+            secure,
+            "__Http-b=1; Secure; Path=/cookies/; HttpOnly"
+        ));
+        // __Host-Http- additionally requires host-only + Path=/.
+        assert!(!set_cookie_from_http(
+            secure,
+            "__Host-Http-c=1; Secure; Path=/cookies/; HttpOnly"
+        )); // path not /
+        assert!(set_cookie_from_http(
+            secure,
+            "__Host-Http-c=1; Secure; Path=/; HttpOnly"
+        ));
+        // document.cookie can't set HttpOnly, so the __Http- prefixes never apply to it.
+        assert!(!set_cookie(secure, "__Http-d=1; Secure; Path=/; HttpOnly"));
+    }
+
+    #[test]
+    fn cookie_dom_cannot_set_or_overwrite_httponly() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "https://web-platform.test:8443/x.html";
+        // HttpOnly set via HTTP is hidden from document.cookie but kept.
+        assert!(set_cookie_from_http(page, "k=server; Path=/; HttpOnly"));
+        assert!(!has(&cookies_for_document(page), "k=server"));
+        // A document.cookie write may not overwrite the HttpOnly cookie.
+        assert!(!set_cookie(page, "k=dom; Path=/"));
+        assert!(has(&cookies_for_request(page), "k=server"));
+        // And document.cookie can't create an HttpOnly cookie (attribute ignored).
+        clear_cookies();
+        assert!(set_cookie(page, "j=1; Path=/; HttpOnly"));
+        assert!(has(&cookies_for_document(page), "j=1")); // visible → not HttpOnly
     }
 
     #[test]
