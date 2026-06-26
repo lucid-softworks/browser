@@ -692,6 +692,18 @@
     }
     return out;
   }
+  // A read-only SVGTransformList that re-reads its items live (for baseVal/animVal reflection).
+  function makeLiveTransformList(getItems) {
+    var L = Object.create(globalThis.SVGTransformList.prototype);
+    L.__l = {
+      len: function () { return getItems().length; },
+      get: function (i) { return getItems()[i]; },
+      clear: function () {}, init: function (t) { return t; }, append: function (t) { return t; },
+      insert: function (t) { return t; }, remove: function (i) { return getItems()[i]; }, replace: function (t) { return t; },
+      consolidate: function () { var items = getItems(); if (!items.length) { return null; } var m = items[0].matrix; for (var k = 1; k < items.length; k++) { m = m.multiply(items[k].matrix); } return makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); }
+    };
+    return L;
+  }
   function makeTransformList(items) {
     var L = Object.create(globalThis.SVGTransformList.prototype);
     L.__l = {
@@ -726,8 +738,8 @@
   function makeAnimatedTransformListAttr(el, attr) {
     var node = el.__node;
     var anim = Object.create(globalThis.SVGAnimatedTransformList.prototype);
-    Object.defineProperty(anim, "baseVal", { get: function () { return makeTransformList(parseTransformList(getAttr(node, attr) || "")); }, enumerable: true });
-    Object.defineProperty(anim, "animVal", { get: function () { return makeTransformList(transformAnimVal(el, attr)); }, enumerable: true });
+    anim.__base = makeLiveTransformList(function () { return parseTransformList(getAttr(node, attr) || ""); });
+    anim.__anim = makeLiveTransformList(function () { return transformAnimVal(el, attr); });
     return anim;
   }
   function makeAnimatedTransformList(el) { return makeAnimatedTransformListAttr(el, "transform"); }
@@ -783,9 +795,8 @@
   }
   function makeAnimatedPAR() {
     var par = Object.create(globalThis.SVGAnimatedPreserveAspectRatio.prototype);
-    function mk() { var p = Object.create(SVGPreserveAspectRatio.prototype); p.align = 6; p.meetOrSlice = 1; return p; }
-    Object.defineProperty(par, "baseVal", { value: mk(), enumerable: true });
-    Object.defineProperty(par, "animVal", { value: mk(), enumerable: true });
+    function mk() { var p = Object.create(SVGPreserveAspectRatio.prototype); p.__align = 6; p.__mos = 1; return p; }
+    par.__base = mk(); par.__anim = mk();
     return par;
   }
   function svgAncestor(el, names) {
@@ -1109,6 +1120,23 @@
       var parent = pn ? (rebuilt[pn] || globalThis[pn]) : null;
       if (parent) { try { Object.setPrototypeOf(fn, parent); } catch (e) {} }
       try { Object.defineProperty(fn, "prototype", { writable: false, enumerable: false, configurable: false }); } catch (e) {}
+    });
+  }
+
+  // WebIDL requires interface members to be enumerable, and accessor/operation functions to be named
+  // ("get x" / "set x" / the operation name). Apply this across every SVG interface prototype.
+  function enumerateProtoMembers() {
+    SVG_IFACE_NAMES.forEach(function (n) {
+      var C = globalThis[n]; if (typeof C !== "function") { return; }
+      var proto = C.prototype;
+      Object.getOwnPropertyNames(proto).forEach(function (k) {
+        if (k === "constructor" || k.indexOf("__") === 0) { return; }
+        var d = Object.getOwnPropertyDescriptor(proto, k); if (!d) { return; }
+        if (d.get) { try { Object.defineProperty(d.get, "name", { value: "get " + k, configurable: true }); } catch (e) {} }
+        if (d.set) { try { Object.defineProperty(d.set, "name", { value: "set " + k, configurable: true }); } catch (e) {} }
+        if (typeof d.value === "function") { try { Object.defineProperty(d.value, "name", { value: k, configurable: true }); } catch (e) {} }
+        if (!d.enumerable && d.configurable) { d.enumerable = true; try { Object.defineProperty(proto, k, d); } catch (e) {} }
+      });
     });
   }
 
@@ -1789,5 +1817,6 @@
   installGeometryProtos();
   installSvgProtos();
   finalizeInterfaces();
+  enumerateProtoMembers();
   globalThis.__svgEnrich = svgEnrich;
 })();
