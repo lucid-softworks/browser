@@ -11327,32 +11327,197 @@
     return Promise.reject(new TypeError("Body cannot be parsed as FormData"));
   }
 
+  // --- CORS (Cross-Origin Resource Sharing) -------------------------------------------------
+  // Shared by fetch() and XMLHttpRequest. We are the user agent, so this privileged bootstrap code
+  // — not page script — runs the Fetch standard's CORS protocol: tag a request as same- or
+  // cross-origin, add the `Origin` header, issue a preflight (OPTIONS) when the request isn't
+  // "simple", check `Access-Control-Allow-Origin` (and friends) on the response, and filter which
+  // response headers page script may read. A failed check is a *network error* (the caller throws
+  // `NetworkError` for sync XHR / fires `error` for async, and rejects with `TypeError` for fetch).
+
+  // CORS-safelisted response-header names: readable cross-origin without being listed in
+  // `Access-Control-Expose-Headers`. (`content-length` is included to match browser behaviour.)
+  var __corsSafelistedResponseHeaders = {
+    "cache-control": 1, "content-language": 1, "content-type": 1,
+    "expires": 1, "last-modified": 1, "pragma": 1, "content-length": 1
+  };
+  // Response headers page script may never read, same- or cross-origin.
+  var __forbiddenResponseHeaders = { "set-cookie": 1, "set-cookie2": 1 };
+
+  // The origin (scheme "://" host) of an absolute URL, or null for non-http(s)/opaque URLs.
+  function __urlOrigin(href) {
+    try {
+      var u = new globalThis.URL(href);
+      if (u.protocol === "http:" || u.protocol === "https:") { return u.protocol + "//" + u.host; }
+    } catch (e) {}
+    return null;
+  }
+  // This document's origin (e.g. "http://web-platform.test:8000").
+  function __selfOrigin() {
+    try { if (globalThis.origin) { return globalThis.origin; } } catch (e) {}
+    try { return globalThis.location && globalThis.location.origin; } catch (e) {}
+    return null;
+  }
+  // A request header is CORS-safelisted (no preflight needed) when it is accept / accept-language /
+  // content-language, or a content-type whose essence is one of the three form/​plain MIME types.
+  function __isSafelistedRequestHeader(name, value) {
+    name = String(name).toLowerCase();
+    if (name === "accept" || name === "accept-language" || name === "content-language") { return true; }
+    if (name === "content-type") {
+      var essence = String(value).split(";")[0].trim().toLowerCase();
+      return essence === "application/x-www-form-urlencoded" ||
+             essence === "multipart/form-data" || essence === "text/plain";
+    }
+    return false;
+  }
+  // Split an Access-Control-Allow/Expose list header into trimmed, lowercased, non-empty tokens.
+  function __splitTokens(value) {
+    if (value == null) { return []; }
+    return String(value).split(",").map(function (s) { return s.trim().toLowerCase(); })
+                        .filter(function (s) { return s.length > 0; });
+  }
+  // CORS check on a response's `Access-Control-Allow-Origin` (already OWS-trimmed and, if the server
+  // sent it twice, combined — both of which then fail the exact match). `*` succeeds only when the
+  // request is not credentialed; an exact origin match additionally needs ACA-Credentials:true when
+  // credentialed.
+  function __allowOriginOk(headers, origin, credentialed) {
+    var acao = headers.get("access-control-allow-origin");
+    if (acao == null) { return false; }
+    if (acao === "*") { return !credentialed; }
+    if (acao !== origin) { return false; }
+    if (credentialed) { return headers.get("access-control-allow-credentials") === "true"; }
+    return true;
+  }
+  // A CORS-preflight (OPTIONS) succeeds when it is a 2xx whose ACAO passes and whose
+  // Allow-Methods / Allow-Headers cover the actual method and every non-safelisted request header.
+  function __preflightOk(headers, status, method, nonSafelistedNames, origin, credentialed) {
+    if (!(status >= 200 && status < 300)) { return false; }
+    if (!__allowOriginOk(headers, origin, credentialed)) { return false; }
+    var m = String(method).toUpperCase();
+    var methodOk = (m === "GET" || m === "HEAD" || m === "POST");
+    if (!methodOk) {
+      var methods = __splitTokens(headers.get("access-control-allow-methods"));
+      if (!credentialed && methods.indexOf("*") >= 0) { methodOk = true; }
+      else if (methods.indexOf(m.toLowerCase()) >= 0) { methodOk = true; }
+    }
+    if (!methodOk) { return false; }
+    var allowed = __splitTokens(headers.get("access-control-allow-headers"));
+    var wildcard = !credentialed && allowed.indexOf("*") >= 0;
+    for (var i = 0; i < nonSafelistedNames.length; i++) {
+      var hn = nonSafelistedNames[i].toLowerCase();
+      if (wildcard && hn !== "authorization") { continue; }
+      if (allowed.indexOf(hn) < 0) { return false; }
+    }
+    return true;
+  }
+  // Build the Headers page script is allowed to read from a response: same-origin exposes everything
+  // (bar forbidden names); cross-origin exposes the CORS-safelisted set plus any name listed in
+  // Access-Control-Expose-Headers (or everything when that list is `*` and the request isn't
+  // credentialed).
+  function __exposedHeaders(raw, crossOrigin, credentialed) {
+    var out = new globalThis.Headers();
+    var exposeList = __splitTokens(raw.get("access-control-expose-headers"));
+    var exposeAll = crossOrigin && !credentialed && exposeList.indexOf("*") >= 0;
+    raw.forEach(function (value, name) {
+      name = String(name).toLowerCase();
+      if (__forbiddenResponseHeaders[name]) { return; }
+      if (!crossOrigin || exposeAll || __corsSafelistedResponseHeaders[name] ||
+          exposeList.indexOf(name) >= 0) {
+        out.set(name, value);
+      }
+    });
+    return out;
+  }
+  // Decide CORS handling for a request. Returns:
+  //   { crossOrigin, origin, preflight, nonSafelisted, credentialed, networkError }
+  // `networkError` is set when the request is doomed before hitting the network (a cross-origin
+  // `same-origin`-mode request). `origin` is this document's origin; `nonSafelisted` is the sorted
+  // list of author header names that force (and must be allowed by) a preflight.
+  function __corsPlan(method, absUrl, authorHeaderNames, authorHeaders, mode, credentialed) {
+    var origin = __selfOrigin();
+    var target = __urlOrigin(absUrl);
+    var crossOrigin = (target != null && origin != null && target !== origin);
+    if (!crossOrigin) { return { crossOrigin: false, origin: origin }; }
+    if (mode === "same-origin") { return { crossOrigin: true, networkError: true }; }
+    var nonSafelisted = [];
+    for (var i = 0; i < authorHeaderNames.length; i++) {
+      var n = authorHeaderNames[i];
+      if (!__isSafelistedRequestHeader(n, authorHeaders[n])) { nonSafelisted.push(n.toLowerCase()); }
+    }
+    nonSafelisted.sort();
+    var m = String(method).toUpperCase();
+    var preflight = (m !== "GET" && m !== "HEAD" && m !== "POST") || nonSafelisted.length > 0;
+    return {
+      crossOrigin: true, origin: origin, preflight: preflight,
+      nonSafelisted: nonSafelisted, credentialed: credentialed
+    };
+  }
+  // Issue the synchronous CORS preflight via the blocking `__request` primitive. Returns true when it
+  // passes. Used by both sync XHR and (blockingly, before the async actual request) async callers.
+  function __runPreflightSync(method, absUrl, plan) {
+    var pre = { "Origin": plan.origin, "Access-Control-Request-Method": String(method).toUpperCase() };
+    if (plan.nonSafelisted.length > 0) { pre["Access-Control-Request-Headers"] = plan.nonSafelisted.join(","); }
+    var env = globalThis.__request("OPTIONS", absUrl, "", JSON.stringify(pre));
+    if (env == null) { return false; }
+    var parsed;
+    try { parsed = JSON.parse(env); } catch (e) { return false; }
+    var h = new globalThis.Headers();
+    if (Array.isArray(parsed.headers)) {
+      for (var i = 0; i < parsed.headers.length; i++) {
+        var p = parsed.headers[i]; if (p && p.length >= 2) { h.set(String(p[0]), String(p[1])); }
+      }
+    }
+    return __preflightOk(h, parsed.status | 0, method, plan.nonSafelisted, plan.origin, plan.credentialed);
+  }
+
   // Async fetch plumbing. `fetch()` calls the non-blocking native `__startFetch`, which spawns a
   // background request thread and returns an id immediately; the page promise is parked in
   // `__pendingFetches[id]` and settled later — on the worker thread, inside the Rust drain — when
   // the request completes, via `__resolveFetch(id, envelopeStr)` / `__rejectFetch(id)`. This lets
   // many fetches run concurrently instead of serializing one blocking call at a time.
   globalThis.__pendingFetches = globalThis.__pendingFetches || {};
-  // Build a Response from a host JSON envelope string (the shape the request fetcher returns).
-  function __responseFromEnvelope(envelope, fallbackUrl) {
-    var env = JSON.parse(envelope);
-    var respBody = env.body != null ? String(env.body) : "";
-    var contentType = env.contentType != null ? String(env.contentType) : "";
+  // Build the raw (unfiltered) response Headers from a parsed host envelope.
+  function __rawHeadersFromEnvelope(env) {
     var rh = new globalThis.Headers();
-    // Full header block (lowercased name + combined value pairs) from the host, when present.
     if (Array.isArray(env.headers)) {
       for (var hi = 0; hi < env.headers.length; hi++) {
         var pair = env.headers[hi];
         if (pair && pair.length >= 2) { rh.set(String(pair[0]), String(pair[1])); }
       }
     }
+    var contentType = env.contentType != null ? String(env.contentType) : "";
     if (contentType && !rh.has("content-type")) { rh.set("content-type", contentType); }
-    return new globalThis.Response(respBody, {
+    return rh;
+  }
+  // Apply CORS to a parsed envelope: returns `{ networkError }` when a cross-origin response fails
+  // its `Access-Control-Allow-Origin` check, otherwise `{ status, statusText, url, body, headers }`
+  // with `headers` already filtered to the names page script may read. `cors` is the plan returned
+  // by `__corsPlan` (or a falsy value for a non-CORS request, e.g. same-origin or a worker import).
+  function __processEnvelope(env, fallbackUrl, cors) {
+    var raw = __rawHeadersFromEnvelope(env);
+    var crossOrigin = !!(cors && cors.crossOrigin);
+    var credentialed = !!(cors && cors.credentialed);
+    if (crossOrigin && !__allowOriginOk(raw, cors.origin, credentialed)) {
+      return { networkError: true };
+    }
+    return {
+      networkError: false,
       status: env.status != null ? (env.status | 0) : 200,
       statusText: env.statusText != null ? String(env.statusText) : "",
-      headers: rh,
       url: env.url != null ? String(env.url) : fallbackUrl,
-      type: "basic"
+      body: env.body != null ? String(env.body) : "",
+      headers: __exposedHeaders(raw, crossOrigin, credentialed),
+      type: crossOrigin ? "cors" : "basic"
+    };
+  }
+  // Build a Response from a host JSON envelope string, applying CORS via the optional `cors` plan.
+  // Returns null on a CORS network error (the caller rejects/throws).
+  function __responseFromEnvelope(envelope, fallbackUrl, cors) {
+    var env = JSON.parse(envelope);
+    var p = __processEnvelope(env, fallbackUrl, cors);
+    if (p.networkError) { return null; }
+    return new globalThis.Response(p.body, {
+      status: p.status, statusText: p.statusText, headers: p.headers, url: p.url, type: p.type
     });
   }
   // Settle a parked fetch with a host envelope (or null → reject as a failed transport).
@@ -11362,8 +11527,9 @@
     delete globalThis.__pendingFetches[id];
     if (envelope == null) { pending.reject(new TypeError("Failed to fetch")); return; }
     var resp;
-    try { resp = __responseFromEnvelope(String(envelope), pending.url); }
+    try { resp = __responseFromEnvelope(String(envelope), pending.url, pending.cors); }
     catch (e) { pending.reject(new TypeError("Failed to fetch")); return; }
+    if (resp == null) { pending.reject(new TypeError("Failed to fetch")); return; }
     pending.resolve(resp);
   });
   // Reject a parked fetch (transport error, or abort).
@@ -11448,10 +11614,29 @@
       if (typeof __startFetch !== "function") {
         return Promise.reject(new TypeError("Failed to fetch"));
       }
+
+      // --- CORS: tag the request, add `Origin`, preflight when not "simple". ---
+      var fMode = init.mode || (input && input.mode) || "cors";
+      var fCreds = init.credentials || (input && input.credentials) || "same-origin";
+      var absUrl = url;
+      try { absUrl = new globalThis.URL(url, (typeof document !== "undefined" && document.baseURI) || (globalThis.location && globalThis.location.href)).href; } catch (e) {}
+      var fNames = Object.keys(headers);
+      var fPlan = __corsPlan(method, absUrl, fNames, headers, fMode, fCreds === "include");
+      if (fPlan.networkError) { return Promise.reject(new TypeError("Failed to fetch")); }
+      if (fPlan.crossOrigin) {
+        headers["Origin"] = fPlan.origin;
+        if (fMode === "cors" && fPlan.preflight && !__runPreflightSync(method, absUrl, fPlan)) {
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }
+      }
+      var fCors = fPlan.crossOrigin && fMode === "cors"
+        ? { crossOrigin: true, origin: fPlan.origin, credentialed: fPlan.credentialed }
+        : null;
+
       // Kick off the request on a background thread; settle the promise later via the drain.
       var id = __startFetch(method, url, bodyStr, JSON.stringify(headers));
       return new Promise(function (resolve, reject) {
-        globalThis.__pendingFetches[id] = { resolve: resolve, reject: reject, url: url };
+        globalThis.__pendingFetches[id] = { resolve: resolve, reject: reject, url: url, cors: fCors };
         // AbortSignal: if it aborts while the request is in flight, reject this id with the abort
         // reason and forget it (a late background completion is then ignored — see __resolveFetch).
         if (signal && typeof signal.addEventListener === "function") {
@@ -11463,24 +11648,169 @@
     });
   }
 
-  // XMLHttpRequest: present but inert.
+  // XMLHttpRequest: real requests over the host fetcher, with the full CORS protocol (shared with
+  // fetch via the helpers above). Synchronous (`open(..., false)`) requests block in `send()` and a
+  // CORS/transport failure throws `NetworkError`; asynchronous requests run on the event loop and a
+  // failure fires the `error` event (readystatechange to DONE first, so listeners see status 0).
   def(globalThis, "XMLHttpRequest", function () {
-    this.readyState = 0; this.status = 0; this.responseText = ""; this.response = "";
-    this.onreadystatechange = null; this.onload = null; this.onerror = null;
-    // open() validates the URL (resolved against the document base) and throws a SyntaxError for an
-    // invalid one, per the spec. The rest of XHR is inert (no real request is issued).
-    this.open = function (method, url) {
-      if (arguments.length >= 2) {
-        var base; try { base = globalThis.location && globalThis.location.href; } catch (e) {}
-        if (parseURL(String(url), base || null).__invalid) {
-          throw new globalThis.DOMException("Failed to execute 'open' on 'XMLHttpRequest': Invalid URL", "SyntaxError");
+    var xhr = this;
+    installEvents(xhr); // addEventListener/removeEventListener/dispatchEvent + on<event> dispatch
+    var method = "GET", absUrl = "", isAsync = true;
+    var reqHeaders = [];       // [name, value] in insertion order, duplicates combined
+    var sendFlag = false, abortFlag = false, errorFlag = false;
+    var respHeaders = new globalThis.Headers(); // exposed (CORS-filtered) response headers
+    var responseXMLCache; var haveResponseXML = false;
+
+    xhr.UNSENT = 0; xhr.OPENED = 1; xhr.HEADERS_RECEIVED = 2; xhr.LOADING = 3; xhr.DONE = 4;
+    xhr.readyState = 0; xhr.status = 0; xhr.statusText = "";
+    xhr.responseText = ""; xhr.response = ""; xhr.responseURL = "";
+    xhr.responseType = ""; xhr.withCredentials = false; xhr.timeout = 0;
+    xhr.onreadystatechange = null; xhr.onload = null; xhr.onerror = null;
+    xhr.onloadstart = null; xhr.onloadend = null; xhr.onprogress = null;
+    xhr.onabort = null; xhr.ontimeout = null;
+
+    function fire(type) {
+      var ev; try { ev = new globalThis.Event(type); } catch (e) { ev = null; }
+      if (ev) { try { xhr.dispatchEvent(ev); return; } catch (e2) {} }
+      var h = xhr["on" + type];
+      if (typeof h === "function") { try { h.call(xhr, ev || { type: type }); } catch (e3) {} }
+    }
+    function setReadyState(rs) { xhr.readyState = rs; fire("readystatechange"); }
+
+    xhr.open = function (m, url, async) {
+      method = String(m).toUpperCase();
+      isAsync = (arguments.length < 3) ? true : !!async;
+      var base; try { base = (typeof document !== "undefined" && document.baseURI) || (globalThis.location && globalThis.location.href); } catch (e) {}
+      if (parseURL(String(url), base || null).__invalid) {
+        throw new globalThis.DOMException("Failed to execute 'open' on 'XMLHttpRequest': Invalid URL", "SyntaxError");
+      }
+      try { absUrl = new globalThis.URL(String(url), base).href; } catch (e2) { absUrl = String(url); }
+      reqHeaders = []; sendFlag = false; abortFlag = false; errorFlag = false;
+      respHeaders = new globalThis.Headers(); haveResponseXML = false; responseXMLCache = undefined;
+      xhr.status = 0; xhr.statusText = ""; xhr.responseText = ""; xhr.response = ""; xhr.responseURL = "";
+      setReadyState(xhr.OPENED);
+    };
+
+    xhr.setRequestHeader = function (name, value) {
+      if (xhr.readyState !== xhr.OPENED || sendFlag) {
+        throw new globalThis.DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': The object's state must be OPENED.", "InvalidStateError");
+      }
+      name = String(name); value = String(value);
+      for (var i = 0; i < reqHeaders.length; i++) {
+        if (reqHeaders[i][0].toLowerCase() === name.toLowerCase()) { reqHeaders[i][1] += ", " + value; return; }
+      }
+      reqHeaders.push([name, value]);
+    };
+
+    xhr.getResponseHeader = function (name) {
+      if (xhr.readyState < xhr.HEADERS_RECEIVED) { return null; }
+      return respHeaders.get(String(name));
+    };
+    xhr.getAllResponseHeaders = function () {
+      if (xhr.readyState < xhr.HEADERS_RECEIVED) { return ""; }
+      var lines = [];
+      respHeaders.forEach(function (v, k) { lines.push(k + ": " + v); });
+      lines.sort();
+      return lines.length ? lines.join("\r\n") + "\r\n" : "";
+    };
+    xhr.overrideMimeType = fn;
+    xhr.abort = function () {
+      abortFlag = true;
+      if (sendFlag && xhr.readyState !== xhr.UNSENT && xhr.readyState !== xhr.DONE) {
+        xhr.readyState = xhr.DONE; xhr.status = 0; xhr.statusText = "";
+        fire("readystatechange"); fire("abort"); fire("loadend");
+      }
+      xhr.readyState = xhr.UNSENT; xhr.status = 0;
+    };
+
+    Object.defineProperty(xhr, "responseXML", {
+      get: function () {
+        if (haveResponseXML) { return responseXMLCache; }
+        haveResponseXML = true; responseXMLCache = null;
+        if (xhr.readyState === xhr.DONE && (xhr.responseType === "" || xhr.responseType === "document")) {
+          var ct = (respHeaders.get("content-type") || "").split(";")[0].trim().toLowerCase();
+          if (ct === "text/xml" || ct === "application/xml" || /\+xml$/.test(ct) || ct === "text/html") {
+            try { responseXMLCache = new globalThis.DOMParser().parseFromString(xhr.responseText, ct === "text/html" ? "text/html" : "application/xml"); } catch (e) { responseXMLCache = null; }
+          }
+        }
+        return responseXMLCache;
+      }, configurable: true, enumerable: true
+    });
+
+    // Populate the response fields from a processed envelope (CORS-filtered headers) and run the
+    // HEADERS_RECEIVED -> LOADING -> DONE readyState progression with its load/loadend events.
+    function deliver(p) {
+      xhr.status = p.status; xhr.statusText = p.statusText;
+      xhr.responseURL = (p.url || absUrl).split("#")[0];
+      respHeaders = p.headers;
+      setReadyState(xhr.HEADERS_RECEIVED);
+      setReadyState(xhr.LOADING);
+      xhr.responseText = p.body;
+      xhr.response = (xhr.responseType === "" || xhr.responseType === "text") ? p.body
+        : (xhr.responseType === "json" ? (function () { try { return JSON.parse(p.body); } catch (e) { return null; } })() : p.body);
+      setReadyState(xhr.DONE);
+      fire("load"); fire("loadend");
+    }
+    // Network error: throw for sync callers; for async, drive readyState to DONE (status 0) and fire
+    // the error/loadend events. Returns a DOMException the sync path rethrows.
+    function networkError() {
+      errorFlag = true; xhr.status = 0; xhr.statusText = ""; xhr.responseText = ""; xhr.response = "";
+      respHeaders = new globalThis.Headers();
+      var err = new globalThis.DOMException("Failed to load '" + absUrl + "'.", "NetworkError");
+      if (!isAsync) { xhr.readyState = xhr.DONE; return err; }
+      setReadyState(xhr.DONE); fire("error"); fire("loadend");
+      return err;
+    }
+
+    xhr.send = function (body) {
+      if (xhr.readyState !== xhr.OPENED || sendFlag) {
+        throw new globalThis.DOMException("Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.", "InvalidStateError");
+      }
+      sendFlag = true;
+      var noBody = (method === "GET" || method === "HEAD" || body == null);
+      var bodyStr = noBody ? "" : String(body);
+
+      // Author headers as a plain object (for CORS planning + the host request).
+      var headers = {}; var names = [];
+      for (var i = 0; i < reqHeaders.length; i++) { headers[reqHeaders[i][0]] = reqHeaders[i][1]; names.push(reqHeaders[i][0]); }
+      // A string body defaults the Content-Type to text/plain (safelisted) when unset.
+      if (!noBody && !names.some(function (n) { return n.toLowerCase() === "content-type"; })) {
+        headers["Content-Type"] = "text/plain;charset=UTF-8"; names.push("Content-Type");
+      }
+
+      fire("loadstart");
+      var credentialed = !!xhr.withCredentials;
+      var plan = __corsPlan(method, absUrl, names, headers, "cors", credentialed);
+      if (plan.networkError) { var e0 = networkError(); if (!isAsync) { throw e0; } return; }
+      if (plan.crossOrigin) {
+        headers["Origin"] = plan.origin;
+        if (plan.preflight && !__runPreflightSync(method, absUrl, plan)) {
+          var e1 = networkError(); if (!isAsync) { throw e1; } return;
         }
       }
-      this.readyState = 1;
+      var cors = plan.crossOrigin ? { crossOrigin: true, origin: plan.origin, credentialed: credentialed } : null;
+
+      if (!isAsync) {
+        var env = globalThis.__request(method, absUrl, bodyStr, JSON.stringify(headers));
+        if (env == null) { throw networkError(); }
+        var parsed; try { parsed = JSON.parse(env); } catch (e) { throw networkError(); }
+        var p = __processEnvelope(parsed, absUrl, cors);
+        if (p.networkError) { throw networkError(); }
+        deliver(p);
+        return;
+      }
+      // Async: settle on the event loop via the shared __startFetch / drain mechanism. A Response is
+      // handed back (already CORS-checked through pending.cors); reject means a network error.
+      var id = __startFetch(method, absUrl, bodyStr, JSON.stringify(headers));
+      globalThis.__pendingFetches[id] = {
+        url: absUrl, cors: cors,
+        resolve: function (resp) {
+          if (abortFlag) { return; }
+          deliver({ status: resp.status, statusText: resp.statusText, url: resp.url, body: resp.__body || "", headers: resp.headers });
+        },
+        reject: function () { if (!abortFlag) { networkError(); } }
+      };
     };
-    this.send = fn; this.setRequestHeader = fn; this.abort = fn;
-    this.getResponseHeader = function () { return null; }; this.getAllResponseHeaders = function () { return ""; };
-    this.addEventListener = fn; this.removeEventListener = fn;
   });
 
   // --- DOM Event constructors + class hierarchy (per the DOM / UI Events standards) ---------
