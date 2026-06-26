@@ -967,6 +967,28 @@
   }
   function segListFromString(d) { return parsePathDataStr(d).map(segToObj); }
 
+  // Normalize a segment list to absolute coordinates (uppercase commands), tracking the current
+  // point and subpath start. Path `d` interpolation requires both endpoints in the same coordinate
+  // mode; browsers normalize to absolute first.
+  function normalizeToAbsolute(segs) {
+    var out = [], cx = 0, cy = 0, sx = 0, sy = 0;
+    for (var i = 0; i < segs.length; i++) {
+      var s = segs[i], rel = s.type >= "a", v = s.values, U = s.type.toUpperCase();
+      switch (U) {
+        case "M": { var x = rel ? cx + v[0] : v[0], y = rel ? cy + v[1] : v[1]; cx = x; cy = y; sx = x; sy = y; out.push({ type: "M", values: [x, y] }); break; }
+        case "L": case "T": { var lx = rel ? cx + v[0] : v[0], ly = rel ? cy + v[1] : v[1]; cx = lx; cy = ly; out.push({ type: U, values: [lx, ly] }); break; }
+        case "H": { var hx = rel ? cx + v[0] : v[0]; cx = hx; out.push({ type: "H", values: [hx] }); break; }
+        case "V": { var vy = rel ? cy + v[0] : v[0]; cy = vy; out.push({ type: "V", values: [vy] }); break; }
+        case "C": { var c = [rel ? cx + v[0] : v[0], rel ? cy + v[1] : v[1], rel ? cx + v[2] : v[2], rel ? cy + v[3] : v[3], rel ? cx + v[4] : v[4], rel ? cy + v[5] : v[5]]; cx = c[4]; cy = c[5]; out.push({ type: "C", values: c }); break; }
+        case "S": case "Q": { var q = [rel ? cx + v[0] : v[0], rel ? cy + v[1] : v[1], rel ? cx + v[2] : v[2], rel ? cy + v[3] : v[3]]; cx = q[2]; cy = q[3]; out.push({ type: U, values: q }); break; }
+        case "A": { var ax = rel ? cx + v[5] : v[5], ay = rel ? cy + v[6] : v[6]; out.push({ type: "A", values: [v[0], v[1], v[2], v[3], v[4], ax, ay] }); cx = ax; cy = ay; break; }
+        case "Z": { cx = sx; cy = sy; out.push({ type: "Z", values: [] }); break; }
+        default: out.push({ type: U, values: v.slice() });
+      }
+    }
+    return out;
+  }
+
   // Add per-coordinate b*scale onto a (segment lists must share command structure).
   function addScaledSegs(a, b, scale) {
     if (!structureMatches(a, b)) { return a; }
@@ -1003,9 +1025,11 @@
       } else if (from != null && by != null) {
         segs = addScaledSegs(parsePathDataStr(from), parsePathDataStr(by), tm.fraction);
       } else if (from != null && to != null) {
-        segs = calc === "discrete" ? (tm.fraction < 1 ? parsePathDataStr(from) : parsePathDataStr(to)) : lerpSegs(parsePathDataStr(from), parsePathDataStr(to), tm.fraction);
+        var fa = normalizeToAbsolute(parsePathDataStr(from)), ta = normalizeToAbsolute(parsePathDataStr(to));
+        segs = calc === "discrete" ? (tm.fraction < 1 ? fa : ta) : lerpSegs(fa, ta, tm.fraction);
       } else if (to != null) {
-        segs = calc === "discrete" ? (tm.fraction < 1 ? baseSegs : parsePathDataStr(to)) : lerpSegs(baseSegs, parsePathDataStr(to), tm.fraction);
+        var ba = normalizeToAbsolute(baseSegs), ta2 = normalizeToAbsolute(parsePathDataStr(to));
+        segs = calc === "discrete" ? (tm.fraction < 1 ? ba : ta2) : lerpSegs(ba, ta2, tm.fraction);
       } else if (from != null) {
         segs = parsePathDataStr(from);
       }
