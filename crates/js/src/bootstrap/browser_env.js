@@ -2031,7 +2031,7 @@
       "font-size-adjust font-synthesis font-display src unicode-range ascent-override descent-override " +
       "line-gap-override size-adjust contain content-visibility container container-type container-name " +
       "counter-set inset gap row-gap column-gap place-items place-content place-self justify-items " +
-      "image-rendering image-orientation shape-outside shape-margin shape-image-threshold " +
+      "image-rendering image-orientation shape-outside shape-inside shape-subtract shape-margin shape-image-threshold " +
       "mix-blend-mode isolation backdrop-filter filter clip-path mask-clip mask-composite mask-mode " +
       "mask-origin mask-position mask-repeat mask-size mask-type mask-border " +
       "offset offset-path offset-distance offset-rotate offset-anchor offset-position " +
@@ -2106,6 +2106,21 @@
     }
     // shape-margin is a non-negative <length-percentage> (no auto/keywords, single token).
     if (name === "shape-margin") { return isValidLengthLike(v, false); }
+    // shape-inside / shape-subtract: auto | [ <basic-shape: circle()|ellipse()|polygon()> | <uri> ]+
+    // (auto only on its own; not none / inset()).
+    if (name === "shape-inside" || name === "shape-subtract") {
+      if (vl === "auto") { return true; }
+      var rest = v.trim();
+      var comp = /^\s*(?:(?:circle|ellipse|polygon)\([^()]*\)|url\(\s*(?:"[^"]*"|'[^']*'|[^)\s]*)\s*\))(?:\s+|$)/i;
+      var matched = false;
+      while (rest.length) {
+        var mm = comp.exec(rest);
+        if (!mm) { return false; }
+        matched = true;
+        rest = rest.slice(mm[0].length);
+      }
+      return matched;
+    }
     return true;
   }
   function isValidColor(v) {
