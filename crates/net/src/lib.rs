@@ -1039,7 +1039,15 @@ pub fn request(
 /// first). Returns the response metadata once the body is fully read, or Err on failure.
 pub fn fetch_streaming(url: &str, on_chunk: &mut dyn FnMut(&[u8])) -> Result<ResponseMeta, String> {
     // GET-only streaming: no request body or custom headers. Records the network log exactly once.
-    request_streaming_core("GET", url, None, &[], true, RequestOpts::default(), on_chunk)
+    request_streaming_core(
+        "GET",
+        url,
+        None,
+        &[],
+        true,
+        RequestOpts::default(),
+        on_chunk,
+    )
 }
 
 /// The single shared request path. Builds + sends the request (with the retry loop), then streams
