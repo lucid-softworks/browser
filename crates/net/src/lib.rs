@@ -1812,7 +1812,10 @@ mod tests {
         let secure = "https://web-platform.test:8443/x.html";
         // SameSite=None without Secure is rejected; with Secure it is stored.
         assert!(!set_cookie_from_http(secure, "n=1; Path=/; SameSite=None"));
-        assert!(set_cookie_from_http(secure, "n=1; Path=/; SameSite=None; Secure"));
+        assert!(set_cookie_from_http(
+            secure,
+            "n=1; Path=/; SameSite=None; Secure"
+        ));
         assert!(has(&cookies_for_document(secure), "n=1"));
         // SameSite=Lax without Secure is fine.
         assert!(set_cookie_from_http(secure, "l=1; Path=/; SameSite=Lax"));
@@ -1824,12 +1827,15 @@ mod tests {
         let _g = COOKIE_TEST_LOCK.lock().unwrap();
         clear_cookies();
         let base = "https://web-platform.test:8443";
-        assert!(set_cookie(
-            &format!("{base}/a/b.html"),
-            "p=1; Path=/a"
+        assert!(set_cookie(&format!("{base}/a/b.html"), "p=1; Path=/a"));
+        assert!(has(
+            &cookies_for_document(&format!("{base}/a/c.html")),
+            "p=1"
         ));
-        assert!(has(&cookies_for_document(&format!("{base}/a/c.html")), "p=1"));
-        assert!(!has(&cookies_for_document(&format!("{base}/x/c.html")), "p=1"));
+        assert!(!has(
+            &cookies_for_document(&format!("{base}/x/c.html")),
+            "p=1"
+        ));
     }
 
     #[test]
