@@ -852,7 +852,6 @@
       }
     }
 
-    enrichGeometry(el);
   }
 
   // -------------------------------------------------------------------------------------------
@@ -1225,31 +1224,31 @@
   }
 
   var GEOM_TAGS = { path: 1, rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1 };
-  function enrichGeometry(el) {
-    var ln = el.__localName;
-    if (GEOM_TAGS[ln]) {
-      def(el, "getTotalLength", function () { return totalLength(el); });
-      def(el, "getPointAtLength", function (len) { return pointAtLength(el, Number(len) || 0); });
-      def(el, "isPointInFill", function () { return false; });
-      def(el, "isPointInStroke", function () { return false; });
-      // pathLength is an SVGAnimatedNumber on every SVGGeometryElement.
-      if (!("pathLength" in el)) {
-        (function () { var c = null; Object.defineProperty(el, "pathLength", { get: function () { if (!c) { c = Object.create(globalThis.SVGAnimatedNumber.prototype); Object.defineProperty(c, "baseVal", { get: function () { return gnum(el, "pathLength"); }, enumerable: true }); Object.defineProperty(c, "animVal", { get: function () { return gnum(el, "pathLength"); }, enumerable: true }); } return c; }, configurable: true, enumerable: true }); })();
-      }
-      if (ln === "path") {
-        def(el, "getPathData", function () { return getPathData(el); });
-        def(el, "setPathData", function (segs) { setPathData(el, segs); });
-        // Deprecated pathSegList API (still used by path-animation tests): base + animated seg lists.
-        Object.defineProperty(el, "pathSegList", { get: function () { return parsePathDataStr(getAttr(el.__node, "d") || "").map(segToObj); }, configurable: true, enumerable: true });
-        Object.defineProperty(el, "animatedPathSegList", { get: function () { return pathAnimSegs(el).map(segToObj); }, configurable: true, enumerable: true });
-      }
-    }
-    // getBBox / getCTM apply to all graphics elements.
-    if (GEOM_TAGS[ln] || ln === "g" || ln === "svg" || ln === "use" || ln === "text" || ln === "image" || ln === "tspan" || ln === "switch" || ln === "a" || ln === "foreignobject") {
-      if (typeof el.getBBox !== "function") { def(el, "getBBox", function () { return bbox(el); }); }
-      if (typeof el.getCTM !== "function") { def(el, "getCTM", function () { return ctmOf(this); }); }
-      if (typeof el.getScreenCTM !== "function") { def(el, "getScreenCTM", function () { return ctmOf(this); }); }
-    }
+  // Geometry/graphics methods live on the interface PROTOTYPES (so idlharness sees them inherited,
+  // not as per-instance own properties). Installed once after the interfaces are defined.
+  function installGeometryProtos() {
+    var Geo = globalThis.SVGGeometryElement.prototype;
+    var Gfx = globalThis.SVGGraphicsElement.prototype;
+    var Path = globalThis.SVGPathElement.prototype;
+    def(Geo, "getTotalLength", function () { return totalLength(this); });
+    def(Geo, "getPointAtLength", function (len) { return pointAtLength(this, Number(len) || 0); });
+    def(Geo, "isPointInFill", function (point) { return false; });
+    def(Geo, "isPointInStroke", function (point) { return false; });
+    Object.defineProperty(Geo, "pathLength", {
+      get: function () {
+        var el = this, c = Object.create(globalThis.SVGAnimatedNumber.prototype);
+        Object.defineProperty(c, "baseVal", { get: function () { return gnum(el, "pathLength"); }, set: function (v) { setAttr(el.__node, "pathLength", String(v)); }, enumerable: true });
+        Object.defineProperty(c, "animVal", { get: function () { return gnum(el, "pathLength"); }, enumerable: true });
+        return c;
+      }, configurable: true, enumerable: true
+    });
+    def(Path, "getPathData", function () { return getPathData(this); });
+    def(Path, "setPathData", function (segs) { setPathData(this, segs); });
+    Object.defineProperty(Path, "pathSegList", { get: function () { return parsePathDataStr(getAttr(this.__node, "d") || "").map(segToObj); }, configurable: true, enumerable: true });
+    Object.defineProperty(Path, "animatedPathSegList", { get: function () { return pathAnimSegs(this).map(segToObj); }, configurable: true, enumerable: true });
+    def(Gfx, "getBBox", function () { return bbox(this); });
+    def(Gfx, "getCTM", function () { return ctmOf(this); });
+    def(Gfx, "getScreenCTM", function () { return ctmOf(this); });
   }
 
   function makeMatrix(a, b, c, d, e, f) {
@@ -1602,5 +1601,6 @@
   }
   globalThis.__svgColorOf = function (el, name) { return fmtColor(colorOf(el, name)); };
 
+  installGeometryProtos();
   globalThis.__svgEnrich = svgEnrich;
 })();
