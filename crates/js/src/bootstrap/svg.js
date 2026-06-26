@@ -1202,7 +1202,7 @@
     "paint-order": ["normal", true]
   };
   // camelCase aliases used for direct property access on the declaration.
-  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color", strokeLinecap: "stroke-linecap", strokeLinejoin: "stroke-linejoin", fillRule: "fill-rule", clipRule: "clip-rule", colorInterpolation: "color-interpolation", colorInterpolationFilters: "color-interpolation-filters", imageRendering: "image-rendering", shapeRendering: "shape-rendering", textRendering: "text-rendering", strokeMiterlimit: "stroke-miterlimit", markerStart: "marker-start", markerMid: "marker-mid", markerEnd: "marker-end" };
+  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color", strokeLinecap: "stroke-linecap", strokeLinejoin: "stroke-linejoin", fillRule: "fill-rule", clipRule: "clip-rule", colorInterpolation: "color-interpolation", colorInterpolationFilters: "color-interpolation-filters", imageRendering: "image-rendering", shapeRendering: "shape-rendering", textRendering: "text-rendering", strokeMiterlimit: "stroke-miterlimit", markerStart: "marker-start", markerMid: "marker-mid", markerEnd: "marker-end", strokeDasharray: "stroke-dasharray", strokeDashoffset: "stroke-dashoffset", paintOrder: "paint-order", clipRule: "clip-rule" };
   function svgAbsUrl(u) { try { return new URL(u, document.baseURI).href; } catch (e) { return u; } }
   // fill / stroke <paint>: none | <color> | <url> [none|<color>]? — computed serialization.
   function paintComputed(el, name) {
@@ -1266,7 +1266,58 @@
     }
     return parseColor(raw, el) || [0, 0, 0, 1];
   }
+  // Per-property computed initial value (`i`) + whether it inherits (`h`). Used to resolve the
+  // CSS-wide keywords initial/inherit/unset/revert.
+  var SVG_PROP_META = {
+    "fill": { i: "rgb(0, 0, 0)", h: true }, "stroke": { i: "none", h: true },
+    "color": { i: "rgb(0, 0, 0)", h: true }, "stop-color": { i: "rgb(0, 0, 0)", h: false },
+    "flood-color": { i: "rgb(0, 0, 0)", h: false }, "lighting-color": { i: "rgb(255, 255, 255)", h: false },
+    "fill-opacity": { i: "1", h: true }, "stroke-opacity": { i: "1", h: true },
+    "stop-opacity": { i: "1", h: false }, "opacity": { i: "1", h: false },
+    "stroke-width": { i: "1px", h: true }, "stroke-miterlimit": { i: "4", h: true },
+    "marker-start": { i: "none", h: true }, "marker-mid": { i: "none", h: true }, "marker-end": { i: "none", h: true }, "marker": { i: "none", h: true },
+    "text-anchor": { i: "start", h: true }, "text-decoration-line": { i: "none", h: false },
+    "text-decoration-style": { i: "solid", h: false }, "text-decoration-color": { i: "__cc__", h: false },
+    "stroke-linecap": { i: "butt", h: true }, "stroke-linejoin": { i: "miter", h: true },
+    "fill-rule": { i: "nonzero", h: true }, "clip-rule": { i: "nonzero", h: true },
+    "color-interpolation": { i: "srgb", h: true }, "color-interpolation-filters": { i: "linearrgb", h: true },
+    "image-rendering": { i: "auto", h: true }, "shape-rendering": { i: "auto", h: true }, "text-rendering": { i: "auto", h: true },
+    "paint-order": { i: "normal", h: true }, "visibility": { i: "visible", h: true },
+    "stroke-dasharray": { i: "none", h: true }, "stroke-dashoffset": { i: "0px", h: true }
+  };
+  // Validate + minimally serialize paint-order (an invalid value computes to the initial `normal`).
+  function canonPaintOrderJs(v) {
+    v = String(v).toLowerCase().trim();
+    if (v === "normal" || v === "") { return "normal"; }
+    var toks = v.split(/\s+/), ok = { fill: 1, stroke: 1, markers: 1 }, seen = {}, def = ["fill", "stroke", "markers"];
+    if (toks.length < 1 || toks.length > 3) { return "normal"; }
+    for (var i = 0; i < toks.length; i++) { if (!ok[toks[i]] || seen[toks[i]]) { return "normal"; } seen[toks[i]] = 1; }
+    var full = toks.slice();
+    for (var d = 0; d < def.length; d++) { if (full.indexOf(def[d]) < 0) { full.push(def[d]); } }
+    for (var k = 1; k <= 3; k++) {
+      var rb = full.slice(0, k);
+      for (var e = 0; e < def.length; e++) { if (rb.indexOf(def[e]) < 0) { rb.push(def[e]); } }
+      if (rb.join(" ") === full.join(" ")) { return full.slice(0, k).join(" "); }
+    }
+    return full.join(" ");
+  }
+  function svgInitial(el, name) {
+    var m = SVG_PROP_META[name];
+    if (!m) { return ""; }
+    return m.i === "__cc__" ? fmtColor(nativeColor(el)) : m.i;
+  }
   function svgComputed(el, name) {
+    // Resolve the CSS-wide keywords (initial | inherit | unset | revert) when set explicitly.
+    var meta = SVG_PROP_META[name];
+    if (meta) {
+      var rawk = rawStyleOrAttr(el, name);
+      if (rawk != null) {
+        var lck = rawk.trim().toLowerCase();
+        if (lck === "initial") { return svgInitial(el, name); }
+        if (lck === "inherit") { var pp = svgParent(el); return pp ? svgComputed(pp, name) : svgInitial(el, name); }
+        if (lck === "unset" || lck === "revert") { var pq = svgParent(el); return (meta.h && pq) ? svgComputed(pq, name) : svgInitial(el, name); }
+      }
+    }
     if (name === "text-decoration-color") { return fmtColor(decoColor(el)); }
     if (SVG_PAINT_PROPS[name]) { return paintComputed(el, name); }
     if (SVG_MARKER_PROPS[name]) { return markerComputed(el, name); }
@@ -1293,6 +1344,24 @@
       if (rm == null || rm === "inherit") { var pm = svgParent(el); return pm ? svgComputed(pm, "stroke-miterlimit") : "4"; }
       return String(parseFloat(rm));
     }
+    if (name === "paint-order") {
+      var rpo = rawStyleOrAttr(el, "paint-order");
+      if (rpo == null) { var ppo = svgParent(el); return ppo ? svgComputed(ppo, name) : "normal"; }
+      return canonPaintOrderJs(rpo);
+    }
+    if (name === "stroke-dashoffset") {
+      var rd = rawStyleOrAttr(el, "stroke-dashoffset");
+      if (rd == null) { var pd = svgParent(el); return pd ? svgComputed(pd, name) : "0px"; }
+      rd = rd.trim();
+      return /%\s*$/.test(rd) ? rd : (numOf(el, "stroke-dashoffset") + "px");
+    }
+    if (name === "stroke-dasharray") {
+      var ra = rawStyleOrAttr(el, "stroke-dasharray");
+      if (ra == null) { var pa = svgParent(el); return pa ? svgComputed(pa, name) : "none"; }
+      ra = ra.trim();
+      if (ra.toLowerCase() === "none" || ra === "") { return "none"; }
+      return ra.split(/[\s,]+/).filter(Boolean).map(function (t) { return /%$/.test(t) ? t : (parseLen(t).value + "px"); }).join(", ");
+    }
     if (SVG_KEYWORD_PROPS[name]) {
       var spec = SVG_KEYWORD_PROPS[name], raw2 = rawStyleOrAttr(el, name);
       if (raw2 == null || raw2 === "inherit") {
@@ -1309,7 +1378,7 @@
     }
     return null;
   }
-  function svgHandles(kebab) { return !!(SVG_COLOR_PROPS[kebab] || SVG_PAINT_PROPS[kebab] || SVG_MARKER_PROPS[kebab] || SVG_NUM_PROPS[kebab] || SVG_KEYWORD_PROPS[kebab] || kebab === "stroke-miterlimit" || kebab === "marker" || kebab === "visibility"); }
+  function svgHandles(kebab) { return !!SVG_PROP_META[kebab]; }
   var nativeGCS = globalThis.getComputedStyle;
   if (typeof nativeGCS === "function") {
     globalThis.getComputedStyle = function (el, pseudo) {
