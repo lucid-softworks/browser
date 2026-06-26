@@ -631,16 +631,28 @@ const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 /// A fetched HTTP response.
 pub struct Response {
     pub status: u16,
+    /// The HTTP reason phrase exactly as sent by the server (e.g. `OK`, `OHAI`, `StatusText`).
+    /// Empty for the non-HTTP paths. XHR's `statusText` and `fetch()`'s `Response.statusText`
+    /// report this verbatim rather than a synthesized phrase.
+    pub status_text: String,
     pub content_type: String,
     pub body: Vec<u8>,
     pub final_url: String,
+    /// All response headers, in receipt order, as `(name, value)` with the names lowercased and
+    /// duplicate fields combined with `, ` (per the Fetch standard's header combine). Empty for the
+    /// non-HTTP paths (`file://`, `about:blank`, cache hits) that have no real header block.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Response metadata (everything except the body), for streaming callers.
 pub struct ResponseMeta {
     pub status: u16,
+    /// The server's HTTP reason phrase — see [`Response::status_text`].
+    pub status_text: String,
     pub content_type: String,
     pub final_url: String,
+    /// All response headers (lowercased name, combined value) — see [`Response::headers`].
+    pub headers: Vec<(String, String)>,
     /// True when the response makes the document cross-origin isolated: a `same-origin`
     /// Cross-Origin-Opener-Policy AND a `require-corp`/`credentialless` Cross-Origin-Embedder-Policy.
     /// Drives `self.crossOriginIsolated` in page JS. Non-HTTP responses (about:/file:/cache) are
@@ -957,9 +969,11 @@ pub fn request(
     })?;
     Ok(Response {
         status: meta.status,
+        status_text: meta.status_text,
         content_type: meta.content_type,
         body: buf,
         final_url: meta.final_url,
+        headers: meta.headers,
     })
 }
 
@@ -1037,8 +1051,10 @@ fn request_streaming_inner(
         on_chunk(html);
         return Ok(ResponseMeta {
             status: 200,
+            status_text: "OK".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             final_url: url.to_string(),
+            headers: Vec::new(),
             cross_origin_isolated: false,
         });
     }
@@ -1050,8 +1066,10 @@ fn request_streaming_inner(
         on_chunk(&resp.body);
         return Ok(ResponseMeta {
             status: resp.status,
+            status_text: resp.status_text,
             content_type: resp.content_type,
             final_url: resp.final_url,
+            headers: resp.headers,
             cross_origin_isolated: false,
         });
     }
@@ -1075,8 +1093,10 @@ fn request_streaming_inner(
             on_chunk(&bytes[body_off..]);
             return Ok(ResponseMeta {
                 status: 200,
+                status_text: "OK".to_string(),
                 content_type,
                 final_url,
+                headers: Vec::new(),
                 cross_origin_isolated: false,
             });
         }
@@ -1156,6 +1176,7 @@ fn request_streaming_inner(
     };
 
     let status = resp.status();
+    let status_text = resp.status_text().to_string();
     // The URL the response actually came from — ureq follows redirects, so this is the post-redirect
     // location (e.g. en.wikipedia.org/ → /wiki/Main_Page). Falls back to the requested URL.
     let final_url = {
@@ -1179,6 +1200,27 @@ fn request_streaming_inner(
         .header("Content-Type")
         .unwrap_or("application/octet-stream")
         .to_string();
+
+    // Snapshot every response header (lowercased name, duplicate fields combined with `, ` per the
+    // Fetch standard) before the response is consumed by `into_reader`. Powers `fetch()`/XHR header
+    // access (`Response.headers`, `getResponseHeader`) and the CORS layer that reads
+    // `Access-Control-*` off the response.
+    let resp_headers: Vec<(String, String)> = resp
+        .headers_names()
+        .into_iter()
+        .map(|name| {
+            // Strip leading/trailing HTTP OWS (SP/HT only — not VT/FF/CR/LF) from each field value
+            // before combining, exactly as a conformant header parser does. The CORS layer compares
+            // `Access-Control-Allow-Origin` byte-for-byte, so e.g. `" *  "` must read back as `"*"`.
+            let values = resp
+                .all(&name)
+                .iter()
+                .map(|v| v.trim_matches([' ', '\t']))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (name.to_ascii_lowercase(), values)
+        })
+        .collect();
 
     // Cross-origin isolation: COOP `same-origin` + COEP `require-corp`/`credentialless` (first token
     // of each, case-insensitive). Drives `self.crossOriginIsolated` for the loaded document.
@@ -1261,8 +1303,10 @@ fn request_streaming_inner(
 
     Ok(ResponseMeta {
         status,
+        status_text,
         content_type,
         final_url,
+        headers: resp_headers,
         cross_origin_isolated,
     })
 }
@@ -1366,9 +1410,11 @@ fn fetch_file(path: &str, original: &str) -> Result<Response, String> {
     .to_string();
     Ok(Response {
         status: 200,
+        status_text: "OK".to_string(),
         content_type,
         body,
         final_url: original.to_string(),
+        headers: Vec::new(),
     })
 }
 

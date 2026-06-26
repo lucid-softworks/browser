@@ -11339,7 +11339,14 @@
     var respBody = env.body != null ? String(env.body) : "";
     var contentType = env.contentType != null ? String(env.contentType) : "";
     var rh = new globalThis.Headers();
-    if (contentType) { rh.set("content-type", contentType); }
+    // Full header block (lowercased name + combined value pairs) from the host, when present.
+    if (Array.isArray(env.headers)) {
+      for (var hi = 0; hi < env.headers.length; hi++) {
+        var pair = env.headers[hi];
+        if (pair && pair.length >= 2) { rh.set(String(pair[0]), String(pair[1])); }
+      }
+    }
+    if (contentType && !rh.has("content-type")) { rh.set("content-type", contentType); }
     return new globalThis.Response(respBody, {
       status: env.status != null ? (env.status | 0) : 200,
       statusText: env.statusText != null ? String(env.statusText) : "",

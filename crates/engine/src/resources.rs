@@ -54,14 +54,20 @@ pub(crate) fn build_request_fetcher(
         };
         let resp = net::request(method, url, body_opt, &headers).ok()?;
         let ok = (200..300).contains(&resp.status);
-        let status_text = reason_phrase(resp.status);
+        // The server's verbatim reason phrase; fall back to a synthesized one only when absent.
+        let status_text = if resp.status_text.is_empty() {
+            reason_phrase(resp.status).to_string()
+        } else {
+            resp.status_text.clone()
+        };
         let body_str = String::from_utf8_lossy(&resp.body);
         Some(build_response_envelope(
             ok,
             resp.status,
-            status_text,
+            &status_text,
             &resp.final_url,
             &resp.content_type,
+            &resp.headers,
             &body_str,
         ))
     })
@@ -225,16 +231,20 @@ pub(crate) fn json_escape(s: &str, out: &mut String) {
     }
 }
 
-/// Build the JSON response envelope the JS `fetch()` parses into a `Response`.
+/// Build the JSON response envelope the JS `fetch()` parses into a `Response`. `headers` is the full
+/// response header block (lowercased names, combined values); it is emitted as a `headers` array of
+/// `[name, value]` pairs so the JS side can populate `Response.headers` / XHR `getResponseHeader`
+/// and run the CORS layer (which reads `Access-Control-*` off the response).
 pub(crate) fn build_response_envelope(
     ok: bool,
     status: u16,
     status_text: &str,
     url: &str,
     content_type: &str,
+    headers: &[(String, String)],
     body: &str,
 ) -> String {
-    let mut s = String::with_capacity(body.len() + 128);
+    let mut s = String::with_capacity(body.len() + 256);
     s.push_str("{\"ok\":");
     s.push_str(if ok { "true" } else { "false" });
     s.push_str(",\"status\":");
@@ -245,7 +255,18 @@ pub(crate) fn build_response_envelope(
     json_escape(url, &mut s);
     s.push_str("\",\"contentType\":\"");
     json_escape(content_type, &mut s);
-    s.push_str("\",\"body\":\"");
+    s.push_str("\",\"headers\":[");
+    for (i, (name, value)) in headers.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('[');
+        s.push_str(&json_str(name));
+        s.push(',');
+        s.push_str(&json_str(value));
+        s.push(']');
+    }
+    s.push_str("],\"body\":\"");
     json_escape(body, &mut s);
     s.push_str("\"}");
     s
