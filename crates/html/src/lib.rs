@@ -24,6 +24,9 @@
 
 use dom::{Document, ElementData, NodeData, NodeId};
 
+pub mod xml;
+pub use xml::parse_xml;
+
 /// The SVG namespace URI (foreign content entered via an `<svg>` start tag).
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 /// The MathML namespace URI (foreign content entered via a `<math>` start tag).

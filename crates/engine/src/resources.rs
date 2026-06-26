@@ -706,6 +706,19 @@ pub(crate) fn url_has_image_extension(url: &str) -> bool {
     .any(|ext| path.ends_with(ext))
 }
 
+/// Whether `url`'s path ends with an XML-document extension (used only when the server sends no
+/// usable content type — otherwise the content type decides).
+pub(crate) fn url_has_xml_extension(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    [".svg", ".xhtml", ".xml", ".xht"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+}
+
 /// A minimal generated document that displays `url` as a centered image on a neutral backdrop —
 /// the "image viewer" real browsers show when you navigate straight to an image file.
 pub(crate) fn image_viewer_html(url: &str) -> String {

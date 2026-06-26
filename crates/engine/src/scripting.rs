@@ -32,16 +32,23 @@ pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSour
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag == "script" {
                 if is_js_type(e.attrs.get("type").map(String::as_str)) {
-                    if let Some(src) = e.attrs.get("src") {
+                    // External: HTML `src`, or SVG `href` / `xlink:href` (SVG script elements).
+                    let ext = e
+                        .attrs
+                        .get("src")
+                        .or_else(|| e.attrs.get("href"))
+                        .or_else(|| e.attrs.get("xlink:href"));
+                    if let Some(src) = ext {
                         if let Some(abs) = resolve_url(base, src) {
                             out.push(ScriptSource::External(abs));
                         }
                     } else {
-                        // The HTML parser stores a script's body as a single Text child.
+                        // The script body is text (HTML) or a CDATA section (XML/SVG).
                         let mut source = String::new();
                         for &child in &doc.get(id).children {
-                            if let dom::NodeData::Text(t) = &doc.get(child).data {
-                                source.push_str(t);
+                            match &doc.get(child).data {
+                                dom::NodeData::Text(t) | dom::NodeData::Cdata(t) => source.push_str(t),
+                                _ => {}
                             }
                         }
                         out.push(ScriptSource::Inline(source));
