@@ -1198,7 +1198,8 @@
     "text-anchor": ["start", true], "text-decoration-style": ["solid", false], "text-decoration-line": ["none", false],
     "stroke-linecap": ["butt", true], "stroke-linejoin": ["miter", true], "fill-rule": ["nonzero", true],
     "clip-rule": ["nonzero", true], "color-interpolation": ["srgb", true], "color-interpolation-filters": ["linearrgb", true],
-    "image-rendering": ["auto", true], "shape-rendering": ["auto", true], "text-rendering": ["auto", true]
+    "image-rendering": ["auto", true], "shape-rendering": ["auto", true], "text-rendering": ["auto", true],
+    "paint-order": ["normal", true]
   };
   // camelCase aliases used for direct property access on the declaration.
   var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color", strokeLinecap: "stroke-linecap", strokeLinejoin: "stroke-linejoin", fillRule: "fill-rule", clipRule: "clip-rule", colorInterpolation: "color-interpolation", colorInterpolationFilters: "color-interpolation-filters", imageRendering: "image-rendering", shapeRendering: "shape-rendering", textRendering: "text-rendering", strokeMiterlimit: "stroke-miterlimit", markerStart: "marker-start", markerMid: "marker-mid", markerEnd: "marker-end" };
@@ -1269,6 +1270,11 @@
     if (name === "text-decoration-color") { return fmtColor(decoColor(el)); }
     if (SVG_PAINT_PROPS[name]) { return paintComputed(el, name); }
     if (SVG_MARKER_PROPS[name]) { return markerComputed(el, name); }
+    // `marker` shorthand: the common longhand value, else "" (per CSSOM shorthand serialization).
+    if (name === "marker") {
+      var ms = markerComputed(el, "marker-start"), mm = markerComputed(el, "marker-mid"), me = markerComputed(el, "marker-end");
+      return ms === mm && mm === me ? ms : "";
+    }
     if (SVG_COLOR_PROPS[name]) { var c = colorOf(el, name); return c == null ? "none" : fmtColor(c); }
     if (name === "stroke-width") {
       // % is kept as a percentage; otherwise resolve to px.
@@ -1303,7 +1309,7 @@
     }
     return null;
   }
-  function svgHandles(kebab) { return !!(SVG_COLOR_PROPS[kebab] || SVG_PAINT_PROPS[kebab] || SVG_MARKER_PROPS[kebab] || SVG_NUM_PROPS[kebab] || SVG_KEYWORD_PROPS[kebab] || kebab === "stroke-miterlimit" || kebab === "visibility"); }
+  function svgHandles(kebab) { return !!(SVG_COLOR_PROPS[kebab] || SVG_PAINT_PROPS[kebab] || SVG_MARKER_PROPS[kebab] || SVG_NUM_PROPS[kebab] || SVG_KEYWORD_PROPS[kebab] || kebab === "stroke-miterlimit" || kebab === "marker" || kebab === "visibility"); }
   var nativeGCS = globalThis.getComputedStyle;
   if (typeof nativeGCS === "function") {
     globalThis.getComputedStyle = function (el, pseudo) {

@@ -1561,6 +1561,8 @@
     if (name === "place-items") return ["align-items", "justify-items"];
     if (name === "place-self") return ["align-self", "justify-self"];
     if (name === "columns") return ["column-width", "column-count"];
+    // SVG `marker` shorthand sets all three marker longhands to the same value.
+    if (name === "marker") return ["marker-start", "marker-mid", "marker-end"];
     return null;
   }
   // Shorthands we don't value-serialize but whose longhand set we know, so the CSS-wide-keyword
@@ -1727,6 +1729,8 @@
       if (!fl) return null;
       return [["flex-grow", fl.grow], ["flex-basis", fl.basis], ["flex-shrink", fl.shrink]];
     }
+    // `marker` sets all three marker longhands to the same value.
+    if (name === "marker") { return [["marker-start", value], ["marker-mid", value], ["marker-end", value]]; }
     return null;
   }
   // Parse the `flex` shorthand into {grow, shrink, basis}. Returns null if it can't be modeled.
@@ -1838,6 +1842,11 @@
       // A CSS-wide keyword in any longhand can't combine (handled by the early-return above).
       // Canonical: `grow shrink basis`.
       return fg + " " + fsk + " " + fb;
+    }
+    // `marker`: the common longhand value when all three markers agree, else "".
+    if (name === "marker") {
+      var m0 = g("marker-start"), m1 = g("marker-mid"), m2 = g("marker-end");
+      return m0 === m1 && m1 === m2 ? m0 : "";
     }
     return "";
   }
@@ -2124,9 +2133,16 @@
     if (name === "stroke-miterlimit") {
       return /^\+?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?$/i.test(v) && !/\.$/.test(v) && parseFloat(v) >= 0;
     }
-    // marker-start/mid/end: none | <url>.
-    if (name === "marker-start" || name === "marker-mid" || name === "marker-end") {
+    // marker (shorthand) and marker-start/mid/end: none | <url>.
+    if (name === "marker-start" || name === "marker-mid" || name === "marker-end" || name === "marker") {
       return vl === "none" || /^url\(/i.test(v);
+    }
+    // paint-order: normal | [ fill || stroke || markers ] (each keyword at most once).
+    if (name === "paint-order") {
+      if (vl === "normal") { return true; }
+      var poToks = vl.split(/\s+/), poOk = { fill: 1, stroke: 1, markers: 1 }, poSeen = {};
+      for (var pi = 0; pi < poToks.length; pi++) { var pt = poToks[pi]; if (!poOk[pt] || poSeen[pt]) { return false; } poSeen[pt] = 1; }
+      return poToks.length >= 1 && poToks.length <= 3;
     }
     // SVG text presentation properties with a small keyword/length grammar.
     if (name === "text-anchor") { return vl === "start" || vl === "middle" || vl === "end"; }
@@ -2242,6 +2258,20 @@
     return o;
   })();
   var OPACITY_VALUED = { "opacity": 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "flood-opacity": 1, "shape-image-threshold": 1 };
+  // Canonicalize paint-order: fill in missing keywords in the default order (fill, stroke, markers),
+  // then return the shortest prefix that round-trips to the full order.
+  function canonPaintOrder(v) {
+    v = String(v).toLowerCase().trim();
+    if (v === "normal" || v === "") { return "normal"; }
+    var toks = v.split(/\s+/), def = ["fill", "stroke", "markers"], full = toks.slice();
+    for (var d = 0; d < def.length; d++) { if (full.indexOf(def[d]) < 0) { full.push(def[d]); } }
+    for (var k = 1; k <= 3; k++) {
+      var rebuilt = full.slice(0, k);
+      for (var e = 0; e < def.length; e++) { if (rebuilt.indexOf(def[e]) < 0) { rebuilt.push(def[e]); } }
+      if (rebuilt.join(" ") === full.join(" ")) { return full.slice(0, k).join(" "); }
+    }
+    return full.join(" ");
+  }
   function setDecl(out, name, val, important) {
     important = !!important;
     if (val != null && hasOwn(LENGTH_VALUED, name) && /^[+-]?0(?:\.0*)?$/.test(String(val).trim())) {
@@ -2252,6 +2282,8 @@
       var am = /^([-+]?(?:\d+\.?\d*|\.\d+))%$/.exec(String(val).trim());
       if (am) { val = String(parseFloat(am[1]) / 100); }
     }
+    // paint-order serializes minimally (drops keywords whose position matches the default order).
+    if (val != null && name === "paint-order") { val = canonPaintOrder(String(val)); }
     var i = findDecl(out, name);
     if (val == null || val === "") { if (i >= 0) out.splice(i, 1); return; }
     if (i >= 0) {
