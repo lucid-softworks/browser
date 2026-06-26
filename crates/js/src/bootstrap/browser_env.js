@@ -404,6 +404,11 @@
   });
   // `location` already exists (a minimal stub from install_globals); overwrite it.
   globalThis.location = location;
+  // window.origin / self.origin: the global's origin (tracks navigation via location.origin).
+  Object.defineProperty(globalThis, "origin", {
+    get: function () { return location.origin; },
+    enumerable: true, configurable: true
+  });
   function __makeDetachedWindow(url) {
     var childState = {};
     function childSync(p) {
