@@ -457,25 +457,37 @@
     return L;
   }
 
-  function makeAnimatedLength(el, attr) {
+  function makeAnimatedLength(el, attr, dflt) {
     var node = el.__node;
+    dflt = dflt == null ? "0" : dflt;
+    function raw() { var v = getAttr(node, attr); return v == null || v === "" ? dflt : v; }
     var anim = Object.create(SVGAnimatedLength.prototype);
     var baseVal = makeLength(
-      function () { return parseLen(getAttr(node, attr)).value; },
-      function () { return getAttr(node, attr); },
-      function () { return parseLen(getAttr(node, attr)).type; },
+      function () { return parseLen(raw()).value; },
+      raw,
+      function () { return parseLen(raw()).type; },
       function (v) { setAttr(node, attr, String(v)); }
     );
     var animVal = makeLength(
-      function () { return svgAnimNum(el, attr, parseLen(getAttr(node, attr)).value); },
-      function () { return getAttr(node, attr); },
-      function () { return parseLen(getAttr(node, attr)).type; },
+      function () { return svgAnimNum(el, attr, parseLen(raw()).value); },
+      raw,
+      function () { return parseLen(raw()).type; },
       null
     );
     Object.defineProperty(anim, "baseVal", { value: baseVal, enumerable: true });
     Object.defineProperty(anim, "animVal", { value: animVal, enumerable: true });
     return anim;
   }
+  // Spec initial values for length attributes that aren't "0", keyed by "tag.attr".
+  var LEN_DEFAULTS = {
+    "filter.x": "-10%", "filter.y": "-10%", "filter.width": "120%", "filter.height": "120%",
+    "mask.x": "-10%", "mask.y": "-10%", "mask.width": "120%", "mask.height": "120%",
+    "lineargradient.x1": "0%", "lineargradient.y1": "0%", "lineargradient.x2": "100%", "lineargradient.y2": "0%",
+    "radialgradient.cx": "50%", "radialgradient.cy": "50%", "radialgradient.r": "50%",
+    "radialgradient.fx": "50%", "radialgradient.fy": "50%", "radialgradient.fr": "0%",
+    "svg.width": "100%", "svg.height": "100%",
+    "marker.markerWidth": "3", "marker.markerHeight": "3"
+  };
 
   // SVGRect (live, backed by a 4-number attribute) and SVGAnimatedRect (viewBox).
   function makeRect(getVec) {
@@ -528,7 +540,10 @@
     pattern: ["x", "y", "width", "height"],
     mask: ["x", "y", "width", "height"],
     filter: ["x", "y", "width", "height"],
-    marker: ["refX", "refY", "markerWidth", "markerHeight"]
+    marker: ["refX", "refY", "markerWidth", "markerHeight"],
+    lineargradient: ["x1", "y1", "x2", "y2"],
+    radialgradient: ["cx", "cy", "r", "fx", "fy", "fr"],
+    textpath: ["startOffset"]
   };
 
   // SVGAnimatedAngle (marker orient) and SVGAnimatedEnumeration helpers.
@@ -580,8 +595,9 @@
       def(el, "__svgLenCache", cache);
       for (var i = 0; i < attrs.length; i++) {
         (function (a) {
+          var dflt = LEN_DEFAULTS[ln + "." + a];
           Object.defineProperty(el, a, {
-            get: function () { return cache[a] || (cache[a] = makeAnimatedLength(el, a)); },
+            get: function () { return cache[a] || (cache[a] = makeAnimatedLength(el, a, dflt)); },
             configurable: true, enumerable: true
           });
         })(attrs[i]);

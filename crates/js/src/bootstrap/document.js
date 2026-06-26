@@ -852,7 +852,12 @@
     // { namespaceURI, prefix, localName } so getAttributeNS / Attr.localName reflect correctly.
     function elIsHtml() {
       var m = __nsMeta[id];
-      return m ? m.isHTML : (__nodeType(id) === 1);
+      if (m) { return m.isHTML; }
+      if (__nodeType(id) !== 1) { return false; }
+      // Parsed elements have no metadata: HTML-namespace (stored as null) lowercases attribute
+      // names; SVG/MathML foreign content is case-sensitive.
+      var ns = __namespaceUri(id);
+      return ns == null || ns === HTML_NS;
     }
     def(el, "getAttribute", function (name) {
       // HTML elements ASCII-lowercase the qualified name before matching (stored lowercased).
