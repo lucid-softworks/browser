@@ -2090,6 +2090,83 @@
     "shape-rendering": ["auto", "optimizespeed", "crispedges", "geometricprecision"],
     "text-rendering": ["auto", "optimizespeed", "optimizelegibility", "geometricprecision"]
   };
+  // A small CSS calc() engine: parse + type-check (length/percentage/number consistency), constant-
+  // fold pure-number expressions, and resolve to {px,pct} given length-unit context (em/vw/…).
+  var __calc = (function () {
+    var ABS = { px: 1, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6, "in": 96, pt: 96 / 72, pc: 16 };
+    function lex(s) {
+      s = s.replace(/calc\(/gi, "("); // nested calc() == parentheses
+      var t = [], i = 0, n = s.length;
+      var re = /\s*(?:([0-9]*\.?[0-9]+(?:e[-+]?[0-9]+)?)([a-z%]*)|([-+*/()]))/iy;
+      while (i < n) {
+        if (/\s/.test(s[i]) && re.lastIndex <= i) { /* handled by regex skip */ }
+        re.lastIndex = i; var m = re.exec(s); if (!m || m.index !== i && false) { return null; }
+        if (!m) { if (/\s/.test(s[i])) { i++; continue; } return null; }
+        i = re.lastIndex;
+        if (m[1] != null) { t.push({ t: "v", num: parseFloat(m[1]), unit: (m[2] || "").toLowerCase() }); }
+        else { t.push({ t: m[3] }); }
+        while (i < n && /\s/.test(s[i])) { i++; }
+      }
+      return t;
+    }
+    function parse(str) {
+      str = String(str).trim();
+      var m = /^calc\(([\s\S]*)\)$/i.exec(str); if (!m) { return null; }
+      var toks = lex(m[1]); if (!toks || !toks.length) { return null; }
+      var pos = 0;
+      function peek() { return toks[pos]; }
+      function expr() { var a = term(); if (a == null) { return null; } while (peek() && (peek().t === "+" || peek().t === "-")) { var op = toks[pos++].t; var b = term(); if (b == null) { return null; } a = { op: op, a: a, b: b }; } return a; }
+      function term() { var a = factor(); if (a == null) { return null; } while (peek() && (peek().t === "*" || peek().t === "/")) { var op = toks[pos++].t; var b = factor(); if (b == null) { return null; } a = { op: op, a: a, b: b }; } return a; }
+      function factor() { var k = peek(); if (!k) { return null; } if (k.t === "(") { pos++; var e = expr(); if (!e || !peek() || peek().t !== ")") { return null; } pos++; return e; } if (k.t === "v") { pos++; return { leaf: k }; } return null; }
+      var ast = expr(); if (ast == null || pos !== toks.length) { return null; }
+      return ast;
+    }
+    // Type kind: {k:"num",v} | {k:"dim",l,p} | {k:"bad"}.
+    function kind(node) {
+      if (node.leaf) { var u = node.leaf.unit; if (u === "") { return { k: "num", v: node.leaf.num }; } if (u === "%") { return { k: "dim", l: false, p: true }; } if (ABS[u] != null || /^(em|ex|ch|rem|vw|vh|vmin|vmax|lh|rlh|cap|ic|vi|vb)$/.test(u)) { return { k: "dim", l: true, p: false }; } return { k: "bad" }; }
+      var a = kind(node.a), b = kind(node.b); if (a.k === "bad" || b.k === "bad") { return { k: "bad" }; }
+      if (node.op === "+" || node.op === "-") { if (a.k === "num" && b.k === "num") { return { k: "num", v: node.op === "+" ? a.v + b.v : a.v - b.v }; } if (a.k === "dim" && b.k === "dim") { return { k: "dim", l: a.l || b.l, p: a.p || b.p }; } return { k: "bad" }; }
+      if (node.op === "*") { if (a.k === "num" && b.k === "num") { return { k: "num", v: a.v * b.v }; } if (a.k === "num") { return b; } if (b.k === "num") { return a; } return { k: "bad" }; }
+      if (node.op === "/") { if (b.k !== "num") { return { k: "bad" }; } if (a.k === "num") { return { k: "num", v: a.v / b.v }; } return a; }
+      return { k: "bad" };
+    }
+    // Resolve to {px, pct, num} given ctx {fs, rfs, vw, vh}.
+    function resolve(node, ctx) {
+      if (node.leaf) {
+        var u = node.leaf.unit, x = node.leaf.num;
+        if (u === "") { return { px: 0, pct: 0, num: x }; }
+        if (u === "%") { return { px: 0, pct: x, num: 0 }; }
+        if (ABS[u] != null) { return { px: x * ABS[u], pct: 0, num: 0 }; }
+        var rel = { em: ctx.fs, ex: ctx.fs * 0.5, ch: ctx.fs * 0.5, cap: ctx.fs, ic: ctx.fs, rem: ctx.rfs, vw: ctx.vw / 100, vh: ctx.vh / 100, vi: ctx.vw / 100, vb: ctx.vh / 100, vmin: Math.min(ctx.vw, ctx.vh) / 100, vmax: Math.max(ctx.vw, ctx.vh) / 100, lh: ctx.fs * 1.2, rlh: ctx.rfs * 1.2 };
+        if (rel[u] != null) { return { px: x * rel[u], pct: 0, num: 0 }; }
+        return null;
+      }
+      var a = resolve(node.a, ctx), b = resolve(node.b, ctx); if (!a || !b) { return null; }
+      if (node.op === "+") { return { px: a.px + b.px, pct: a.pct + b.pct, num: a.num + b.num }; }
+      if (node.op === "-") { return { px: a.px - b.px, pct: a.pct - b.pct, num: a.num - b.num }; }
+      if (node.op === "*") { var s = (a.px === 0 && a.pct === 0) ? a.num : null, t2 = (b.px === 0 && b.pct === 0) ? b.num : null; if (s != null) { return { px: b.px * s, pct: b.pct * s, num: b.num * s }; } if (t2 != null) { return { px: a.px * t2, pct: a.pct * t2, num: a.num * t2 }; } return null; }
+      if (node.op === "/") { var d = (b.px === 0 && b.pct === 0) ? b.num : null; if (d) { return { px: a.px / d, pct: a.pct / d, num: a.num / d }; } return null; }
+      return null;
+    }
+    function fmtNum(x) { return (Math.round(x * 1e6) / 1e6).toString(); }
+    return {
+      // Whether a calc() string is type-valid for a <length-percentage>/<number> context.
+      valid: function (str) { var a = parse(str); if (!a) { return false; } return kind(a).k !== "bad"; },
+      // If `str` is a calc() with a pure-number value, return "calc(N)"; if it's a unit calc, return
+      // the normalized string; null if not calc/invalid.
+      serialize: function (str) { var a = parse(str); if (!a) { return null; } var k = kind(a); if (k.k === "bad") { return null; } if (k.k === "num") { return "calc(" + fmtNum(k.v) + ")"; } return null; },
+      // Resolve a calc() to a computed string (px, or "calc(P% + Xpx)" if it keeps a percentage).
+      compute: function (str, ctx) {
+        var a = parse(str); if (!a) { return null; } var k = kind(a); if (k.k === "bad") { return null; }
+        var r = resolve(a, ctx); if (!r) { return null; }
+        var px = r.px + r.num; // user-unit numbers count as px in SVG length context
+        if (r.pct === 0) { return fmtNum(px) + "px"; }
+        if (px === 0) { return fmtNum(r.pct) + "%"; }
+        return "calc(" + fmtNum(r.pct) + "%" + (px >= 0 ? " + " + fmtNum(px) + "px" : " - " + fmtNum(-px) + "px") + ")";
+      }
+    };
+  })();
+  globalThis.__calc = __calc;
   function isValidValue(name, value) {
     var v = String(value).trim();
     if (v === "") return false;
@@ -2098,6 +2175,18 @@
     var vl = v.toLowerCase();
     if (/(^|[^a-z-])(var|env)\s*\(/i.test(v)) return true; // can't validate around substitutions
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
+    // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
+    // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
+    // non-negative; stroke-dashoffset allows negatives.
+    if (name === "stroke-width") { return /^calc\(/i.test(v) ? __calc.valid(v) : isStrokeLen(v, false); }
+    if (name === "stroke-dashoffset") { return /^calc\(/i.test(v) ? __calc.valid(v) : isStrokeLen(v, true); }
+    if (name === "stroke-dasharray") {
+      if (vl === "none") { return true; }
+      var items = splitDashList(v);
+      if (!items.length) { return false; }
+      for (var si = 0; si < items.length; si++) { var it = items[si]; if (/^calc\(/i.test(it) ? !__calc.valid(it) : !isStrokeLen(it, false)) { return false; } }
+      return true;
+    }
     // inline-size / block-size: auto | content keywords | non-negative <length-percentage>
     // (NOT none / border-width keywords, unlike the generic NONNEG set) — checked first.
     if (name === "inline-size" || name === "block-size") {
@@ -2191,6 +2280,29 @@
     for (var i = 0; i < names.length; i++) o[names[i]] = 1;
     return o;
   })();
+  // Split a list on commas/whitespace at the top level (not inside parentheses, e.g. calc()).
+  function splitDashList(v) {
+    var out = [], cur = "", depth = 0;
+    for (var i = 0; i < v.length; i++) {
+      var c = v[i];
+      if (c === "(") { depth++; }
+      else if (c === ")") { depth--; }
+      if (depth === 0 && (c === "," || /\s/.test(c))) { if (cur.trim()) { out.push(cur.trim()); cur = ""; } continue; }
+      cur += c;
+    }
+    if (cur.trim()) { out.push(cur.trim()); }
+    return out;
+  }
+  globalThis.__splitDashList = splitDashList;
+  var STROKE_LEN_UNITS = /^(px|em|ex|ch|rem|vw|vh|vmin|vmax|cm|mm|q|in|pt|pc|cap|ic|vi|vb|lh|rlh)$/;
+  // A single <length-percentage> | <number> token (no trailing dot, optional sign).
+  function isStrokeLen(v, allowNegative) {
+    var m = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z%]*)$/i.exec(String(v).trim());
+    if (!m || /\.$/.test(m[1])) { return false; }
+    var num = parseFloat(m[1]), unit = m[2].toLowerCase();
+    if (!allowNegative && num < 0) { return false; }
+    return unit === "" || unit === "%" || STROKE_LEN_UNITS.test(unit);
+  }
   function isValidLengthLike(v, allowNegative) {
     // Accept a single dimension/percentage/zero/calc token (optionally signed).
     if (/^calc\(/i.test(v)) return true;
@@ -2258,6 +2370,12 @@
     return o;
   })();
   var OPACITY_VALUED = { "opacity": 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "flood-opacity": 1, "shape-image-threshold": 1 };
+  // Serialize one stroke length token: fold a pure-number calc() to calc(N); lowercase the unit.
+  function serStrokeTok(it) {
+    if (/^calc\(/i.test(it)) { var s = __calc.serialize(it); return s != null ? s : it; }
+    var m = /^([-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)([a-z%]*)$/i.exec(it.trim());
+    return m ? m[1] + m[2].toLowerCase() : it;
+  }
   // Canonicalize paint-order: fill in missing keywords in the default order (fill, stroke, markers),
   // then return the shortest prefix that round-trips to the full order.
   function canonPaintOrder(v) {
@@ -2284,6 +2402,15 @@
     }
     // paint-order serializes minimally (drops keywords whose position matches the default order).
     if (val != null && name === "paint-order") { val = canonPaintOrder(String(val)); }
+    // stroke length properties: lowercase units, fold pure-number calc(), and (dasharray)
+    // serialize the list comma-separated.
+    if (val != null && (name === "stroke-width" || name === "stroke-dashoffset" || name === "stroke-dasharray")) {
+      var sv = String(val).trim();
+      if (!(name === "stroke-dasharray" && sv.toLowerCase() === "none")) {
+        var toks = name === "stroke-dasharray" ? splitDashList(sv) : [sv];
+        val = toks.map(serStrokeTok).join(", ");
+      }
+    }
     var i = findDecl(out, name);
     if (val == null || val === "") { if (i >= 0) out.splice(i, 1); return; }
     if (i >= 0) {

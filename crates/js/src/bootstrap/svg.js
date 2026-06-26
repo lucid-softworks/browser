@@ -1320,6 +1320,22 @@
     }
     return full.join(" ");
   }
+  // Resolve a stroke length token to its computed value (px, "P%", or "calc(P% + Xpx)") using the
+  // element's font metrics and the viewport for em/vw/etc. via the shared calc engine.
+  function svgLenCtx(el) {
+    var fs = 16, rfs = 16;
+    try { fs = parseFloat(nativeGCS(el).getPropertyValue("font-size")) || 16; } catch (e) {}
+    try { rfs = parseFloat(nativeGCS(el.ownerDocument.documentElement).getPropertyValue("font-size")) || 16; } catch (e2) {}
+    return { fs: fs, rfs: rfs, vw: globalThis.innerWidth || 0, vh: globalThis.innerHeight || 0 };
+  }
+  function computeStrokeLen(el, raw, nonneg) {
+    if (!globalThis.__calc) { return /%\s*$/.test(raw) ? raw : (parseLen(raw).value + "px"); }
+    var s = /^calc\(/i.test(raw) ? raw : "calc(" + raw + ")";
+    var c = globalThis.__calc.compute(s, svgLenCtx(el));
+    if (c == null) { return raw; }
+    if (nonneg && /^-[0-9.]+px$/.test(c)) { return "0px"; } // non-negative length clamps to 0
+    return c;
+  }
   function svgInitial(el, name) {
     var m = SVG_PROP_META[name];
     if (!m) { return ""; }
@@ -1348,10 +1364,9 @@
     }
     if (SVG_COLOR_PROPS[name]) { var c = colorOf(el, name); return c == null ? "none" : fmtColor(c); }
     if (name === "stroke-width") {
-      // % is kept as a percentage; otherwise resolve to px.
       var rw = rawStyleOrAttr(el, "stroke-width");
-      if (rw != null && /%\s*$/.test(rw.trim())) { return rw.trim(); }
-      return numOf(el, "stroke-width") + "px";
+      if (rw == null) { var pw = svgParent(el); return pw ? svgComputed(pw, name) : "1px"; }
+      return computeStrokeLen(el, rw.trim(), true);
     }
     if (SVG_NUM_PROPS[name]) {
       var nv = numOf(el, name);
@@ -1372,15 +1387,15 @@
     if (name === "stroke-dashoffset") {
       var rd = rawStyleOrAttr(el, "stroke-dashoffset");
       if (rd == null) { var pd = svgParent(el); return pd ? svgComputed(pd, name) : "0px"; }
-      rd = rd.trim();
-      return /%\s*$/.test(rd) ? rd : (numOf(el, "stroke-dashoffset") + "px");
+      return computeStrokeLen(el, rd.trim());
     }
     if (name === "stroke-dasharray") {
       var ra = rawStyleOrAttr(el, "stroke-dasharray");
       if (ra == null) { var pa = svgParent(el); return pa ? svgComputed(pa, name) : "none"; }
       ra = ra.trim();
       if (ra.toLowerCase() === "none" || ra === "") { return "none"; }
-      return ra.split(/[\s,]+/).filter(Boolean).map(function (t) { return /%$/.test(t) ? t : (parseLen(t).value + "px"); }).join(", ");
+      var dlist = (globalThis.__splitDashList ? globalThis.__splitDashList(ra) : ra.split(/[\s,]+/).filter(Boolean));
+      return dlist.map(function (t) { return computeStrokeLen(el, t, true); }).join(", ");
     }
     if (SVG_KEYWORD_PROPS[name]) {
       var spec = SVG_KEYWORD_PROPS[name], raw2 = rawStyleOrAttr(el, name);
