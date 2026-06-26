@@ -1189,34 +1189,84 @@
     return svgAnimNum(el, name, base);
   }
 
-  var SVG_COLOR_PROPS = { fill: 1, stroke: 1, color: 1, "stop-color": 1, "flood-color": 1, "lighting-color": 1 };
+  var SVG_COLOR_PROPS = { fill: 1, stroke: 1, color: 1, "stop-color": 1, "flood-color": 1, "lighting-color": 1, "text-decoration-color": 1 };
   var SVG_NUM_PROPS = { opacity: 1, "fill-opacity": 1, "stroke-opacity": 1, "stop-opacity": 1, "stroke-width": 1 };
+  // SVG text keyword properties: [initial, inherited].
+  var SVG_KEYWORD_PROPS = { "text-anchor": ["start", true], "text-decoration-style": ["solid", false], "text-decoration-line": ["none", false] };
   // camelCase aliases used for direct property access on the declaration.
-  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility" };
+  var CAMEL = { fill: "fill", stroke: "stroke", color: "color", opacity: "opacity", stopColor: "stop-color", floodColor: "flood-color", lightingColor: "lighting-color", fillOpacity: "fill-opacity", strokeOpacity: "stroke-opacity", stopOpacity: "stop-opacity", strokeWidth: "stroke-width", visibility: "visibility", textAnchor: "text-anchor", textDecorationLine: "text-decoration-line", textDecorationStyle: "text-decoration-style", textDecorationColor: "text-decoration-color" };
+  function canonDecorationLine(v) {
+    v = v.toLowerCase().trim();
+    if (v === "none" || v === "spelling-error" || v === "grammar-error") { return v; }
+    var order = ["underline", "overline", "line-through", "blink"], toks = v.split(/\s+/);
+    var out = order.filter(function (o) { return toks.indexOf(o) >= 0; });
+    return out.length ? out.join(" ") : "none";
+  }
+    // The element's cascaded `color` (includes `<style>`-rule colors that rawStyleOrAttr misses),
+    // used to resolve `currentColor`.
+  function nativeColor(el) {
+    try { var c = nativeGCS(el).getPropertyValue("color"); var pc = parseColor(c, el); if (pc) { return pc; } } catch (e) {}
+    return colorOf(el, "color");
+  }
+  function decoColor(el) {
+    var raw = rawStyleOrAttr(el, "text-decoration-color");
+    if (raw == null) { return nativeColor(el); } // initial currentColor
+    var r = raw.trim().toLowerCase();
+    if (r === "currentcolor") { return nativeColor(el); }
+    if (r === "inherit") {
+      var p = svgParent(el);
+      if (p) {
+        var praw = rawStyleOrAttr(p, "text-decoration-color");
+        var pr = praw == null ? "currentcolor" : praw.trim().toLowerCase();
+        // currentColor (or another inherit) resolves against THIS element's color.
+        if (pr === "currentcolor" || pr === "inherit") { return nativeColor(el); }
+        return parseColor(praw, p) || [0, 0, 0, 1];
+      }
+      return nativeColor(el);
+    }
+    return parseColor(raw, el) || [0, 0, 0, 1];
+  }
   function svgComputed(el, name) {
+    if (name === "text-decoration-color") { return fmtColor(decoColor(el)); }
     if (SVG_COLOR_PROPS[name]) { var c = colorOf(el, name); return c == null ? "none" : fmtColor(c); }
     if (SVG_NUM_PROPS[name]) { var v = numOf(el, name); return name === "stroke-width" ? v + "px" : String(v); }
+    if (SVG_KEYWORD_PROPS[name]) {
+      var spec = SVG_KEYWORD_PROPS[name], raw2 = rawStyleOrAttr(el, name);
+      if (raw2 == null || raw2 === "inherit") {
+        var p2 = svgParent(el);
+        if (p2 && (spec[1] || raw2 === "inherit")) { return svgComputed(p2, name); }
+        return spec[0];
+      }
+      return name === "text-decoration-line" ? canonDecorationLine(raw2) : raw2.toLowerCase();
+    }
     if (name === "visibility") {
-      var raw = rawStyleOrAttr(el, "visibility");
-      if (raw == null) { var p = svgParent(el); return p ? svgComputed(p, "visibility") : "visible"; }
-      return raw;
+      var raw3 = rawStyleOrAttr(el, "visibility");
+      if (raw3 == null) { var p = svgParent(el); return p ? svgComputed(p, "visibility") : "visible"; }
+      return raw3;
     }
     return null;
   }
+  function svgHandles(kebab) { return !!(SVG_COLOR_PROPS[kebab] || SVG_NUM_PROPS[kebab] || SVG_KEYWORD_PROPS[kebab] || kebab === "visibility"); }
   var nativeGCS = globalThis.getComputedStyle;
   if (typeof nativeGCS === "function") {
     globalThis.getComputedStyle = function (el, pseudo) {
       var decl = nativeGCS.call(this, el, pseudo);
       if (!el || el.namespaceURI !== SVG_NS) { return decl; }
       return new Proxy(decl, {
+        has: function (target, prop) {
+          if (typeof prop === "string") {
+            if (CAMEL[prop] && svgHandles(CAMEL[prop])) { return true; }
+            if (svgHandles(prop)) { return true; }
+          }
+          return Reflect.has(target, prop);
+        },
         get: function (target, prop) {
           if (typeof prop === "string") {
             if (prop === "getPropertyValue") {
               return function (n) { var v = svgComputed(el, String(n).toLowerCase()); return v != null ? v : target.getPropertyValue(n); };
             }
             if (CAMEL[prop]) { var cv = svgComputed(el, CAMEL[prop]); if (cv != null) { return cv; } }
-            var kebab = prop.replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); });
-            if (SVG_COLOR_PROPS[kebab] || SVG_NUM_PROPS[kebab] || kebab === "visibility") { var kv = svgComputed(el, kebab); if (kv != null) { return kv; } }
+            if (svgHandles(prop)) { var kv = svgComputed(el, prop); if (kv != null) { return kv; } }
           }
           var r = target[prop];
           return typeof r === "function" ? r.bind(target) : r;

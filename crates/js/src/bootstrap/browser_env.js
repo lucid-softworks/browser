@@ -2089,6 +2089,17 @@
     if (name === "opacity") {
       return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(v);
     }
+    // SVG text presentation properties with a small keyword/length grammar.
+    if (name === "text-anchor") { return vl === "start" || vl === "middle" || vl === "end"; }
+    if (name === "text-decoration-style") { return /^(solid|double|dotted|dashed|wavy)$/.test(vl); }
+    if (name === "text-decoration-line") {
+      if (vl === "none" || vl === "spelling-error" || vl === "grammar-error") { return true; }
+      var dlToks = vl.split(/\s+/), dlOk = { underline: 1, overline: 1, "line-through": 1, blink: 1 }, dlSeen = {};
+      for (var di = 0; di < dlToks.length; di++) { var dt = dlToks[di]; if (!dlOk[dt] || dlSeen[dt]) { return false; } dlSeen[dt] = 1; }
+      return dlToks.length > 0;
+    }
+    // shape-margin is a non-negative <length-percentage> (no auto/keywords, single token).
+    if (name === "shape-margin") { return isValidLengthLike(v, false); }
     return true;
   }
   function isValidColor(v) {
