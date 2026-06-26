@@ -1245,6 +1245,27 @@ fn render_children(
 }
 
 /// Render a single SVG element (and its subtree) at the current transform `m` + inherited paint.
+/// SVG conditional processing: an element renders only when its `requiredExtensions` /
+/// `systemLanguage` (and the always-true-in-SVG2 `requiredFeatures`) are satisfied. We support no
+/// extensions, so any non-empty `requiredExtensions` fails; `systemLanguage` matches the UA's `en`.
+fn conditional_ok(el: &dom::ElementData) -> bool {
+    if let Some(re) = attr(el, "requiredExtensions") {
+        if !re.trim().is_empty() {
+            return false;
+        }
+    }
+    if let Some(sl) = attr(el, "systemLanguage") {
+        let ok = sl.split(',').any(|t| {
+            let t = t.trim().to_ascii_lowercase();
+            t == "en" || t.starts_with("en-")
+        });
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
 fn render_element(
     doc: &Document,
     child: NodeId,
@@ -1264,6 +1285,11 @@ fn render_element(
             _ => return,
         };
         let tag = el.tag.to_ascii_lowercase();
+        // Conditional processing: an element with unsatisfied requiredExtensions/systemLanguage is
+        // not rendered (and prunes its subtree).
+        if !conditional_ok(el) {
+            return;
+        }
         // Skip non-rendered defs/metadata/etc. (gradients/clipPath are resolved on demand, not drawn
         // directly here). `<use>`/`<svg>`/`<symbol>` ARE handled below.
         if matches!(
@@ -1300,6 +1326,19 @@ fn render_element(
                     styles,
                     depth + 1,
                 );
+            }
+            // `<switch>` renders only its first child whose conditional-processing attributes pass.
+            "switch" => {
+                for &c in &doc.get(child).children {
+                    if let NodeData::Element(ce) = &doc.get(c).data {
+                        if conditional_ok(ce) {
+                            render_element(
+                                doc, c, child_m, &child_state, surf, font, styles, depth + 1,
+                            );
+                            break;
+                        }
+                    }
+                }
             }
             // A nested `<svg>` / `<symbol>` establishes its own viewport at (x,y) with its own
             // viewBox — the structure SVG sprite sheets use (one inner <svg> per icon).
