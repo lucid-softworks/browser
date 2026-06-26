@@ -81,7 +81,14 @@ jobs:
           shared-key: release-deps
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Build WebDriver server
-        run: cargo build --release -p webdriver
+        run: |
+          # See ci.yml: the prebuilt V8 static lib is carried in the shared cache; if it's missing,
+          # build V8 from source instead of failing at the link step.
+          if ! cargo build --release -p webdriver; then
+            echo "::notice::prebuilt V8 unavailable — building V8 from source"
+            export V8_FROM_SOURCE=1
+            cargo build --release -p webdriver
+          fi
       - name: Upload WebDriver binary
         uses: actions/upload-artifact@v4
         with:

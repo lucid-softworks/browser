@@ -72,5 +72,13 @@ jobs:
       # so exclude it here.
       - name: Build + test
         run: |
-          cargo build --workspace --release --exclude ffi
+          # The `v8` crate links a prebuilt `librusty_v8.a` that the Swatinem cache carries between
+          # runs. If that lib isn't available (cache cleared, or a Cargo.lock change invalidated the
+          # entry) the build fails fast at the V8 link step — so fall back to building V8 from source,
+          # which produces the lib and seeds gn_out into the cache for subsequent runs.
+          if ! cargo build --workspace --release --exclude ffi; then
+            echo "::notice::prebuilt V8 unavailable — building V8 from source"
+            export V8_FROM_SOURCE=1
+            cargo build --workspace --release --exclude ffi
+          fi
           cargo test --workspace --release --exclude ffi
