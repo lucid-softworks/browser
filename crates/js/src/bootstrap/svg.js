@@ -698,11 +698,29 @@
     // Marker: orientAngle / orientType / markerUnits.
     if (ln === "marker") {
       var node = el.__node;
-      def(el, "orientAngle", makeAnimatedAngle(el, "orient"));
-      def(el, "orientType", makeAnimatedEnum(function () { var o = getAttr(node, "orient"); if (o === "auto" || o === "auto-start-reverse") { return 1; } return 2; }));
+      var isAutoOrient = function () { var o = getAttr(node, "orient"); return o === "auto" || o === "auto-start-reverse"; };
+      var angleNum = function () { var o = getAttr(node, "orient"); return (o == null || isAutoOrient()) ? 0 : parseAngle(o).value; };
+      // orientAngle (SVGAnimatedAngle) — baseVal writes sync to the `orient` attribute.
+      var oa = Object.create(SVGAngle.prototype);
+      Object.defineProperty(oa, "value", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
+      Object.defineProperty(oa, "valueInSpecifiedUnits", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
+      Object.defineProperty(oa, "valueAsString", { get: function () { return String(angleNum()); }, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
+      Object.defineProperty(oa, "unitType", { get: function () { var o = getAttr(node, "orient"); return (o == null || isAutoOrient()) ? 1 : parseAngle(o).type; }, enumerable: true });
+      def(oa, "newValueSpecifiedUnits", function (u, v) { setAttr(node, "orient", String(v)); });
+      def(oa, "convertToSpecifiedUnits", function () { setAttr(node, "orient", String(angleNum())); });
+      var orientAngle = Object.create(globalThis.SVGAnimatedAngle.prototype);
+      Object.defineProperty(orientAngle, "baseVal", { value: oa, enumerable: true });
+      Object.defineProperty(orientAngle, "animVal", { value: makeAngle(function () { return svgAnimNum(el, "orient", angleNum(), angleVec); }), enumerable: true });
+      def(el, "orientAngle", orientAngle);
+      // orientType (SVGAnimatedEnumeration) — baseVal writes sync to the `orient` attribute.
+      var orientTypeVal = function () { var o = getAttr(node, "orient"); if (o == null) { return 2; } return isAutoOrient() ? 1 : 2; };
+      var orientType = Object.create(globalThis.SVGAnimatedEnumeration.prototype);
+      Object.defineProperty(orientType, "baseVal", { get: orientTypeVal, set: function (v) { v = v | 0; if (v === 1) { setAttr(node, "orient", "auto"); } else if (v === 2) { setAttr(node, "orient", String(angleNum())); } }, enumerable: true });
+      Object.defineProperty(orientType, "animVal", { get: orientTypeVal, enumerable: true });
+      def(el, "orientType", orientType);
       def(el, "markerUnits", makeAnimatedEnum(function () { var u = getAttr(node, "markerUnits"); return u === "userSpaceOnUse" ? 1 : 2; }));
       def(el, "setOrientToAuto", function () { setAttr(node, "orient", "auto"); });
-      def(el, "setOrientToAngle", function (a) { setAttr(node, "orient", (a && a.value != null ? a.value : a) + "deg"); });
+      def(el, "setOrientToAngle", function (a) { setAttr(node, "orient", String(a && a.value != null ? a.value : a)); });
       def(el, "SVG_MARKER_ORIENT_UNKNOWN", 0); def(el, "SVG_MARKER_ORIENT_AUTO", 1); def(el, "SVG_MARKER_ORIENT_ANGLE", 2);
     }
 
