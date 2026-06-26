@@ -558,6 +558,24 @@
       }
     }
 
+    // SVGTextContentElement methods (text / tspan / textPath / tref).
+    if (ln === "text" || ln === "tspan" || ln === "tref" || ln === "textpath" || ln === "altglyph") {
+      def(el, "getNumberOfChars", function () { var t = this.textContent; return t == null ? 0 : String(t).length; });
+      def(el, "getComputedTextLength", function () { return bbox(this).width; });
+      def(el, "getSubStringLength", function (i, n) { var len = this.getNumberOfChars(); var total = bbox(this).width; if (!len) { return 0; } return total * Math.max(0, Math.min(n, len - i)) / len; });
+      def(el, "getRotationOfChar", function (i) {
+        var r = getAttr(this.__node, "rotate"); if (r == null || r === "") { return 0; }
+        var list = vecParse(r); if (!list.length) { return 0; }
+        return i < list.length ? list[i] : list[list.length - 1];
+      });
+      def(el, "getStartPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * i / len, b.y + b.height); });
+      def(el, "getEndPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * (i + 1) / len, b.y + b.height); });
+      def(el, "getExtentOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makeRectObj(b.x + b.width * i / len, b.y, b.width / len, b.height); });
+      def(el, "getCharNumAtPosition", function (p) { var b = bbox(this); var len = this.getNumberOfChars() || 1; if (!p || b.width === 0) { return -1; } var idx = Math.floor((p.x - b.x) / (b.width / len)); return idx >= 0 && idx < len ? idx : -1; });
+      def(el, "selectSubString", function () {});
+      if (!("textLength" in el)) { (function () { var tc = null; Object.defineProperty(el, "textLength", { get: function () { if (!tc) { tc = makeAnimatedLength(el, "textLength"); } return tc; }, configurable: true, enumerable: true }); })(); }
+      def(el, "lengthAdjust", makeAnimatedEnum(function () { return getAttr(el.__node, "lengthAdjust") === "spacingAndGlyphs" ? 2 : 1; }));
+    }
     // Text-positioning elements: x/y/dx/dy are length lists, rotate is a number list.
     if (ln === "text" || ln === "tspan" || ln === "tref" || ln === "textpath" || ln === "altglyph") {
       var listCache = {};
@@ -849,16 +867,40 @@
     for (var s = 0; s < segs.length; s++) { var a = segs[s][0], b = segs[s][1], d = Math.hypot(b.x - a.x, b.y - a.y); if (acc + d >= len || s === segs.length - 1) { var f = d > 0 ? (len - acc) / d : 0; return makePoint(a.x + f * (b.x - a.x), a.y + f * (b.y - a.y)); } acc += d; }
     var last = segs[segs.length - 1][1]; return makePoint(last.x, last.y);
   }
+  var CONTAINER_TAGS = { g: 1, svg: 1, a: 1, switch: 1, symbol: 1, marker: 1, defs: 0 };
   function bbox(el) {
     var ln = el.__localName;
     if (ln === "rect") { return makeRectObj(gnum(el, "x"), gnum(el, "y"), gnum(el, "width"), gnum(el, "height")); }
     if (ln === "circle") { var r = gnum(el, "r"); return makeRectObj(gnum(el, "cx") - r, gnum(el, "cy") - r, 2 * r, 2 * r); }
     if (ln === "ellipse") { var rx = gnum(el, "rx"), ry = gnum(el, "ry"); return makeRectObj(gnum(el, "cx") - rx, gnum(el, "cy") - ry, 2 * rx, 2 * ry); }
     if (ln === "line") { var x1 = gnum(el, "x1"), y1 = gnum(el, "y1"), x2 = gnum(el, "x2"), y2 = gnum(el, "y2"); return makeRectObj(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1)); }
-    var cs = shapeContours(el); var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
-    for (var i = 0; i < cs.length; i++) { var pts = cs[i].pts; for (var k = 0; k < pts.length; k++) { minx = Math.min(minx, pts[k].x); miny = Math.min(miny, pts[k].y); maxx = Math.max(maxx, pts[k].x); maxy = Math.max(maxy, pts[k].y); } }
-    if (!isFinite(minx)) { return makeRectObj(0, 0, 0, 0); }
-    return makeRectObj(minx, miny, maxx - minx, maxy - miny);
+    if (GEOM_TAGS[ln]) {
+      var cs = shapeContours(el); var mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
+      for (var i = 0; i < cs.length; i++) { var pts = cs[i].pts; for (var k = 0; k < pts.length; k++) { mnx = Math.min(mnx, pts[k].x); mny = Math.min(mny, pts[k].y); mxx = Math.max(mxx, pts[k].x); mxy = Math.max(mxy, pts[k].y); } }
+      if (!isFinite(mnx)) { return makeRectObj(0, 0, 0, 0); }
+      return makeRectObj(mnx, mny, mxx - mnx, mxy - mny);
+    }
+    // Container: union of children's bboxes, each mapped through the child's own transform.
+    if (CONTAINER_TAGS[ln]) {
+      var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+      var kids = el.childNodes;
+      for (var c = 0; c < (kids ? kids.length : 0); c++) {
+        var ch = kids[c];
+        if (!ch || ch.nodeType !== 1 || ch.namespaceURI !== SVG_NS) { continue; }
+        var cln = ch.__localName;
+        if (!GEOM_TAGS[cln] && !CONTAINER_TAGS[cln] && cln !== "text" && cln !== "image" && cln !== "use") { continue; }
+        var b = bbox(ch);
+        if (b.width === 0 && b.height === 0 && !GEOM_TAGS[cln]) { continue; }
+        var tl = parseTransformList(getAttr(ch.__node, "transform") || "");
+        var m = makeMatrix(1, 0, 0, 1, 0, 0);
+        for (var ti = 0; ti < tl.length; ti++) { m = m.multiply(tl[ti].matrix); }
+        var corners = [[b.x, b.y], [b.x + b.width, b.y], [b.x, b.y + b.height], [b.x + b.width, b.y + b.height]];
+        for (var q = 0; q < 4; q++) { var px = m.a * corners[q][0] + m.c * corners[q][1] + m.e, py = m.b * corners[q][0] + m.d * corners[q][1] + m.f; minx = Math.min(minx, px); miny = Math.min(miny, py); maxx = Math.max(maxx, px); maxy = Math.max(maxy, py); }
+      }
+      if (!isFinite(minx)) { return makeRectObj(0, 0, 0, 0); }
+      return makeRectObj(minx, miny, maxx - minx, maxy - miny);
+    }
+    return makeRectObj(0, 0, 0, 0);
   }
   function makePoint(x, y) { var P = Object.create(globalThis.SVGPoint.prototype); P.x = x; P.y = y; def(P, "matrixTransform", function (m) { return makePoint(m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f); }); return P; }
   function makeRectObj(x, y, w, h) { var R = Object.create(globalThis.SVGRect.prototype); R.x = x; R.y = y; R.width = w; R.height = h; return R; }
