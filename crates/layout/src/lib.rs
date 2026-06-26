@@ -2238,6 +2238,199 @@ mod tests {
     }
 
     #[test]
+    fn abspos_grid_child_percentage_size_uses_grid_area_containing_block() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let grid = doc.append_element(body, "div");
+        let child = doc.append_element(grid, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            grid,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                position: style::Position::Relative,
+                width: Some(500.0),
+                height: Some(500.0),
+                padding: style::Edges::all(15.0),
+                grid_template_columns: vec![
+                    style::TrackSize::Px(50.0),
+                    style::TrackSize::Px(100.0),
+                    style::TrackSize::Px(150.0),
+                    style::TrackSize::Px(200.0),
+                ],
+                grid_template_rows: vec![
+                    style::TrackSize::Px(50.0),
+                    style::TrackSize::Px(100.0),
+                    style::TrackSize::Px(150.0),
+                    style::TrackSize::Px(200.0),
+                ],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            child,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Absolute,
+                width_pct: Some(1.0),
+                height_pct: Some(1.0),
+                grid_column: Some(style::GridPlacement {
+                    start: None,
+                    start_span: Some(2),
+                    end: style::GridEnd::Line(4),
+                }),
+                grid_row: Some(style::GridPlacement {
+                    start: None,
+                    start_span: Some(2),
+                    end: style::GridEnd::Line(4),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let gbox = find_box(&root_box, &|x| x.node == Some(grid)).unwrap();
+        let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
+        let content = gbox.dimensions.content;
+        let c = cbox.dimensions.content;
+        assert!((c.x - (content.x + 50.0)).abs() < 0.5, "x={} want {}", c.x, content.x + 50.0);
+        assert!((c.y - (content.y + 50.0)).abs() < 0.5, "y={} want {}", c.y, content.y + 50.0);
+        assert!((c.width - 250.0).abs() < 0.5, "width={} want 250", c.width);
+        assert!((c.height - 250.0).abs() < 0.5, "height={} want 250", c.height);
+    }
+
+    #[test]
+    fn abspos_grid_child_end_lines_use_padding_box_edges() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let grid = doc.append_element(body, "div");
+        let child = doc.append_element(grid, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            grid,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                position: style::Position::Relative,
+                width: Some(500.0),
+                height: Some(500.0),
+                padding: style::Edges::all(15.0),
+                grid_template_columns: vec![
+                    style::TrackSize::Px(50.0),
+                    style::TrackSize::Px(100.0),
+                    style::TrackSize::Px(150.0),
+                    style::TrackSize::Px(200.0),
+                ],
+                grid_template_rows: vec![
+                    style::TrackSize::Px(50.0),
+                    style::TrackSize::Px(100.0),
+                    style::TrackSize::Px(150.0),
+                    style::TrackSize::Px(200.0),
+                ],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            child,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Absolute,
+                width_pct: Some(1.0),
+                height_pct: Some(1.0),
+                grid_column: Some(style::GridPlacement {
+                    start: None,
+                    start_span: None,
+                    end: style::GridEnd::Line(3),
+                }),
+                grid_row: Some(style::GridPlacement {
+                    start: None,
+                    start_span: None,
+                    end: style::GridEnd::Line(2),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let gbox = find_box(&root_box, &|x| x.node == Some(grid)).unwrap();
+        let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
+        let pad = gbox.dimensions.padding_box();
+        let c = cbox.dimensions.content;
+        assert!((c.x - pad.x).abs() < 0.5, "x={} want {}", c.x, pad.x);
+        assert!((c.y - pad.y).abs() < 0.5, "y={} want {}", c.y, pad.y);
+        assert!((c.width - 165.0).abs() < 0.5, "width={} want 165", c.width);
+        assert!((c.height - 65.0).abs() < 0.5, "height={} want 65", c.height);
+    }
+
+    #[test]
+    fn abspos_grid_child_rtl_column_lines_map_from_inline_start() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let grid = doc.append_element(body, "div");
+        let child = doc.append_element(grid, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            grid,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                position: style::Position::Relative,
+                direction: style::Direction::Rtl,
+                width: Some(500.0),
+                height: Some(500.0),
+                padding: style::Edges::all(15.0),
+                grid_template_columns: vec![
+                    style::TrackSize::Px(50.0),
+                    style::TrackSize::Px(100.0),
+                    style::TrackSize::Px(150.0),
+                    style::TrackSize::Px(200.0),
+                ],
+                grid_template_rows: vec![style::TrackSize::Px(50.0)],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            child,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Absolute,
+                width_pct: Some(1.0),
+                height_pct: Some(1.0),
+                grid_column: Some(style::GridPlacement {
+                    start: Some(1),
+                    start_span: None,
+                    end: style::GridEnd::Line(2),
+                }),
+                grid_row: Some(style::GridPlacement {
+                    start: Some(1),
+                    start_span: None,
+                    end: style::GridEnd::Line(2),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
+        let c = cbox.dimensions.content;
+        assert!((c.x - 465.0).abs() < 0.5, "x={} want 465", c.x);
+        assert!((c.width - 50.0).abs() < 0.5, "width={} want 50", c.width);
+    }
+
+    #[test]
     fn sibling_after_wrapped_paragraph_clears_its_margin_box() {
         // body > p (multi-line wrapped text) , div (sibling). The sibling's content.y must be
         // >= the paragraph block's margin-box bottom (no vertical overlap). This guards the bug

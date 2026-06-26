@@ -605,6 +605,7 @@ pub(crate) fn resolve_out_of_flow(
     // are `auto`) is its hypothetical in-flow origin — approximated by this parent's content-box
     // top-left. Captured before the loop so each child sees the same parent content rect.
     let parent_content = boxx.dimensions.content;
+    let is_grid_parent = matches!(display_of(boxx, styles), style::Display::Grid | style::Display::InlineGrid);
     // If this box is a flex container, abspos children take their static position from its
     // justify-content / align-items (resolved per child's align-self) rather than the top-left.
     let flex_parent: Option<style::ComputedStyle> = match display_of(boxx, styles) {
@@ -639,11 +640,15 @@ pub(crate) fn resolve_out_of_flow(
         match position_of(&boxx.children[i], styles) {
             style::Position::Absolute => {
                 let fa = flex_align_for(&boxx.children[i]);
+                let grid_cb =
+                    is_grid_parent.then(|| crate::grid::abspos_grid_containing_block(boxx, &boxx.children[i], styles)).flatten();
+                let cb = grid_cb.unwrap_or(ctx.positioned);
+                let static_rect = grid_cb.unwrap_or(parent_content);
                 let child = &mut boxx.children[i];
                 layout_out_of_flow(
                     child,
-                    ctx.positioned,
-                    parent_content,
+                    cb,
+                    static_rect,
                     inline_cursor,
                     fa,
                     ctx,
@@ -758,6 +763,15 @@ pub(crate) fn layout_out_of_flow(
     let inset_top = cs.top_spec.resolve_px(cb.height).or(cs.top);
     let inset_bottom = cs.bottom_spec.resolve_px(cb.height).or(cs.bottom);
 
+    let explicit_w = cs
+        .width
+        .or_else(|| cs.width_pct.map(|p| (cb.width * p).max(0.0)));
+    let explicit_h = cs.height.or_else(|| {
+        cs.height_pct
+            .filter(|_| cb.height > 0.0)
+            .map(|p| (cb.height * p).max(0.0))
+    });
+
     // Content width:
     //   * explicit `width` wins;
     //   * `left` AND `right` both set with no width => stretch to fill between them;
@@ -766,7 +780,7 @@ pub(crate) fn layout_out_of_flow(
     //     border), so we strip the box's own horizontal padding/border back off to get content.
     let content_width = if replaced {
         replaced_w
-    } else if let Some(w) = cs.width {
+    } else if let Some(w) = explicit_w {
         w
     } else if let (Some(l), Some(r)) = (inset_left, inset_right) {
         (cb.width - l - r - horizontal).max(0.0)
@@ -784,7 +798,7 @@ pub(crate) fn layout_out_of_flow(
     // space goes to the auto margin(s) (CSS 2.2 §10.3.7) — centering when both are auto. Otherwise
     // auto margins stay 0 (the style crate already resolved them so).
     if let (Some(l), Some(r)) = (inset_left, inset_right) {
-        if cs.width.is_some() && (cs.margin_auto[1] || cs.margin_auto[3]) {
+        if explicit_w.is_some() && (cs.margin_auto[1] || cs.margin_auto[3]) {
             let free = cb.width
                 - l
                 - r
@@ -878,7 +892,7 @@ pub(crate) fn layout_out_of_flow(
     let final_height = if replaced {
         content_height
     } else {
-        cs.height.unwrap_or(content_height)
+        explicit_h.unwrap_or(content_height)
     };
     let final_height = clamp_height(boxx, final_height, cb.height, styles);
     boxx.dimensions.content.height = final_height;
