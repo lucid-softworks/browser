@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 engine = { path = "../engine" }
+net = { path = "../net" }
 base64 = "0.22"
 image = "0.25"
 

@@ -67,6 +67,18 @@ pub(crate) fn build_request_fetcher(
     })
 }
 
+/// Build the cookie getter passed to the JS runtime: given the document URL, returns the
+/// cookies that should be visible to `document.cookie` (name=value; ...).
+pub(crate) fn build_cookie_getter() -> std::sync::Arc<dyn Fn(&str) -> String + Send + Sync> {
+    std::sync::Arc::new(|url: &str| net::cookies_for_document(url))
+}
+
+/// Build the cookie setter passed to the JS runtime: given the document URL and a cookie
+/// string (from `document.cookie = "..."`), stores it in the shared jar. Returns true on success.
+pub(crate) fn build_cookie_setter() -> std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync> {
+    std::sync::Arc::new(|url: &str, cookie: &str| net::set_cookie(url, cookie))
+}
+
 /// Build the host WebSocket *connector* passed into the JS [`js::Session`]: it backs the real
 /// `WebSocket` class. Given `(url, id, evt_tx)` it spawns a dedicated thread running [`net::ws_run`]
 /// for the lifetime of that socket and returns the `out` sender the JS side uses to send/close.

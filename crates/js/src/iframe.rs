@@ -213,6 +213,8 @@ fn prim_iframe_load(
         let ctx = v8::Context::new(scope, Default::default());
         let cscope = &mut v8::ContextScope::new(scope, ctx);
         let shared: SharedDoc = Rc::new(RefCell::new(doc));
+        let cookie_getter = std::sync::Arc::clone(&page_state.cookie_getter);
+        let cookie_setter = std::sync::Arc::clone(&page_state.cookie_setter);
         let state = HostState::with_fetcher(
             Rc::clone(&shared),
             Rc::new(|_| None),
@@ -220,6 +222,8 @@ fn prim_iframe_load(
             fetch_tx,
             ws_connector,
             ws_tx,
+            cookie_getter,
+            cookie_setter,
         );
         cscope.get_current_context().set_slot(state);
         install_browser_environment(cscope, &frame_url);

@@ -352,6 +352,8 @@ pub fn run_modules(
     modules: HashMap<String, String>,
     fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send>,
     request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
+    cookie_getter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
 ) -> (dom::Document, Vec<EvalOutput>) {
     let url = url.to_string();
     let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
@@ -393,6 +395,8 @@ pub fn run_modules(
                     fetch_tx,
                     ws_connector,
                     ws_evt_tx,
+                    cookie_getter,
+                    cookie_setter,
                 );
                 scope.get_current_context().set_slot(state);
                 let registry = Rc::new(ModuleRegistry {

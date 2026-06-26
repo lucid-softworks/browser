@@ -5,9 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# `cookies` so the shared agent persists Set-Cookie across requests AND redirects (stay logged in).
-ureq = { version = "2", features = ["cookies"] }
-cookie_store = "0.21"
+ureq = "2"
 # Same rustls (0.23) / webpki-roots backend ureq uses, so adding the WPT test CA to the trust store
 # (gated behind `WPT_CA_FILE`, used only by wpt-runner) doesn't pull a second TLS stack. `ring` is
 # pinned so a process-default CryptoProvider always exists and building a ClientConfig can't panic.

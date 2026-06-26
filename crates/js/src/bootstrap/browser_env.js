@@ -1180,14 +1180,12 @@
   });
 
   // --- document extras ---------------------------------------------------------------------
-  var cookieStore = "";
+  // Delegate to the Rust-side cookie jar (shared with HTTP requests) so that cookies set via
+  // Set-Cookie headers are visible to document.cookie and vice-versa. The host provides proper
+  // domain/path/secure/httpOnly matching via the native bridge.
   Object.defineProperty(document, "cookie", {
-    get: function () { return cookieStore; },
-    set: function (v) {
-      v = String(v);
-      var pair = v.split(";")[0];
-      if (pair.indexOf("=") >= 0) { cookieStore = cookieStore ? (cookieStore + "; " + pair) : pair; }
-    },
+    get: function () { try { return __cookie(); } catch (e) { return ""; } },
+    set: function (v) { try { __setCookie(String(v)); } catch (e) {} },
     enumerable: true, configurable: true
   });
 

@@ -119,6 +119,8 @@ fn prim_worker_create(
     let page_state = host_state(scope);
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
+    let cookie_getter = std::sync::Arc::clone(&page_state.cookie_getter);
+    let cookie_setter = std::sync::Arc::clone(&page_state.cookie_setter);
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
     let (ws_tx, ws_evt_rx) = std::sync::mpsc::channel();
 
@@ -133,6 +135,8 @@ fn prim_worker_create(
             fetch_tx,
             ws_connector,
             ws_tx,
+            cookie_getter,
+            cookie_setter,
         );
         cscope.get_current_context().set_slot(state);
         install_browser_environment(cscope, &script_url);
