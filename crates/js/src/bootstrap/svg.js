@@ -647,213 +647,14 @@
     try { ln = (el.localName || el.tagName || "").toLowerCase(); } catch (e) {}
     def(el, "__localName", ln);
 
-    // Enumerated presentation properties (SVGAnimatedEnumeration: type/operator/gradientUnits/…).
-    if (ENUM_PROPS[ln]) {
-      ENUM_PROPS[ln].forEach(function (s) { def(el, s[0], makeEnumProp(el, s[0], s[1], s[2])); });
-    }
-
     // Set the specific SVG element interface prototype (so `instanceof SVGRectElement` works); its
-    // chain ends at SVGElement.prototype set by browser-env's applyNodePrototype.
+    // chain ends at SVGElement.prototype set by browser-env's applyNodePrototype. All reflected IDL
+    // members live on the interface prototypes (see installSvgProtos), inherited from here.
     var ifaceName = TAG_IFACE[ln];
-    if (ifaceName && globalThis[ifaceName] && globalThis[ifaceName].prototype) {
+    if (ifaceName) {
       try { if (Object.getPrototypeOf(el) !== globalThis[ifaceName].prototype) { Object.setPrototypeOf(el, globalThis[ifaceName].prototype); } } catch (e) {}
     }
-
-    // Scalar length attributes -> SVGAnimatedLength (cached per element+attr).
-    var attrs = LEN_ATTRS[ln];
-    if (attrs) {
-      var cache = {};
-      def(el, "__svgLenCache", cache);
-      for (var i = 0; i < attrs.length; i++) {
-        (function (a) {
-          var dflt = LEN_DEFAULTS[ln + "." + a];
-          Object.defineProperty(el, a, {
-            get: function () { return cache[a] || (cache[a] = makeAnimatedLength(el, a, dflt)); },
-            configurable: true, enumerable: true
-          });
-        })(attrs[i]);
-      }
-    }
-
-    // SVGTextContentElement methods (text / tspan / textPath / tref).
-    if (ln === "text" || ln === "tspan" || ln === "tref" || ln === "textpath" || ln === "altglyph") {
-      def(el, "getNumberOfChars", function () { var t = this.textContent; return t == null ? 0 : String(t).length; });
-      def(el, "getComputedTextLength", function () { return bbox(this).width; });
-      def(el, "getSubStringLength", function (i, n) { var len = this.getNumberOfChars(); var total = bbox(this).width; if (!len) { return 0; } return total * Math.max(0, Math.min(n, len - i)) / len; });
-      def(el, "getRotationOfChar", function (i) {
-        var r = getAttr(this.__node, "rotate"); if (r == null || r === "") { return 0; }
-        var list = vecParse(r); if (!list.length) { return 0; }
-        return i < list.length ? list[i] : list[list.length - 1];
-      });
-      def(el, "getStartPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * i / len, b.y + b.height); });
-      def(el, "getEndPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * (i + 1) / len, b.y + b.height); });
-      def(el, "getExtentOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makeRectObj(b.x + b.width * i / len, b.y, b.width / len, b.height); });
-      def(el, "getCharNumAtPosition", function (p) { var b = bbox(this); var len = this.getNumberOfChars() || 1; if (!p || b.width === 0) { return -1; } var idx = Math.floor((p.x - b.x) / (b.width / len)); return idx >= 0 && idx < len ? idx : -1; });
-      def(el, "selectSubString", function () {});
-      if (!("textLength" in el)) { (function () { var tc = null; Object.defineProperty(el, "textLength", { get: function () { if (!tc) { tc = makeAnimatedLength(el, "textLength"); } return tc; }, configurable: true, enumerable: true }); })(); }
-      def(el, "lengthAdjust", makeEnumProp(el, "lengthAdjust", LENGTHADJUST_MAP, "spacing"));
-    }
-    // Text-positioning elements: x/y/dx/dy are length lists, rotate is a number list.
-    if (ln === "text" || ln === "tspan" || ln === "tref" || ln === "textpath" || ln === "altglyph") {
-      var listCache = {};
-      [["x", globalThis.SVGLengthList, SVGLength], ["y", globalThis.SVGLengthList, SVGLength],
-       ["dx", globalThis.SVGLengthList, SVGLength], ["dy", globalThis.SVGLengthList, SVGLength],
-       ["rotate", globalThis.SVGNumberList, globalThis.SVGNumber]].forEach(function (spec) {
-        Object.defineProperty(el, spec[0], {
-          get: function () { return listCache[spec[0]] || (listCache[spec[0]] = makeAnimatedItemList(el, spec[0], spec[1], spec[2])); },
-          configurable: true, enumerable: true
-        });
-      });
-    }
-
-    // viewBox -> SVGAnimatedRect (on the elements that take one).
-    if (ln === "svg" || ln === "symbol" || ln === "marker" || ln === "pattern" || ln === "view") {
-      (function () {
-        var vbCache = null;
-        Object.defineProperty(el, "viewBox", {
-          get: function () { return vbCache || (vbCache = makeAnimatedRect(el, "viewBox")); },
-          configurable: true, enumerable: true
-        });
-      })();
-    }
-    // preserveAspectRatio: a minimal SVGAnimatedPreserveAspectRatio (the default xMidYMid meet).
-    if (ln === "svg" || ln === "symbol" || ln === "marker" || ln === "pattern" || ln === "view" || ln === "image" || ln === "feimage") {
-      if (!("preserveAspectRatio" in el)) {
-        var par = Object.create(globalThis.SVGAnimatedPreserveAspectRatio.prototype);
-        function makePar() { var p = Object.create(SVGPreserveAspectRatio.prototype); p.align = 6; p.meetOrSlice = 1; return p; }
-        Object.defineProperty(par, "baseVal", { value: makePar(), enumerable: true });
-        Object.defineProperty(par, "animVal", { value: makePar(), enumerable: true });
-        def(el, "preserveAspectRatio", par);
-      }
-    }
-
-    // The <svg> root: the animation timeline controls + create* factories.
-    if (ln === "svg") {
-      def(el, "pauseAnimations", function () { clock.paused = true; });
-      def(el, "unpauseAnimations", function () { clock.paused = false; });
-      def(el, "setCurrentTime", function (s) { var v = Number(s); clock.time = isFinite(v) ? v : 0; });
-      def(el, "getCurrentTime", function () { return clock.time; });
-      def(el, "suspendRedraw", function () { return 0; });
-      def(el, "unsuspendRedraw", function () {});
-      def(el, "unsuspendRedrawAll", function () {});
-      def(el, "forceRedraw", function () {});
-      def(el, "createSVGLength", function () { var L = Object.create(SVGLength.prototype); L.value = 0; L.valueInSpecifiedUnits = 0; L.valueAsString = "0"; L.unitType = 1; def(L, "newValueSpecifiedUnits", function (u, v) { this.value = v; this.valueInSpecifiedUnits = v; }); def(L, "convertToSpecifiedUnits", function () {}); return L; });
-      def(el, "createSVGNumber", function () { var N = Object.create(globalThis.SVGNumber.prototype); N.value = 0; return N; });
-      def(el, "createSVGPoint", function () { var P = Object.create(globalThis.SVGPoint.prototype); P.x = 0; P.y = 0; def(P, "matrixTransform", function (m) { return P; }); return P; });
-      def(el, "createSVGRect", function () { var R = Object.create(globalThis.SVGRect.prototype); R.x = 0; R.y = 0; R.width = 0; R.height = 0; return R; });
-      def(el, "createSVGMatrix", function () { return makeMatrix(1, 0, 0, 1, 0, 0); });
-      def(el, "createSVGTransform", function () { var T = Object.create(SVGTransform.prototype); T.type = 0; T.angle = 0; T.matrix = makeMatrix(1, 0, 0, 1, 0, 0); def(T, "setMatrix", function (m) { this.matrix = m; this.type = 1; }); def(T, "setTranslate", function (x, y) { this.matrix = makeMatrix(1, 0, 0, 1, x, y); this.type = 2; }); def(T, "setScale", function (sx, sy) { this.matrix = makeMatrix(sx, 0, 0, sy, 0, 0); this.type = 3; }); def(T, "setRotate", function (ang) { this.angle = ang; this.type = 4; }); return T; });
-      def(el, "createSVGAngle", function () { var A = Object.create(SVGAngle.prototype); A.value = 0; A.unitType = 1; return A; });
-      def(el, "createSVGTransformFromMatrix", function (m) { var T = el.createSVGTransform(); T.setMatrix(m); return T; });
-      def(el, "getElementById", function (id) { return el.ownerDocument.getElementById(id); });
-      // Geometry queries: an element intersects `rect` (in this svg's user space) when its CTM-mapped
-      // bounding box overlaps the rect.
-      var elemViewBox = function (e) {
-        var b = bbox(e), m = ctmOf(e);
-        var xs = [b.x, b.x + b.width], ys = [b.y, b.y + b.height], mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
-        for (var i = 0; i < 2; i++) { for (var j = 0; j < 2; j++) { var px = m.a * xs[i] + m.c * ys[j] + m.e, py = m.b * xs[i] + m.d * ys[j] + m.f; mnx = Math.min(mnx, px); mny = Math.min(mny, py); mxx = Math.max(mxx, px); mxy = Math.max(mxy, py); } }
-        return { x: mnx, y: mny, w: mxx - mnx, h: mxy - mny };
-      };
-      var rectsOverlap = function (b, r) { return b.x < r.x + r.width && b.x + b.w > r.x && b.y < r.y + r.height && b.y + b.h > r.y; };
-      def(el, "checkIntersection", function (element, rect) { return rectsOverlap(elemViewBox(element), rect); });
-      def(el, "checkEnclosure", function (element, rect) { var b = elemViewBox(element); return b.x >= rect.x && b.y >= rect.y && b.x + b.w <= rect.x + rect.width && b.y + b.h <= rect.y + rect.height; });
-      def(el, "getIntersectionList", function (rect, ref) {
-        var root = ref || el, out = [];
-        var GRAPHICS = { rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1, path: 1, text: 1, image: 1, use: 1 };
-        var SKIP = { defs: 1, clippath: 1, mask: 1, symbol: 1, marker: 1, pattern: 1, lineargradient: 1, radialgradient: 1, filter: 1 };
-        (function walk(n) {
-          var kids = n.childNodes;
-          for (var i = 0; kids && i < kids.length; i++) {
-            var c = kids[i];
-            if (!c || c.nodeType !== 1 || c.namespaceURI !== SVG_NS) { continue; }
-            var ln2 = c.__localName;
-            if (SKIP[ln2]) { continue; } // non-rendered containers (and their subtrees)
-            var disp = ""; try { disp = nativeGCS(c).getPropertyValue("display"); } catch (e) {}
-            if (disp === "none") { continue; }
-            var pe = getAttr(c.__node, "pointer-events"); try { var sp = nativeGCS(c).getPropertyValue("pointer-events"); if (sp) { pe = sp; } } catch (e2) {}
-            if (GRAPHICS[ln2] && pe !== "none" && rectsOverlap(elemViewBox(c), rect)) { out.push(c); }
-            if (ln2 !== "use") { walk(c); } // <use> renders a clone, not its DOM children
-          }
-        })(root);
-        return out;
-      });
-      def(el, "getEnclosureList", function (rect, ref) { return []; });
-    }
-
-    // Animation elements: the timeline-query API used by some tests.
-    if (isAnimEl(el)) {
-      if (typeof el.getStartTime !== "function") {
-        def(el, "getStartTime", function () { return parseBegin(getAttr(el.__node, "begin")); });
-      }
-      if (typeof el.getCurrentTime !== "function") { def(el, "getCurrentTime", function () { return clock.time; }); }
-      if (typeof el.getSimpleDuration !== "function") {
-        def(el, "getSimpleDuration", function () { var d = parseClock(getAttr(el.__node, "dur")); if (d == null) { throw new globalThis.DOMException("no simple duration", "NotSupportedError"); } return d; });
-      }
-      Object.defineProperty(el, "targetElement", {
-        get: function () {
-          var href = getAttr(el.__node, "href"); if (href == null) { href = getAttr(el.__node, "xlink:href"); }
-          if (href && href.charAt(0) === "#") { return el.ownerDocument.getElementById(href.slice(1)); }
-          return el.parentNode && el.parentNode.nodeType === 1 ? el.parentNode : null;
-        }, configurable: true, enumerable: true
-      });
-    }
-
-    // Marker: orientAngle / orientType / markerUnits.
-    if (ln === "marker") {
-      var node = el.__node;
-      var isAutoOrient = function () { var o = getAttr(node, "orient"); return o === "auto" || o === "auto-start-reverse"; };
-      var angleNum = function () { var o = getAttr(node, "orient"); return (o == null || isAutoOrient()) ? 0 : parseAngle(o).value; };
-      // orientAngle (SVGAnimatedAngle) — baseVal writes sync to the `orient` attribute.
-      var oa = Object.create(SVGAngle.prototype);
-      Object.defineProperty(oa, "value", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
-      Object.defineProperty(oa, "valueInSpecifiedUnits", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
-      Object.defineProperty(oa, "valueAsString", { get: function () { return String(angleNum()); }, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
-      Object.defineProperty(oa, "unitType", { get: function () { var o = getAttr(node, "orient"); return (o == null || isAutoOrient()) ? 1 : parseAngle(o).type; }, enumerable: true });
-      def(oa, "newValueSpecifiedUnits", function (u, v) { setAttr(node, "orient", String(v)); });
-      def(oa, "convertToSpecifiedUnits", function () { setAttr(node, "orient", String(angleNum())); });
-      var orientAngle = Object.create(globalThis.SVGAnimatedAngle.prototype);
-      Object.defineProperty(orientAngle, "baseVal", { value: oa, enumerable: true });
-      Object.defineProperty(orientAngle, "animVal", { value: makeAngle(function () { return svgAnimNum(el, "orient", angleNum(), angleVec); }), enumerable: true });
-      def(el, "orientAngle", orientAngle);
-      // orientType (SVGAnimatedEnumeration) — baseVal writes sync to the `orient` attribute.
-      var orientTypeVal = function () { var o = getAttr(node, "orient"); if (o == null) { return 2; } return isAutoOrient() ? 1 : 2; };
-      var orientType = Object.create(globalThis.SVGAnimatedEnumeration.prototype);
-      Object.defineProperty(orientType, "baseVal", { get: orientTypeVal, set: function (v) { v = v | 0; if (v === 1) { setAttr(node, "orient", "auto"); } else if (v === 2) { setAttr(node, "orient", String(angleNum())); } }, enumerable: true });
-      Object.defineProperty(orientType, "animVal", { get: orientTypeVal, enumerable: true });
-      def(el, "orientType", orientType);
-      def(el, "setOrientToAuto", function () { setAttr(node, "orient", "auto"); });
-      def(el, "setOrientToAngle", function (a) { setAttr(node, "orient", String(a && a.value != null ? a.value : a)); });
-      def(el, "SVG_MARKER_ORIENT_UNKNOWN", 0); def(el, "SVG_MARKER_ORIENT_AUTO", 1); def(el, "SVG_MARKER_ORIENT_ANGLE", 2);
-    }
-
-    // transform -> SVGAnimatedTransformList (cached); className -> SVGAnimatedString.
-    (function () {
-      var tCache = null;
-      Object.defineProperty(el, "transform", { get: function () { return tCache || (tCache = makeAnimatedTransformList(el)); }, configurable: true, enumerable: true });
-    })();
-    // gradientTransform / patternTransform on gradient and pattern elements.
-    if (ln === "lineargradient" || ln === "radialgradient") {
-      var gtCache = null;
-      Object.defineProperty(el, "gradientTransform", { get: function () { return gtCache || (gtCache = makeAnimatedTransformListAttr(el, "gradientTransform")); }, configurable: true, enumerable: true });
-    }
-    if (ln === "pattern") {
-      var ptCache = null;
-      Object.defineProperty(el, "patternTransform", { get: function () { return ptCache || (ptCache = makeAnimatedTransformListAttr(el, "patternTransform")); }, configurable: true, enumerable: true });
-    }
-    (function () {
-      var cCache = null;
-      Object.defineProperty(el, "className", { get: function () { return cCache || (cCache = makeAnimatedString(el, "class")); }, configurable: true, enumerable: true });
-    })();
-    // href is an SVGAnimatedString on the elements that take one (a, use, image, gradients, …).
-    if (ln === "a" || ln === "use" || ln === "image" || ln === "lineargradient" || ln === "radialgradient" || ln === "pattern" || ln === "textpath" || ln === "mpath" || ln === "feimage" || ln === "tref") {
-      if (!("href" in el) || typeof el.href !== "object") {
-        var hCache = null;
-        Object.defineProperty(el, "href", { get: function () { return hCache || (hCache = makeAnimatedString(el, getAttr(el.__node, "href") != null ? "href" : "xlink:href")); }, configurable: true, enumerable: true });
-      }
-    }
-
   }
-
   // -------------------------------------------------------------------------------------------
   // transform / SVGAnimatedTransformList + animateTransform.
   // -------------------------------------------------------------------------------------------
@@ -939,6 +740,257 @@
     Object.defineProperty(anim, "baseVal", { get: function () { var v = getAttr(node, attr); return v == null ? "" : v; }, set: function (v) { setAttr(node, attr, v == null ? "" : String(v)); }, enumerable: true });
     Object.defineProperty(anim, "animVal", { get: function () { var v = getAttr(node, attr); return v == null ? "" : v; }, enumerable: true });
     return anim;
+  }
+  function makeAnimatedNumber(el, attr, dflt) {
+    var node = el.__node; dflt = dflt == null ? 0 : dflt;
+    function base() { var v = getAttr(node, attr); return v == null || v === "" ? dflt : (parseFloat(v) || 0); }
+    var a = Object.create(globalThis.SVGAnimatedNumber.prototype);
+    Object.defineProperty(a, "baseVal", { get: base, set: function (v) { setAttr(node, attr, String(+v)); }, enumerable: true });
+    Object.defineProperty(a, "animVal", { get: function () { return svgAnimNum(el, attr, base()); }, enumerable: true });
+    return a;
+  }
+  function makeAnimatedInteger(el, attr, dflt) {
+    var node = el.__node; dflt = dflt == null ? 0 : dflt;
+    function base() { var v = getAttr(node, attr); return v == null || v === "" ? dflt : (parseInt(v, 10) || 0); }
+    var a = Object.create(globalThis.SVGAnimatedInteger.prototype);
+    Object.defineProperty(a, "baseVal", { get: base, set: function (v) { setAttr(node, attr, String(v | 0)); }, enumerable: true });
+    Object.defineProperty(a, "animVal", { get: base, enumerable: true });
+    return a;
+  }
+  function makeAnimatedBoolean(el, attr) {
+    var node = el.__node;
+    function base() { return getAttr(node, attr) === "true"; }
+    var a = Object.create(globalThis.SVGAnimatedBoolean.prototype);
+    Object.defineProperty(a, "baseVal", { get: base, set: function (v) { setAttr(node, attr, v ? "true" : "false"); }, enumerable: true });
+    Object.defineProperty(a, "animVal", { get: base, enumerable: true });
+    return a;
+  }
+  // SVGStringList (requiredExtensions / systemLanguage / requiredFeatures): a live list backed by a
+  // whitespace/comma-separated attribute.
+  function makeStringList(el, attr) {
+    var node = el.__node;
+    function vec() { var s = getAttr(node, attr); return s == null || s === "" ? [] : String(s).trim().split(/[\s,]+/).filter(function (x) { return x.length; }); }
+    function put(v) { setAttr(node, attr, v.join(" ")); }
+    var L = Object.create(globalThis.SVGStringList.prototype);
+    Object.defineProperty(L, "numberOfItems", { get: function () { return vec().length; }, enumerable: true });
+    Object.defineProperty(L, "length", { get: function () { return vec().length; }, enumerable: true });
+    def(L, "clear", function () { setAttr(node, attr, ""); });
+    def(L, "initialize", function (s) { put([String(s)]); return s; });
+    def(L, "getItem", function (i) { var v = vec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } return v[i]; });
+    def(L, "insertItemBefore", function (s, i) { var v = vec(); v.splice(Math.max(0, Math.min(i, v.length)), 0, String(s)); put(v); return s; });
+    def(L, "replaceItem", function (s, i) { var v = vec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } v[i] = String(s); put(v); return s; });
+    def(L, "removeItem", function (i) { var v = vec(); if (i < 0 || i >= v.length) { throw new globalThis.DOMException("index", "IndexSizeError"); } var r = v.splice(i, 1)[0]; put(v); return r; });
+    def(L, "appendItem", function (s) { var v = vec(); v.push(String(s)); put(v); return s; });
+    return L;
+  }
+  function makeAnimatedPAR() {
+    var par = Object.create(globalThis.SVGAnimatedPreserveAspectRatio.prototype);
+    function mk() { var p = Object.create(SVGPreserveAspectRatio.prototype); p.align = 6; p.meetOrSlice = 1; return p; }
+    Object.defineProperty(par, "baseVal", { value: mk(), enumerable: true });
+    Object.defineProperty(par, "animVal", { value: mk(), enumerable: true });
+    return par;
+  }
+  function svgAncestor(el, names) {
+    var p = el.parentNode;
+    while (p && p.nodeType === 1) {
+      if (p.namespaceURI === SVG_NS && names[p.__localName]) { return p; }
+      p = p.parentNode;
+    }
+    return null;
+  }
+
+  // A cached accessor installed on an interface PROTOTYPE: the SVGAnimated* wrapper is built lazily
+  // per element and memoized on the instance (stable identity), but the property itself is inherited.
+  function accProto(proto, name, factory) {
+    Object.defineProperty(proto, name, {
+      get: function () {
+        var c = this.__svgCache || def(this, "__svgCache", {}) || this.__svgCache;
+        if (!(name in c)) { c[name] = factory(this, name); }
+        return c[name];
+      },
+      configurable: true, enumerable: true
+    });
+  }
+
+  // Install the SVG reflected IDL members on the interface PROTOTYPES (so they are inherited, which is
+  // what idlharness verifies — not present as per-instance own properties). Run once at bootstrap.
+  function installSvgProtos() {
+    var G = globalThis;
+    // Scalar length attributes per element interface (reuse the per-tag tables).
+    for (var tag in LEN_ATTRS) {
+      if (!LEN_ATTRS.hasOwnProperty(tag)) { continue; }
+      var ifn = TAG_IFACE[tag]; if (!ifn) { continue; }
+      (function (proto, tg) {
+        LEN_ATTRS[tg].forEach(function (a) { accProto(proto, a, function (el) { return makeAnimatedLength(el, a, LEN_DEFAULTS[tg + "." + a]); }); });
+      })(G[ifn].prototype, tag);
+    }
+    // Enumerated attributes per element interface.
+    for (var etag in ENUM_PROPS) {
+      if (!ENUM_PROPS.hasOwnProperty(etag)) { continue; }
+      var eifn = TAG_IFACE[etag]; if (!eifn) { continue; }
+      (function (proto, specs) {
+        specs.forEach(function (s) { accProto(proto, s[0], function (el) { return makeEnumProp(el, s[0], s[1], s[2]); }); });
+      })(G[eifn].prototype, ENUM_PROPS[etag]);
+    }
+
+    // SVGElement: className / ownerSVGElement / viewportElement.
+    accProto(G.SVGElement.prototype, "className", function (el) { return makeAnimatedString(el, "class"); });
+    Object.defineProperty(G.SVGElement.prototype, "ownerSVGElement", { get: function () { return svgAncestor(this, { svg: 1 }); }, configurable: true, enumerable: true });
+    Object.defineProperty(G.SVGElement.prototype, "viewportElement", { get: function () { return svgAncestor(this, { svg: 1, symbol: 1 }); }, configurable: true, enumerable: true });
+
+    // SVGGraphicsElement: transform + the SVGTests members (requiredExtensions / systemLanguage).
+    accProto(G.SVGGraphicsElement.prototype, "transform", function (el) { return makeAnimatedTransformList(el); });
+    var TESTS = [G.SVGGraphicsElement, G.SVGAnimationElement, G.SVGClipPathElement, G.SVGPatternElement, G.SVGMaskElement];
+    TESTS.forEach(function (C) {
+      accProto(C.prototype, "requiredExtensions", function (el) { return makeStringList(el, "requiredExtensions"); });
+      accProto(C.prototype, "systemLanguage", function (el) { return makeStringList(el, "systemLanguage"); });
+    });
+
+    // SVGURIReference.href (SVGAnimatedString) on the interfaces that include it.
+    [G.SVGAElement, G.SVGUseElement, G.SVGImageElement, G.SVGGradientElement, G.SVGPatternElement, G.SVGTextPathElement, G.SVGMPathElement, G.SVGFEImageElement, G.SVGScriptElement].forEach(function (C) {
+      accProto(C.prototype, "href", function (el) { return makeAnimatedString(el, getAttr(el.__node, "href") != null ? "href" : "xlink:href"); });
+    });
+
+    // SVGFitToViewBox: viewBox + preserveAspectRatio.
+    [G.SVGSVGElement, G.SVGSymbolElement, G.SVGMarkerElement, G.SVGPatternElement, G.SVGViewElement].forEach(function (C) {
+      accProto(C.prototype, "viewBox", function (el) { return makeAnimatedRect(el, "viewBox"); });
+    });
+    [G.SVGSVGElement, G.SVGSymbolElement, G.SVGMarkerElement, G.SVGPatternElement, G.SVGViewElement, G.SVGImageElement, G.SVGFEImageElement].forEach(function (C) {
+      accProto(C.prototype, "preserveAspectRatio", function (el) { return makeAnimatedPAR(); });
+    });
+
+    // Gradient / pattern transforms.
+    accProto(G.SVGGradientElement.prototype, "gradientTransform", function (el) { return makeAnimatedTransformListAttr(el, "gradientTransform"); });
+    accProto(G.SVGPatternElement.prototype, "patternTransform", function (el) { return makeAnimatedTransformListAttr(el, "patternTransform"); });
+
+    // SVGTextPositioningElement: x/y/dx/dy length-lists + rotate number-list.
+    [["x", G.SVGLengthList, SVGLength], ["y", G.SVGLengthList, SVGLength], ["dx", G.SVGLengthList, SVGLength], ["dy", G.SVGLengthList, SVGLength], ["rotate", G.SVGNumberList, G.SVGNumber]].forEach(function (spec) {
+      accProto(G.SVGTextPositioningElement.prototype, spec[0], function (el) { return makeAnimatedItemList(el, spec[0], spec[1], spec[2]); });
+    });
+
+    // SVGStopElement.offset (SVGAnimatedNumber).
+    accProto(G.SVGStopElement.prototype, "offset", function (el) { return makeAnimatedNumber(el, "offset", 0); });
+
+    installTextContentProto(G.SVGTextContentElement.prototype);
+    installMarkerProto(G.SVGMarkerElement.prototype);
+    installSvgRootProto(G.SVGSVGElement.prototype);
+    installAnimationProto(G.SVGAnimationElement.prototype);
+  }
+
+  function installTextContentProto(proto) {
+    accProto(proto, "textLength", function (el) { return makeAnimatedLength(el, "textLength"); });
+    accProto(proto, "lengthAdjust", function (el) { return makeEnumProp(el, "lengthAdjust", LENGTHADJUST_MAP, "spacing"); });
+    def(proto, "getNumberOfChars", function () { var t = this.textContent; return t == null ? 0 : String(t).length; });
+    def(proto, "getComputedTextLength", function () { return bbox(this).width; });
+    def(proto, "getSubStringLength", function (i, n) { var len = this.getNumberOfChars(); var total = bbox(this).width; if (!len) { return 0; } return total * Math.max(0, Math.min(n, len - i)) / len; });
+    def(proto, "getRotationOfChar", function (i) { var r = getAttr(this.__node, "rotate"); if (r == null || r === "") { return 0; } var list = vecParse(r); if (!list.length) { return 0; } return i < list.length ? list[i] : list[list.length - 1]; });
+    def(proto, "getStartPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * i / len, b.y + b.height); });
+    def(proto, "getEndPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * (i + 1) / len, b.y + b.height); });
+    def(proto, "getExtentOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makeRectObj(b.x + b.width * i / len, b.y, b.width / len, b.height); });
+    def(proto, "getCharNumAtPosition", function (p) { var b = bbox(this); var len = this.getNumberOfChars() || 1; if (!p || b.width === 0) { return -1; } var idx = Math.floor((p.x - b.x) / (b.width / len)); return idx >= 0 && idx < len ? idx : -1; });
+    def(proto, "selectSubString", function () {});
+  }
+
+  function makeOrientAngle(el) {
+    var node = el.__node;
+    var isAuto = function () { var o = getAttr(node, "orient"); return o === "auto" || o === "auto-start-reverse"; };
+    var angleNum = function () { var o = getAttr(node, "orient"); return (o == null || isAuto()) ? 0 : parseAngle(o).value; };
+    var oa = Object.create(SVGAngle.prototype);
+    Object.defineProperty(oa, "value", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
+    Object.defineProperty(oa, "valueInSpecifiedUnits", { get: angleNum, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
+    Object.defineProperty(oa, "valueAsString", { get: function () { return String(angleNum()); }, set: function (v) { setAttr(node, "orient", String(v)); }, enumerable: true });
+    Object.defineProperty(oa, "unitType", { get: function () { var o = getAttr(node, "orient"); return (o == null || isAuto()) ? 1 : parseAngle(o).type; }, enumerable: true });
+    def(oa, "newValueSpecifiedUnits", function (u, v) { setAttr(node, "orient", String(v)); });
+    def(oa, "convertToSpecifiedUnits", function () { setAttr(node, "orient", String(angleNum())); });
+    var orientAngle = Object.create(globalThis.SVGAnimatedAngle.prototype);
+    Object.defineProperty(orientAngle, "baseVal", { value: oa, enumerable: true });
+    Object.defineProperty(orientAngle, "animVal", { value: makeAngle(function () { return svgAnimNum(el, "orient", angleNum(), angleVec); }), enumerable: true });
+    return orientAngle;
+  }
+  function makeOrientType(el) {
+    var node = el.__node;
+    var isAuto = function () { var o = getAttr(node, "orient"); return o === "auto" || o === "auto-start-reverse"; };
+    var angleNum = function () { var o = getAttr(node, "orient"); return (o == null || isAuto()) ? 0 : parseAngle(o).value; };
+    var val = function () { var o = getAttr(node, "orient"); if (o == null) { return 2; } return isAuto() ? 1 : 2; };
+    var orientType = Object.create(globalThis.SVGAnimatedEnumeration.prototype);
+    Object.defineProperty(orientType, "baseVal", { get: val, set: function (v) { v = v | 0; if (v === 1) { setAttr(node, "orient", "auto"); } else if (v === 2) { setAttr(node, "orient", String(angleNum())); } }, enumerable: true });
+    Object.defineProperty(orientType, "animVal", { get: val, enumerable: true });
+    return orientType;
+  }
+  function installMarkerProto(proto) {
+    accProto(proto, "orientAngle", makeOrientAngle);
+    accProto(proto, "orientType", makeOrientType);
+    def(proto, "setOrientToAuto", function () { setAttr(this.__node, "orient", "auto"); });
+    def(proto, "setOrientToAngle", function (a) { setAttr(this.__node, "orient", String(a && a.value != null ? a.value : a)); });
+  }
+
+  function installSvgRootProto(proto) {
+    def(proto, "pauseAnimations", function () { clock.paused = true; });
+    def(proto, "unpauseAnimations", function () { clock.paused = false; });
+    def(proto, "animationsPaused", function () { return !!clock.paused; });
+    def(proto, "setCurrentTime", function (s) { var v = Number(s); clock.time = isFinite(v) ? v : 0; });
+    def(proto, "getCurrentTime", function () { return clock.time; });
+    def(proto, "suspendRedraw", function () { return 0; });
+    def(proto, "unsuspendRedraw", function () {});
+    def(proto, "unsuspendRedrawAll", function () {});
+    def(proto, "forceRedraw", function () {});
+    def(proto, "deselectAll", function () {});
+    def(proto, "createSVGLength", function () { var L = Object.create(SVGLength.prototype); L.value = 0; L.valueInSpecifiedUnits = 0; L.valueAsString = "0"; L.unitType = 1; def(L, "newValueSpecifiedUnits", function (u, v) { this.value = v; this.valueInSpecifiedUnits = v; }); def(L, "convertToSpecifiedUnits", function () {}); return L; });
+    def(proto, "createSVGNumber", function () { var N = Object.create(globalThis.SVGNumber.prototype); N.value = 0; return N; });
+    def(proto, "createSVGPoint", function () { var P = Object.create(globalThis.SVGPoint.prototype); P.x = 0; P.y = 0; def(P, "matrixTransform", function (m) { return P; }); return P; });
+    def(proto, "createSVGRect", function () { var R = Object.create(globalThis.SVGRect.prototype); R.x = 0; R.y = 0; R.width = 0; R.height = 0; return R; });
+    def(proto, "createSVGMatrix", function () { return makeMatrix(1, 0, 0, 1, 0, 0); });
+    def(proto, "createSVGTransform", function () { var T = Object.create(SVGTransform.prototype); T.type = 0; T.angle = 0; T.matrix = makeMatrix(1, 0, 0, 1, 0, 0); def(T, "setMatrix", function (m) { this.matrix = m; this.type = 1; }); def(T, "setTranslate", function (x, y) { this.matrix = makeMatrix(1, 0, 0, 1, x, y); this.type = 2; }); def(T, "setScale", function (sx, sy) { this.matrix = makeMatrix(sx, 0, 0, sy, 0, 0); this.type = 3; }); def(T, "setRotate", function (ang) { this.angle = ang; this.type = 4; }); return T; });
+    def(proto, "createSVGAngle", function () { var A = Object.create(SVGAngle.prototype); A.value = 0; A.unitType = 1; return A; });
+    def(proto, "createSVGTransformFromMatrix", function (m) { var T = this.createSVGTransform(); T.setMatrix(m); return T; });
+    def(proto, "getElementById", function (id) { return this.ownerDocument.getElementById(id); });
+    var elemViewBox = function (e) {
+      var b = bbox(e), m = ctmOf(e);
+      var xs = [b.x, b.x + b.width], ys = [b.y, b.y + b.height], mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
+      for (var i = 0; i < 2; i++) { for (var j = 0; j < 2; j++) { var px = m.a * xs[i] + m.c * ys[j] + m.e, py = m.b * xs[i] + m.d * ys[j] + m.f; mnx = Math.min(mnx, px); mny = Math.min(mny, py); mxx = Math.max(mxx, px); mxy = Math.max(mxy, py); } }
+      return { x: mnx, y: mny, w: mxx - mnx, h: mxy - mny };
+    };
+    var rectsOverlap = function (b, r) { return b.x < r.x + r.width && b.x + b.w > r.x && b.y < r.y + r.height && b.y + b.h > r.y; };
+    def(proto, "checkIntersection", function (element, rect) { return rectsOverlap(elemViewBox(element), rect); });
+    def(proto, "checkEnclosure", function (element, rect) { var b = elemViewBox(element); return b.x >= rect.x && b.y >= rect.y && b.x + b.w <= rect.x + rect.width && b.y + b.h <= rect.y + rect.height; });
+    def(proto, "getIntersectionList", function (rect, ref) {
+      var root = ref || this, out = [];
+      var GRAPHICS = { rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1, path: 1, text: 1, image: 1, use: 1 };
+      var SKIP = { defs: 1, clippath: 1, mask: 1, symbol: 1, marker: 1, pattern: 1, lineargradient: 1, radialgradient: 1, filter: 1 };
+      (function walk(n) {
+        var kids = n.childNodes;
+        for (var i = 0; kids && i < kids.length; i++) {
+          var c = kids[i];
+          if (!c || c.nodeType !== 1 || c.namespaceURI !== SVG_NS) { continue; }
+          var ln2 = c.__localName;
+          if (SKIP[ln2]) { continue; }
+          var disp = ""; try { disp = nativeGCS(c).getPropertyValue("display"); } catch (e) {}
+          if (disp === "none") { continue; }
+          var pe = getAttr(c.__node, "pointer-events"); try { var sp = nativeGCS(c).getPropertyValue("pointer-events"); if (sp) { pe = sp; } } catch (e2) {}
+          if (GRAPHICS[ln2] && pe !== "none" && rectsOverlap(elemViewBox(c), rect)) { out.push(c); }
+          if (ln2 !== "use") { walk(c); }
+        }
+      })(root);
+      return out;
+    });
+    def(proto, "getEnclosureList", function (rect, ref) { return []; });
+  }
+
+  function installAnimationProto(proto) {
+    def(proto, "getStartTime", function () { return parseBegin(getAttr(this.__node, "begin")); });
+    def(proto, "getCurrentTime", function () { return clock.time; });
+    def(proto, "getSimpleDuration", function () { var d = parseClock(getAttr(this.__node, "dur")); if (d == null) { throw new globalThis.DOMException("no simple duration", "NotSupportedError"); } return d; });
+    def(proto, "beginElement", function () {});
+    def(proto, "beginElementAt", function () {});
+    def(proto, "endElement", function () {});
+    def(proto, "endElementAt", function () {});
+    Object.defineProperty(proto, "targetElement", {
+      get: function () {
+        var href = getAttr(this.__node, "href"); if (href == null) { href = getAttr(this.__node, "xlink:href"); }
+        if (href && href.charAt(0) === "#") { return this.ownerDocument.getElementById(href.slice(1)); }
+        return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null;
+      }, configurable: true, enumerable: true
+    });
   }
 
   // -------------------------------------------------------------------------------------------
@@ -1602,5 +1654,6 @@
   globalThis.__svgColorOf = function (el, name) { return fmtColor(colorOf(el, name)); };
 
   installGeometryProtos();
+  installSvgProtos();
   globalThis.__svgEnrich = svgEnrich;
 })();
