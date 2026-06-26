@@ -5297,6 +5297,69 @@ mod tests {
     }
 
     #[test]
+    fn iframe_async_fetch_then_postmessage_roundtrips() {
+        // A cross-origin frame that, on receiving an OBJECT message, does an async CORS fetch and
+        // posts the result back to the parent — the wpt/cors remote-origin pattern (page -> frame ->
+        // fetch -> frame -> page). Exercises both the async-fetch drain in a frame realm AND
+        // cross-realm structuredClone of a plain object (the message payload survives the hop).
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.createElement('iframe');
+                window.addEventListener('message', function (e) { document.body.setAttribute('data-reply', String(e.data)); });
+                f.src = 'https://y/frame.html';
+                f.onload = function () { f.contentWindow.postMessage({ cmd: 'go', key: 'K' }, '*'); };
+                document.body.appendChild(f);
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("frame.html") {
+                    // The cross-origin frame echoes the object's `key` back with the fetched body, so
+                    // a lost/garbled cross-realm clone (key === undefined) fails the assertion.
+                    let body = "<!doctype html><html><body><script>self.addEventListener('message', function (e) { var k = e.data.key; var x = new XMLHttpRequest(); x.open('GET', 'https://x/data.txt', true); x.onload = function(){ parent.postMessage('got:' + k + ':' + x.responseText, '*'); }; x.onerror = function(){ parent.postMessage('err', '*'); }; x.send(); });<\\/script></body></html>";
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{body}"}}"#
+                    ))
+                } else if u.ends_with("data.txt") {
+                    // ACAO:* so the cross-origin fetch passes the CORS check.
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/plain","headers":[["access-control-allow-origin","*"]],"body":"HELLO"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-reply").as_deref(),
+            Some("got:K:HELLO"),
+            "frame async fetch result + object payload should round-trip back to the page"
+        );
+    }
+
+    #[test]
     fn window_open_runs_child_and_opener_postmessage_roundtrips() {
         // window.open() loads a real auxiliary browsing context: the child's script runs, and
         // cross-window postMessage works both ways with correct `event.source` identity (the child

@@ -10556,7 +10556,13 @@
           return v.slice(0, v.size, v.type);
         }
         var proto = Object.getPrototypeOf(v);
-        if (proto === Object.prototype || proto === null) { // plain object: own enumerable string keys
+        // A plain object — including one from ANOTHER realm (cross-frame `postMessage`), whose
+        // prototype is that realm's `Object.prototype` (not ours, so `=== Object.prototype` fails).
+        // Detect the latter by its `[object Object]` tag plus a prototype whose own prototype is null
+        // (the shape of every realm's `Object.prototype`).
+        var isPlain = proto === Object.prototype || proto === null ||
+          (tag === "[object Object]" && proto !== null && Object.getPrototypeOf(proto) === null);
+        if (isPlain) {                                      // plain object: own enumerable string keys
           out = {}; seen.set(v, out);
           Object.keys(v).forEach(function (k) { out[k] = clone(v[k]); });
           return out;
