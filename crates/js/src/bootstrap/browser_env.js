@@ -472,8 +472,14 @@
   ["protocol", "host", "hostname", "port", "pathname", "origin"].forEach(function (name) {
     Object.defineProperty(location, name, { get: function () { return locationState[name]; }, enumerable: true, configurable: true });
   });
-  // `location` already exists (a minimal stub from install_globals); overwrite it.
-  globalThis.location = location;
+  // `location` already exists (a minimal stub from install_globals); overwrite it. Per WebIDL the
+  // attribute has [PutForwards=href], so `self.location = "..."` navigates (sets href) rather than
+  // replacing the Location object.
+  Object.defineProperty(globalThis, "location", {
+    get: function () { return location; },
+    set: function (v) { location.href = String(v); },
+    enumerable: true, configurable: true
+  });
   // window.origin / self.origin: the global's origin (tracks navigation via location.origin).
   Object.defineProperty(globalThis, "origin", {
     get: function () { return location.origin; },
