@@ -42,7 +42,18 @@
     webdriver: false,
     plugins: [],
     mimeTypes: [],
-    userActivation: { hasBeenActive: false, isActive: false },
+    // Transient user activation, backed by a timestamp stamped on trusted input (see
+    // __dispatchSyntheticEvent). isActive holds for the ~5s transient window after a gesture;
+    // hasBeenActive is sticky once the page has ever been activated.
+    userActivation: {
+      get isActive() {
+        var s = globalThis.__uaStamp;
+        if (typeof s !== "number") { return false; }
+        var now = (typeof globalThis.__loopNow === "function") ? globalThis.__loopNow() : Date.now();
+        return now - s < 5000;
+      },
+      get hasBeenActive() { return typeof globalThis.__uaStamp === "number"; }
+    },
     sendBeacon: function (url) {
       // Validate the URL (resolved against the document base) and throw on an invalid one, per spec;
       // otherwise inert (no beacon is actually sent).
@@ -60,7 +71,7 @@
     // no picker to open it ultimately rejects (InvalidStateError) rather than returning contacts.
     contacts: {
       getProperties: function () { return Promise.resolve(["address", "email", "icon", "name", "tel"]); },
-      select: function (properties) {
+      select: function (properties, options) {
         try {
           if (globalThis.top && globalThis.top !== globalThis) {
             return Promise.reject(new globalThis.DOMException(
@@ -80,8 +91,33 @@
               return Promise.reject(new globalThis.TypeError("Invalid contact property: " + properties[i]));
             }
           }
-          return Promise.reject(new globalThis.DOMException(
-            "The contacts picker could not be opened.", "InvalidStateError"));
+          var mock = globalThis.__contactsMock;
+          if (mock && mock.busy) {
+            return Promise.reject(new globalThis.DOMException(
+              "Contacts are already being selected.", "InvalidStateError"));
+          }
+          // With no real picker, the test backend (WebContactsTest.setSelectedContacts) supplies the
+          // result. An unconfigured backend or a null result means the picker couldn't be opened.
+          if (!mock || !mock.configured || mock.contacts === null) {
+            return Promise.reject(new globalThis.TypeError("The contacts picker could not be opened."));
+          }
+          mock.busy = true;
+          var multiple = !!(options && options.multiple);
+          var selected = mock.contacts;
+          return new Promise(function (resolve) {
+            setTimeout(function () {
+              mock.busy = false;
+              var list = multiple ? selected : selected.slice(0, 1);
+              resolve(list.map(function (c) {
+                var out = {};
+                for (var j = 0; j < properties.length; j++) {
+                  var p = properties[j];
+                  out[p] = (c && c[p] != null) ? c[p] : [];
+                }
+                return out;
+              }));
+            }, 0);
+          });
         } catch (e) { return Promise.reject(e); }
       }
     },
@@ -11134,6 +11170,16 @@
     });
   }
 
+  // Contact Picker test backend. WPT's contacts tests require the UA to expose a `WebContactsTest`
+  // whose setSelectedContacts() primes the result that navigator.contacts.select() returns (real UAs
+  // ship this only in test builds; we have no contacts backend, so this IS the backend for tests).
+  globalThis.__contactsMock = { configured: false, contacts: null, busy: false };
+  globalThis.WebContactsTest = function WebContactsTest() {};
+  globalThis.WebContactsTest.prototype.setSelectedContacts = function (contacts) {
+    globalThis.__contactsMock.configured = true;
+    globalThis.__contactsMock.contacts = contacts;
+  };
+
   // Minimal Web Animations `Animation` for `Element.animate()`. We don't run/composite animations,
   // so this models only the lifecycle: `finished`/`ready` promises and play-state, with the effect
   // treated as completing after its `delay + duration`. Enough for the common "await a throwaway
@@ -12944,6 +12990,13 @@
     try { node = canon(__wrapNode(nodeId)); } catch (e) { node = null; }
     if (!node) { return true; }
     type = String(type);
+
+    // These trusted input events are activation-triggering: stamp transient user activation so
+    // navigator.userActivation + activation-gated APIs (e.g. the Contact Picker) see the gesture.
+    if (type === "mousedown" || type === "pointerdown" || type === "click" ||
+        type === "keydown" || type === "touchstart" || type === "touchend") {
+      globalThis.__uaStamp = (typeof globalThis.__loopNow === "function") ? globalThis.__loopNow() : Date.now();
+    }
 
     // SVG content isn't in the box tree, so the engine's hit-test lands on the <svg> element. For a
     // pointer/mouse event, refine the target to the actual shape under the point so listeners on SVG
