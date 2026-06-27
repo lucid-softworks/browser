@@ -1932,5 +1932,7 @@
   installSvgProtos();
   finalizeInterfaces();
   enumerateProtoMembers();
+  // ShadowAnimation has a 2-argument constructor; restore its length after the finalize rebuild.
+  try { Object.defineProperty(globalThis.ShadowAnimation, "length", { value: 2, configurable: true }); } catch (e) {}
   globalThis.__svgEnrich = svgEnrich;
 })();
