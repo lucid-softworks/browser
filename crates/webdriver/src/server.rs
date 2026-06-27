@@ -147,6 +147,9 @@ impl WdError {
     fn invalid_argument(msg: impl Into<String>) -> Self {
         WdError::new(400, "invalid argument", msg)
     }
+    fn no_such_cookie() -> Self {
+        WdError::new(404, "no such cookie", "no such cookie")
+    }
     fn javascript_error(msg: impl Into<String>) -> Self {
         WdError::new(500, "javascript error", msg)
     }
@@ -367,6 +370,13 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &Mutex<Sessions>) ->
             with_session(id, sessions, |_| Ok(Json::Null))
         }
 
+        // Cookies: delegate to the shared net jar so document.cookie <-> WD cookies are consistent.
+        ("GET", ["session", id, "cookie"]) => get_all_cookies_cmd(id, sessions),
+        ("GET", ["session", id, "cookie", name]) => get_named_cookie_cmd(id, name, sessions),
+        ("POST", ["session", id, "cookie"]) => add_cookie_cmd(id, body, sessions),
+        ("DELETE", ["session", id, "cookie"]) => delete_all_cookies_cmd(id, sessions),
+        ("DELETE", ["session", id, "cookie", name]) => delete_named_cookie_cmd(id, name, sessions),
+
         _ => Err(WdError::unknown_command()),
     }
 }
@@ -470,6 +480,131 @@ fn delete_session(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
     // Idempotent: deleting an unknown session is not an error per spec.
     guard.map.remove(id);
     Ok(Json::Null)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cookies (wired to net's shared jar so they are visible to document.cookie)
+// ---------------------------------------------------------------------------------------------
+
+fn get_all_cookies_cmd(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |_| {
+        let cookies = net::get_all_cookies();
+        let arr: Vec<Json> = cookies
+            .into_iter()
+            .map(|c| {
+                let mut m = vec![
+                    ("name", Json::Str(c.name)),
+                    ("value", Json::Str(c.value)),
+                    ("domain", Json::Str(c.domain)),
+                    ("path", Json::Str(c.path)),
+                    ("secure", Json::Bool(c.secure)),
+                    ("httpOnly", Json::Bool(c.http_only)),
+                ];
+                if let Some(exp) = c.expiry {
+                    m.push(("expiry", Json::Num(exp as f64)));
+                }
+                obj(m)
+            })
+            .collect();
+        Ok(Json::Arr(arr))
+    })
+}
+
+fn get_named_cookie_cmd(id: &str, name: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |_| {
+        let cookies = net::get_all_cookies();
+        if let Some(c) = cookies.into_iter().find(|c| c.name == name) {
+            let mut m = vec![
+                ("name", Json::Str(c.name)),
+                ("value", Json::Str(c.value)),
+                ("domain", Json::Str(c.domain)),
+                ("path", Json::Str(c.path)),
+                ("secure", Json::Bool(c.secure)),
+                ("httpOnly", Json::Bool(c.http_only)),
+            ];
+            if let Some(exp) = c.expiry {
+                m.push(("expiry", Json::Num(exp as f64)));
+            }
+            Ok(obj(m))
+        } else {
+            Err(WdError::no_such_cookie())
+        }
+    })
+}
+
+fn add_cookie_cmd(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |sess| {
+        let parsed = parse(body).unwrap_or(Json::Null);
+        let cookie = parsed.get("cookie").unwrap_or(&parsed);
+        let name = cookie
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let value = cookie
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            return Err(WdError::invalid_argument("cookie name required"));
+        }
+        let domain = cookie.get("domain").and_then(|v| v.as_str());
+        let path = cookie.get("path").and_then(|v| v.as_str());
+        let secure = cookie
+            .get("secure")
+            .and_then(|v| match v {
+                crate::json::Json::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+        let http_only = cookie
+            .get("httpOnly")
+            .and_then(|v| match v {
+                crate::json::Json::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .unwrap_or(false);
+
+        // Build a Set-Cookie-like string and store against the current page URL (or a synthesized one).
+        // Use the session's current url as the request context for domain/path rules.
+        let url = if sess.url.is_empty() {
+            "https://web-platform.test/"
+        } else {
+            &sess.url
+        };
+        let mut s = format!("{}={}", name, value);
+        if let Some(d) = domain {
+            s.push_str(&format!("; Domain={}", d));
+        }
+        if let Some(p) = path {
+            s.push_str(&format!("; Path={}", p));
+        }
+        if secure {
+            s.push_str("; Secure");
+        }
+        if http_only {
+            s.push_str("; HttpOnly");
+        }
+        // expiry (seconds since epoch) -> Max-Age or Expires would be more work; ignore for now.
+        // WebDriver "Add Cookie" behaves like a Set-Cookie header (may set Secure/HttpOnly).
+        let _ = net::set_cookie_from_http(url, &s);
+        Ok(Json::Null)
+    })
+}
+
+fn delete_all_cookies_cmd(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |_| {
+        net::clear_cookies();
+        Ok(Json::Null)
+    })
+}
+
+fn delete_named_cookie_cmd(id: &str, name: &str, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |_| {
+        net::delete_cookie(name);
+        Ok(Json::Null)
+    })
 }
 
 // ---------------------------------------------------------------------------------------------

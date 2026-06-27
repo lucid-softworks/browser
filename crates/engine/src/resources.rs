@@ -46,25 +46,66 @@ pub enum StyleSource {
 pub(crate) fn build_request_fetcher(
 ) -> std::sync::Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> {
     std::sync::Arc::new(|method: &str, url: &str, body: &str, headers_json: &str| {
-        let headers = parse_headers_json(headers_json);
+        let mut headers = parse_headers_json(headers_json);
         let body_opt: Option<&[u8]> = if body.is_empty() {
             None
         } else {
             Some(body.as_bytes())
         };
-        let resp = net::request(method, url, body_opt, &headers).ok()?;
+        // The CORS layer follows redirects itself (per-hop CORS checks), so it marks requests that
+        // must NOT be auto-followed with an internal `X-Lucid-No-Redirect` sentinel. Strip it here so
+        // it never reaches the network, and use it to disable redirect-following for that request.
+        let mut no_redirect = false;
+        let mut no_credentials = false;
+        headers.retain(|(name, _)| {
+            if name.eq_ignore_ascii_case("x-lucid-no-redirect") {
+                no_redirect = true;
+                false
+            } else if name.eq_ignore_ascii_case("x-lucid-no-credentials") {
+                no_credentials = true;
+                false
+            } else {
+                true
+            }
+        });
+        // Fetch semantics: a 4xx/5xx is a real response (`ok:false`), not a transport error. A CORS
+        // preflight (OPTIONS) likewise must not follow redirects, and is always uncredentialed.
+        let opts = net::RequestOpts {
+            allow_error_status: true,
+            follow_redirects: !no_redirect && !method.eq_ignore_ascii_case("OPTIONS"),
+            credentials: !no_credentials && !method.eq_ignore_ascii_case("OPTIONS"),
+        };
+        let resp = net::request_ext(method, url, body_opt, &headers, opts).ok()?;
         let ok = (200..300).contains(&resp.status);
-        let status_text = reason_phrase(resp.status);
+        // The server's verbatim reason phrase; fall back to a synthesized one only when absent.
+        let status_text = if resp.status_text.is_empty() {
+            reason_phrase(resp.status).to_string()
+        } else {
+            resp.status_text.clone()
+        };
         let body_str = String::from_utf8_lossy(&resp.body);
         Some(build_response_envelope(
             ok,
             resp.status,
-            status_text,
+            &status_text,
             &resp.final_url,
             &resp.content_type,
+            &resp.headers,
             &body_str,
         ))
     })
+}
+
+/// Build the cookie getter passed to the JS runtime: given the document URL, returns the
+/// cookies that should be visible to `document.cookie` (name=value; ...).
+pub(crate) fn build_cookie_getter() -> std::sync::Arc<dyn Fn(&str) -> String + Send + Sync> {
+    std::sync::Arc::new(|url: &str| net::cookies_for_document(url))
+}
+
+/// Build the cookie setter passed to the JS runtime: given the document URL and a cookie
+/// string (from `document.cookie = "..."`), stores it in the shared jar. Returns true on success.
+pub(crate) fn build_cookie_setter() -> std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync> {
+    std::sync::Arc::new(|url: &str, cookie: &str| net::set_cookie(url, cookie))
 }
 
 /// Build the host WebSocket *connector* passed into the JS [`js::Session`]: it backs the real
@@ -213,16 +254,20 @@ pub(crate) fn json_escape(s: &str, out: &mut String) {
     }
 }
 
-/// Build the JSON response envelope the JS `fetch()` parses into a `Response`.
+/// Build the JSON response envelope the JS `fetch()` parses into a `Response`. `headers` is the full
+/// response header block (lowercased names, combined values); it is emitted as a `headers` array of
+/// `[name, value]` pairs so the JS side can populate `Response.headers` / XHR `getResponseHeader`
+/// and run the CORS layer (which reads `Access-Control-*` off the response).
 pub(crate) fn build_response_envelope(
     ok: bool,
     status: u16,
     status_text: &str,
     url: &str,
     content_type: &str,
+    headers: &[(String, String)],
     body: &str,
 ) -> String {
-    let mut s = String::with_capacity(body.len() + 128);
+    let mut s = String::with_capacity(body.len() + 256);
     s.push_str("{\"ok\":");
     s.push_str(if ok { "true" } else { "false" });
     s.push_str(",\"status\":");
@@ -233,7 +278,18 @@ pub(crate) fn build_response_envelope(
     json_escape(url, &mut s);
     s.push_str("\",\"contentType\":\"");
     json_escape(content_type, &mut s);
-    s.push_str("\",\"body\":\"");
+    s.push_str("\",\"headers\":[");
+    for (i, (name, value)) in headers.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('[');
+        s.push_str(&json_str(name));
+        s.push(',');
+        s.push_str(&json_str(value));
+        s.push(']');
+    }
+    s.push_str("],\"body\":\"");
     json_escape(body, &mut s);
     s.push_str("\"}");
     s

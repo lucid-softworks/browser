@@ -6,29 +6,37 @@
   "use strict";
   var g = globalThis;
   var nodeId = g.__frameNodeId;
+  var isAux = !!g.__frameIsAuxWindow;
 
-  // parent / top: a messaging facade onto the page context. (A real browser exposes the parent
-  // Window object; cross-realm property access is limited here to postMessage, which is what
-  // cross-frame tests use.)
-  var parentRef = {
-    postMessage: function (data, targetOrigin, transfer) {
-      if (typeof g.__framePostToParent === "function") { g.__framePostToParent(nodeId, data); }
-    },
+  // A messaging facade onto the page (the opener for a window.open target, or the parent for an
+  // iframe). A real browser exposes the other Window object; cross-realm property access is limited
+  // here to postMessage, which is what cross-context tests use.
+  var pageRef = {
+    postMessage: function (data, targetOrigin, transfer) { g.__framePostToParent(nodeId, data); },
     closed: false
   };
-  try { Object.defineProperty(g, "parent", { value: parentRef, writable: true, configurable: true }); } catch (e) {}
-  try { Object.defineProperty(g, "top", { value: parentRef, writable: true, configurable: true }); } catch (e) {}
-  try { Object.defineProperty(g, "frameElement", { value: null, writable: true, configurable: true }); } catch (e) {}
 
-  // page -> frame: the native bridge calls this with the parent's value; localise with the frame's
-  // own structuredClone, then deliver a `message` event on a fresh task.
+  if (isAux) {
+    // A window.open() target is its own top-level browsing context: parent/top are itself, there is
+    // no frameElement, and `opener` is the page that opened it.
+    Object.defineProperty(g, "parent", { value: g, writable: true, configurable: true });
+    Object.defineProperty(g, "top", { value: g, writable: true, configurable: true });
+    Object.defineProperty(g, "frameElement", { value: null, writable: true, configurable: true });
+    Object.defineProperty(g, "opener", { value: pageRef, writable: true, configurable: true });
+  } else {
+    // parent / top: the messaging facade onto the page context.
+    Object.defineProperty(g, "parent", { value: pageRef, writable: true, configurable: true });
+    Object.defineProperty(g, "top", { value: pageRef, writable: true, configurable: true });
+    Object.defineProperty(g, "frameElement", { value: null, writable: true, configurable: true });
+  }
+
+  // page -> frame: the native bridge calls this with the page's value; localise with the frame's
+  // own structuredClone, then deliver a `message` event on a fresh task. `source` is the page facade
+  // (opener/parent) so handlers that reply via `event.source.postMessage(...)` reach the page.
   g.__frameAccept = function (data) {
-    var cloned; try { cloned = g.structuredClone(data); } catch (e) { cloned = data; }
+    var cloned = g.structuredClone(data);
     setTimeout(function () {
-      var ev;
-      try { ev = new g.MessageEvent("message", { data: cloned, origin: "", lastEventId: "", source: parentRef, ports: [] }); }
-      catch (e2) { ev = { type: "message", data: cloned }; }
-      try { g.dispatchEvent(ev); } catch (e3) {}
+      g.dispatchEvent(new g.MessageEvent("message", { data: cloned, origin: "", lastEventId: "", source: pageRef, ports: [] }));
     }, 0);
   };
 })();

@@ -106,6 +106,8 @@ impl Session {
         fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send>,
         request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
         ws_connector: WsConnector,
+        cookie_getter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+        cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
         // Layout rects to seed into HostState BEFORE the page's scripts run, so synchronous
         // layout-dependent reads during load see real geometry. `(rects, naturals, insets,
         // margins, scroll_y_css, doc_height_css)` (CSS px). `None` to seed nothing.
@@ -142,6 +144,8 @@ impl Session {
                         fetcher,
                         request_fetcher,
                         ws_connector,
+                        cookie_getter,
+                        cookie_setter,
                         init_tx,
                         cmd_rx,
                         initial_rects,
@@ -465,6 +469,8 @@ pub(crate) fn session_thread_main(
     fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send>,
     request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
     ws_connector: WsConnector,
+    cookie_getter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+    cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
     init_tx: std::sync::mpsc::Sender<(dom::Document, Vec<EvalOutput>)>,
     cmd_rx: std::sync::mpsc::Receiver<SessionCmd>,
     initial_rects: Option<(
@@ -508,6 +514,8 @@ pub(crate) fn session_thread_main(
             fetch_tx,
             ws_connector,
             ws_evt_tx,
+            cookie_getter,
+            cookie_setter,
         );
         scope.get_current_context().set_slot(state);
         let registry = Rc::new(ModuleRegistry {

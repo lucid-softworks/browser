@@ -7,6 +7,502 @@
 use std::io::Read;
 use std::sync::OnceLock;
 
+// =================================================================================================
+// Cookie jar (hand-rolled, RFC 6265). We manage cookies ourselves — instead of relying on ureq's
+// internal store — so that `document.cookie` reads/writes the SAME jar used for HTTP requests.
+// Only `std` + our `wurl::Url` are used; no external cookie/url crates.
+// =================================================================================================
+
+/// One stored cookie. `domain` is always a canonical lowercase host with no leading dot; the
+/// `host_only` flag distinguishes a cookie with no `Domain` attribute (exact-host match only) from
+/// one with a `Domain` attribute (matches the domain and its subdomains).
+#[derive(Clone)]
+struct StoredCookie {
+    name: String,
+    value: String,
+    domain: String,
+    host_only: bool,
+    path: String,
+    secure: bool,
+    http_only: bool,
+    /// Absolute expiry in unix seconds; `None` is a session cookie (no expiry).
+    expires: Option<u64>,
+    /// Monotonic insertion order, used to order the `Cookie` header and as a stable tie-break.
+    creation: u64,
+}
+
+fn jar() -> &'static std::sync::Mutex<Vec<StoredCookie>> {
+    static JAR: OnceLock<std::sync::Mutex<Vec<StoredCookie>>> = OnceLock::new();
+    JAR.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn next_creation() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// RFC 6265 §5.1.3 domain-match: `host` equals `domain`, or `host` is a subdomain of `domain`
+/// (ends with `.domain`). Both are expected lowercase with no leading dot.
+fn domain_match(host: &str, domain: &str) -> bool {
+    if host == domain {
+        return true;
+    }
+    host.len() > domain.len()
+        && host.ends_with(domain)
+        && host.as_bytes()[host.len() - domain.len() - 1] == b'.'
+}
+
+/// RFC 6265 §5.1.4 path-match: `req_path` equals `cookie_path`, or `cookie_path` is a prefix of it
+/// ending in `/`, or the first char of `req_path` past the prefix is `/`.
+fn path_match(req_path: &str, cookie_path: &str) -> bool {
+    if req_path == cookie_path {
+        return true;
+    }
+    if let Some(rest) = req_path.strip_prefix(cookie_path) {
+        return cookie_path.ends_with('/') || rest.starts_with('/');
+    }
+    false
+}
+
+/// RFC 6265 §5.1.4 default-path for a request whose path is `req_path` (already query-stripped).
+fn default_path(req_path: &str) -> String {
+    if !req_path.starts_with('/') {
+        return "/".to_string();
+    }
+    match req_path.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(i) => req_path[..i].to_string(),
+    }
+}
+
+/// Whether `u` is a potentially-trustworthy (secure) context for cookie purposes: a secure scheme,
+/// or a loopback host (so local dev over `http://localhost` still gets Secure cookies).
+fn is_secure_context(u: &wurl::Url) -> bool {
+    let s = u.scheme();
+    if s.eq_ignore_ascii_case("https") || s.eq_ignore_ascii_case("wss") {
+        return true;
+    }
+    let h = u.hostname();
+    h == "localhost" || h.ends_with(".localhost") || h == "127.0.0.1" || h == "::1"
+}
+
+/// The request path (no query/fragment), defaulting an empty path to "/".
+fn request_path(u: &wurl::Url) -> String {
+    let p = u.path_str();
+    if p.is_empty() {
+        "/".to_string()
+    } else {
+        p
+    }
+}
+
+/// Build the `name=value; name=value` cookie string for `url`. `include_http_only` is true for the
+/// HTTP `Cookie` header and false for `document.cookie` (which must not expose HttpOnly cookies).
+fn collect_cookies(url: &str, include_http_only: bool) -> String {
+    let u = match wurl::Url::parse(url) {
+        Ok(u) => u,
+        Err(()) => return String::new(),
+    };
+    let host = u.hostname();
+    if host.is_empty() {
+        return String::new();
+    }
+    let path = request_path(&u);
+    let secure_ctx = u.scheme().eq_ignore_ascii_case("https");
+    let now = now_secs();
+
+    let mut guard = match jar().lock() {
+        Ok(g) => g,
+        Err(_) => return String::new(),
+    };
+    guard.retain(|c| c.expires.is_none_or(|e| e > now));
+
+    let mut matches: Vec<&StoredCookie> = guard
+        .iter()
+        .filter(|c| {
+            if c.http_only && !include_http_only {
+                return false;
+            }
+            if c.secure && !secure_ctx {
+                return false;
+            }
+            let dm = if c.host_only {
+                host == c.domain
+            } else {
+                domain_match(&host, &c.domain)
+            };
+            dm && path_match(&path, &c.path)
+        })
+        .collect();
+    // RFC 6265 §5.4: longer paths first, then earlier creation first.
+    matches.sort_by(|a, b| {
+        b.path
+            .len()
+            .cmp(&a.path.len())
+            .then(a.creation.cmp(&b.creation))
+    });
+    matches
+        .iter()
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Cookies visible to `document.cookie` for `url` (non-HttpOnly, domain/path/secure matched).
+pub fn cookies_for_document(url: &str) -> String {
+    collect_cookies(url, false)
+}
+
+/// Cookies to send in the HTTP `Cookie` header for `url` (includes HttpOnly cookies).
+pub fn cookies_for_request(url: &str) -> String {
+    collect_cookies(url, true)
+}
+
+/// Store a cookie from `document.cookie = "..."` (a non-HTTP API). The `HttpOnly` attribute is
+/// ignored, and an existing HttpOnly cookie with the same name/domain/path is left untouched.
+pub fn set_cookie(url: &str, cookie_str: &str) -> bool {
+    store_cookie(url, cookie_str, false)
+}
+
+/// Store a cookie received from a `Set-Cookie` HTTP response header (`HttpOnly` is honoured).
+pub fn set_cookie_from_http(url: &str, cookie_str: &str) -> bool {
+    store_cookie(url, cookie_str, true)
+}
+
+/// Parse a cookie string and store it against the request `url`, applying RFC 6265 attribute rules.
+/// `from_http` distinguishes a `Set-Cookie` header (HttpOnly honoured) from a `document.cookie`
+/// write (HttpOnly ignored; can't overwrite an existing HttpOnly cookie). Returns true unless the
+/// input is unusable (bad URL or missing name). A cookie whose computed expiry is in the past
+/// deletes any matching stored cookie (how the spec — and the WPT cleanup callbacks — express
+/// deletion).
+fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
+    let u = match wurl::Url::parse(url) {
+        Ok(u) => u,
+        Err(()) => return false,
+    };
+    let host = u.hostname();
+    if host.is_empty() {
+        return false;
+    }
+    let req_path = request_path(&u);
+
+    let mut parts = cookie_str.split(';');
+    let first = parts.next().unwrap_or("");
+    let eq = match first.find('=') {
+        Some(i) => i,
+        None => return false, // no name=value pair
+    };
+    let name = first[..eq].trim().to_string();
+    let value = first[eq + 1..].trim().to_string();
+    if name.is_empty() {
+        return false;
+    }
+
+    let mut domain_attr: Option<String> = None;
+    let mut path_attr: Option<String> = None;
+    let mut secure = false;
+    let mut http_only = false;
+    let mut same_site: Option<String> = None;
+    let mut max_age: Option<i64> = None;
+    let mut expires_attr: Option<u64> = None;
+
+    for attr in parts {
+        let attr = attr.trim();
+        let (key, val) = match attr.find('=') {
+            Some(i) => (attr[..i].trim(), attr[i + 1..].trim()),
+            None => (attr, ""),
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "domain" => {
+                // Strip a single leading dot; an empty value means "no Domain" (host-only).
+                let d = val.trim_start_matches('.').to_ascii_lowercase();
+                if !d.is_empty() {
+                    domain_attr = Some(d);
+                }
+            }
+            "path" => {
+                if val.starts_with('/') {
+                    path_attr = Some(val.to_string());
+                }
+            }
+            "secure" => secure = true,
+            "httponly" => http_only = true,
+            "max-age" => {
+                if let Ok(n) = val.parse::<i64>() {
+                    max_age = Some(n);
+                }
+            }
+            "expires" => expires_attr = parse_cookie_date(val),
+            "samesite" => same_site = Some(val.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    // A `document.cookie` write (non-HTTP API) cannot set the HttpOnly attribute.
+    if !from_http {
+        http_only = false;
+    }
+
+    let now = now_secs();
+    // Max-Age takes precedence over Expires (RFC 6265 §5.3). Non-positive Max-Age = expired.
+    let expires = match max_age {
+        Some(ma) if ma <= 0 => Some(0),
+        Some(ma) => Some(now.saturating_add(ma as u64)),
+        None => expires_attr,
+    };
+
+    // Resolve domain. A Domain attribute that does not domain-match the request host is rejected.
+    let (domain, host_only) = match domain_attr {
+        Some(d) => {
+            if !domain_match(&host, &d) {
+                return false;
+            }
+            (d, false)
+        }
+        None => (host, true),
+    };
+    let path = path_attr.unwrap_or_else(|| default_path(&req_path));
+
+    // Cookie security rules (RFC 6265bis §4.1.3 + strict-secure).
+    let secure_origin = is_secure_context(&u);
+    // A `Secure` cookie may only be set over a secure transport.
+    if secure && !secure_origin {
+        return false;
+    }
+    // `SameSite=None` requires the `Secure` attribute (RFC 6265bis §5.4).
+    if same_site.as_deref() == Some("none") && !secure {
+        return false;
+    }
+    // Cookie name prefixes (RFC 6265bis §4.1.3, plus the __Http-/__Host-Http- prefixes which also
+    // require HttpOnly). Checked most-specific first; a `document.cookie` write can't set HttpOnly,
+    // so the __Http- prefixes never apply to it.
+    let lname = name.to_ascii_lowercase();
+    let prefix_violation = if lname.starts_with("__host-http-") {
+        !secure || !http_only || !host_only || path != "/"
+    } else if lname.starts_with("__http-") {
+        !secure || !http_only
+    } else if lname.starts_with("__host-") {
+        !secure || !host_only || path != "/"
+    } else if lname.starts_with("__secure-") {
+        !secure
+    } else {
+        false
+    };
+    if prefix_violation {
+        return false;
+    }
+
+    let mut guard = match jar().lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let existing = guard
+        .iter()
+        .find(|c| c.name == name && c.domain == domain && c.path == path);
+    // A non-HTTP API (document.cookie) may not overwrite or delete an HttpOnly cookie.
+    if !from_http && existing.is_some_and(|c| c.http_only) {
+        return false;
+    }
+    // Preserve the original creation time on overwrite (RFC 6265 §5.3 step 11.3).
+    let creation = existing.map(|c| c.creation);
+    guard.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+
+    // An already-expired cookie just deletes the matching entry (done above) — don't store it.
+    if expires.is_some_and(|e| e <= now) {
+        return true;
+    }
+    guard.push(StoredCookie {
+        name,
+        value,
+        domain,
+        host_only,
+        path,
+        secure,
+        http_only,
+        expires,
+        creation: creation.unwrap_or_else(next_creation),
+    });
+    true
+}
+
+/// Clear all cookies (supports WebDriver "Delete All Cookies" for test cleanup).
+pub fn clear_cookies() {
+    if let Ok(mut guard) = jar().lock() {
+        guard.clear();
+    }
+}
+
+/// Delete cookie(s) by name (best effort).
+pub fn delete_cookie(name: &str) {
+    if let Ok(mut guard) = jar().lock() {
+        guard.retain(|c| c.name != name);
+    }
+}
+
+/// Snapshot cookie for WebDriver protocol.
+pub struct WebDriverCookie {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub expiry: Option<u64>,
+}
+
+/// Return all (unexpired) cookies currently stored.
+pub fn get_all_cookies() -> Vec<WebDriverCookie> {
+    let now = now_secs();
+    let guard = match jar().lock() {
+        Ok(g) => g,
+        Err(_) => return vec![],
+    };
+    guard
+        .iter()
+        .filter(|c| c.expires.is_none_or(|e| e > now))
+        .map(|c| WebDriverCookie {
+            name: c.name.clone(),
+            value: c.value.clone(),
+            domain: c.domain.clone(),
+            path: c.path.clone(),
+            secure: c.secure,
+            http_only: c.http_only,
+            expiry: c.expires,
+        })
+        .collect()
+}
+
+/// Parse a cookie `Expires` date into absolute unix seconds, per RFC 6265 §5.1.1. Tolerant of the
+/// many real-world formats (e.g. `Sun, 06 Nov 1994 08:49:37 GMT`, `01-Jan-1970 00:00:00 GMT`).
+/// Returns `None` if a complete, valid date can't be assembled. Dates before the unix epoch clamp
+/// to 0 (so they read as already-expired).
+fn parse_cookie_date(s: &str) -> Option<u64> {
+    let mut hour: Option<u32> = None;
+    let mut minute: Option<u32> = None;
+    let mut second: Option<u32> = None;
+    let mut day: Option<u32> = None;
+    let mut month: Option<u32> = None;
+    let mut year: Option<i64> = None;
+
+    for token in s.split(is_cookie_date_delimiter) {
+        if token.is_empty() {
+            continue;
+        }
+        if hour.is_none() {
+            if let Some((h, m, sec)) = parse_hms(token) {
+                hour = Some(h);
+                minute = Some(m);
+                second = Some(sec);
+                continue;
+            }
+        }
+        let (num, digits) = leading_digits(token);
+        if day.is_none() && (1..=2).contains(&digits) && (1..=31).contains(&num) {
+            day = Some(num as u32);
+            continue;
+        }
+        if month.is_none() {
+            if let Some(m) = parse_month(token) {
+                month = Some(m);
+                continue;
+            }
+        }
+        if year.is_none() && (2..=4).contains(&digits) {
+            year = Some(num as i64);
+            continue;
+        }
+    }
+
+    let (mut y, mo, d, h, mi, se) = (year?, month?, day?, hour?, minute?, second?);
+    // Two-digit year handling (RFC 6265 §5.1.1).
+    if (0..=69).contains(&y) {
+        y += 2000;
+    } else if (70..=99).contains(&y) {
+        y += 1900;
+    }
+    if y < 1601 || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let days = days_from_civil(y, mo as i64, d as i64);
+    let secs = days * 86_400 + (h as i64) * 3600 + (mi as i64) * 60 + se as i64;
+    Some(secs.max(0) as u64)
+}
+
+/// RFC 6265 §5.1.1 date delimiter: %x09 / %x20-2F / %x3B-40 / %x5B-60 / %x7B-7E.
+fn is_cookie_date_delimiter(c: char) -> bool {
+    let b = c as u32;
+    c == '\t'
+        || (0x20..=0x2f).contains(&b)
+        || (0x3b..=0x40).contains(&b)
+        || (0x5b..=0x60).contains(&b)
+        || (0x7b..=0x7e).contains(&b)
+}
+
+/// Parse a `hh:mm:ss` time token (each field is leading 1–2 digits; trailing junk is ignored).
+fn parse_hms(token: &str) -> Option<(u32, u32, u32)> {
+    let mut it = token.split(':');
+    let h = it.next()?;
+    let m = it.next()?;
+    let s = it.next()?;
+    if it.next().is_some() {
+        return None;
+    }
+    let (h, hd) = leading_digits(h);
+    let (m, md) = leading_digits(m);
+    let (s, sd) = leading_digits(s);
+    if hd == 0 || md == 0 || sd == 0 {
+        return None;
+    }
+    Some((h as u32, m as u32, s as u32))
+}
+
+/// First 3 letters case-insensitively matched to a month (1–12), else `None`.
+fn parse_month(token: &str) -> Option<u32> {
+    if token.len() < 3 {
+        return None;
+    }
+    let key = token[..3].to_ascii_lowercase();
+    [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ]
+    .iter()
+    .position(|m| *m == key)
+    .map(|i| i as u32 + 1)
+}
+
+/// Value and count of the leading run of ASCII digits in `token` (count 0 if none).
+fn leading_digits(token: &str) -> (u64, usize) {
+    let mut n: u64 = 0;
+    let mut count = 0;
+    for ch in token.chars() {
+        match ch.to_digit(10) {
+            Some(d) => {
+                n = n.saturating_mul(10).saturating_add(d as u64);
+                count += 1;
+            }
+            None => break,
+        }
+    }
+    (n, count)
+}
+
+/// Days from the unix epoch (1970-01-01) to `y-m-d` (proleptic Gregorian). Howard Hinnant's
+/// `days_from_civil`. `m` in 1..=12.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// A single shared HTTP agent: it pools TCP/TLS connections and caches DNS per host, so many
 /// concurrent fetches to the same origin (e.g. a 200+ module graph) reuse connections instead
 /// of each doing its own DNS lookup + handshake — which previously overwhelmed flaky resolvers
@@ -17,14 +513,33 @@ fn agent() -> &'static ureq::Agent {
         let mut builder = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(10))
             .timeout_read(std::time::Duration::from_secs(15))
-            .max_idle_connections_per_host(16)
-            // Persist cookies across requests AND redirects so logins/sessions survive.
-            .cookie_store(cookie_store::CookieStore::new(None));
+            .max_idle_connections_per_host(16);
+        // Cookies are managed by our own cookie_store() (see cookies_for_document / set_cookie)
+        // so that document.cookie and HTTP requests share the same jar. We intentionally do NOT
+        // call .cookie_store(...) here; we inject the Cookie header and parse Set-Cookie ourselves.
         // Test-driving env knobs (no effect on normal browsing):
         //  - `WPT_INSECURE_TLS`: accept any server certificate. The WebDriver server sets this so
         //    `.https` WPT tests load over TLS against `wpt serve`'s self-signed cert without needing
         //    the checkout's CA path (matches the `acceptInsecureCerts` capability it advertises).
         //  - `WPT_CA_FILE`: trust a specific extra CA (the WPT `tools/certs/cacert.pem`).
+        if let Some(cfg) = wpt_tls_config() {
+            builder = builder.tls_config(std::sync::Arc::new(cfg));
+        }
+        builder.build()
+    })
+}
+
+/// A sibling of [`agent`] configured to NOT follow redirects (`redirects(0)`). ureq's redirect
+/// policy is agent-level, so no-redirect requests (CORS preflights) use this pooled agent instead;
+/// a 3xx then surfaces as a normal 3xx response rather than being transparently followed.
+fn agent_no_redirect() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let mut builder = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(15))
+            .max_idle_connections_per_host(16)
+            .redirects(0);
         if let Some(cfg) = wpt_tls_config() {
             builder = builder.tls_config(std::sync::Arc::new(cfg));
         }
@@ -134,16 +649,28 @@ const MAX_BODY_BYTES: u64 = 16 * 1024 * 1024 * 1024; // 16 GiB
 /// A fetched HTTP response.
 pub struct Response {
     pub status: u16,
+    /// The HTTP reason phrase exactly as sent by the server (e.g. `OK`, `OHAI`, `StatusText`).
+    /// Empty for the non-HTTP paths. XHR's `statusText` and `fetch()`'s `Response.statusText`
+    /// report this verbatim rather than a synthesized phrase.
+    pub status_text: String,
     pub content_type: String,
     pub body: Vec<u8>,
     pub final_url: String,
+    /// All response headers, in receipt order, as `(name, value)` with the names lowercased and
+    /// duplicate fields combined with `, ` (per the Fetch standard's header combine). Empty for the
+    /// non-HTTP paths (`file://`, `about:blank`, cache hits) that have no real header block.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Response metadata (everything except the body), for streaming callers.
 pub struct ResponseMeta {
     pub status: u16,
+    /// The server's HTTP reason phrase — see [`Response::status_text`].
+    pub status_text: String,
     pub content_type: String,
     pub final_url: String,
+    /// All response headers (lowercased name, combined value) — see [`Response::headers`].
+    pub headers: Vec<(String, String)>,
     /// True when the response makes the document cross-origin isolated: a `same-origin`
     /// Cross-Origin-Opener-Policy AND a `require-corp`/`credentialless` Cross-Origin-Embedder-Policy.
     /// Drives `self.crossOriginIsolated` in page JS. Non-HTTP responses (about:/file:/cache) are
@@ -437,6 +964,56 @@ pub fn fetch(url: &str) -> Result<Response, String> {
     request("GET", url, None, &[])
 }
 
+/// Per-request knobs for [`request_ext`]. The defaults reproduce [`request`]'s historical behaviour
+/// (a non-2xx status is an `Err`; redirects are followed), so navigation/subresource callers are
+/// unaffected. The `fetch()`/XHR request fetcher opts into the spec behaviour instead: a 4xx/5xx is
+/// a real response (`ok:false`), and a CORS preflight must NOT follow redirects (a 3xx is a failure).
+#[derive(Clone, Copy)]
+pub struct RequestOpts {
+    /// Return the response for a 4xx/5xx status instead of mapping it to `Err` (no status-based
+    /// retry). The Fetch model treats an HTTP error status as a perfectly good response.
+    pub allow_error_status: bool,
+    /// Follow 3xx redirects (the default). A CORS preflight sets this false so a redirected
+    /// preflight surfaces as a 3xx response the caller can reject.
+    pub follow_redirects: bool,
+    /// Send the shared jar's cookies and store the response's `Set-Cookie` (the default). A
+    /// non-credentialed CORS request (XHR `withCredentials=false` / fetch credentials != include,
+    /// cross-origin) sets this false so it neither sends nor stores cookies.
+    pub credentials: bool,
+}
+
+impl Default for RequestOpts {
+    fn default() -> Self {
+        RequestOpts {
+            allow_error_status: false,
+            follow_redirects: true,
+            credentials: true,
+        }
+    }
+}
+
+/// Like [`request`] but with explicit [`RequestOpts`]. Backs the `fetch()`/XHR request fetcher.
+pub fn request_ext(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(String, String)],
+    opts: RequestOpts,
+) -> Result<Response, String> {
+    let mut buf = Vec::new();
+    let meta = request_streaming_core(method, url, body, headers, true, opts, &mut |chunk| {
+        buf.extend_from_slice(chunk);
+    })?;
+    Ok(Response {
+        status: meta.status,
+        status_text: meta.status_text,
+        content_type: meta.content_type,
+        body: buf,
+        final_url: meta.final_url,
+        headers: meta.headers,
+    })
+}
+
 /// Issue an HTTP request with an arbitrary `method` and return a [`Response`], or an
 /// `Err(String)` describing the failure. Supports GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS over
 /// `http(s)://` (via the reused HTTP client) and `file://` reads (GET-like, body/headers ignored).
@@ -454,16 +1031,7 @@ pub fn request(
     // Accumulate the streamed body into a Vec so the historical buffered `Response` surface is
     // identical. The shared core records the network log exactly once (here), so we pass
     // `log = true` and don't record again.
-    let mut buf = Vec::new();
-    let meta = request_streaming_core(method, url, body, headers, true, &mut |chunk| {
-        buf.extend_from_slice(chunk);
-    })?;
-    Ok(Response {
-        status: meta.status,
-        content_type: meta.content_type,
-        body: buf,
-        final_url: meta.final_url,
-    })
+    request_ext(method, url, body, headers, RequestOpts::default())
 }
 
 /// Perform `url` like `request("GET", ...)` but deliver the body INCREMENTALLY: `on_chunk` is
@@ -471,7 +1039,15 @@ pub fn request(
 /// first). Returns the response metadata once the body is fully read, or Err on failure.
 pub fn fetch_streaming(url: &str, on_chunk: &mut dyn FnMut(&[u8])) -> Result<ResponseMeta, String> {
     // GET-only streaming: no request body or custom headers. Records the network log exactly once.
-    request_streaming_core("GET", url, None, &[], true, on_chunk)
+    request_streaming_core(
+        "GET",
+        url,
+        None,
+        &[],
+        true,
+        RequestOpts::default(),
+        on_chunk,
+    )
 }
 
 /// The single shared request path. Builds + sends the request (with the retry loop), then streams
@@ -484,12 +1060,13 @@ fn request_streaming_core(
     body: Option<&[u8]>,
     headers: &[(String, String)],
     log: bool,
+    opts: RequestOpts,
     on_chunk: &mut dyn FnMut(&[u8]),
 ) -> Result<ResponseMeta, String> {
     let start = std::time::Instant::now();
     // Count the total bytes streamed (sum of chunk lengths) for the network log.
     let mut total: usize = 0;
-    let result = request_streaming_inner(method, url, body, headers, &mut |chunk| {
+    let result = request_streaming_inner(method, url, body, headers, opts, &mut |chunk| {
         total += chunk.len();
         on_chunk(chunk);
     });
@@ -523,6 +1100,7 @@ fn request_streaming_inner(
     url: &str,
     body: Option<&[u8]>,
     headers: &[(String, String)],
+    opts: RequestOpts,
     on_chunk: &mut dyn FnMut(&[u8]),
 ) -> Result<ResponseMeta, String> {
     let method_uc = method.to_ascii_uppercase();
@@ -540,8 +1118,10 @@ fn request_streaming_inner(
         on_chunk(html);
         return Ok(ResponseMeta {
             status: 200,
+            status_text: "OK".to_string(),
             content_type: "text/html; charset=utf-8".to_string(),
             final_url: url.to_string(),
+            headers: Vec::new(),
             cross_origin_isolated: false,
         });
     }
@@ -553,8 +1133,10 @@ fn request_streaming_inner(
         on_chunk(&resp.body);
         return Ok(ResponseMeta {
             status: resp.status,
+            status_text: resp.status_text,
             content_type: resp.content_type,
             final_url: resp.final_url,
+            headers: resp.headers,
             cross_origin_isolated: false,
         });
     }
@@ -578,8 +1160,10 @@ fn request_streaming_inner(
             on_chunk(&bytes[body_off..]);
             return Ok(ResponseMeta {
                 status: 200,
+                status_text: "OK".to_string(),
                 content_type,
                 final_url,
+                headers: Vec::new(),
                 cross_origin_isolated: false,
             });
         }
@@ -587,6 +1171,16 @@ fn request_streaming_inner(
 
     // Whether this method carries a request body.
     let has_body = matches!(method_uc.as_str(), "POST" | "PUT" | "PATCH" | "DELETE");
+
+    // Inject cookies for this request URL from our shared jar (document.cookie and HTTP share it).
+    // The HTTP Cookie header includes HttpOnly cookies (unlike document.cookie). A non-credentialed
+    // request (`opts.credentials == false`) sends none.
+    let cookie_header = if opts.credentials {
+        cookies_for_request(url)
+    } else {
+        String::new()
+    };
+    let has_cookie_header = !cookie_header.is_empty();
 
     // Present a mainstream browser User-Agent. Many sites (Google, etc.) serve a stripped
     // or blocked page to unknown clients like ureq's default UA, so we look like a browser.
@@ -600,17 +1194,35 @@ fn request_streaming_inner(
     //     modest timeout, never the multiply-the-timeout loop.
     let mut attempt = 0;
     let resp = loop {
-        let mut req = agent()
+        let ag = if opts.follow_redirects {
+            agent()
+        } else {
+            agent_no_redirect()
+        };
+        // A default header is sent only when the caller did not set one of its own (case-insensitive)
+        // — an author-supplied `Accept` / `Accept-Language` (e.g. an XHR `setRequestHeader`) must be
+        // the only such header on the wire, not be shadowed or duplicated by our default.
+        let has = |n: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
+        let mut req = ag
             .request(&method_uc, url)
             // Bound the whole request (DNS + connect + read) so one stalled connection can't
             // hang the engine. Kept modest so a dead sub-resource fails fast.
-            .timeout(std::time::Duration::from_secs(8))
-            .set("User-Agent", BROWSER_USER_AGENT)
-            .set(
+            .timeout(std::time::Duration::from_secs(8));
+        if !has("User-Agent") {
+            req = req.set("User-Agent", BROWSER_USER_AGENT);
+        }
+        if !has("Accept") {
+            req = req.set(
                 "Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
-            .set("Accept-Language", "en-US,en;q=0.9");
+            );
+        }
+        if !has("Accept-Language") {
+            req = req.set("Accept-Language", "en-US,en;q=0.9");
+        }
+        if has_cookie_header {
+            req = req.set("Cookie", &cookie_header);
+        }
         for (name, value) in headers {
             req = req.set(name, value);
         }
@@ -628,8 +1240,13 @@ fn request_streaming_inner(
         };
         match result {
             Ok(resp) => break resp,
-            // Fast status failures: retry rate-limit/server statuses with backoff (up to 3×).
-            Err(ureq::Error::Status(code, _)) => {
+            // A 4xx/5xx status. The Fetch model (fetch()/XHR) wants the response itself — return it
+            // verbatim, no status-based retry. Other callers keep the historical Err mapping (with a
+            // backoff retry for rate-limit/server statuses).
+            Err(ureq::Error::Status(code, resp)) => {
+                if opts.allow_error_status {
+                    break resp;
+                }
                 if (code == 403 || code == 429 || code >= 500) && attempt < 3 {
                     attempt += 1;
                     std::thread::sleep(backoff(attempt));
@@ -651,6 +1268,7 @@ fn request_streaming_inner(
     };
 
     let status = resp.status();
+    let status_text = resp.status_text().to_string();
     // The URL the response actually came from — ureq follows redirects, so this is the post-redirect
     // location (e.g. en.wikipedia.org/ → /wiki/Main_Page). Falls back to the requested URL.
     let final_url = {
@@ -661,10 +1279,43 @@ fn request_streaming_inner(
             u.to_string()
         }
     };
+
+    // Store any Set-Cookie headers from the final response into our shared jar so that
+    // document.cookie can see them (and subsequent requests will send them). A non-credentialed
+    // request (`opts.credentials == false`) ignores them.
+    if opts.credentials {
+        for sc in resp.all("set-cookie") {
+            // A Set-Cookie response header (HttpOnly honoured), against the URL that sent it
+            // (final_url after redirects).
+            let _ = set_cookie_from_http(&final_url, sc);
+        }
+    }
+
     let content_type = resp
         .header("Content-Type")
         .unwrap_or("application/octet-stream")
         .to_string();
+
+    // Snapshot every response header (lowercased name, duplicate fields combined with `, ` per the
+    // Fetch standard) before the response is consumed by `into_reader`. Powers `fetch()`/XHR header
+    // access (`Response.headers`, `getResponseHeader`) and the CORS layer that reads
+    // `Access-Control-*` off the response.
+    let resp_headers: Vec<(String, String)> = resp
+        .headers_names()
+        .into_iter()
+        .map(|name| {
+            // Strip leading/trailing HTTP OWS (SP/HT only — not VT/FF/CR/LF) from each field value
+            // before combining, exactly as a conformant header parser does. The CORS layer compares
+            // `Access-Control-Allow-Origin` byte-for-byte, so e.g. `" *  "` must read back as `"*"`.
+            let values = resp
+                .all(&name)
+                .iter()
+                .map(|v| v.trim_matches([' ', '\t']))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (name.to_ascii_lowercase(), values)
+        })
+        .collect();
 
     // Cross-origin isolation: COOP `same-origin` + COEP `require-corp`/`credentialless` (first token
     // of each, case-insensitive). Drives `self.crossOriginIsolated` for the loaded document.
@@ -747,8 +1398,10 @@ fn request_streaming_inner(
 
     Ok(ResponseMeta {
         status,
+        status_text,
         content_type,
         final_url,
+        headers: resp_headers,
         cross_origin_isolated,
     })
 }
@@ -852,9 +1505,11 @@ fn fetch_file(path: &str, original: &str) -> Result<Response, String> {
     .to_string();
     Ok(Response {
         status: 200,
+        status_text: "OK".to_string(),
         content_type,
         body,
         final_url: original.to_string(),
+        headers: Vec::new(),
     })
 }
 
@@ -1080,6 +1735,248 @@ mod tests {
     fn invalid_url_is_err() {
         assert!(fetch("not a url").is_err());
         assert!(fetch("http://").is_err());
+    }
+
+    // The cookie jar is a process-global; serialize the cookie tests (which clear and mutate it)
+    // so they don't interfere when the test runner executes them in parallel.
+    static COOKIE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn has(cookies: &str, pair: &str) -> bool {
+        cookies.split("; ").any(|c| c == pair)
+    }
+
+    #[test]
+    fn cookie_domain_attribute_matches_host_is_visible() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "https://web-platform.test:8443/cookies/domain/x.html";
+        // Domain attribute equal to the host => a (non-host-only) domain cookie.
+        assert!(set_cookie(
+            page,
+            "domain-attribute-matches-host=b; Path=/; Domain=web-platform.test"
+        ));
+        assert!(has(
+            &cookies_for_document(page),
+            "domain-attribute-matches-host=b"
+        ));
+        // ...and it is sent to a subdomain (domain cookie, not host-only).
+        let sub = "https://sub.web-platform.test:8443/cookies/resources/list.py";
+        assert!(has(
+            &cookies_for_request(sub),
+            "domain-attribute-matches-host=b"
+        ));
+    }
+
+    #[test]
+    fn cookie_domain_leading_period_stripped_and_equivalent() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "https://web-platform.test:8443/x.html";
+        // A leading "." is stripped; with and without it must be the same stored cookie.
+        assert!(set_cookie(page, "c=1; Path=/; Domain=.web-platform.test"));
+        assert!(set_cookie(page, "c=2; Path=/; Domain=web-platform.test"));
+        let doc = cookies_for_document(page);
+        assert!(has(&doc, "c=2"), "second value should overwrite: {doc:?}");
+        assert!(!has(&doc, "c=1"), "old value should be gone: {doc:?}");
+    }
+
+    #[test]
+    fn cookie_no_domain_attribute_is_host_only() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "http://web-platform.test:8000/x.html";
+        assert!(set_cookie(page, "host-only=b; Path=/"));
+        assert!(has(&cookies_for_document(page), "host-only=b"));
+        // Host-only: NOT sent to a subdomain.
+        let sub = "http://sub.web-platform.test:8000/x";
+        assert!(!has(&cookies_for_request(sub), "host-only=b"));
+    }
+
+    #[test]
+    fn cookie_domain_not_matching_host_is_rejected() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "https://web-platform.test:8443/x.html";
+        assert!(!set_cookie(page, "evil=1; Domain=example.com"));
+        assert!(cookies_for_document(page).is_empty());
+    }
+
+    #[test]
+    fn cookie_secure_hidden_on_insecure_origin() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        assert!(set_cookie(secure, "s=1; Path=/; Secure"));
+        assert!(has(&cookies_for_document(secure), "s=1"));
+        let insecure = "http://web-platform.test:8000/x.html";
+        assert!(!has(&cookies_for_document(insecure), "s=1"));
+    }
+
+    #[test]
+    fn cookie_expired_in_past_deletes() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "https://web-platform.test:8443/x.html";
+        assert!(set_cookie(page, "k=v; Path=/"));
+        assert!(has(&cookies_for_document(page), "k=v"));
+        // The WPT cleanup form: a past Expires date removes the cookie.
+        assert!(set_cookie(
+            page,
+            "k=0; Path=/; expires=01-jan-1970 00:00:00 GMT"
+        ));
+        assert!(!has(&cookies_for_document(page), "k=v"));
+        assert!(!has(&cookies_for_document(page), "k=0"));
+    }
+
+    #[test]
+    fn cookie_max_age_zero_deletes() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "https://web-platform.test:8443/x.html";
+        assert!(set_cookie(page, "k=v; Path=/"));
+        assert!(set_cookie(page, "k=v; Path=/; Max-Age=0"));
+        assert!(cookies_for_document(page).is_empty());
+    }
+
+    #[test]
+    fn cookie_date_parser_handles_common_formats() {
+        // Epoch.
+        assert_eq!(parse_cookie_date("01-Jan-1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_cookie_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        // A known timestamp: 1994-11-06 08:49:37 UTC = 784111777.
+        assert_eq!(
+            parse_cookie_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        // Pre-epoch clamps to 0 (reads as already-expired).
+        assert_eq!(parse_cookie_date("Tue, 01 Jan 1963 00:00:00 GMT"), Some(0));
+        // Garbage => no date.
+        assert_eq!(parse_cookie_date("not a date"), None);
+    }
+
+    #[test]
+    fn cookie_secure_only_over_secure_transport() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let insecure = "http://web-platform.test:8000/x.html";
+        // A Secure cookie set from a non-secure origin is rejected.
+        assert!(!set_cookie(insecure, "s=1; Path=/; Secure"));
+        assert!(cookies_for_document(insecure).is_empty());
+        // From a secure origin it is stored.
+        let secure = "https://web-platform.test:8443/x.html";
+        assert!(set_cookie(secure, "s=1; Path=/; Secure"));
+        assert!(has(&cookies_for_document(secure), "s=1"));
+    }
+
+    #[test]
+    fn cookie_secure_prefix() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // __Secure- requires the Secure attribute (case-insensitive prefix).
+        assert!(!set_cookie(secure, "__Secure-a=1; Path=/"));
+        assert!(!set_cookie(secure, "__SeCuRe-a=1; Path=/"));
+        assert!(set_cookie(secure, "__Secure-a=1; Path=/; Secure"));
+        assert!(has(&cookies_for_document(secure), "__Secure-a=1"));
+        // From a non-secure origin, even with Secure it cannot be set (strict-secure).
+        clear_cookies();
+        let insecure = "http://web-platform.test:8000/x.html";
+        assert!(!set_cookie(insecure, "__Secure-a=1; Path=/; Secure"));
+        assert!(cookies_for_document(insecure).is_empty());
+    }
+
+    #[test]
+    fn cookie_host_prefix() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // __Host- requires Secure + Path=/ + no Domain.
+        assert!(!set_cookie(secure, "__Host-a=1; Path=/")); // not Secure
+        assert!(!set_cookie(
+            secure,
+            "__Host-a=1; Secure; Path=/; Domain=web-platform.test"
+        )); // has Domain
+        assert!(!set_cookie(secure, "__Host-a=1; Secure; Path=/foo")); // path not /
+        assert!(set_cookie(secure, "__Host-a=1; Secure; Path=/"));
+        assert!(has(&cookies_for_document(secure), "__Host-a=1"));
+    }
+
+    #[test]
+    fn cookie_http_prefix_requires_secure_and_httponly() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // __Http- requires Secure + HttpOnly (path may be non-root).
+        assert!(!set_cookie_from_http(secure, "__Http-a=1; Secure; Path=/")); // no HttpOnly
+        assert!(set_cookie_from_http(
+            secure,
+            "__Http-a=1; Secure; Path=/; HttpOnly"
+        ));
+        assert!(set_cookie_from_http(
+            secure,
+            "__Http-b=1; Secure; Path=/cookies/; HttpOnly"
+        ));
+        // __Host-Http- additionally requires host-only + Path=/.
+        assert!(!set_cookie_from_http(
+            secure,
+            "__Host-Http-c=1; Secure; Path=/cookies/; HttpOnly"
+        )); // path not /
+        assert!(set_cookie_from_http(
+            secure,
+            "__Host-Http-c=1; Secure; Path=/; HttpOnly"
+        ));
+        // document.cookie can't set HttpOnly, so the __Http- prefixes never apply to it.
+        assert!(!set_cookie(secure, "__Http-d=1; Secure; Path=/; HttpOnly"));
+    }
+
+    #[test]
+    fn cookie_dom_cannot_set_or_overwrite_httponly() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let page = "https://web-platform.test:8443/x.html";
+        // HttpOnly set via HTTP is hidden from document.cookie but kept.
+        assert!(set_cookie_from_http(page, "k=server; Path=/; HttpOnly"));
+        assert!(!has(&cookies_for_document(page), "k=server"));
+        // A document.cookie write may not overwrite the HttpOnly cookie.
+        assert!(!set_cookie(page, "k=dom; Path=/"));
+        assert!(has(&cookies_for_request(page), "k=server"));
+        // And document.cookie can't create an HttpOnly cookie (attribute ignored).
+        clear_cookies();
+        assert!(set_cookie(page, "j=1; Path=/; HttpOnly"));
+        assert!(has(&cookies_for_document(page), "j=1")); // visible → not HttpOnly
+    }
+
+    #[test]
+    fn cookie_samesite_none_requires_secure() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let secure = "https://web-platform.test:8443/x.html";
+        // SameSite=None without Secure is rejected; with Secure it is stored.
+        assert!(!set_cookie_from_http(secure, "n=1; Path=/; SameSite=None"));
+        assert!(set_cookie_from_http(
+            secure,
+            "n=1; Path=/; SameSite=None; Secure"
+        ));
+        assert!(has(&cookies_for_document(secure), "n=1"));
+        // SameSite=Lax without Secure is fine.
+        assert!(set_cookie_from_http(secure, "l=1; Path=/; SameSite=Lax"));
+        assert!(has(&cookies_for_document(secure), "l=1"));
+    }
+
+    #[test]
+    fn cookie_path_scoping() {
+        let _g = COOKIE_TEST_LOCK.lock().unwrap();
+        clear_cookies();
+        let base = "https://web-platform.test:8443";
+        assert!(set_cookie(&format!("{base}/a/b.html"), "p=1; Path=/a"));
+        assert!(has(
+            &cookies_for_document(&format!("{base}/a/c.html")),
+            "p=1"
+        ));
+        assert!(!has(
+            &cookies_for_document(&format!("{base}/x/c.html")),
+            "p=1"
+        ));
     }
 
     #[test]

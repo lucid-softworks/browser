@@ -48,6 +48,7 @@ pub fn clear_frames() {
 /// iframes work).
 pub(crate) fn register_iframe_natives(scope: &mut v8::PinScope, global: v8::Local<v8::Object>) {
     set_fn(scope, global, "__iframeLoad", prim_iframe_load);
+    set_fn(scope, global, "__windowOpen", prim_window_open);
     set_fn(
         scope,
         global,
@@ -167,33 +168,69 @@ fn prim_iframe_load(
             None
         }
     };
+    let ok = build_browsing_context(scope, node_id, &url, srcdoc, false);
+    rv.set(v8::Boolean::new(scope, ok).into());
+}
 
+/// Synthetic node id for an auxiliary window (`window.open`). Uses a high base so it never collides
+/// with a real `<iframe>` element's DOM node id (those are small and assigned per document).
+fn next_aux_window_id() -> u32 {
+    thread_local! {
+        static COUNTER: std::cell::Cell<u32> = const { std::cell::Cell::new(0x7000_0000) };
+    }
+    COUNTER.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1));
+        v
+    })
+}
+
+/// `__windowOpen(url) -> number`. Open an auxiliary top-level browsing context (a `window.open`
+/// target): allocate a synthetic id, load+run its document like a frame, and register the realm.
+/// Returns the synthetic id (used by the page's window proxy to message/read the new window), or 0
+/// if the document failed to load.
+fn prim_window_open(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let url = arg_str(scope, &args, 0);
+    let node_id = next_aux_window_id();
+    let ok = build_browsing_context(scope, node_id, &url, None, true);
+    rv.set(v8::Number::new(scope, if ok { node_id as f64 } else { 0.0 }).into());
+}
+
+/// Build a child browsing-context realm (an `<iframe>` when `is_aux` is false, or a `window.open`
+/// auxiliary window when true): resolve the document HTML from `srcdoc`/`url`, create a fresh
+/// `v8::Context`, install the browser env + frame overlay, run the document's classic scripts, and
+/// register the realm under `node_id`. Returns whether a document was loaded.
+fn build_browsing_context(
+    scope: &mut v8::PinScope,
+    node_id: u32,
+    url: &str,
+    srcdoc: Option<String>,
+    is_aux: bool,
+) -> bool {
     let page_state = host_state(scope);
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
 
     // Resolve the frame's document HTML + its base URL (+ the response's charset, if any).
     let (html_src, frame_url, frame_charset) = match &srcdoc {
-        Some(s) => (s.clone(), url.clone(), None),
+        Some(s) => (s.clone(), url.to_string(), None),
         None => {
-            if let Some((html, charset)) = decode_data_url(&url) {
-                (html, url.clone(), charset)
+            if let Some((html, charset)) = decode_data_url(url) {
+                (html, url.to_string(), charset)
             } else if url.is_empty() || url == "about:blank" {
                 (String::new(), "about:blank".to_string(), None)
             } else {
                 // Fetch the document HTML via the host fetcher (envelope JSON: {ok,status,body,...}).
-                match request_fetcher("GET", &url, "", "{}") {
+                match request_fetcher("GET", url, "", "{}") {
                     Some(env) => match extract_envelope_body(&env) {
-                        Some(body) => (body, url.clone(), extract_envelope_charset(&env)),
-                        None => {
-                            rv.set(v8::Boolean::new(scope, false).into());
-                            return;
-                        }
+                        Some(body) => (body, url.to_string(), extract_envelope_charset(&env)),
+                        None => return false,
                     },
-                    None => {
-                        rv.set(v8::Boolean::new(scope, false).into());
-                        return;
-                    }
+                    None => return false,
                 }
             }
         }
@@ -213,6 +250,8 @@ fn prim_iframe_load(
         let ctx = v8::Context::new(scope, Default::default());
         let cscope = &mut v8::ContextScope::new(scope, ctx);
         let shared: SharedDoc = Rc::new(RefCell::new(doc));
+        let cookie_getter = std::sync::Arc::clone(&page_state.cookie_getter);
+        let cookie_setter = std::sync::Arc::clone(&page_state.cookie_setter);
         let state = HostState::with_fetcher(
             Rc::clone(&shared),
             Rc::new(|_| None),
@@ -220,6 +259,8 @@ fn prim_iframe_load(
             fetch_tx,
             ws_connector,
             ws_tx,
+            cookie_getter,
+            cookie_setter,
         );
         cscope.get_current_context().set_slot(state);
         install_browser_environment(cscope, &frame_url);
@@ -228,6 +269,14 @@ fn prim_iframe_load(
         let kid = v8::String::new(cscope, "__frameNodeId").unwrap();
         let vid = v8::Number::new(cscope, node_id as f64);
         g.set(cscope, kid.into(), vid.into());
+        // Auxiliary windows (window.open) get top-level semantics + an `opener`; the overlay keys
+        // off this flag instead of wiring parent/top/frameElement to the page.
+        if is_aux {
+            if let Some(kaux) = v8::String::new(cscope, "__frameIsAuxWindow") {
+                let vaux = v8::Boolean::new(cscope, true);
+                g.set(cscope, kaux.into(), vaux.into());
+            }
+        }
         // Seed the document's charset so the frame's URL parsing encodes queries with it.
         if let Some(cs) = &frame_charset {
             if let Some(kcs) = v8::String::new(cscope, "__documentCharset") {
@@ -270,7 +319,7 @@ fn prim_iframe_load(
             alive: true,
         })
     });
-    rv.set(v8::Boolean::new(scope, true).into());
+    true
 }
 
 /// `__framePostToFrame(nodeId, value)`. Page → frame: deliver a message into the frame context.

@@ -80,6 +80,16 @@ jobs:
         with:
           shared-key: release-deps
       - uses: mozilla-actions/sccache-action@v0.0.9
+      # See ci.yml: fetch the matching prebuilt librusty_v8.a directly and point the crate at it via
+      # RUSTY_V8_ARCHIVE, so the V8 native lib is provisioned deterministically (not cache-dependent).
+      - name: Provision prebuilt V8 static lib
+        run: |
+          ver="$(cargo pkgid v8 | sed 's/.*@//')"
+          url="https://github.com/denoland/rusty_v8/releases/download/v${ver}/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz"
+          echo "Fetching $url"
+          curl -fL --retry 3 "$url" -o /tmp/librusty_v8.a.gz
+          gunzip -f /tmp/librusty_v8.a.gz
+          echo "RUSTY_V8_ARCHIVE=/tmp/librusty_v8.a" >> "$GITHUB_ENV"
       - name: Build WebDriver server
         run: cargo build --release -p webdriver
       - name: Upload WebDriver binary

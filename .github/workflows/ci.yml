@@ -66,6 +66,19 @@ jobs:
       # Engine font tests need a system TTF; Linux runners ship none by default.
       - name: Install fonts
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
+      # The `v8` crate normally downloads its prebuilt `librusty_v8.a` itself, but that download is
+      # unreliable here (and a cleared/invalidated cache then leaves it missing → the build fails at
+      # the V8 link step). Fetch the matching prebuilt static lib for this version directly and point
+      # the crate at it via RUSTY_V8_ARCHIVE, so the native lib is provisioned deterministically and
+      # doesn't depend on the cache.
+      - name: Provision prebuilt V8 static lib
+        run: |
+          ver="$(cargo pkgid v8 | sed 's/.*@//')"
+          url="https://github.com/denoland/rusty_v8/releases/download/v${ver}/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz"
+          echo "Fetching $url"
+          curl -fL --retry 3 "$url" -o /tmp/librusty_v8.a.gz
+          gunzip -f /tmp/librusty_v8.a.gz
+          echo "RUSTY_V8_ARCHIVE=/tmp/librusty_v8.a" >> "$GITHUB_ENV"
       # The `ffi` crate is a cdylib that statically embeds V8; on Linux the V8 static lib's
       # thread-locals can't be linked into a shared object (R_X86_64_TPOFF32 against -shared). It's
       # the macOS-shell-only C ABI anyway (Linux/Windows shells link the engine crate directly),

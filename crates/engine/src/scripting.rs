@@ -542,7 +542,18 @@ pub fn run_modules(doc: dom::Document, page_url: &str) -> (dom::Document, Vec<St
         })
     });
     let request_fetcher = build_request_fetcher();
-    let (doc, results) = js::run_modules(doc, page_url, entries, sources, fetcher, request_fetcher);
+    let cookie_getter = build_cookie_getter();
+    let cookie_setter = build_cookie_setter();
+    let (doc, results) = js::run_modules(
+        doc,
+        page_url,
+        entries,
+        sources,
+        fetcher,
+        request_fetcher,
+        cookie_getter,
+        cookie_setter,
+    );
     let mut out = notes;
     for result in results {
         out.extend(result.console);
@@ -717,6 +728,8 @@ pub(crate) fn start_session(
     });
     let request_fetcher = build_request_fetcher();
     let ws_connector = build_ws_connector();
+    let cookie_getter = build_cookie_getter();
+    let cookie_setter = build_cookie_setter();
     let (session, snapshot, results) = js::Session::new(
         doc,
         classic,
@@ -726,6 +739,8 @@ pub(crate) fn start_session(
         fetcher,
         request_fetcher,
         ws_connector,
+        cookie_getter,
+        cookie_setter,
         initial_rects,
     );
     for result in results {

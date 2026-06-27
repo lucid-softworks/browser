@@ -609,6 +609,30 @@ pub(crate) fn prim_storage_save(
     let _ = std::fs::write(storage_path(&key), json);
 }
 
+/// `__cookie()` -> string — current document.cookie value for the page URL (from the host jar).
+pub(crate) fn prim_cookie(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let url = state.page_url.borrow().clone();
+    let s = (state.cookie_getter)(&url);
+    rv.set(js_str(scope, &s));
+}
+
+/// `__setCookie(v)` — set a cookie string (from document.cookie = "...").
+pub(crate) fn prim_set_cookie(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let v = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let url = state.page_url.borrow().clone();
+    let _ = (state.cookie_setter)(&url, &v);
+}
+
 /// `__scrollY() -> number` — the page's current vertical scroll offset (CSS px), so `window.scrollY`
 /// / `pageYOffset` / `scrollingElement.scrollTop` report the real position the engine is showing.
 pub(crate) fn prim_scroll_y(
@@ -2181,6 +2205,8 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__attrNames", prim_attr_names);
     set_fn(scope, global, "__storageLoad", prim_storage_load);
     set_fn(scope, global, "__storageSave", prim_storage_save);
+    set_fn(scope, global, "__cookie", prim_cookie);
+    set_fn(scope, global, "__setCookie", prim_set_cookie);
     set_fn(scope, global, "__cryptoRandom", prim_crypto_random);
     set_fn(scope, global, "__scrollY", prim_scroll_y);
     set_fn(scope, global, "__prefersDark", prim_prefers_dark);
