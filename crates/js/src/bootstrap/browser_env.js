@@ -7259,11 +7259,12 @@
       // secureConnectionStart is in [connectStart, connectEnd] and must be non-zero over TLS.
       e.secureConnectionStart = __isHttpsPage ? 0.001 : 0;
       e.connectEnd = 0.002; e.requestStart = 0.002; e.responseStart = 0.003; e.responseEnd = 0.004;
-      // A reload / history navigation unloads the previous same-origin document, so its unload event
-      // ran (non-zero); a fresh navigate has no previous document (0).
-      var __reloadish = globalThis.__navType === "reload" || globalThis.__navType === "back_forward";
-      e.unloadEventStart = __reloadish ? 0.001 : 0;
-      e.unloadEventEnd = __reloadish ? 0.002 : 0;
+      // A reload / history navigation, or any navigation that replaced a previous same-origin document
+      // in this browsing context, unloaded that document — so its unload event ran (non-zero). A fresh
+      // navigation with no previous document leaves these at 0.
+      var __unloaded = globalThis.__navType === "reload" || globalThis.__navType === "back_forward" || globalThis.__hadPreviousDoc === true;
+      e.unloadEventStart = __unloaded ? 0.001 : 0;
+      e.unloadEventEnd = __unloaded ? 0.002 : 0;
       e.domInteractive = 0; e.domContentLoadedEventStart = 0; e.domContentLoadedEventEnd = 0;
       e.domComplete = 0; e.loadEventStart = 0; e.loadEventEnd = 0;
       e.duration = 0;
@@ -7276,6 +7277,8 @@
     globalThis.__navEntry = __navEntry;
     globalThis.__resourceEntries.push(__navEntry);
     if (__isHttpsPage) { perf.timing.secureConnectionStart = __perfOrigin; }
+    // Legacy timing mirrors the unload event for a navigation that replaced a previous document.
+    if (__navEntry.unloadEventStart > 0) { perf.timing.unloadEventStart = __perfOrigin; perf.timing.unloadEventEnd = __perfOrigin; }
     // Fill the load-phase timings and deliver the entry to "navigation" observers (called once, at the
     // window load event, by __fireLifecycleEvents).
     globalThis.__finalizeNavTiming = function (phase) {
@@ -9335,11 +9338,16 @@
       });
 
       // Load every static iframe in the parsed document — including srcless ones (which get an
-      // about:blank browsing context and fire `load`).
-      try {
-        var __ifs = document.getElementsByTagName("iframe");
-        for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i]); }
-      } catch (e) {}
+      // about:blank browsing context and fire `load`). Deferred to a task so the synchronous document
+      // fetch in build_browsing_context runs once the event loop / network fetcher is live (a fetch
+      // during the bootstrap install phase returns nothing); a page that touches contentWindow sooner
+      // still triggers a lazy load via the getter.
+      setTimeout(function () {
+        try {
+          var __ifs = document.getElementsByTagName("iframe");
+          for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i]); }
+        } catch (e) {}
+      }, 0);
     }
   } catch (e) {}
 

@@ -268,12 +268,18 @@ fn build_browsing_context(
             cookie_setter,
         );
         cscope.get_current_context().set_slot(state);
-        // Seed the navigation type before the env bootstrap so Navigation Timing's `type` is correct.
+        // Seed the navigation type + whether a previous document existed for this frame (a same-origin
+        // replacement unloads the old document → non-zero unloadEvent timings), before the env bootstrap
+        // so Navigation Timing reflects them.
+        let had_prev = FRAME_REG.with(|r| r.borrow().iter().any(|f| f.node_id == node_id));
         {
             let g0 = cscope.get_current_context().global(cscope);
             let knt = v8::String::new(cscope, "__navType").unwrap();
             let vnt = crate::js_str(cscope, nav_type);
             g0.set(cscope, knt.into(), vnt);
+            let khp = v8::String::new(cscope, "__hadPreviousDoc").unwrap();
+            let vhp = v8::Boolean::new(cscope, had_prev);
+            g0.set(cscope, khp.into(), vhp.into());
         }
         install_browser_environment(cscope, &frame_url);
         // Seed the host node id so the overlay can wire frameElement/parent messaging.
