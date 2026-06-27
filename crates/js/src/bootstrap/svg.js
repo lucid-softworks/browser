@@ -91,6 +91,11 @@
   subClass("SVGElement", "Element");
   subClass("SVGGraphicsElement", "SVGElement");
   subClass("SVGSVGElement", "SVGGraphicsElement");
+  // SVG2 aliases the geometry value types to the CSSOM DOM types; chain our implementations so that
+  // `viewBox.baseVal instanceof DOMRect`, `createSVGMatrix() instanceof DOMMatrix`, etc. hold.
+  subClass("SVGRect", "DOMRect");
+  subClass("SVGPoint", "DOMPoint");
+  subClass("SVGMatrix", "DOMMatrix");
   subClass("SVGGeometryElement", "SVGGraphicsElement");
   subClass("SVGPathElement", "SVGGeometryElement");
   subClass("SVGRectElement", "SVGGeometryElement");
@@ -1049,8 +1054,8 @@
   // All SVG interface object names, so the finalize pass can give each the required interface-object
   // semantics (throw when called, locked `prototype`, `prototype.constructor`, parent-interface chain).
   var SVG_IFACE_NAMES = [
-    "SVGLength", "SVGAngle", "SVGTransform", "SVGPreserveAspectRatio", "SVGNumber", "SVGRect", "SVGPoint",
-    "SVGMatrix", "SVGTransformList", "SVGPointList", "SVGLengthList", "SVGNumberList", "SVGStringList",
+    "SVGLength", "SVGAngle", "SVGTransform", "SVGPreserveAspectRatio", "SVGNumber",
+    "SVGTransformList", "SVGPointList", "SVGLengthList", "SVGNumberList", "SVGStringList",
     "SVGAnimatedLength", "SVGAnimatedLengthList", "SVGAnimatedNumber", "SVGAnimatedNumberList",
     "SVGAnimatedInteger", "SVGAnimatedEnumeration", "SVGAnimatedBoolean", "SVGAnimatedString",
     "SVGAnimatedRect", "SVGAnimatedAngle", "SVGAnimatedPreserveAspectRatio", "SVGAnimatedTransformList",

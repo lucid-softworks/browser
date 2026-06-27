@@ -5844,11 +5844,15 @@
     if (typeof el.load !== "function") { def(el, "load", fn); }
     if (typeof el.canPlayType !== "function") { def(el, "canPlayType", function () { return ""; }); }
     if (typeof el.addTextTrack !== "function") { def(el, "addTextTrack", function (kind) { return { kind: kind || "", mode: "disabled", cues: [], activeCues: [], addCue: fn, removeCue: fn, addEventListener: fn, removeEventListener: fn }; }); }
-    // SVGSVGElement animation controls (no SMIL): accept and ignore.
-    if (typeof el.pauseAnimations !== "function") { def(el, "pauseAnimations", fn); }
-    if (typeof el.unpauseAnimations !== "function") { def(el, "unpauseAnimations", fn); }
-    if (typeof el.setCurrentTime !== "function") { def(el, "setCurrentTime", fn); }
-    if (typeof el.getCurrentTime !== "function") { def(el, "getCurrentTime", function () { return 0; }); }
+    // SVGSVGElement / SVGAnimationElement timeline controls are provided on the SVG interface
+    // prototypes by svg.js; only install inert fallbacks on non-SVG elements (never as own props that
+    // would shadow the prototype methods).
+    if (el.namespaceURI !== "http://www.w3.org/2000/svg") {
+      if (typeof el.pauseAnimations !== "function") { def(el, "pauseAnimations", fn); }
+      if (typeof el.unpauseAnimations !== "function") { def(el, "unpauseAnimations", fn); }
+      if (typeof el.setCurrentTime !== "function") { def(el, "setCurrentTime", fn); }
+      if (typeof el.getCurrentTime !== "function") { def(el, "getCurrentTime", function () { return 0; }); }
+    }
     // Declarative partial-update methods (WICG): {append,prepend,before,after,replaceWith}HTML[Unsafe].
     globalThis.__addPartialMethods(el);
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
