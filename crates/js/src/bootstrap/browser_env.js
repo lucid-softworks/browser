@@ -9193,8 +9193,16 @@
         }
         var key = (srcdoc != null) ? ("srcdoc:" + srcdoc) : (url || "");
         if (key === "") { return; }
-        if (el.__frameLoadedKey === key) { return; }
+        if (el.__frameLoadedKey === key && navType !== "reload") { return; }
         el.__frameLoadedKey = key;
+        // Maintain the frame's session history (for contentWindow.history.back/forward/go). A normal
+        // navigation pushes (truncating any forward entries); reload/back_forward don't add an entry.
+        if (!el.__history) { el.__history = []; el.__histIndex = -1; }
+        if (navType !== "back_forward" && navType !== "reload") {
+          el.__history = el.__history.slice(0, el.__histIndex + 1);
+          el.__history.push(key);
+          el.__histIndex = el.__history.length - 1;
+        }
         globalThis.__framesByNode[el.__node] = el;
         var ok;
         try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null), navType || "navigate"); }
@@ -9241,6 +9249,31 @@
         });
       }
       globalThis.__frameLocationProxy = __frameLocationProxy;
+
+      // A page-side History facade for `frame.contentWindow.history`: back/forward/go navigate the
+      // frame element along its session history (recorded in __loadFrame) as a "back_forward"
+      // navigation. Same-document pushState/replaceState just adjust the entry list.
+      function __frameHistoryProxy(el) {
+        return {
+          get length() { return el.__history ? el.__history.length : 0; },
+          state: null,
+          scrollRestoration: "auto",
+          go: function (delta) {
+            delta = delta | 0;
+            if (!el.__history || delta === 0) { return; }
+            var ni = (el.__histIndex || 0) + delta;
+            if (ni < 0 || ni >= el.__history.length) { return; }
+            el.__histIndex = ni;
+            var target = el.__history[ni];
+            if (target.indexOf("srcdoc:") === 0) { return; } // srcdoc entries aren't URL-restorable
+            el.setAttribute("src", target); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el, "back_forward");
+          },
+          back: function () { this.go(-1); },
+          forward: function () { this.go(1); },
+          pushState: function () { if (el.__history) { el.__history = el.__history.slice(0, el.__histIndex + 1); } },
+          replaceState: function () {}
+        };
+      }
 
       // Connection hook (called from document.js insertNode): when an <iframe> with a src/srcdoc is
       // inserted into the tree, load its nested browsing context. Walks the inserted subtree so a
@@ -9291,6 +9324,7 @@
                     // `location` returns a navigating facade so `contentWindow.location.href = url`
                     // (and assign/replace/reload) actually navigate the frame.
                     if (prop === "location") { return el.__frameLocProxy || (el.__frameLocProxy = __frameLocationProxy(el)); }
+                    if (prop === "history") { return el.__frameHistProxy || (el.__frameHistProxy = __frameHistoryProxy(el)); }
                     if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
                     return undefined;
                   },
