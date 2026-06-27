@@ -13263,15 +13263,18 @@
         self.__fireCookieDiff(name, before);
       });
     };
-    // The change event fires asynchronously (a task) after the store mutation, per spec.
+    // The change event fires asynchronously after the store mutation. We dispatch it on a microtask
+    // (not a macrotask) so it is delivered in step with the promise-chained test flow: a cleanup
+    // delete's change is consumed before the next operation's observer registers, rather than leaking
+    // a stale event into it.
     def(CookieStore.prototype, "__fireCookieChange", function (changed, deleted) {
       var self = this;
-      setTimeout(function () {
+      Promise.resolve().then(function () {
         var ev;
         try { ev = new globalThis.CookieChangeEvent("change", { changed: changed, deleted: deleted }); }
         catch (e) { return; }
         try { self.dispatchEvent(ev); } catch (e) {}
-      }, 0);
+      });
     });
     // Fire a change event only if the jar value for `name` actually changed from `before` (captured
     // before the mutation). A no-op write — duplicate value, or setting an already-expired cookie —
