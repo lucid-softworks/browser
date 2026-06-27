@@ -11126,6 +11126,15 @@
     anim.finished = new Promise(function (resolve) { settle = resolve; });
     // Swallow rejection-less completion; cancel just resolves the lifecycle for our purposes.
     anim.ready = Promise.resolve(anim);
+    // Animation is an EventTarget: fire `finish`/`cancel` to both the `on*` attribute handler and any
+    // addEventListener listeners (the common "await finish to sync a frame" idiom uses either).
+    var animListeners = {};
+    function fireAnimEvent(type, onProp) {
+      var ev; try { ev = new globalThis.Event(type); } catch (e) { ev = { type: type }; }
+      if (typeof anim[onProp] === "function") { try { anim[onProp].call(anim, ev); } catch (e) {} }
+      var l = animListeners[type];
+      if (l) { for (var i = 0; i < l.length; i++) { try { l[i].call(anim, ev); } catch (e) {} } }
+    }
     var done = false;
     function finishNow() {
       if (done) { return; }
@@ -11133,7 +11142,7 @@
       anim.playState = "finished";
       anim.currentTime = delay + dur;
       settle(anim);
-      if (typeof anim.onfinish === "function") { try { anim.onfinish.call(anim, { type: "finish" }); } catch (e) {} }
+      fireAnimEvent("finish", "onfinish");
     }
     anim.play = function () { anim.playState = "running"; };
     anim.pause = function () { anim.playState = "paused"; };
@@ -11145,14 +11154,25 @@
       anim.playState = "idle";
       anim.currentTime = null;
       settle(anim); // resolve rather than reject: nothing awaits a cancellation here
-      if (typeof anim.oncancel === "function") { try { anim.oncancel.call(anim, { type: "cancel" }); } catch (e) {} }
+      fireAnimEvent("cancel", "oncancel");
     };
     anim.updatePlaybackRate = fn;
     anim.commitStyles = fn;   // we don't interpolate, so there are no computed values to commit
     anim.persist = fn;
-    anim.addEventListener = fn;
-    anim.removeEventListener = fn;
-    anim.dispatchEvent = function () { return false; };
+    anim.addEventListener = function (type, cb) {
+      if (typeof cb !== "function") { return; }
+      (animListeners[type] || (animListeners[type] = [])).push(cb);
+    };
+    anim.removeEventListener = function (type, cb) {
+      var l = animListeners[type];
+      if (l) { var i = l.indexOf(cb); if (i >= 0) { l.splice(i, 1); } }
+    };
+    anim.dispatchEvent = function (ev) {
+      if (!ev || !ev.type) { return false; }
+      var l = animListeners[ev.type];
+      if (l) { for (var i = 0; i < l.slice().length; i++) { try { l[i].call(anim, ev); } catch (e) {} } }
+      return true;
+    };
     setTimeout(finishNow, delay + dur);
     return anim;
   });
