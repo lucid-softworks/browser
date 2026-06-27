@@ -13303,6 +13303,10 @@
         }
         var str = name + "=; path=" + delPath + "; expires=Thu, 01 Jan 1970 00:00:00 GMT";
         if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
+        // The deletion write must itself satisfy any __Secure-/__Host- prefix rules (which require
+        // Secure), or the store rejects it and the cookie is never removed. Add Secure on https.
+        var delSecure = false; try { delSecure = globalThis.location.protocol === "https:"; } catch (e) {}
+        if (delSecure) { str += "; secure"; }
         var before = __cookieValueOf(name);
         try { __setCookie(str); } catch (e) { reject(e); return; }
         resolve(undefined);
