@@ -7241,10 +7241,23 @@
       if (typeof globalThis.PerformanceEntry !== "function") { def(globalThis, "PerformanceEntry", function PerformanceEntry() {}); }
       if (typeof globalThis.PerformanceResourceTiming !== "function") {
         def(globalThis, "PerformanceResourceTiming", function PerformanceResourceTiming() {});
-        try { Object.setPrototypeOf(globalThis.PerformanceResourceTiming.prototype, globalThis.PerformanceEntry.prototype); } catch (e) {}
       }
       def(globalThis, "PerformanceNavigationTiming", function PerformanceNavigationTiming() {});
-      try { Object.setPrototypeOf(globalThis.PerformanceNavigationTiming.prototype, globalThis.PerformanceResourceTiming.prototype); } catch (e) {}
+      // Both the prototype chain and the interface-object ([[Prototype]]) chain
+      // (PerformanceNavigationTiming : PerformanceResourceTiming : PerformanceEntry), with
+      // constructor back-pointers — what idlharness's interface-object checks verify.
+      (function () {
+        var chain = [
+          [globalThis.PerformanceResourceTiming, globalThis.PerformanceEntry],
+          [globalThis.PerformanceNavigationTiming, globalThis.PerformanceResourceTiming]
+        ];
+        for (var i = 0; i < chain.length; i++) {
+          var child = chain[i][0], parent = chain[i][1];
+          try { Object.setPrototypeOf(child.prototype, parent.prototype); } catch (e) {}
+          try { Object.setPrototypeOf(child, parent); } catch (e) {}
+          try { Object.defineProperty(child.prototype, "constructor", { value: child, writable: true, enumerable: false, configurable: true }); } catch (e) {}
+        }
+      })();
     }
     var __isHttpsPage = /^https:/.test(__pgurl);
     var __navEntry = Object.create(globalThis.PerformanceNavigationTiming.prototype);
