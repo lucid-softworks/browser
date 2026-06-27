@@ -13112,12 +13112,17 @@
       try { return origin === globalThis.location.origin; } catch (e) { return false; }
     }
     CookieStore.prototype.get = function (nameOrOptions) {
-      var name, url;
-      if (typeof nameOrOptions === "string") { name = nameOrOptions; }
-      else if (nameOrOptions && typeof nameOrOptions === "object") { name = nameOrOptions.name; url = nameOrOptions.url; }
-      // get requires a name or a url; an option-less / empty-options call is a TypeError.
-      if ((name == null || name === "") && url == null) {
-        return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or url."));
+      // get() with no argument is a TypeError; get('') is a valid query for the nameless cookie.
+      if (arguments.length === 0) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or options."));
+      }
+      var url;
+      if (nameOrOptions && typeof nameOrOptions === "object") {
+        url = nameOrOptions.url;
+        // get(options) with neither a name nor a url is a TypeError.
+        if (nameOrOptions.name == null && url == null) {
+          return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or url."));
+        }
       }
       if (url != null && !__cookieUrlOk(url)) {
         return Promise.reject(new globalThis.TypeError("CookieStore.get url must be same-origin."));
@@ -13156,9 +13161,13 @@
         // domain and requires path "/".
         var secureOrigin = false; try { secureOrigin = globalThis.location.protocol === "https:"; } catch (e) {}
         var pathOpt = opts.path == null ? "/" : String(opts.path);
-        // Name prefixes are case-insensitive: __Secure- requires a secure origin; __Host- also forbids
-        // a domain and requires path "/".
-        var lname = name.toLowerCase();
+        // Name prefixes are case-insensitive and apply after leading whitespace. __Http-/__Host-Http-
+        // require HttpOnly, which the Cookie Store cannot set, so they always reject. __Secure- needs a
+        // secure origin; __Host- also forbids a domain and requires path "/".
+        var lname = name.replace(/^\s+/, "").toLowerCase();
+        if (lname.lastIndexOf("__http-", 0) === 0 || lname.lastIndexOf("__host-http-", 0) === 0) {
+          reject(new globalThis.TypeError("__Http-/__Host-Http- cookies require HttpOnly.")); return;
+        }
         if (lname.lastIndexOf("__secure-", 0) === 0 && !secureOrigin) {
           reject(new globalThis.TypeError("__Secure- cookies require a secure origin.")); return;
         }
