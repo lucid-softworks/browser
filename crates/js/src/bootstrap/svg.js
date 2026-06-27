@@ -776,6 +776,19 @@
   }
   // SVGStringList (requiredExtensions / systemLanguage / requiredFeatures): a live list backed by a
   // whitespace/comma-separated attribute.
+  // SVGPointList over the `points` attribute (live; items are SVGPoint).
+  function makePointList(el) {
+    var node = el.__node;
+    function vec() { var s = getAttr(node, "points"); if (s == null || s === "") { return []; } var n = String(s).trim().split(/[\s,]+/).filter(function (x) { return x.length; }).map(parseFloat); var pts = []; for (var i = 0; i + 1 < n.length; i += 2) { pts.push([n[i], n[i + 1]]); } return pts; }
+    var L = Object.create(globalThis.SVGPointList.prototype);
+    L.__l = {
+      len: function () { return vec().length; },
+      get: function (i) { var p = vec()[i]; return makePoint(p[0], p[1]); },
+      clear: function () { setAttr(node, "points", ""); }, init: function (p) { return p; }, append: function (p) { return p; },
+      insert: function (p) { return p; }, remove: function (i) { var p = vec()[i]; return makePoint(p[0], p[1]); }, replace: function (p) { return p; }
+    };
+    return L;
+  }
   function makeStringList(el, attr) {
     var node = el.__node;
     function vec() { var s = getAttr(node, attr); return s == null || s === "" ? [] : String(s).trim().split(/[\s,]+/).filter(function (x) { return x.length; }); }
@@ -880,6 +893,18 @@
     // SVGStopElement.offset (SVGAnimatedNumber).
     accProto(G.SVGStopElement.prototype, "offset", function (el) { return makeAnimatedNumber(el, "offset", 0); });
 
+    // SVGAnimatedPoints: points / animatedPoints on polyline & polygon.
+    [G.SVGPolylineElement, G.SVGPolygonElement].forEach(function (C) {
+      accProto(C.prototype, "points", function (el) { return makePointList(el); });
+      accProto(C.prototype, "animatedPoints", function (el) { return makePointList(el); });
+    });
+    // SVGUseElement instance roots (shadow tree not modelled — expose null).
+    Object.defineProperty(G.SVGUseElement.prototype, "instanceRoot", { get: function () { return null; }, enumerable: true, configurable: true });
+    Object.defineProperty(G.SVGUseElement.prototype, "animatedInstanceRoot", { get: function () { return null; }, enumerable: true, configurable: true });
+    // crossOrigin (SVGImageElement) and disabled (SVGStyleElement).
+    Object.defineProperty(G.SVGImageElement.prototype, "crossOrigin", { get: function () { var v = getAttr(this.__node, "crossorigin"); return v == null ? null : v; }, set: function (v) { setAttr(this.__node, "crossorigin", v == null ? "" : String(v)); }, enumerable: true, configurable: true });
+    Object.defineProperty(G.SVGStyleElement.prototype, "disabled", { get: function () { return !!this.__disabled; }, set: function (v) { this.__disabled = !!v; }, enumerable: true, configurable: true });
+
     installTextContentProto(G.SVGTextContentElement.prototype);
     installMarkerProto(G.SVGMarkerElement.prototype);
     installSvgRootProto(G.SVGSVGElement.prototype);
@@ -980,6 +1005,8 @@
       return out;
     });
     def(proto, "getEnclosureList", function (rect, ref) { return []; });
+    Object.defineProperty(proto, "currentScale", { get: function () { return this.__curScale || 1; }, set: function (v) { this.__curScale = +v; }, enumerable: true, configurable: true });
+    Object.defineProperty(proto, "currentTranslate", { get: function () { return this.__curTrans || (this.__curTrans = makePoint(0, 0)); }, enumerable: true, configurable: true });
   }
 
   // All SVG interface object names, so the finalize pass can give each the required interface-object
@@ -1147,7 +1174,7 @@
           if (d.set) { var s0 = d.set; d.set = function (v) { if (!proto.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } return s0.call(this, v); }; rename(d.set, "set " + k, 1); }
         } else if (typeof d.value === "function") {
           var f0 = d.value, ln = f0.length;
-          d.value = function () { if (!proto.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } return f0.apply(this, arguments); };
+          d.value = function () { if (!proto.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } if (arguments.length < ln) { throw new TypeError("Not enough arguments"); } return f0.apply(this, arguments); };
           rename(d.value, k, ln);
         }
         d.enumerable = true;
@@ -1170,6 +1197,13 @@
         if (href && href.charAt(0) === "#") { return this.ownerDocument.getElementById(href.slice(1)); }
         return this.parentNode && this.parentNode.nodeType === 1 ? this.parentNode : null;
       }, configurable: true, enumerable: true
+    });
+    ["onbegin", "onend", "onrepeat"].forEach(function (h) {
+      Object.defineProperty(proto, h, {
+        get: function () { return (this.__eh && this.__eh[h]) || null; },
+        set: function (v) { (this.__eh || (this.__eh = {}))[h] = typeof v === "function" ? v : null; },
+        enumerable: true, configurable: true
+      });
     });
   }
 
