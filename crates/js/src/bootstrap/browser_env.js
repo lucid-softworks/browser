@@ -9160,7 +9160,7 @@
       var IFP2 = globalThis.HTMLIFrameElement.prototype;
       globalThis.__framesByNode = globalThis.__framesByNode || {};
 
-      function __loadFrame(el, navType) {
+      function __loadFrame(el, navType, syncLoad) {
         if (!el || typeof el.__node !== "number") { return; }
         var srcdoc = (el.getAttribute && el.hasAttribute && el.hasAttribute("srcdoc")) ? el.getAttribute("srcdoc") : null;
         var rawSrc = (el.getAttribute) ? el.getAttribute("src") : null;
@@ -9178,11 +9178,15 @@
         var ok;
         try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null), navType || "navigate"); }
         catch (e) { ok = false; }
-        setTimeout(function () {
+        var fireLoad = function () {
           var ev;
           try { ev = new globalThis.Event(ok ? "load" : "error"); } catch (e) { ev = { type: ok ? "load" : "error", target: el, currentTarget: el }; }
           try { el.dispatchEvent(ev); } catch (e) {}
-        }, 0);
+        };
+        // A child frame's load fires before its parent's load (the parent waits for child loads). When
+        // loading static frames during the parent's lifecycle, dispatch synchronously so handlers added
+        // later (in the parent's body onload) only see subsequent navigations; otherwise async.
+        if (syncLoad) { fireLoad(); } else { setTimeout(fireLoad, 0); }
       }
       globalThis.__loadFrameEl = __loadFrame;
 
@@ -9348,7 +9352,7 @@
       // event fires and onload handlers can read contentWindow.performance/document.
       globalThis.__loadStaticFrames = function () {
         var __ifs = document.getElementsByTagName("iframe");
-        for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i]); }
+        for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i], "navigate", true); }
       };
     }
   } catch (e) {}
