@@ -12958,6 +12958,19 @@
       }
       return out;
     }
+    // A cookie `domain` is valid only when it has no leading dot and domain-matches the current host:
+    // either equal to it, or a parent of it (host is a subdomain of domain). null/"" = host-only.
+    function __cookieDomainOk(domain) {
+      if (domain == null) { return true; }
+      domain = String(domain);
+      if (domain === "") { return true; }
+      if (domain.charAt(0) === ".") { return false; }
+      var host = "";
+      try { host = String(globalThis.location.hostname); } catch (e) {}
+      host = host.toLowerCase();
+      domain = domain.toLowerCase();
+      return host === domain || (host.length > domain.length + 1 && host.slice(-(domain.length + 1)) === "." + domain);
+    }
     // Resolve get/getAll/delete's (name | options) overload to a name filter (null = match any).
     function __cookieQueryName(arg) {
       if (arg == null) { return null; }
@@ -12973,9 +12986,23 @@
       }
       return Promise.resolve(items);
     };
+    // The given URL (a cookie creation/query URL) must resolve and be same-origin; returns its origin
+    // or null when invalid/cross-origin (the caller then rejects with TypeError).
+    function __cookieUrlOk(url) {
+      var origin;
+      try { origin = new globalThis.URL(String(url), globalThis.location.href).origin; } catch (e) { return false; }
+      try { return origin === globalThis.location.origin; } catch (e) { return false; }
+    }
     CookieStore.prototype.get = function (nameOrOptions) {
-      if (arguments.length === 0) {
-        return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or options."));
+      var name, url;
+      if (typeof nameOrOptions === "string") { name = nameOrOptions; }
+      else if (nameOrOptions && typeof nameOrOptions === "object") { name = nameOrOptions.name; url = nameOrOptions.url; }
+      // get requires a name or a url; an option-less / empty-options call is a TypeError.
+      if ((name == null || name === "") && url == null) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or url."));
+      }
+      if (url != null && !__cookieUrlOk(url)) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.get url must be same-origin."));
       }
       return this.getAll(nameOrOptions).then(function (all) { return all.length ? all[0] : null; });
     };
@@ -13003,6 +13030,9 @@
         if (name === "" && (val === "" || val.indexOf("=") >= 0)) {
           reject(new globalThis.TypeError("Cookie with empty name must have a non-empty value without '='.")); return;
         }
+        if (!__cookieDomainOk(opts.domain)) {
+          reject(new globalThis.TypeError("Cookie domain must domain-match the current host and have no leading dot.")); return;
+        }
         if (__utf8Len(name) + __utf8Len(val) > 4096) { reject(new globalThis.TypeError("Cookie name and value exceed 4096 bytes.")); return; }
         var str = name + "=" + val + "; path=" + (opts.path == null ? "/" : String(opts.path));
         if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
@@ -13025,6 +13055,9 @@
           opts = nameOrOptions; name = opts.name == null ? "" : String(opts.name);
         } else { opts = {}; name = nameOrOptions == null ? "" : String(nameOrOptions); }
         if (name.indexOf("=") >= 0 || name.indexOf(";") >= 0) { reject(new globalThis.TypeError("Invalid cookie name.")); return; }
+        if (!__cookieDomainOk(opts.domain)) {
+          reject(new globalThis.TypeError("Cookie domain must domain-match the current host and have no leading dot.")); return;
+        }
         var str = name + "=; path=" + (opts.path == null ? "/" : String(opts.path)) + "; expires=Thu, 01 Jan 1970 00:00:00 GMT";
         if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
         try { __setCookie(str); } catch (e) { reject(e); return; }
