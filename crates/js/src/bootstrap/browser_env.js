@@ -10260,10 +10260,14 @@
         finally { __swBypassFetch = prev; }
       });
       var runInScope = function (src, url) {
+        // `with (self)` scopes bare globals to the worker scope (as the dedicated-worker path does):
+        // testharness exposes test/promise_test/etc. on `self`, so a worker test's bare `promise_test`
+        // must resolve to the SCOPE's testharness — not the page's window globals — or its tests would
+        // register on the page and the scope's fetch_tests_from_worker would never complete.
         var fn = (globalThis.Function)(
           "self", "registration", "clients", "location", "caches", "skipWaiting",
           "importScripts", "fetch", "addEventListener", "removeEventListener", "dispatchEvent",
-          src + "\n//# sourceURL=" + url + "\n"
+          "with (self) {\n" + src + "\n}\n//# sourceURL=" + url + "\n"
         );
         fn.call(scope, scope, reg, clients, scope.location, caches, scope.skipWaiting,
           scope.importScripts, scope.fetch, scope.addEventListener, scope.removeEventListener, scope.dispatchEvent);
