@@ -9208,14 +9208,18 @@
         try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null), navType || "navigate"); }
         catch (e) { ok = false; }
         var fireLoad = function () {
+          el.__pendingLoadTimer = null;
           var ev;
           try { ev = new globalThis.Event(ok ? "load" : "error"); } catch (e) { ev = { type: ok ? "load" : "error", target: el, currentTarget: el }; }
           try { el.dispatchEvent(ev); } catch (e) {}
         };
+        // A pending load is superseded by a new navigation (e.g. appendChild schedules an about:blank
+        // load, then src=… is set in the same task — only the latter must fire `load`).
+        if (el.__pendingLoadTimer != null) { try { clearTimeout(el.__pendingLoadTimer); } catch (e) {} el.__pendingLoadTimer = null; }
         // A child frame's load fires before its parent's load (the parent waits for child loads). When
         // loading static frames during the parent's lifecycle, dispatch synchronously so handlers added
         // later (in the parent's body onload) only see subsequent navigations; otherwise async.
-        if (syncLoad) { fireLoad(); } else { setTimeout(fireLoad, 0); }
+        if (syncLoad) { fireLoad(); } else { el.__pendingLoadTimer = setTimeout(fireLoad, 0); }
       }
       globalThis.__loadFrameEl = __loadFrame;
 
