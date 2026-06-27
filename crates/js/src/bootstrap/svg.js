@@ -138,6 +138,17 @@
    "SVGFEConvolveMatrixElement", "SVGFEDiffuseLightingElement", "SVGFEDisplacementMapElement", "SVGFEDropShadowElement",
    "SVGFEFloodElement", "SVGFEGaussianBlurElement", "SVGFEImageElement", "SVGFEMergeElement", "SVGFEMorphologyElement",
    "SVGFEOffsetElement", "SVGFESpecularLightingElement", "SVGFETileElement", "SVGFETurbulenceElement"].forEach(function (n) { subClass(n, "SVGElement"); });
+  // SMIL TimeEvent (: Event), the <use> shadow root (: ShadowRoot) and ShadowAnimation (: Animation).
+  subClass("TimeEvent", "Event");
+  subClass("SVGUseElementShadowRoot", "ShadowRoot");
+  subClass("ShadowAnimation", typeof globalThis.Animation === "function" ? "Animation" : "Object");
+  (function () {
+    var T = globalThis.TimeEvent.prototype;
+    Object.defineProperty(T, "view", { get: function () { return this.__view || null; }, enumerable: true, configurable: true });
+    Object.defineProperty(T, "detail", { get: function () { return this.__detail || 0; }, enumerable: true, configurable: true });
+    def(T, "initTimeEvent", function (typeArg, viewArg, detailArg) { this.__view = viewArg || null; this.__detail = detailArg | 0; });
+    Object.defineProperty(globalThis.ShadowAnimation.prototype, "sourceAnimation", { get: function () { return this.__sourceAnimation || null; }, enumerable: true, configurable: true });
+  })();
 
   // Tag (lowercased local name) -> interface constructor name, used to set each element's prototype.
   var TAG_IFACE = {
@@ -904,6 +915,12 @@
     // crossOrigin (SVGImageElement) and disabled (SVGStyleElement).
     Object.defineProperty(G.SVGImageElement.prototype, "crossOrigin", { get: function () { var v = getAttr(this.__node, "crossorigin"); return v == null ? null : v; }, set: function (v) { setAttr(this.__node, "crossorigin", v == null ? "" : String(v)); }, enumerable: true, configurable: true });
     Object.defineProperty(G.SVGStyleElement.prototype, "disabled", { get: function () { return !!this.__disabled; }, set: function (v) { this.__disabled = !!v; }, enumerable: true, configurable: true });
+    // DOMString attribute reflections that document.js would otherwise install as own props.
+    function reflectStr(proto, prop, attr) { Object.defineProperty(proto, prop, { get: function () { var v = getAttr(this.__node, attr); return v == null ? "" : v; }, set: function (v) { setAttr(this.__node, attr, String(v)); }, enumerable: true, configurable: true }); }
+    accProto(G.SVGAElement.prototype, "target", function (el) { return makeAnimatedString(el, "target"); });
+    ["download", "ping", "rel", "hreflang", "type", "referrerPolicy", "text"].forEach(function (p) { reflectStr(G.SVGAElement.prototype, p, p === "referrerPolicy" ? "referrerpolicy" : p); });
+    ["type", "media", "title"].forEach(function (p) { reflectStr(G.SVGStyleElement.prototype, p, p); });
+    ["type", "crossOrigin"].forEach(function (p) { reflectStr(G.SVGScriptElement.prototype, p, p === "crossOrigin" ? "crossorigin" : p); });
 
     installTextContentProto(G.SVGTextContentElement.prototype);
     installMarkerProto(G.SVGMarkerElement.prototype);
@@ -1033,7 +1050,8 @@
     "SVGFEMergeElement", "SVGFEMorphologyElement", "SVGFEOffsetElement", "SVGFESpecularLightingElement",
     "SVGFETileElement", "SVGFETurbulenceElement", "SVGComponentTransferFunctionElement",
     "SVGFEFuncRElement", "SVGFEFuncGElement", "SVGFEFuncBElement", "SVGFEFuncAElement",
-    "SVGFEPointLightElement", "SVGFESpotLightElement", "SVGFEDistantLightElement", "SVGFEMergeNodeElement"
+    "SVGFEPointLightElement", "SVGFESpotLightElement", "SVGFEDistantLightElement", "SVGFEMergeNodeElement",
+    "TimeEvent", "SVGUseElementShadowRoot", "ShadowAnimation"
   ];
   // Members of the SVG value / SVGAnimated* types live on their PROTOTYPES, reading per-instance state
   // from `__`-prefixed backing slots (which idlharness ignores). Run once at bootstrap.
