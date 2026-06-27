@@ -1123,19 +1123,32 @@
     });
   }
 
-  // WebIDL requires interface members to be enumerable, and accessor/operation functions to be named
-  // ("get x" / "set x" / the operation name). Apply this across every SVG interface prototype.
+  // Apply the per-member WebIDL semantics idlharness checks across every SVG interface prototype:
+  // members are enumerable; accessor/operation functions carry their proper name and length; and each
+  // throws a TypeError when invoked on the bare interface prototype (the brand check). The prototype
+  // also gets a Symbol.toStringTag so the class string is "[object <Interface>]".
   function enumerateProtoMembers() {
+    function rename(fn, nm, len) {
+      try { Object.defineProperty(fn, "name", { value: nm, configurable: true }); } catch (e) {}
+      if (len != null) { try { Object.defineProperty(fn, "length", { value: len, configurable: true }); } catch (e2) {} }
+    }
     SVG_IFACE_NAMES.forEach(function (n) {
       var C = globalThis[n]; if (typeof C !== "function") { return; }
       var proto = C.prototype;
+      try { Object.defineProperty(proto, Symbol.toStringTag, { value: n, writable: false, enumerable: false, configurable: true }); } catch (e) {}
       Object.getOwnPropertyNames(proto).forEach(function (k) {
         if (k === "constructor" || k.indexOf("__") === 0) { return; }
-        var d = Object.getOwnPropertyDescriptor(proto, k); if (!d) { return; }
-        if (d.get) { try { Object.defineProperty(d.get, "name", { value: "get " + k, configurable: true }); } catch (e) {} }
-        if (d.set) { try { Object.defineProperty(d.set, "name", { value: "set " + k, configurable: true }); } catch (e) {} }
-        if (typeof d.value === "function") { try { Object.defineProperty(d.value, "name", { value: k, configurable: true }); } catch (e) {} }
-        if (!d.enumerable && d.configurable) { d.enumerable = true; try { Object.defineProperty(proto, k, d); } catch (e) {} }
+        var d = Object.getOwnPropertyDescriptor(proto, k); if (!d || !d.configurable) { return; }
+        if (d.get || d.set) {
+          if (d.get) { var g0 = d.get; d.get = function () { if (this === proto) { throw new TypeError("Illegal invocation"); } return g0.call(this); }; rename(d.get, "get " + k, 0); }
+          if (d.set) { var s0 = d.set; d.set = function (v) { if (this === proto) { throw new TypeError("Illegal invocation"); } return s0.call(this, v); }; rename(d.set, "set " + k, 1); }
+        } else if (typeof d.value === "function") {
+          var f0 = d.value, ln = f0.length;
+          d.value = function () { if (this === proto) { throw new TypeError("Illegal invocation"); } return f0.apply(this, arguments); };
+          rename(d.value, k, ln);
+        }
+        d.enumerable = true;
+        try { Object.defineProperty(proto, k, d); } catch (e3) {}
       });
     });
   }
