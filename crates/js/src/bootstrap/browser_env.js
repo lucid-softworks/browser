@@ -4266,6 +4266,7 @@
     li: "HTMLLIElement", table: "HTMLTableElement", tr: "HTMLTableRowElement", td: "HTMLTableCellElement",
     th: "HTMLTableCellElement", canvas: "HTMLCanvasElement", video: "HTMLVideoElement",
     audio: "HTMLAudioElement", iframe: "HTMLIFrameElement", template: "HTMLTemplateElement",
+    object: "HTMLObjectElement", embed: "HTMLEmbedElement",
     h1: "HTMLHeadingElement", h2: "HTMLHeadingElement", h3: "HTMLHeadingElement",
     h4: "HTMLHeadingElement", h5: "HTMLHeadingElement", h6: "HTMLHeadingElement",
     body: "HTMLBodyElement", frameset: "HTMLFrameSetElement",
@@ -9094,11 +9095,24 @@
       var IFP = globalThis.HTMLIFrameElement.prototype;
       Object.defineProperty(IFP, "contentDocument", {
         get: function () {
-          // A loaded frame (real nested realm) exposes its own parsed document.
+          // A loaded frame (real nested realm) exposes its own parsed document. Wrap it so
+          // `contentDocument.defaultView` is the contentWindow proxy: the raw frame window can't be
+          // read across realms (V8 access check → "no access"), but the proxy reads via __frameGet.
           if (this.__frameLoadedKey && typeof __frameGet === "function") {
             try {
               var rdoc = __frameGet(this.__node, "document");
-              if (rdoc) { return rdoc; }
+              if (rdoc) {
+                var elc = this;
+                if (typeof globalThis.Proxy === "function") {
+                  if (!elc.__cdocWrap) {
+                    elc.__cdocWrap = new globalThis.Proxy(rdoc, {
+                      get: function (t, p) { return p === "defaultView" ? elc.contentWindow : t[p]; }
+                    });
+                  }
+                  return elc.__cdocWrap;
+                }
+                return rdoc;
+              }
             } catch (e) {}
           }
           if (!this.__cdoc) {
@@ -9194,7 +9208,9 @@
       function __loadFrame(el, navType, syncLoad) {
         if (!el || typeof el.__node !== "number") { return; }
         var srcdoc = (el.getAttribute && el.hasAttribute && el.hasAttribute("srcdoc")) ? el.getAttribute("srcdoc") : null;
+        // <iframe> uses src; <object> nests its browsing context via the `data` attribute.
         var rawSrc = (el.getAttribute) ? el.getAttribute("src") : null;
+        if (rawSrc == null && el.getAttribute) { rawSrc = el.getAttribute("data"); }
         var url = null;
         if (rawSrc != null && rawSrc !== "") {
           try { url = new globalThis.URL(rawSrc, globalThis.location.href).href; } catch (e) { url = rawSrc; }
@@ -9331,7 +9347,7 @@
         get: function () {
           // A srcless iframe still has a window: lazily give it an about:blank realm on first access.
           if (!this.__frameLoadedKey) {
-            var hasSrc = this.getAttribute && (this.getAttribute("src") || (this.hasAttribute && this.hasAttribute("srcdoc")));
+            var hasSrc = this.getAttribute && (this.getAttribute("src") || this.getAttribute("data") || (this.hasAttribute && this.hasAttribute("srcdoc")));
             if (!hasSrc) { __loadFrame(this); }
           }
           if (this.__frameLoadedKey) {
@@ -9388,6 +9404,16 @@
         enumerable: true, configurable: true
       });
 
+      // <object data="…html"> is a frame host too: give it the same contentWindow + contentDocument
+      // accessors (they key off this.__node / this.__frameLoadedKey, which work on any element).
+      if (globalThis.HTMLObjectElement && globalThis.HTMLObjectElement.prototype) {
+        var OBJP = globalThis.HTMLObjectElement.prototype;
+        var __cwd = Object.getOwnPropertyDescriptor(IFP2, "contentWindow");
+        var __cdd = Object.getOwnPropertyDescriptor(IFP, "contentDocument");
+        if (__cwd) { Object.defineProperty(OBJP, "contentWindow", __cwd); }
+        if (__cdd) { Object.defineProperty(OBJP, "contentDocument", __cdd); }
+      }
+
       // frame -> page message delivery (the native bridge calls this on the page context). The
       // source is the iframe's contentWindow, or — for a window.open() target — the window object we
       // handed back from open() (looked up by synthetic id), so the opener's
@@ -9440,6 +9466,13 @@
       globalThis.__loadStaticFrames = function () {
         var __ifs = document.getElementsByTagName("iframe");
         for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i], "navigate", true); }
+        // <object data="…html"> nests a browsing context too (only those with a data resource). Load
+        // it async (no syncLoad): its realm must not be reached from the still-running parent lifecycle,
+        // and it has no child-before-parent step-machine requirement like iframes do.
+        var __objs = document.getElementsByTagName("object");
+        for (var __o = 0; __o < __objs.length; __o++) {
+          if (__objs[__o].getAttribute && __objs[__o].getAttribute("data")) { __loadFrame(__objs[__o], "navigate", false); }
+        }
       };
     }
   } catch (e) {}
