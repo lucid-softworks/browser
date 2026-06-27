@@ -499,6 +499,7 @@ fn get_all_cookies_cmd(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
                     ("path", Json::Str(c.path)),
                     ("secure", Json::Bool(c.secure)),
                     ("httpOnly", Json::Bool(c.http_only)),
+                    ("sameSite", Json::Str(c.same_site)),
                 ];
                 if let Some(exp) = c.expiry {
                     m.push(("expiry", Json::Num(exp as f64)));
@@ -521,6 +522,7 @@ fn get_named_cookie_cmd(id: &str, name: &str, sessions: &Mutex<Sessions>) -> WdR
                 ("path", Json::Str(c.path)),
                 ("secure", Json::Bool(c.secure)),
                 ("httpOnly", Json::Bool(c.http_only)),
+                ("sameSite", Json::Str(c.same_site)),
             ];
             if let Some(exp) = c.expiry {
                 m.push(("expiry", Json::Num(exp as f64)));

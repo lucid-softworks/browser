@@ -13123,16 +13123,31 @@
         // domain and requires path "/".
         var secureOrigin = false; try { secureOrigin = globalThis.location.protocol === "https:"; } catch (e) {}
         var pathOpt = opts.path == null ? "/" : String(opts.path);
-        if (name.lastIndexOf("__Secure-", 0) === 0 && !secureOrigin) {
+        // Name prefixes are case-insensitive: __Secure- requires a secure origin; __Host- also forbids
+        // a domain and requires path "/".
+        var lname = name.toLowerCase();
+        if (lname.lastIndexOf("__secure-", 0) === 0 && !secureOrigin) {
           reject(new globalThis.TypeError("__Secure- cookies require a secure origin.")); return;
         }
-        if (name.lastIndexOf("__Host-", 0) === 0 && (!secureOrigin || opts.domain != null || pathOpt !== "/")) {
+        if (lname.lastIndexOf("__host-", 0) === 0 && (!secureOrigin || opts.domain != null || pathOpt !== "/")) {
           reject(new globalThis.TypeError("__Host- cookies require a secure origin, no domain, and path '/'.")); return;
+        }
+        if (opts.maxAge != null && opts.expires != null) {
+          reject(new globalThis.TypeError("Cookie cannot set both maxAge and expires.")); return;
         }
         var str = name + "=" + val + "; path=" + pathOpt;
         if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
-        if (opts.expires != null) {
-          var d = new Date(opts.expires);
+        // The cookie store caps a cookie's lifetime at 400 days; clamp both Max-Age and Expires.
+        var MAX_AGE_SEC = 400 * 24 * 60 * 60;
+        if (opts.maxAge != null) {
+          var ma = Math.trunc(Number(opts.maxAge));
+          if (ma > MAX_AGE_SEC) { ma = MAX_AGE_SEC; }
+          str += "; max-age=" + ma;
+        } else if (opts.expires != null) {
+          var exp = Number(opts.expires);
+          var maxExp = Date.now() + MAX_AGE_SEC * 1000;
+          if (exp > maxExp) { exp = maxExp; }
+          var d = new Date(exp);
           if (!isNaN(d.getTime())) { str += "; expires=" + d.toUTCString(); }
         }
         try { if (globalThis.location.protocol === "https:") { str += "; secure"; } } catch (e) {}

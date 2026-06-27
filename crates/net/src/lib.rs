@@ -27,6 +27,8 @@ struct StoredCookie {
     http_only: bool,
     /// Absolute expiry in unix seconds; `None` is a session cookie (no expiry).
     expires: Option<u64>,
+    /// The lowercased SameSite attribute (`strict`/`lax`/`none`), if any.
+    same_site: Option<String>,
     /// Monotonic insertion order, used to order the `Cookie` header and as a stable tie-break.
     creation: u64,
 }
@@ -234,8 +236,16 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
             "secure" => secure = true,
             "httponly" => http_only = true,
             "max-age" => {
-                if let Ok(n) = val.parse::<i64>() {
+                let t = val.trim();
+                if let Ok(n) = t.parse::<i64>() {
                     max_age = Some(n);
+                } else if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+                    max_age = Some(i64::MAX); // positive value too large to parse → clamp below
+                } else if t.starts_with('-')
+                    && t.len() > 1
+                    && t[1..].bytes().all(|b| b.is_ascii_digit())
+                {
+                    max_age = Some(-1); // negative value too large → already expired
                 }
             }
             "expires" => expires_attr = parse_cookie_date(val),
@@ -249,11 +259,14 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
     }
 
     let now = now_secs();
+    // A cookie's lifetime is capped at 400 days (RFC 6265bis §5.5); clamp Max-Age and Expires.
+    const MAX_AGE_SECS: u64 = 400 * 24 * 60 * 60;
+    let max_expiry = now.saturating_add(MAX_AGE_SECS);
     // Max-Age takes precedence over Expires (RFC 6265 §5.3). Non-positive Max-Age = expired.
     let expires = match max_age {
         Some(ma) if ma <= 0 => Some(0),
-        Some(ma) => Some(now.saturating_add(ma as u64)),
-        None => expires_attr,
+        Some(ma) => Some(now.saturating_add(ma as u64).min(max_expiry)),
+        None => expires_attr.map(|e| e.min(max_expiry)),
     };
 
     // Resolve domain. A Domain attribute that does not domain-match the request host is rejected.
@@ -325,6 +338,7 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
         secure,
         http_only,
         expires,
+        same_site,
         creation: creation.unwrap_or_else(next_creation),
     });
     true
@@ -353,6 +367,8 @@ pub struct WebDriverCookie {
     pub secure: bool,
     pub http_only: bool,
     pub expiry: Option<u64>,
+    /// SameSite attribute, capitalized for WebDriver (`Strict`/`Lax`/`None`); `None`/absent → `Lax`.
+    pub same_site: String,
 }
 
 /// Return all (unexpired) cookies currently stored.
@@ -373,6 +389,11 @@ pub fn get_all_cookies() -> Vec<WebDriverCookie> {
             secure: c.secure,
             http_only: c.http_only,
             expiry: c.expires,
+            same_site: match c.same_site.as_deref() {
+                Some("strict") => "Strict".to_string(),
+                Some("none") => "None".to_string(),
+                _ => "Lax".to_string(),
+            },
         })
         .collect()
 }
