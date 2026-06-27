@@ -18,3 +18,7 @@
 # Local checkout of the web-platform-tests suite (cloned for conformance runs)
 /wpt/
 dist/
+
+# Scratch area lists generated for wpt-run-missing.sh (local, per-run)
+/scripts/.missing_areas.txt
+/scripts/.remaining_areas.txt
