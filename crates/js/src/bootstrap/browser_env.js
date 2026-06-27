@@ -9230,6 +9230,24 @@
         // loading static frames during the parent's lifecycle, dispatch synchronously so handlers added
         // later (in the parent's body onload) only see subsequent navigations; otherwise async.
         if (syncLoad) { fireLoad(); } else { el.__pendingLoadTimer = setTimeout(fireLoad, 0); }
+        // Honor <meta http-equiv="refresh"> in the loaded frame document (a client-side redirect: a
+        // normal navigation, so redirectCount stays 0). Resolve the target against the frame's URL.
+        if (ok && srcdoc == null) {
+          try {
+            var fdoc = __frameGet(el.__node, "document");
+            var metas = (fdoc && fdoc.getElementsByTagName) ? fdoc.getElementsByTagName("meta") : [];
+            for (var mi = 0; mi < metas.length; mi++) {
+              var he = metas[mi].getAttribute && metas[mi].getAttribute("http-equiv");
+              if (!he || he.toLowerCase() !== "refresh") { continue; }
+              var rm = /^\s*([0-9.]+)\s*(?:;\s*url\s*=\s*['"]?([^'"]+))?/i.exec(metas[mi].getAttribute("content") || "");
+              if (rm && rm[2]) {
+                var tgt; try { tgt = new globalThis.URL(rm[2].trim(), url || "about:blank").href; } catch (e) { tgt = rm[2].trim(); }
+                setTimeout((function (u) { return function () { el.setAttribute("src", u); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el); }; })(tgt), (parseFloat(rm[1]) || 0) * 1000);
+              }
+              break;
+            }
+          } catch (e) {}
+        }
       }
       globalThis.__loadFrameEl = __loadFrame;
 
