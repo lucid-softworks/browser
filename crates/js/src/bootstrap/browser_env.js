@@ -13103,6 +13103,10 @@
       try { host = String(globalThis.location.hostname); } catch (e) {}
       host = host.toLowerCase();
       domain = domain.toLowerCase();
+      // A cookie's Domain may not be a public suffix (eTLD). Approximate the PSL: a single-label
+      // domain (no embedded dot) that isn't the full host is a suffix like "com"/"test" — reject it.
+      // (WPT runs under the ".test" eTLD.)
+      if (domain.indexOf(".") < 0 && domain !== host) { return false; }
       return host === domain || (host.length > domain.length + 1 && host.slice(-(domain.length + 1)) === "." + domain);
     }
     // Resolve get/getAll/delete's (name | options) overload to a name filter (null = match any). The
