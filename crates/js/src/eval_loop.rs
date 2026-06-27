@@ -41,6 +41,20 @@ pub(crate) static VP_W: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 pub(crate) static VP_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(780);
 pub(crate) static DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Byte length of the main document's response body, surfaced to JS as `__responseBodySize` so
+/// Navigation Timing reports a real `encodedBodySize`/`transferSize`. Set by the engine right before
+/// the JS session runs; `0` means unknown (the bootstrap then falls back to the serialized DOM size).
+pub(crate) static RESPONSE_BODY_SIZE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Set the main document's response-body byte length (read into `__responseBodySize`).
+pub fn set_response_body_size(bytes: usize) {
+    RESPONSE_BODY_SIZE.store(
+        bytes.min(u32::MAX as usize) as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Live OS appearance: `true` when the user's effective macOS appearance is Dark. Drives the
 /// `prefers-color-scheme` media feature in both the JS `matchMedia` API (via `__prefersDark()`)
 /// and, in parallel, the CSS `@media (prefers-color-scheme)` cascade (the `style` crate keeps its
@@ -181,11 +195,21 @@ pub(crate) fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
         let b = v8::Boolean::new(scope, cross_origin_isolated());
         global.set(scope, k.into(), b.into());
     }
+    {
+        let k = v8::String::new(scope, "__responseBodySize").unwrap();
+        let n = v8::Number::new(
+            scope,
+            RESPONSE_BODY_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f64,
+        );
+        global.set(scope, k.into(), n.into());
+    }
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
     // IndexedDB (in-memory) — depends on structuredClone + queueMicrotask from the prior bootstraps.
     eval_internal(scope, INDEXEDDB_BOOTSTRAP, "<indexeddb>");
     // Web Crypto SubtleCrypto (digest + HMAC) — depends on `crypto` from browser-env.
     eval_internal(scope, WEBCRYPTO_BOOTSTRAP, "<webcrypto>");
+    // SVG DOM (SVG* interfaces, animated-attribute reflection, SMIL) — depends on browser-env.
+    eval_internal(scope, SVG_BOOTSTRAP, "<svg>");
     // Expose elements with an `id` as named globals (HTML named-properties-on-window). The DOM is
     // already fully parsed by the time the environment is installed (the engine batches scripts
     // after `parser.finish()`), so every static-markup id is visible to author scripts that follow.
@@ -227,6 +251,11 @@ pub(crate) const INDEXEDDB_BOOTSTRAP: &str = include_str!("bootstrap/indexeddb.j
 /// export), a pure-JS implementation layered onto the `crypto` object from browser-env (whose
 /// getRandomValues already uses the OS CSPRNG via the `__cryptoRandom` native).
 pub(crate) const WEBCRYPTO_BOOTSTRAP: &str = include_str!("bootstrap/webcrypto.js");
+
+/// SVG DOM: the SVG* IDL interface constructors, animated-attribute reflection
+/// (SVGAnimatedLength.baseVal/animVal), and a SMIL animation engine. Depends on the element
+/// wrapper machinery + DOMException from <browser-env>; enrichElement calls into `__svgEnrich`.
+pub(crate) const SVG_BOOTSTRAP: &str = include_str!("bootstrap/svg.js");
 
 // ---------------------------------------------------------------------------------------------
 // Event loop drain + script evaluation against a V8 context.

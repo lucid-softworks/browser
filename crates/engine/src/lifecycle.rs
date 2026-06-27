@@ -150,11 +150,15 @@ impl Engine {
         // (some sites are http-only), unless HSTS pins the host to https. A real HTTP error status
         // is NOT a fallback trigger. Each attempt streams into a fresh parser.
         let mut target = fixup.url;
-        let (parser, result) = loop {
+        let (parser, raw_body, result) = loop {
             let mut parser = html::StreamParser::new();
+            let mut raw_body: Vec<u8> = Vec::new();
             let mut last_paint: Option<Instant> = None;
             let result = net::fetch_streaming(&target, &mut |chunk| {
                 parser.feed(chunk);
+                // Keep the raw bytes too: an XML/SVG/XHTML document is parsed from them by the XML
+                // parser (the HTML stream parser is only used for HTML).
+                raw_body.extend_from_slice(chunk);
                 // Partial frames are pure cost when nobody is listening — only paint when a frame
                 // callback is installed.
                 if !streaming {
@@ -184,7 +188,7 @@ impl Engine {
                     continue;
                 }
             }
-            break (parser, result);
+            break (parser, raw_body, result);
         };
 
         match result {
@@ -192,16 +196,27 @@ impl Engine {
                 // Cross-origin isolation (COOP+COEP on this navigation) drives self.crossOriginIsolated
                 // in the page's JS (and any worker it spawns). Set before the session/scripts start.
                 js::set_cross_origin_isolated(meta.cross_origin_isolated);
+                // Response body byte length → Navigation Timing's encodedBodySize / transferSize.
+                js::set_response_body_size(raw_body.len());
                 // HTML when the server says so, OR when the type is unknown/generic and the body
                 // sniffs as HTML (mirrors the old `content_type.contains("html")` gate, extended
                 // with a structural sniff for type-less responses).
                 let ct = meta.content_type.to_ascii_lowercase();
+                // An XML document family (image/svg+xml, application/xhtml+xml, application/xml,
+                // text/xml): parse it with the XML parser and treat it as a scriptable document
+                // (real browsers render a top-level SVG/XHTML document, not as a raw image/text).
+                let is_xml = ct.contains("xml")
+                    || ((ct.is_empty() || ct == "application/octet-stream")
+                        && url_has_xml_extension(&meta.final_url));
                 // Navigating directly to an image: wrap it in a tiny generated document so it renders
-                // as a picture (like real browsers) instead of showing raw bytes.
-                let is_image = ct.starts_with("image/")
-                    || (!ct.contains("html") && url_has_image_extension(&meta.final_url));
+                // as a picture (like real browsers) instead of showing raw bytes. SVG is XML, not this.
+                let is_image = !is_xml
+                    && (ct.starts_with("image/")
+                        || (!ct.contains("html") && url_has_image_extension(&meta.final_url)));
                 let final_doc = if is_image {
                     html::parse(&image_viewer_html(&meta.final_url))
+                } else if is_xml {
+                    html::parse_xml(&String::from_utf8_lossy(&raw_body))
                 } else {
                     parser.finish()
                 };
@@ -209,9 +224,11 @@ impl Engine {
                     || ct.contains("html")
                     || (ct.is_empty() || ct == "application/octet-stream")
                         && document_looks_like_html(&final_doc);
+                // Documents that get a JS session + script execution: HTML and XML alike.
+                let scriptable = looks_html || is_xml;
 
                 // Build the FINAL state exactly as the non-streaming path did.
-                let base = if looks_html {
+                let base = if scriptable {
                     base_url(&final_doc, &meta.final_url)
                 } else {
                     meta.final_url.clone()
@@ -226,7 +243,7 @@ impl Engine {
                 } else {
                     None
                 };
-                let doc = if looks_html {
+                let doc = if scriptable {
                     // Pre-layout the parsed document (inline-CSS only, no network) so the JS session
                     // can seed `layout_rects` BEFORE its scripts run. Synchronous layout-dependent
                     // reads during load (getBoundingClientRect / elementFromPoint / caret*FromPoint)

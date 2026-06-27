@@ -446,9 +446,15 @@ pub(crate) fn build_replaced_or_control(
     if el.tag.eq_ignore_ascii_case("img")
         || el.tag.eq_ignore_ascii_case("canvas")
         || el.tag.eq_ignore_ascii_case("svg")
+        || el.tag.eq_ignore_ascii_case("object")
+        || el.tag.eq_ignore_ascii_case("embed")
     {
         let is_canvas = el.tag.eq_ignore_ascii_case("canvas");
-        let is_img = el.tag.eq_ignore_ascii_case("img");
+        // `<object>`/`<embed>` rendering an image/SVG resource behave like `<img>` for sizing: the
+        // width/height attributes set the used size and a bitmap is supplied for the node id.
+        let is_img = el.tag.eq_ignore_ascii_case("img")
+            || el.tag.eq_ignore_ascii_case("object")
+            || el.tag.eq_ignore_ascii_case("embed");
         let intrinsic = if is_canvas {
             // Prefer the explicit width/height attributes; fall back to the spec default 300x150.
             let aw = el
@@ -770,6 +776,8 @@ pub(crate) fn build_box(
             if el.tag.eq_ignore_ascii_case("img")
                 || el.tag.eq_ignore_ascii_case("canvas")
                 || el.tag.eq_ignore_ascii_case("svg")
+                || el.tag.eq_ignore_ascii_case("object")
+                || el.tag.eq_ignore_ascii_case("embed")
                 || el.tag.eq_ignore_ascii_case("input")
                 || el.tag.eq_ignore_ascii_case("textarea")
                 || el.tag.eq_ignore_ascii_case("select")

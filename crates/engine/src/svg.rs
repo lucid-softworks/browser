@@ -133,6 +133,9 @@ struct PaintState {
     /// In forced colors mode (and not forced-color-adjust:none), the element's forced `currentColor`
     /// — gradient stops authored with non-system colors resolve to it (so the gradient goes solid).
     force_stops: Option<(u8, u8, u8)>,
+    /// The inherited `color` (for `currentColor` resolution) set via the `color` presentation
+    /// attribute — which the CSS cascade does not currently carry into SVG painting.
+    current_color: Option<Color>,
 }
 
 impl Default for PaintState {
@@ -152,6 +155,7 @@ impl Default for PaintState {
             opacity: 1.0,
             evenodd: false,
             force_stops: None,
+            current_color: None,
         }
     }
 }
@@ -939,7 +943,16 @@ fn flatten_rect(x: f32, y: f32, w: f32, h: f32, rx: f32, ry: f32, m: &Affine) ->
 // ----------------------------------------------------------------------------------------------
 
 fn attr<'a>(el: &'a dom::ElementData, name: &str) -> Option<&'a str> {
-    el.attrs.get(name).map(|s| s.as_str())
+    if let Some(s) = el.attrs.get(name) {
+        return Some(s.as_str());
+    }
+    // SVG keeps camelCase attribute names (viewBox, gradientUnits, …) in their canonical case, but
+    // the rasterizer asks for them in lowercase; fall back to a case-insensitive match. SVG has no
+    // attributes that differ only by case, so this is unambiguous.
+    el.attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 /// Number attribute (strips a trailing `px`); default `d`.
@@ -989,14 +1002,13 @@ fn resolve_paint(val: &str, inherited: Option<Color>, current: Option<Color>) ->
     if v.eq_ignore_ascii_case("inherit") {
         return inherited;
     }
-    // url(#...) gradients/patterns are unsupported → fall back to a mid-gray so the shape is visible.
+    // url(#...) paint reference: use the explicit fallback after it when present, else (an
+    // unresolved reference with no fallback) the paint is `none`.
     if v.starts_with("url(") {
-        return Some(Color {
-            r: 128,
-            g: 128,
-            b: 128,
-            a: 255,
-        });
+        return match paint_url_fallback(v) {
+            Some(fb) => resolve_paint(&fb, inherited, current),
+            None => None,
+        };
     }
     parse_css_color(v).or(inherited)
 }
@@ -1021,18 +1033,29 @@ fn apply_paint(
             c.color
         }
     });
-    let current = cur_rgb.map(|(r, g, b)| Color { r, g, b, a: 255 });
+    let cascade_current = cur_rgb.map(|(r, g, b)| Color { r, g, b, a: 255 });
+    // The `color` presentation attribute updates the inherited current color (the cascade doesn't
+    // carry SVG presentation attributes). Track it through the PaintState so `currentColor` on this
+    // element and its descendants resolves correctly.
+    if let Some(v) = prop(el, "color", &style) {
+        let base = st.current_color.or(cascade_current);
+        if let Some(c) = resolve_paint(&v, base, base) {
+            st.current_color = Some(c);
+        }
+    }
+    let current = st.current_color.or(cascade_current);
     if let Some(v) = prop(el, "fill", &style) {
         if let Some(id) = paint_url_id(&v) {
-            // A `url(#id)` paint (gradient/pattern): remember the ref; keep a gray solid fallback in
-            // case it doesn't resolve to a gradient we support.
+            // A `url(#id)` paint (gradient/pattern): remember the ref. If it doesn't resolve to a
+            // gradient we support, use the explicit fallback paint when given (e.g.
+            // `url(#x) currentColor`), else a gray solid so the shape stays visible.
             st.fill_url = Some(id);
-            st.fill = Some(Color {
-                r: 128,
-                g: 128,
-                b: 128,
-                a: 255,
-            });
+            // If the reference doesn't resolve to a gradient we support, use the explicit fallback
+            // paint when given (`url(#x) green`), else `none` (an unresolved reference paints nothing).
+            st.fill = match paint_url_fallback(&v) {
+                Some(fb) => resolve_paint(&fb, st.fill, current),
+                None => None,
+            };
         } else {
             st.fill_url = None;
             st.fill = resolve_paint(&v, st.fill, current);
@@ -1231,7 +1254,178 @@ fn render_children(
 }
 
 /// Render a single SVG element (and its subtree) at the current transform `m` + inherited paint.
+/// SVG conditional processing: an element renders only when its `requiredExtensions` /
+/// `systemLanguage` (and the always-true-in-SVG2 `requiredFeatures`) are satisfied. We support no
+/// extensions, so any non-empty `requiredExtensions` fails; `systemLanguage` matches the UA's `en`.
+fn conditional_ok(el: &dom::ElementData) -> bool {
+    if let Some(re) = attr(el, "requiredExtensions") {
+        if !re.trim().is_empty() {
+            return false;
+        }
+    }
+    if let Some(sl) = attr(el, "systemLanguage") {
+        let ok = sl.split(',').any(|t| {
+            let t = t.trim().to_ascii_lowercase();
+            t == "en" || t.starts_with("en-")
+        });
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Render an element, applying `clip-path` / `mask` if present: the element's output is rendered to
+/// a temporary surface, intersected with the clip coverage / mask luminance, then composited.
 fn render_element(
+    doc: &Document,
+    child: NodeId,
+    m: Affine,
+    state: &PaintState,
+    surf: &mut Surface,
+    font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
+    depth: usize,
+) {
+    if depth > 256 {
+        return;
+    }
+    let (clip_id, mask_id, child_m) = match &doc.get(child).data {
+        NodeData::Element(el) => {
+            let style = attr(el, "style").map(|s| s.to_string());
+            let url_of = |name: &str| {
+                prop(el, name, &style).and_then(|v| {
+                    if v.trim().eq_ignore_ascii_case("none") {
+                        None
+                    } else {
+                        paint_url_id(&v)
+                    }
+                })
+            };
+            let cm = match attr(el, "transform") {
+                Some(t) => m.then(parse_transform(t)),
+                None => m,
+            };
+            (url_of("clip-path"), url_of("mask"), cm)
+        }
+        _ => (None, None, m),
+    };
+    if clip_id.is_none() && mask_id.is_none() {
+        render_element_body(doc, child, m, state, surf, font, styles, depth);
+        return;
+    }
+    let mut temp = Surface::new(surf.w, surf.h);
+    render_element_body(doc, child, m, state, &mut temp, font, styles, depth);
+    if let Some(id) = clip_id {
+        apply_clip(&mut temp, doc, &id, child_m, font, styles);
+    }
+    if let Some(id) = mask_id {
+        apply_mask(&mut temp, doc, &id, child_m, font, styles);
+    }
+    composite_over(surf, &temp);
+}
+
+/// Multiply each pixel's alpha in `temp` by the coverage of a `<clipPath>` (rendered in white).
+fn apply_clip(
+    temp: &mut Surface,
+    doc: &Document,
+    clip_id: &str,
+    m: Affine,
+    font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
+) {
+    let cid = match find_by_id(doc, clip_id) {
+        Some(n) => n,
+        None => return,
+    };
+    if !matches!(&doc.get(cid).data, NodeData::Element(e) if e.tag.eq_ignore_ascii_case("clippath"))
+    {
+        // An invalid clip-path reference makes the element not render at all.
+        for i in (3..temp.px.len()).step_by(4) {
+            temp.px[i] = 0;
+        }
+        return;
+    }
+    let mut mask = Surface::new(temp.w, temp.h);
+    let white = PaintState {
+        fill: Some(Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }),
+        stroke: None,
+        fill_url: None,
+        ..PaintState::default()
+    };
+    render_children(doc, cid, m, &white, &mut mask, font, styles, 0);
+    for i in (0..temp.px.len()).step_by(4) {
+        let cov = mask.px[i + 3] as u32;
+        temp.px[i + 3] = (temp.px[i + 3] as u32 * cov / 255) as u8;
+    }
+}
+
+/// Multiply each pixel's alpha in `temp` by the luminance×alpha of a `<mask>`.
+fn apply_mask(
+    temp: &mut Surface,
+    doc: &Document,
+    mask_id: &str,
+    m: Affine,
+    font: Option<&SystemFont>,
+    styles: Option<&StyleMap>,
+) {
+    let mid = match find_by_id(doc, mask_id) {
+        Some(n) => n,
+        None => return,
+    };
+    if !matches!(&doc.get(mid).data, NodeData::Element(e) if e.tag.eq_ignore_ascii_case("mask")) {
+        return;
+    }
+    let mut msurf = Surface::new(temp.w, temp.h);
+    render_children(
+        doc,
+        mid,
+        m,
+        &PaintState::default(),
+        &mut msurf,
+        font,
+        styles,
+        0,
+    );
+    for i in (0..temp.px.len()).step_by(4) {
+        let r = msurf.px[i] as u32;
+        let g = msurf.px[i + 1] as u32;
+        let b = msurf.px[i + 2] as u32;
+        let a = msurf.px[i + 3] as u32;
+        // sRGB luminance × alpha (per the SVG mask luminance formula, ×1000 fixed-point).
+        let lum = (2126 * r + 7152 * g + 722 * b) / 10000;
+        let cov = lum * a / 255;
+        temp.px[i + 3] = (temp.px[i + 3] as u32 * cov / 255) as u8;
+    }
+}
+
+/// Source-over composite `src` onto `dst` (both straight-alpha RGBA, same dimensions).
+fn composite_over(dst: &mut Surface, src: &Surface) {
+    let w = dst.w as i32;
+    for i in (0..src.px.len()).step_by(4) {
+        if src.px[i + 3] == 0 {
+            continue;
+        }
+        let p = (i / 4) as i32;
+        dst.blend(
+            p % w,
+            p / w,
+            Color {
+                r: src.px[i],
+                g: src.px[i + 1],
+                b: src.px[i + 2],
+                a: src.px[i + 3],
+            },
+        );
+    }
+}
+
+fn render_element_body(
     doc: &Document,
     child: NodeId,
     m: Affine,
@@ -1250,6 +1444,11 @@ fn render_element(
             _ => return,
         };
         let tag = el.tag.to_ascii_lowercase();
+        // Conditional processing: an element with unsatisfied requiredExtensions/systemLanguage is
+        // not rendered (and prunes its subtree).
+        if !conditional_ok(el) {
+            return;
+        }
         // Skip non-rendered defs/metadata/etc. (gradients/clipPath are resolved on demand, not drawn
         // directly here). `<use>`/`<svg>`/`<symbol>` ARE handled below.
         if matches!(
@@ -1286,6 +1485,26 @@ fn render_element(
                     styles,
                     depth + 1,
                 );
+            }
+            // `<switch>` renders only its first child whose conditional-processing attributes pass.
+            "switch" => {
+                for &c in &doc.get(child).children {
+                    if let NodeData::Element(ce) = &doc.get(c).data {
+                        if conditional_ok(ce) {
+                            render_element(
+                                doc,
+                                c,
+                                child_m,
+                                &child_state,
+                                surf,
+                                font,
+                                styles,
+                                depth + 1,
+                            );
+                            break;
+                        }
+                    }
+                }
             }
             // A nested `<svg>` / `<symbol>` establishes its own viewport at (x,y) with its own
             // viewBox — the structure SVG sprite sheets use (one inner <svg> per icon).
@@ -1449,6 +1668,21 @@ fn render_element(
                 );
             }
         }
+    }
+}
+
+/// Extract the fallback paint after a `url(...)` reference (e.g. the `currentColor` in
+/// `fill="url(#x) currentColor"`), or `None` when only the reference is given.
+fn paint_url_fallback(v: &str) -> Option<String> {
+    let t = v.trim();
+    if !t.starts_with("url(") {
+        return None;
+    }
+    let after = t.split_once(')')?.1.trim();
+    if after.is_empty() {
+        None
+    } else {
+        Some(after.to_string())
     }
 }
 

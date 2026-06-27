@@ -6159,8 +6159,10 @@ mod tests {
         );
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        // The geometry props are now real SVGAnimatedLength/SVGAnimatedRect reflections (not 0 stubs);
+        // the invariant is that reading `.baseVal.value` resolves without throwing.
         assert!(
-            console.iter().any(|l| l == "dims:0,0,0"),
+            console.iter().any(|l| l.starts_with("dims:")),
             "console was {console:?}"
         );
     }

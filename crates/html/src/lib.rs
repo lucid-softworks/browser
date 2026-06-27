@@ -24,10 +24,82 @@
 
 use dom::{Document, ElementData, NodeData, NodeId};
 
+pub mod xml;
+pub use xml::parse_xml;
+
 /// The SVG namespace URI (foreign content entered via an `<svg>` start tag).
 const SVG_NS: &str = "http://www.w3.org/2000/svg";
 /// The MathML namespace URI (foreign content entered via a `<math>` start tag).
 const MATHML_NS: &str = "http://www.w3.org/1998/Math/MathML";
+
+/// The SVG foreign-content attribute case-adjustment table (HTML spec §13.2.6.5 "adjust SVG
+/// attributes"). The HTML tokenizer lowercases all attribute names, but SVG defines many camelCase
+/// attribute names (`attributeName`, `viewBox`, `gradientUnits`, …); inside SVG content the parser
+/// restores the correct case so `getAttribute("viewBox")` and SVG presentation/SMIL attributes work.
+/// Maps the lowercased name (as the tokenizer produces) to the correct camelCase name.
+fn adjust_svg_attr_name(lower: &str) -> Option<&'static str> {
+    Some(match lower {
+        "attributename" => "attributeName",
+        "attributetype" => "attributeType",
+        "basefrequency" => "baseFrequency",
+        "baseprofile" => "baseProfile",
+        "calcmode" => "calcMode",
+        "clippathunits" => "clipPathUnits",
+        "diffuseconstant" => "diffuseConstant",
+        "edgemode" => "edgeMode",
+        "filterunits" => "filterUnits",
+        "glyphref" => "glyphRef",
+        "gradienttransform" => "gradientTransform",
+        "gradientunits" => "gradientUnits",
+        "kernelmatrix" => "kernelMatrix",
+        "kernelunitlength" => "kernelUnitLength",
+        "keypoints" => "keyPoints",
+        "keysplines" => "keySplines",
+        "keytimes" => "keyTimes",
+        "lengthadjust" => "lengthAdjust",
+        "limitingconeangle" => "limitingConeAngle",
+        "markerheight" => "markerHeight",
+        "markerunits" => "markerUnits",
+        "markerwidth" => "markerWidth",
+        "maskcontentunits" => "maskContentUnits",
+        "maskunits" => "maskUnits",
+        "numoctaves" => "numOctaves",
+        "pathlength" => "pathLength",
+        "patterncontentunits" => "patternContentUnits",
+        "patterntransform" => "patternTransform",
+        "patternunits" => "patternUnits",
+        "pointsatx" => "pointsAtX",
+        "pointsaty" => "pointsAtY",
+        "pointsatz" => "pointsAtZ",
+        "preservealpha" => "preserveAlpha",
+        "preserveaspectratio" => "preserveAspectRatio",
+        "primitiveunits" => "primitiveUnits",
+        "refx" => "refX",
+        "refy" => "refY",
+        "repeatcount" => "repeatCount",
+        "repeatdur" => "repeatDur",
+        "requiredextensions" => "requiredExtensions",
+        "requiredfeatures" => "requiredFeatures",
+        "specularconstant" => "specularConstant",
+        "specularexponent" => "specularExponent",
+        "spreadmethod" => "spreadMethod",
+        "startoffset" => "startOffset",
+        "stddeviation" => "stdDeviation",
+        "stitchtiles" => "stitchTiles",
+        "surfacescale" => "surfaceScale",
+        "systemlanguage" => "systemLanguage",
+        "tablevalues" => "tableValues",
+        "targetx" => "targetX",
+        "targety" => "targetY",
+        "textlength" => "textLength",
+        "viewbox" => "viewBox",
+        "viewtarget" => "viewTarget",
+        "xchannelselector" => "xChannelSelector",
+        "ychannelselector" => "yChannelSelector",
+        "zoomandpan" => "zoomAndPan",
+        _ => return None,
+    })
+}
 
 /// Elements that never have children and need no end tag.
 const VOID_ELEMENTS: &[&str] = &[
@@ -767,6 +839,26 @@ impl<'a> Parser<'a> {
                 parent_ns
             }
         };
+        // Inside SVG content, restore the camelCase of SVG's adjusted attribute names (the tokenizer
+        // lowercases them). Rebuild the map preserving insertion order; later duplicates keep the
+        // first-wins behavior of the original map.
+        let attrs = if namespace.as_deref() == Some(SVG_NS) {
+            let mut adjusted: dom::AttrMap = dom::AttrMap::new();
+            for (k, v) in attrs {
+                match adjust_svg_attr_name(&k) {
+                    Some(camel) => {
+                        adjusted.entry(camel.to_string()).or_insert(v);
+                    }
+                    None => {
+                        adjusted.entry(k).or_insert(v);
+                    }
+                }
+            }
+            adjusted
+        } else {
+            attrs
+        };
+
         let node = self.doc.append_child(
             parent,
             NodeData::Element(ElementData {

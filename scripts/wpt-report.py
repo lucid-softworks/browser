@@ -88,6 +88,12 @@ def build_tree(results, area):
         if subs:
             sp = sum(1 for s in subs if s["status"] in GOOD_SUB)
             sf = len(subs) - sp
+            # A harness-level ERROR/TIMEOUT/CRASH means the file itself did not complete cleanly — that
+            # is a failure of the file even when every subtest that ran passed (e.g. an ERROR for
+            # "duplicate test names"). Count it so the file never shows as 100%/green while badged
+            # ERROR. (Reftests/single-page tests have no subtests and already fold status into sp/sf.)
+            if r["status"] not in GOOD_FILE:
+                sf += 1
         else:
             # Reftests / single-page tests have no subtests; count the file-level status as one
             # pass/fail so the report shows 1/1 or 0/1 rather than 0/0.
@@ -237,9 +243,12 @@ def page_html(node, rel_to_root, area, depth):
         ftot = sp + sf
         if ftot > 0:
             fpct = pct_of(sp, ftot)
+            # Broken files render red regardless of their subtest rate, so an ERROR/TIMEOUT file is
+            # never shown as a green/100% pass.
+            color = "#d33" if broken else bar_color(fpct)
             ratecell = (
                 f"<td class=num><span class=minibar>"
-                f"<i style='width:{fpct:.0f}%;background:{bar_color(fpct)}'></i></span>"
+                f"<i style='width:{fpct:.0f}%;background:{color}'></i></span>"
                 f"<span class=pct>{fpct:.0f}%</span></td>"
             )
         else:

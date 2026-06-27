@@ -46,7 +46,9 @@ fi
 #    and the comparison can't run).
 #    The requested test paths ("${TESTS[@]}") are added too, so running an area that isn't yet in the
 #    sparse checkout pulls it into the working tree instead of silently finding 0 tests.
-( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks interfaces "${TESTS[@]}" >/dev/null 2>&1 || true )
+#    `images` holds shared raster test images (e.g. /images/blue.png) that reftests load as CSS
+#    backgrounds / `<img>` / `<object>` sources.
+( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks interfaces images "${TESTS[@]}" >/dev/null 2>&1 || true )
 
 # 2. Install our product into the checkout's wptrunner.browsers package (the checkout is gitignored,
 #    so the canonical copy lives in tools/wpt/). Register the product name in BUILTIN_PRODUCTS.
