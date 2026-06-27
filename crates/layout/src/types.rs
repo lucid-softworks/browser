@@ -50,6 +50,14 @@ fn expand(r: Rect, e: Edges) -> Rect {
     }
 }
 
+/// Resolved grid line geometry for a laid-out grid container, in physical coordinates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridGeometry {
+    pub column_lines: Vec<f32>,
+    pub row_lines: Vec<f32>,
+    pub direction: style::Direction,
+}
+
 /// Everything the painter needs to draw a box, lifted out of the computed style so the
 /// painter never has to re-consult the style map.
 #[derive(Debug, Clone, PartialEq)]
@@ -245,6 +253,8 @@ pub struct LayoutBox {
     /// Used (resolved) margins `[top, right, bottom, left]` in px once `auto` is resolved, so
     /// `getComputedStyle` can report the used value of a `margin: auto` block. `None` until laid out.
     pub used_margins: Option<[f32; 4]>,
+    /// Resolved grid line positions for grid containers, used by abspos grid children.
+    pub grid_geometry: Option<GridGeometry>,
 }
 
 impl LayoutBox {
@@ -257,6 +267,7 @@ impl LayoutBox {
             children: Vec::new(),
             used_insets: None,
             used_margins: None,
+            grid_geometry: None,
         }
     }
 }
