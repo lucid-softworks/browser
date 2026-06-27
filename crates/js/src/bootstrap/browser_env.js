@@ -1279,7 +1279,14 @@
   // domain/path/secure/httpOnly matching via the native bridge.
   Object.defineProperty(document, "cookie", {
     get: function () { try { return __cookie(); } catch (e) { return ""; } },
-    set: function (v) { try { __setCookie(String(v)); } catch (e) {} },
+    set: function (v) {
+      // A document.cookie write is observable by the Cookie Store API's change event — but only when
+      // it actually changes the jar value (capture before/after around the write to diff).
+      var nm = null, before;
+      try { nm = globalThis.__cookieNameOf(String(v)); before = globalThis.__cookieValueOf(nm); } catch (e) {}
+      try { __setCookie(String(v)); } catch (e) {}
+      try { if (nm != null && globalThis.__cookieStoreFireDiff) { globalThis.__cookieStoreFireDiff(nm, before); } } catch (e) {}
+    },
     enumerable: true, configurable: true
   });
 
@@ -12938,10 +12945,11 @@
       }
       return n;
     }
+    // A CookieListItem as exposed by get()/getAll() and change events: our flat jar only round-trips
+    // name=value, and the spec's read item exposes exactly { name, value } (the other attributes are
+    // verified out-of-band via testdriver in the window tests, not on the returned object).
     function __cookieItem(name, value) {
-      var secure = false;
-      try { secure = globalThis.location.protocol === "https:"; } catch (e) {}
-      return { name: name, value: value, domain: null, path: "/", expires: null, secure: secure, sameSite: "strict", partitioned: false };
+      return { name: name, value: value };
     }
     function __cookieJarItems() {
       var raw = "";
@@ -12957,6 +12965,13 @@
         out.push(__cookieItem(name, value));
       }
       return out;
+    }
+    // The current value of `name` in the jar, or undefined when absent. Used to diff before/after a
+    // mutation so a change event fires only on a real change (a no-op write isn't observed).
+    function __cookieValueOf(name) {
+      var items = __cookieJarItems();
+      for (var i = 0; i < items.length; i++) { if (items[i].name === name) { return items[i].value; } }
+      return undefined;
     }
     // A cookie `domain` is valid only when it has no leading dot and domain-matches the current host:
     // either equal to it, or a parent of it (host is a subdomain of domain). null/"" = host-only.
@@ -13034,7 +13049,17 @@
           reject(new globalThis.TypeError("Cookie domain must domain-match the current host and have no leading dot.")); return;
         }
         if (__utf8Len(name) + __utf8Len(val) > 4096) { reject(new globalThis.TypeError("Cookie name and value exceed 4096 bytes.")); return; }
-        var str = name + "=" + val + "; path=" + (opts.path == null ? "/" : String(opts.path));
+        // Cookie name prefixes: __Secure- requires a secure origin; __Host- additionally forbids a
+        // domain and requires path "/".
+        var secureOrigin = false; try { secureOrigin = globalThis.location.protocol === "https:"; } catch (e) {}
+        var pathOpt = opts.path == null ? "/" : String(opts.path);
+        if (name.lastIndexOf("__Secure-", 0) === 0 && !secureOrigin) {
+          reject(new globalThis.TypeError("__Secure- cookies require a secure origin.")); return;
+        }
+        if (name.lastIndexOf("__Host-", 0) === 0 && (!secureOrigin || opts.domain != null || pathOpt !== "/")) {
+          reject(new globalThis.TypeError("__Host- cookies require a secure origin, no domain, and path '/'.")); return;
+        }
+        var str = name + "=" + val + "; path=" + pathOpt;
         if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
         if (opts.expires != null) {
           var d = new Date(opts.expires);
@@ -13042,9 +13067,10 @@
         }
         try { if (globalThis.location.protocol === "https:") { str += "; secure"; } } catch (e) {}
         str += "; samesite=" + (opts.sameSite == null ? "strict" : String(opts.sameSite));
+        var before = __cookieValueOf(name);
         try { __setCookie(str); } catch (e) { reject(e); return; }
         resolve(undefined);
-        self.__fireCookieChange([__cookieItem(name, val)], []);
+        self.__fireCookieDiff(name, before);
       });
     };
     CookieStore.prototype.delete = function (nameOrOptions) {
@@ -13060,10 +13086,10 @@
         }
         var str = name + "=; path=" + (opts.path == null ? "/" : String(opts.path)) + "; expires=Thu, 01 Jan 1970 00:00:00 GMT";
         if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
+        var before = __cookieValueOf(name);
         try { __setCookie(str); } catch (e) { reject(e); return; }
         resolve(undefined);
-        // A deletion change carries the name but no value (per spec, value is undefined).
-        self.__fireCookieChange([], [__cookieItem(name, undefined)]);
+        self.__fireCookieDiff(name, before);
       });
     };
     // The change event fires asynchronously (a task) after the store mutation, per spec.
@@ -13076,10 +13102,32 @@
         try { self.dispatchEvent(ev); } catch (e) {}
       }, 0);
     });
+    // Fire a change event only if the jar value for `name` actually changed from `before` (captured
+    // before the mutation). A no-op write — duplicate value, or setting an already-expired cookie —
+    // is not observed. Absent -> present is a change; present -> absent is a deletion.
+    def(CookieStore.prototype, "__fireCookieDiff", function (name, before) {
+      var after = __cookieValueOf(name);
+      if (after === before) { return; }
+      if (after === undefined) { this.__fireCookieChange([], [__cookieItem(name, undefined)]); }
+      else { this.__fireCookieChange([__cookieItem(name, after)], []); }
+    });
 
     var cookieStore = Object.create(CookieStore.prototype);
     installEvents(cookieStore); // addEventListener/removeEventListener/dispatchEvent + onchange
     def(globalThis, "cookieStore", cookieStore);
+
+    // Parse the cookie name from a "name=value; attrs" document.cookie write string.
+    def(globalThis, "__cookieNameOf", function (v) {
+      var s = String(v);
+      var semi = s.indexOf(";");
+      var pair = semi >= 0 ? s.slice(0, semi) : s;
+      var eq = pair.indexOf("=");
+      return (eq >= 0 ? pair.slice(0, eq) : "").trim();
+    });
+    def(globalThis, "__cookieValueOf", __cookieValueOf);
+    def(globalThis, "__cookieStoreFireDiff", function (name, before) {
+      try { cookieStore.__fireCookieDiff(name, before); } catch (e) {}
+    });
     // Service Worker events (see issue #56). ExtendableEvent.waitUntil collects lifetime-extending
     // promises onto the event's internal state; the SW lifecycle awaits them. FetchEvent.respondWith
     // stashes the response promise for the fetch-interception path (stage 3).
