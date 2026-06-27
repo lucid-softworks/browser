@@ -12889,6 +12889,8 @@
     defSubclass("PageTransitionEvent", Event, { persisted: false });
     defSubclass("BeforeUnloadEvent", Event, { returnValue: "" });
     defSubclass("MessageEvent", Event, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
+    defSubclass("CookieChangeEvent", Event, { changed: [], deleted: [] }, null,
+      { changed: function (v) { return v == null ? [] : v; }, deleted: function (v) { return v == null ? [] : v; } });
     defSubclass("ProgressEvent", Event, { lengthComputable: false, loaded: 0, total: 0 });
     defSubclass("ErrorEvent", Event, { message: "", filename: "", lineno: 0, colno: 0, error: null });
     defSubclass("PromiseRejectionEvent", Event, { promise: null, reason: undefined });
@@ -12911,6 +12913,140 @@
       this.initUIEvent(type, bubbles, cancelable, view, 0);
       def(this, "data", data == null ? "" : String(data));
     };
+
+    // --- Cookie Store API (window) -----------------------------------------------------------
+    // Async cookie access backed by the document cookie jar (__cookie/__setCookie). The jar only
+    // round-trips name=value, so read CookieListItems carry spec defaults for the other members.
+    // The ServiceWorker side (registration.cookies / CookieStoreManager subscriptions) needs a
+    // worker cookie backend we don't have, so it's a non-functional stub.
+    function CookieStore() { throw new globalThis.TypeError("Illegal constructor"); }
+    function CookieStoreManager() { throw new globalThis.TypeError("Illegal constructor"); }
+    CookieStore.prototype = Object.create(globalThis.EventTarget.prototype);
+    Object.defineProperty(CookieStore.prototype, "constructor", { value: CookieStore, enumerable: false, configurable: true, writable: true });
+    try { Object.setPrototypeOf(CookieStore, globalThis.EventTarget); } catch (e) {}
+    def(globalThis, "CookieStore", CookieStore);
+    def(globalThis, "CookieStoreManager", CookieStoreManager);
+
+    function __utf8Len(s) {
+      var n = 0;
+      for (var i = 0; i < s.length; i++) {
+        var c = s.charCodeAt(i);
+        if (c < 0x80) { n += 1; }
+        else if (c < 0x800) { n += 2; }
+        else if (c >= 0xd800 && c <= 0xdbff) { n += 4; i++; }
+        else { n += 3; }
+      }
+      return n;
+    }
+    function __cookieItem(name, value) {
+      var secure = false;
+      try { secure = globalThis.location.protocol === "https:"; } catch (e) {}
+      return { name: name, value: value, domain: null, path: "/", expires: null, secure: secure, sameSite: "strict", partitioned: false };
+    }
+    function __cookieJarItems() {
+      var raw = "";
+      try { raw = __cookie() || ""; } catch (e) {}
+      var out = [];
+      if (raw === "") { return out; }
+      var parts = raw.split(/;\s*/);
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i] === "") { continue; }
+        var eq = parts[i].indexOf("=");
+        var name = eq >= 0 ? parts[i].slice(0, eq) : "";
+        var value = eq >= 0 ? parts[i].slice(eq + 1) : parts[i];
+        out.push(__cookieItem(name, value));
+      }
+      return out;
+    }
+    // Resolve get/getAll/delete's (name | options) overload to a name filter (null = match any).
+    function __cookieQueryName(arg) {
+      if (arg == null) { return null; }
+      if (typeof arg === "string") { return arg; }
+      if (typeof arg === "object") { return arg.name == null ? null : String(arg.name); }
+      return null;
+    }
+    CookieStore.prototype.getAll = function (nameOrOptions) {
+      var filter = __cookieQueryName(nameOrOptions);
+      var items = __cookieJarItems();
+      if (filter != null && filter !== "") {
+        items = items.filter(function (it) { return it.name === filter; });
+      }
+      return Promise.resolve(items);
+    };
+    CookieStore.prototype.get = function (nameOrOptions) {
+      if (arguments.length === 0) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or options."));
+      }
+      return this.getAll(nameOrOptions).then(function (all) { return all.length ? all[0] : null; });
+    };
+    CookieStore.prototype.set = function (nameOrOptions, value) {
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        var name, val, opts;
+        if (typeof nameOrOptions === "object" && nameOrOptions !== null) {
+          opts = nameOrOptions;
+          name = opts.name == null ? "" : String(opts.name);
+          val = opts.value == null ? "" : String(opts.value);
+        } else {
+          opts = {};
+          name = nameOrOptions == null ? "" : String(nameOrOptions);
+          val = value == null ? "" : String(value);
+        }
+        if (name.indexOf("=") >= 0) { reject(new globalThis.TypeError("Cookie name cannot contain '='.")); return; }
+        if (name.indexOf(";") >= 0 || val.indexOf(";") >= 0) { reject(new globalThis.TypeError("Cookie name/value cannot contain ';'.")); return; }
+        // Control characters (U+0000–U+001F and U+007F) are invalid in a cookie name or value.
+        if (/[\u0000-\u001f\u007f]/.test(name) || /[\u0000-\u001f\u007f]/.test(val)) {
+          reject(new globalThis.TypeError("Cookie name/value contains a control character.")); return;
+        }
+        // A nameless cookie can't also be valueless, nor carry an '=' in its value (it would be
+        // indistinguishable from a name=value cookie).
+        if (name === "" && (val === "" || val.indexOf("=") >= 0)) {
+          reject(new globalThis.TypeError("Cookie with empty name must have a non-empty value without '='.")); return;
+        }
+        if (__utf8Len(name) + __utf8Len(val) > 4096) { reject(new globalThis.TypeError("Cookie name and value exceed 4096 bytes.")); return; }
+        var str = name + "=" + val + "; path=" + (opts.path == null ? "/" : String(opts.path));
+        if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
+        if (opts.expires != null) {
+          var d = new Date(opts.expires);
+          if (!isNaN(d.getTime())) { str += "; expires=" + d.toUTCString(); }
+        }
+        try { if (globalThis.location.protocol === "https:") { str += "; secure"; } } catch (e) {}
+        str += "; samesite=" + (opts.sameSite == null ? "strict" : String(opts.sameSite));
+        try { __setCookie(str); } catch (e) { reject(e); return; }
+        resolve(undefined);
+        self.__fireCookieChange([__cookieItem(name, val)], []);
+      });
+    };
+    CookieStore.prototype.delete = function (nameOrOptions) {
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        var name, opts;
+        if (typeof nameOrOptions === "object" && nameOrOptions !== null) {
+          opts = nameOrOptions; name = opts.name == null ? "" : String(opts.name);
+        } else { opts = {}; name = nameOrOptions == null ? "" : String(nameOrOptions); }
+        if (name.indexOf("=") >= 0 || name.indexOf(";") >= 0) { reject(new globalThis.TypeError("Invalid cookie name.")); return; }
+        var str = name + "=; path=" + (opts.path == null ? "/" : String(opts.path)) + "; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+        if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
+        try { __setCookie(str); } catch (e) { reject(e); return; }
+        resolve(undefined);
+        // A deletion change carries the name but no value (per spec, value is undefined).
+        self.__fireCookieChange([], [__cookieItem(name, undefined)]);
+      });
+    };
+    // The change event fires asynchronously (a task) after the store mutation, per spec.
+    def(CookieStore.prototype, "__fireCookieChange", function (changed, deleted) {
+      var self = this;
+      setTimeout(function () {
+        var ev;
+        try { ev = new globalThis.CookieChangeEvent("change", { changed: changed, deleted: deleted }); }
+        catch (e) { return; }
+        try { self.dispatchEvent(ev); } catch (e) {}
+      }, 0);
+    });
+
+    var cookieStore = Object.create(CookieStore.prototype);
+    installEvents(cookieStore); // addEventListener/removeEventListener/dispatchEvent + onchange
+    def(globalThis, "cookieStore", cookieStore);
     // Service Worker events (see issue #56). ExtendableEvent.waitUntil collects lifetime-extending
     // promises onto the event's internal state; the SW lifecycle awaits them. FetchEvent.respondWith
     // stashes the response promise for the fetch-interception path (stage 3).
