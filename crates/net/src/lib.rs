@@ -253,9 +253,10 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
             _ => {}
         }
     }
-    // A `document.cookie` write (non-HTTP API) cannot set the HttpOnly attribute.
-    if !from_http {
-        http_only = false;
+    // A `document.cookie` write (non-HTTP API) that specifies HttpOnly is ignored entirely — the
+    // cookie is not stored (RFC 6265bis §5.7 step 11).
+    if !from_http && http_only {
+        return false;
     }
 
     let now = now_secs();
@@ -1964,10 +1965,10 @@ mod tests {
         // A document.cookie write may not overwrite the HttpOnly cookie.
         assert!(!set_cookie(page, "k=dom; Path=/"));
         assert!(has(&cookies_for_request(page), "k=server"));
-        // And document.cookie can't create an HttpOnly cookie (attribute ignored).
+        // And document.cookie can't create an HttpOnly cookie — the write is ignored entirely.
         clear_cookies();
-        assert!(set_cookie(page, "j=1; Path=/; HttpOnly"));
-        assert!(has(&cookies_for_document(page), "j=1")); // visible → not HttpOnly
+        assert!(!set_cookie(page, "j=1; Path=/; HttpOnly"));
+        assert!(!has(&cookies_for_document(page), "j=1")); // not stored at all
     }
 
     #[test]
