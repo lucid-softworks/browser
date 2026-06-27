@@ -10266,10 +10266,19 @@
         // testharness exposes test/promise_test/etc. on `self`, so a worker test's bare `promise_test`
         // must resolve to the SCOPE's testharness — not the page's window globals — or its tests would
         // register on the page and the scope's fetch_tests_from_worker would never complete.
+        // Top-level declarations in an importScripts'd file must become worker globals visible across
+        // files (a real worker runs scripts at global scope). Inside the with-block they're function-
+        // local, so detect top-level function/var/let/const/class names and publish each onto `self`.
+        var names = {};
+        var re = /^[ \t]*(?:async[ \t]+)?function[ \t]*\*?[ \t]*([A-Za-z_$][\w$]*)|^[ \t]*(?:var|let|const)[ \t]+([A-Za-z_$][\w$]*)|^[ \t]*class[ \t]+([A-Za-z_$][\w$]*)/gm;
+        var m;
+        while ((m = re.exec(src))) { var nm = m[1] || m[2] || m[3]; if (nm) { names[nm] = true; } }
+        var publish = "";
+        for (var nm2 in names) { publish += "\ntry{self[" + JSON.stringify(nm2) + "]=" + nm2 + "}catch(e){}"; }
         var fn = (globalThis.Function)(
           "self", "registration", "clients", "location", "caches", "skipWaiting",
           "importScripts", "fetch", "addEventListener", "removeEventListener", "dispatchEvent",
-          "with (self) {\n" + src + "\n}\n//# sourceURL=" + url + "\n"
+          "with (self) {\n" + src + "\n" + publish + "\n}\n//# sourceURL=" + url + "\n"
         );
         fn.call(scope, scope, reg, clients, scope.location, caches, scope.skipWaiting,
           scope.importScripts, scope.fetch, scope.addEventListener, scope.removeEventListener, scope.dispatchEvent);
@@ -13156,6 +13165,9 @@
           name = nameOrOptions == null ? "" : String(nameOrOptions);
           val = value == null ? "" : String(value);
         }
+        // Leading/trailing ASCII whitespace is stripped from the name and value.
+        name = __cookieTrim(name);
+        val = __cookieTrim(val);
         if (name.indexOf("=") >= 0) { reject(new globalThis.TypeError("Cookie name cannot contain '='.")); return; }
         if (name.indexOf(";") >= 0 || val.indexOf(";") >= 0) { reject(new globalThis.TypeError("Cookie name/value cannot contain ';'.")); return; }
         // Control characters (U+0000–U+001F and U+007F) are invalid in a cookie name or value.
@@ -13175,6 +13187,14 @@
         // domain and requires path "/".
         var secureOrigin = false; try { secureOrigin = globalThis.location.protocol === "https:"; } catch (e) {}
         var pathOpt = opts.path == null ? "/" : String(opts.path);
+        // A path must be absolute, and path/domain are each capped at 1024 bytes.
+        if (pathOpt !== "" && pathOpt.charAt(0) !== "/") {
+          reject(new globalThis.TypeError("Cookie path must start with '/'.")); return;
+        }
+        if (__utf8Len(pathOpt) > 1024) { reject(new globalThis.TypeError("Cookie path is too long.")); return; }
+        if (opts.domain != null && __utf8Len(String(opts.domain)) > 1024) {
+          reject(new globalThis.TypeError("Cookie domain is too long.")); return;
+        }
         // Name prefixes are case-insensitive and apply after leading whitespace. __Http-/__Host-Http-
         // require HttpOnly, which the Cookie Store cannot set, so they always reject. __Secure- needs a
         // secure origin; __Host- also forbids a domain and requires path "/".
@@ -13221,11 +13241,21 @@
         if (typeof nameOrOptions === "object" && nameOrOptions !== null) {
           opts = nameOrOptions; name = opts.name == null ? "" : String(opts.name);
         } else { opts = {}; name = nameOrOptions == null ? "" : String(nameOrOptions); }
+        name = __cookieTrim(name);
         if (name.indexOf("=") >= 0 || name.indexOf(";") >= 0) { reject(new globalThis.TypeError("Invalid cookie name.")); return; }
         if (!__cookieDomainOk(opts.domain)) {
           reject(new globalThis.TypeError("Cookie domain must domain-match the current host and have no leading dot.")); return;
         }
-        var str = name + "=; path=" + (opts.path == null ? "/" : String(opts.path)) + "; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+        var delPath = opts.path == null ? "/" : String(opts.path);
+        if (delPath !== "" && delPath.charAt(0) !== "/") {
+          reject(new globalThis.TypeError("Cookie path must start with '/'.")); return;
+        }
+        // __Host-/__Host-Http-/__Http- prefixes (case-insensitive) impose the same constraints on delete.
+        var dlname = name.toLowerCase();
+        if (dlname.lastIndexOf("__host-", 0) === 0 && opts.domain != null) {
+          reject(new globalThis.TypeError("__Host- cookies cannot specify a domain.")); return;
+        }
+        var str = name + "=; path=" + delPath + "; expires=Thu, 01 Jan 1970 00:00:00 GMT";
         if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
         var before = __cookieValueOf(name);
         try { __setCookie(str); } catch (e) { reject(e); return; }

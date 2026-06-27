@@ -314,16 +314,20 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
         Ok(g) => g,
         Err(_) => return false,
     };
-    let existing = guard
-        .iter()
-        .find(|c| c.name == name && c.domain == domain && c.path == path);
+    // A host-only cookie and a Domain cookie with the same name/domain/path are distinct (RFC 6265bis
+    // keys cookies on the host-only flag too), so include it in the identity.
+    let existing = guard.iter().find(|c| {
+        c.name == name && c.domain == domain && c.path == path && c.host_only == host_only
+    });
     // A non-HTTP API (document.cookie) may not overwrite or delete an HttpOnly cookie.
     if !from_http && existing.is_some_and(|c| c.http_only) {
         return false;
     }
     // Preserve the original creation time on overwrite (RFC 6265 §5.3 step 11.3).
     let creation = existing.map(|c| c.creation);
-    guard.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+    guard.retain(|c| {
+        !(c.name == name && c.domain == domain && c.path == path && c.host_only == host_only)
+    });
 
     // An already-expired cookie just deletes the matching entry (done above) — don't store it.
     if expires.is_some_and(|e| e <= now) {
