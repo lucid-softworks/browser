@@ -13090,12 +13090,14 @@
       domain = domain.toLowerCase();
       return host === domain || (host.length > domain.length + 1 && host.slice(-(domain.length + 1)) === "." + domain);
     }
-    // Resolve get/getAll/delete's (name | options) overload to a name filter (null = match any).
-    // The query name is trimmed (cookie names carry no surrounding whitespace).
+    // Resolve get/getAll/delete's (name | options) overload to a name filter (null = match any). The
+    // query name is trimmed of ASCII whitespace only — NOT a leading/trailing U+FEFF (BOM), which JS
+    // String.trim would strip but cookies preserve.
+    function __cookieTrim(s) { return String(s).replace(/^[ \t\r\n\f]+|[ \t\r\n\f]+$/g, ""); }
     function __cookieQueryName(arg) {
       if (arg == null) { return null; }
-      if (typeof arg === "string") { return arg.trim(); }
-      if (typeof arg === "object") { return arg.name == null ? null : String(arg.name).trim(); }
+      if (typeof arg === "string") { return __cookieTrim(arg); }
+      if (typeof arg === "object") { return arg.name == null ? null : __cookieTrim(arg.name); }
       return null;
     }
     CookieStore.prototype.getAll = function (nameOrOptions) {
