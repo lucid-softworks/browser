@@ -10245,6 +10245,8 @@
       Object.defineProperty(scope, "ServiceWorkerGlobalScope", { value: globalThis.ServiceWorkerGlobalScope, enumerable: false, configurable: true });
       scope.oninstall = null; scope.onactivate = null; scope.onfetch = null;
       scope.onmessage = null; scope.onmessageerror = null; scope.oncookiechange = null;
+      // The worker's own cookieStore (any same-origin url path is allowed, unlike a Window's).
+      try { if (globalThis.__makeWorkerCookieStore) { Object.defineProperty(scope, "cookieStore", { value: globalThis.__makeWorkerCookieStore(), enumerable: true, configurable: true }); } } catch (e) {}
       Object.defineProperty(scope, "registration", { value: reg, enumerable: true, configurable: true });
       Object.defineProperty(scope, "serviceWorker", { value: sw, enumerable: true, configurable: true });
       try { Object.defineProperty(scope, "location", { value: new globalThis.URL(scriptHref), enumerable: true, configurable: true }); } catch (e) {}
@@ -13089,13 +13091,18 @@
       return host === domain || (host.length > domain.length + 1 && host.slice(-(domain.length + 1)) === "." + domain);
     }
     // Resolve get/getAll/delete's (name | options) overload to a name filter (null = match any).
+    // The query name is trimmed (cookie names carry no surrounding whitespace).
     function __cookieQueryName(arg) {
       if (arg == null) { return null; }
-      if (typeof arg === "string") { return arg; }
-      if (typeof arg === "object") { return arg.name == null ? null : String(arg.name); }
+      if (typeof arg === "string") { return arg.trim(); }
+      if (typeof arg === "object") { return arg.name == null ? null : String(arg.name).trim(); }
       return null;
     }
     CookieStore.prototype.getAll = function (nameOrOptions) {
+      if (nameOrOptions && typeof nameOrOptions === "object" && nameOrOptions.url != null &&
+          !__cookieUrlOk(nameOrOptions.url, this.__isWindow)) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.getAll url is not allowed."));
+      }
       // null = no name given (return every cookie); "" is a real filter (the no-name cookie).
       var filter = __cookieQueryName(nameOrOptions);
       var items = __cookieJarItems();
@@ -13104,12 +13111,17 @@
       }
       return Promise.resolve(items);
     };
-    // The given URL (a cookie creation/query URL) must resolve and be same-origin; returns its origin
-    // or null when invalid/cross-origin (the caller then rejects with TypeError).
-    function __cookieUrlOk(url) {
-      var origin;
-      try { origin = new globalThis.URL(String(url), globalThis.location.href).origin; } catch (e) { return false; }
-      try { return origin === globalThis.location.origin; } catch (e) { return false; }
+    // A cookie creation/query URL must resolve and be same-origin. In a Window it must also match the
+    // document's path (a window may only address its own URL, fragment aside); a worker may use any
+    // same-origin path. Returns false when disallowed (the caller then rejects with TypeError).
+    function __cookieUrlOk(url, isWindow) {
+      var u;
+      try { u = new globalThis.URL(String(url), globalThis.location.href); } catch (e) { return false; }
+      try { if (u.origin !== globalThis.location.origin) { return false; } } catch (e) { return false; }
+      if (isWindow) {
+        try { if (u.pathname !== globalThis.location.pathname) { return false; } } catch (e) { return false; }
+      }
+      return true;
     }
     CookieStore.prototype.get = function (nameOrOptions) {
       // get() with no argument is a TypeError; get('') is a valid query for the nameless cookie.
@@ -13124,8 +13136,8 @@
           return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or url."));
         }
       }
-      if (url != null && !__cookieUrlOk(url)) {
-        return Promise.reject(new globalThis.TypeError("CookieStore.get url must be same-origin."));
+      if (url != null && !__cookieUrlOk(url, this.__isWindow)) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.get url is not allowed."));
       }
       return this.getAll(nameOrOptions).then(function (all) { return all.length ? all[0] : null; });
     };
@@ -13245,7 +13257,15 @@
 
     var cookieStore = Object.create(CookieStore.prototype);
     installEvents(cookieStore); // addEventListener/removeEventListener/dispatchEvent + onchange
+    cookieStore.__isWindow = true; // a Window cookieStore restricts get/getAll urls to the document path
     def(globalThis, "cookieStore", cookieStore);
+    // A worker (e.g. ServiceWorker) gets its own cookieStore that allows any same-origin url path.
+    def(globalThis, "__makeWorkerCookieStore", function () {
+      var cs = Object.create(CookieStore.prototype);
+      installEvents(cs);
+      cs.__isWindow = false;
+      return cs;
+    });
 
     // Parse the cookie name from a "name=value; attrs" document.cookie write string.
     def(globalThis, "__cookieNameOf", function (v) {
