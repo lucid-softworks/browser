@@ -196,6 +196,8 @@ impl Engine {
                 // Cross-origin isolation (COOP+COEP on this navigation) drives self.crossOriginIsolated
                 // in the page's JS (and any worker it spawns). Set before the session/scripts start.
                 js::set_cross_origin_isolated(meta.cross_origin_isolated);
+                // Response body byte length → Navigation Timing's encodedBodySize / transferSize.
+                js::set_response_body_size(raw_body.len());
                 // HTML when the server says so, OR when the type is unknown/generic and the body
                 // sniffs as HTML (mirrors the old `content_type.contains("html")` gate, extended
                 // with a structural sniff for type-less responses).

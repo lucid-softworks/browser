@@ -1134,6 +1134,7 @@
     if (__lifecycleFired) { return; }
     __lifecycleFired = true;
     readyState = "interactive";
+    globalThis.__finalizeNavTiming("interactive");
     fireOn(document, "readystatechange");
     fireOn(document, "DOMContentLoaded");
     readyState = "complete";
@@ -1193,6 +1194,7 @@
         }
       }
     } catch (e) {}
+    globalThis.__finalizeNavTiming("complete");
     fireOn(window, "load");
     fireOn(document, "load");
     fireOn(window, "pageshow");
@@ -7147,8 +7149,13 @@
       if (this.__types.indexOf("resource") >= 0) {
         __ensureResourceMO();
         __scanDocumentNow();
-        if (opts.buffered) {
-          var self = this, buffered = globalThis.__resourceEntries.slice();
+      }
+      // The buffered flag replays already-recorded entries of the observed types (resource,
+      // navigation, …) to this observer.
+      if (opts.buffered) {
+        var self = this, types = this.__types;
+        var buffered = (globalThis.__resourceEntries || []).filter(function (e) { return types.indexOf(e.entryType) >= 0; });
+        if (buffered.length) {
           try { Promise.resolve().then(function () { __perfDeliver(self, buffered); }); } catch (e) { __perfDeliver(self, buffered); }
         }
       }
@@ -7211,8 +7218,90 @@
     perf.__origin = __perfOrigin;
     perf.__last = 0;
     perf.timing = { navigationStart: __perfOrigin, fetchStart: __perfOrigin, domLoading: __perfOrigin, domInteractive: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: __perfOrigin, responseEnd: __perfOrigin, requestStart: __perfOrigin, connectStart: __perfOrigin, connectEnd: __perfOrigin, secureConnectionStart: 0, domainLookupStart: __perfOrigin, domainLookupEnd: __perfOrigin, unloadEventStart: 0, unloadEventEnd: 0, redirectStart: 0, redirectEnd: 0, toJSON: function () { var o = {}, k = Object.keys(this); for (var i = 0; i < k.length; i++) { if (typeof this[k[i]] === "number") { o[k[i]] = this[k[i]]; } } return o; } };
-    perf.navigation = { type: 0, redirectCount: 0, toJSON: function () { return { type: this.type, redirectCount: this.redirectCount }; } };
+    // Legacy PerformanceNavigation (performance.navigation) with its TYPE_* constants.
+    if (typeof globalThis.PerformanceNavigation !== "function") {
+      def(globalThis, "PerformanceNavigation", function PerformanceNavigation() {});
+      var __PNconst = { TYPE_NAVIGATE: 0, TYPE_RELOAD: 1, TYPE_BACK_FORWARD: 2, TYPE_RESERVED: 255 };
+      for (var __pnk in __PNconst) {
+        if (__PNconst.hasOwnProperty(__pnk)) { globalThis.PerformanceNavigation[__pnk] = __PNconst[__pnk]; globalThis.PerformanceNavigation.prototype[__pnk] = __PNconst[__pnk]; }
+      }
+    }
+    perf.navigation = Object.create(globalThis.PerformanceNavigation.prototype);
+    perf.navigation.type = 0;
+    perf.navigation.redirectCount = 0;
+    perf.navigation.toJSON = function () { return { type: this.type, redirectCount: this.redirectCount }; };
     perf.memory = { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 };
+
+    // PerformanceNavigationTiming entry (Navigation Timing 2). One per document, in the entry buffer,
+    // returned by getEntriesByType("navigation") and delivered to observers at load.
+    if (typeof globalThis.PerformanceNavigationTiming !== "function") {
+      if (typeof globalThis.PerformanceEntry !== "function") { def(globalThis, "PerformanceEntry", function PerformanceEntry() {}); }
+      if (typeof globalThis.PerformanceResourceTiming !== "function") {
+        def(globalThis, "PerformanceResourceTiming", function PerformanceResourceTiming() {});
+        try { Object.setPrototypeOf(globalThis.PerformanceResourceTiming.prototype, globalThis.PerformanceEntry.prototype); } catch (e) {}
+      }
+      def(globalThis, "PerformanceNavigationTiming", function PerformanceNavigationTiming() {});
+      try { Object.setPrototypeOf(globalThis.PerformanceNavigationTiming.prototype, globalThis.PerformanceResourceTiming.prototype); } catch (e) {}
+    }
+    var __isHttpsPage = /^https:/.test(__pgurl);
+    var __navEntry = Object.create(globalThis.PerformanceNavigationTiming.prototype);
+    (function (e) {
+      e.name = String((globalThis.location && globalThis.location.href) || __pgurl || "");
+      e.entryType = "navigation";
+      e.startTime = 0;
+      e.initiatorType = "navigation";
+      e.nextHopProtocol = "http/1.1";
+      e.workerStart = 0;
+      e.redirectStart = 0; e.redirectEnd = 0; e.redirectCount = 0;
+      e.fetchStart = 0;
+      e.domainLookupStart = 0; e.domainLookupEnd = 0;
+      e.connectStart = 0;
+      // secureConnectionStart is in [connectStart, connectEnd] and must be non-zero over TLS.
+      e.secureConnectionStart = __isHttpsPage ? 0.001 : 0;
+      e.connectEnd = 0.002; e.requestStart = 0.002; e.responseStart = 0.003; e.responseEnd = 0.004;
+      e.unloadEventStart = 0; e.unloadEventEnd = 0;
+      e.domInteractive = 0; e.domContentLoadedEventStart = 0; e.domContentLoadedEventEnd = 0;
+      e.domComplete = 0; e.loadEventStart = 0; e.loadEventEnd = 0;
+      e.duration = 0;
+      e.type = "navigate";
+      e.transferSize = 0; e.encodedBodySize = 0; e.decodedBodySize = 0;
+      e.responseStatus = 200; e.serverTiming = [];
+      e.toJSON = function () { var o = {}; for (var k in this) { if (typeof this[k] !== "function") { o[k] = this[k]; } } return o; };
+    })(__navEntry);
+    globalThis.__navEntry = __navEntry;
+    globalThis.__resourceEntries.push(__navEntry);
+    if (__isHttpsPage) { perf.timing.secureConnectionStart = __perfOrigin; }
+    // Fill the load-phase timings and deliver the entry to "navigation" observers (called once, at the
+    // window load event, by __fireLifecycleEvents).
+    globalThis.__finalizeNavTiming = function (phase) {
+      var t = 0; try { t = perf.now(); } catch (e) {}
+      var e = globalThis.__navEntry;
+      if (phase === "interactive") {
+        e.domInteractive = t; e.domContentLoadedEventStart = t; e.domContentLoadedEventEnd = t;
+        perf.timing.domInteractive = __perfOrigin + t;
+        perf.timing.domContentLoadedEventStart = __perfOrigin + t;
+        perf.timing.domContentLoadedEventEnd = __perfOrigin + t;
+        // Body sizes are known once the document is parsed. Prefer the real transferred byte count the
+        // engine recorded; fall back to the serialized DOM length. transferSize adds the ~300-byte
+        // response-header overhead (so it exceeds encodedBodySize for an uncached navigation).
+        var body = globalThis.__responseBodySize | 0;
+        if (!body) { try { body = ((document.documentElement && document.documentElement.outerHTML) || "").length; } catch (be) {} }
+        e.decodedBodySize = body; e.encodedBodySize = body; e.transferSize = body + 300;
+      } else if (phase === "complete") {
+        e.domComplete = t; e.loadEventStart = t; e.loadEventEnd = t; e.duration = t;
+        perf.timing.domComplete = __perfOrigin + t;
+        perf.timing.loadEventStart = __perfOrigin + t;
+        perf.timing.loadEventEnd = __perfOrigin + t;
+        var obs = (globalThis.__perfObservers || []).slice();
+        for (var i = 0; i < obs.length; i++) {
+          (function (o) {
+            if (o.__types && o.__types.indexOf("navigation") >= 0) {
+              try { Promise.resolve().then(function () { __perfDeliver(o, [e]); }); } catch (er) { __perfDeliver(o, [e]); }
+            }
+          })(obs[i]);
+        }
+      }
+    };
     // WebIDL: `performance` is an attribute (accessor with a getter), not a data property.
     Object.defineProperty(globalThis, "performance", {
       get: function () { return perf; },

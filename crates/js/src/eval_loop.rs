@@ -41,6 +41,20 @@ pub(crate) static VP_W: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 pub(crate) static VP_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(780);
 pub(crate) static DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Byte length of the main document's response body, surfaced to JS as `__responseBodySize` so
+/// Navigation Timing reports a real `encodedBodySize`/`transferSize`. Set by the engine right before
+/// the JS session runs; `0` means unknown (the bootstrap then falls back to the serialized DOM size).
+pub(crate) static RESPONSE_BODY_SIZE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Set the main document's response-body byte length (read into `__responseBodySize`).
+pub fn set_response_body_size(bytes: usize) {
+    RESPONSE_BODY_SIZE.store(
+        bytes.min(u32::MAX as usize) as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Live OS appearance: `true` when the user's effective macOS appearance is Dark. Drives the
 /// `prefers-color-scheme` media feature in both the JS `matchMedia` API (via `__prefersDark()`)
 /// and, in parallel, the CSS `@media (prefers-color-scheme)` cascade (the `style` crate keeps its
@@ -180,6 +194,14 @@ pub(crate) fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
         let k = v8::String::new(scope, "__crossOriginIsolated").unwrap();
         let b = v8::Boolean::new(scope, cross_origin_isolated());
         global.set(scope, k.into(), b.into());
+    }
+    {
+        let k = v8::String::new(scope, "__responseBodySize").unwrap();
+        let n = v8::Number::new(
+            scope,
+            RESPONSE_BODY_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f64,
+        );
+        global.set(scope, k.into(), n.into());
     }
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
     // IndexedDB (in-memory) — depends on structuredClone + queueMicrotask from the prior bootstraps.
