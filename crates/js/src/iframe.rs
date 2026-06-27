@@ -168,7 +168,11 @@ fn prim_iframe_load(
             None
         }
     };
-    let ok = build_browsing_context(scope, node_id, &url, srcdoc, false);
+    let nav_type = {
+        let a = args.get(3);
+        if a.is_string() { a.to_rust_string_lossy(scope) } else { "navigate".to_string() }
+    };
+    let ok = build_browsing_context(scope, node_id, &url, srcdoc, false, &nav_type);
     rv.set(v8::Boolean::new(scope, ok).into());
 }
 
@@ -196,7 +200,7 @@ fn prim_window_open(
 ) {
     let url = arg_str(scope, &args, 0);
     let node_id = next_aux_window_id();
-    let ok = build_browsing_context(scope, node_id, &url, None, true);
+    let ok = build_browsing_context(scope, node_id, &url, None, true, "navigate");
     rv.set(v8::Number::new(scope, if ok { node_id as f64 } else { 0.0 }).into());
 }
 
@@ -210,6 +214,7 @@ fn build_browsing_context(
     url: &str,
     srcdoc: Option<String>,
     is_aux: bool,
+    nav_type: &str,
 ) -> bool {
     let page_state = host_state(scope);
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
@@ -263,6 +268,13 @@ fn build_browsing_context(
             cookie_setter,
         );
         cscope.get_current_context().set_slot(state);
+        // Seed the navigation type before the env bootstrap so Navigation Timing's `type` is correct.
+        {
+            let g0 = cscope.get_current_context().global(cscope);
+            let knt = v8::String::new(cscope, "__navType").unwrap();
+            let vnt = crate::js_str(cscope, nav_type);
+            g0.set(cscope, knt.into(), vnt);
+        }
         install_browser_environment(cscope, &frame_url);
         // Seed the host node id so the overlay can wire frameElement/parent messaging.
         let g = cscope.get_current_context().global(cscope);

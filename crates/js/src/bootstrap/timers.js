@@ -31,13 +31,16 @@
     Object.defineProperty(globalThis, name, { value: fn, enumerable: false, configurable: true, writable: true });
   }
 
+  // A string handler is compiled as a function body evaluated in global scope (HTML setTimeout/
+  // setInterval allow `setTimeout("code()", 0)`).
+  function coerceHandler(fn) { return typeof fn === "string" ? new Function(fn) : fn; }
   define("setTimeout", function (fn, delay) {
     var args = Array.prototype.slice.call(arguments, 2);
-    return schedule(fn, delay, args, false);
+    return schedule(coerceHandler(fn), delay, args, false);
   });
   define("setInterval", function (fn, delay) {
     var args = Array.prototype.slice.call(arguments, 2);
-    return schedule(fn, delay, args, true);
+    return schedule(coerceHandler(fn), delay, args, true);
   });
   define("clearTimeout", function (id) {
     if (id == null) { return; }

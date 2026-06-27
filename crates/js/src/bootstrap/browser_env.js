@@ -7227,7 +7227,7 @@
       }
     }
     perf.navigation = Object.create(globalThis.PerformanceNavigation.prototype);
-    perf.navigation.type = 0;
+    perf.navigation.type = globalThis.__navType === "reload" ? 1 : (globalThis.__navType === "back_forward" ? 2 : 0);
     perf.navigation.redirectCount = 0;
     perf.navigation.toJSON = function () { return { type: this.type, redirectCount: this.redirectCount }; };
     perf.memory = { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 };
@@ -7259,11 +7259,16 @@
       // secureConnectionStart is in [connectStart, connectEnd] and must be non-zero over TLS.
       e.secureConnectionStart = __isHttpsPage ? 0.001 : 0;
       e.connectEnd = 0.002; e.requestStart = 0.002; e.responseStart = 0.003; e.responseEnd = 0.004;
-      e.unloadEventStart = 0; e.unloadEventEnd = 0;
+      // A reload / history navigation unloads the previous same-origin document, so its unload event
+      // ran (non-zero); a fresh navigate has no previous document (0).
+      var __reloadish = globalThis.__navType === "reload" || globalThis.__navType === "back_forward";
+      e.unloadEventStart = __reloadish ? 0.001 : 0;
+      e.unloadEventEnd = __reloadish ? 0.002 : 0;
       e.domInteractive = 0; e.domContentLoadedEventStart = 0; e.domContentLoadedEventEnd = 0;
       e.domComplete = 0; e.loadEventStart = 0; e.loadEventEnd = 0;
       e.duration = 0;
-      e.type = "navigate";
+      // Navigation type: "navigate" | "reload" | "back_forward" (seeded by the loader via __navType).
+      e.type = String(globalThis.__navType || "navigate");
       e.transferSize = 0; e.encodedBodySize = 0; e.decodedBodySize = 0;
       e.responseStatus = 200; e.serverTiming = [];
       e.toJSON = function () { var o = {}; for (var k in this) { if (typeof this[k] !== "function") { o[k] = this[k]; } } return o; };
@@ -9145,7 +9150,7 @@
       var IFP2 = globalThis.HTMLIFrameElement.prototype;
       globalThis.__framesByNode = globalThis.__framesByNode || {};
 
-      function __loadFrame(el) {
+      function __loadFrame(el, navType) {
         if (!el || typeof el.__node !== "number") { return; }
         var srcdoc = (el.getAttribute && el.hasAttribute && el.hasAttribute("srcdoc")) ? el.getAttribute("srcdoc") : null;
         var rawSrc = (el.getAttribute) ? el.getAttribute("src") : null;
@@ -9161,7 +9166,7 @@
         el.__frameLoadedKey = key;
         globalThis.__framesByNode[el.__node] = el;
         var ok;
-        try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null)); }
+        try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null), navType || "navigate"); }
         catch (e) { ok = false; }
         setTimeout(function () {
           var ev;
@@ -9189,7 +9194,7 @@
         return new globalThis.Proxy({}, {
           get: function (t, p) {
             if (p === "assign" || p === "replace") { return function (u) { navTo(u); }; }
-            if (p === "reload") { return function () { el.__frameLoadedKey = undefined; __loadFrame(el); }; }
+            if (p === "reload") { return function () { el.__frameLoadedKey = undefined; __loadFrame(el, "reload"); }; }
             if (p === "toString") { return function () { var l = frameLoc(); return l ? String(l.href || "") : ""; }; }
             var l = frameLoc(); return l ? l[p] : undefined;
           },
