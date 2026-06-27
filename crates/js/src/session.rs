@@ -569,6 +569,9 @@ pub(crate) fn session_thread_main(
             }
             state.viewport_scroll_y.set(scroll_y_css);
             state.doc_height.set(doc_height_css);
+            // The engine's rects reflect the current DOM: mark layout clean so reads don't re-lay-out
+            // in-Session until the next script mutation bumps dom_version.
+            state.rects_dom_version.set(state.dom_version.get());
         }
 
         // Run initial classic scripts in order, then the module graph, exactly as the load path.
@@ -714,6 +717,8 @@ pub(crate) fn session_thread_main(
                 drop(nat);
                 state.viewport_scroll_y.set(scroll_y_css);
                 state.doc_height.set(doc_height_css);
+                // Engine rects reflect the current DOM: mark layout clean (see initial-rects path).
+                state.rects_dom_version.set(state.dom_version.get());
             }
             SessionCmd::SetCanvasPixels { pixels } => {
                 // Store the engine's rasterized RGBA on HostState for getImageData. Re-enter the

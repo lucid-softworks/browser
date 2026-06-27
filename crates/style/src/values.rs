@@ -231,6 +231,8 @@ pub enum TrackSize {
 pub struct GridPlacement {
     /// 1-based start line (`None` = auto-place).
     pub start: Option<i32>,
+    /// `span N` on the start side of a placement like `span 2 / 4`.
+    pub start_span: Option<i32>,
     /// End placement.
     pub end: GridEnd,
 }
@@ -250,6 +252,7 @@ impl Default for GridPlacement {
     fn default() -> Self {
         GridPlacement {
             start: None,
+            start_span: None,
             end: GridEnd::Auto,
         }
     }

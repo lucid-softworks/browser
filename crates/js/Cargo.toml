@@ -17,6 +17,14 @@ dom = { path = "../dom" }
 # cascade here instead). `style` depends only on `css` + `dom` — no cycle back through `js`.
 style = { path = "../style" }
 css = { path = "../css" }
+# Box-tree + block/inline layout, so getBoundingClientRect / elementsFromPoint reflect DOM mutations
+# made by script SYNCHRONOUSLY (the engine lays out on its own thread and is blocked during JS, so a
+# fresh element would otherwise have no rect until the next engine render). Same rationale as running
+# the cascade in-Session. `layout` depends only on `dom` + `style` — no cycle back through `js`.
+layout = { path = "../layout" }
+# Pure-Rust TrueType metrics (already used by the engine's painter) so in-Session layout can MEASURE
+# text with the same system fonts the engine paints with.
+fontdue = "0.9"
 # HTML parsing, so the `innerHTML` setter can build real child nodes from markup.
 html = { path = "../html" }
 # The software canvas 2D rasterizer (a leaf crate, no internal deps), so OffscreenCanvas can

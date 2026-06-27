@@ -890,6 +890,7 @@ mod tests {
             parse_grid_placement("1 / 3"),
             Some(GridPlacement {
                 start: Some(1),
+                start_span: None,
                 end: GridEnd::Line(3)
             })
         );
@@ -897,6 +898,7 @@ mod tests {
             parse_grid_placement("2 / span 2"),
             Some(GridPlacement {
                 start: Some(2),
+                start_span: None,
                 end: GridEnd::Span(2)
             })
         );
@@ -904,7 +906,42 @@ mod tests {
             parse_grid_placement("span 3"),
             Some(GridPlacement {
                 start: None,
+                start_span: Some(3),
                 end: GridEnd::Span(3)
+            })
+        );
+        assert_eq!(
+            parse_grid_placement("span 2 / 4"),
+            Some(GridPlacement {
+                start: None,
+                start_span: Some(2),
+                end: GridEnd::Line(4)
+            })
+        );
+    }
+
+    #[test]
+    fn grid_placement_longhands_merge() {
+        let sheet = css::parse(
+            "#a { grid-column-start: span 2; grid-column-end: 4; grid-row-start: 2; grid-row-end: span 3 }",
+        );
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(
+            map[&a].grid_column,
+            Some(GridPlacement {
+                start: None,
+                start_span: Some(2),
+                end: GridEnd::Line(4),
+            })
+        );
+        assert_eq!(
+            map[&a].grid_row,
+            Some(GridPlacement {
+                start: Some(2),
+                start_span: None,
+                end: GridEnd::Span(3),
             })
         );
     }
