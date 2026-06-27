@@ -601,9 +601,19 @@ pub(crate) fn collect_images(
     }
 
     // An object/embed SVG (vs a raster/img source) is decoded with its background applied.
-    fn decode_src(bytes: &[u8], ctype: &str, url: &str, is_object: bool, base: &str) -> Option<DecodedImage> {
+    fn decode_src(
+        bytes: &[u8],
+        ctype: &str,
+        url: &str,
+        is_object: bool,
+        base: &str,
+    ) -> Option<DecodedImage> {
         let ct = ctype.to_ascii_lowercase();
-        let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+        let path = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
         if is_object && is_svg_source(&ct, &path, bytes) {
             decode_svg_object(bytes, base)
         } else {
@@ -648,8 +658,14 @@ pub(crate) fn collect_images(
                             .into_iter()
                             .map(|(node, url, is_object)| {
                                 let r = net::fetch(&url).and_then(|resp| {
-                                    decode_src(&resp.body, &resp.content_type, &url, is_object, base)
-                                        .ok_or_else(|| "decode failed".to_string())
+                                    decode_src(
+                                        &resp.body,
+                                        &resp.content_type,
+                                        &url,
+                                        is_object,
+                                        base,
+                                    )
+                                    .ok_or_else(|| "decode failed".to_string())
                                 });
                                 (node, url, r)
                             })
@@ -1016,7 +1032,10 @@ fn css_background_image_url(css: &str) -> Option<String> {
     let u = rest.find("url(")?;
     let inner = &rest[u + 4..];
     let end = inner.find(')')?;
-    let url = inner[..end].trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    let url = inner[..end]
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .trim();
     if url.is_empty() {
         None
     } else {

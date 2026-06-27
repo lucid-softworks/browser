@@ -1329,7 +1329,8 @@ fn apply_clip(
         Some(n) => n,
         None => return,
     };
-    if !matches!(&doc.get(cid).data, NodeData::Element(e) if e.tag.eq_ignore_ascii_case("clippath")) {
+    if !matches!(&doc.get(cid).data, NodeData::Element(e) if e.tag.eq_ignore_ascii_case("clippath"))
+    {
         // An invalid clip-path reference makes the element not render at all.
         for i in (3..temp.px.len()).step_by(4) {
             temp.px[i] = 0;
@@ -1338,7 +1339,12 @@ fn apply_clip(
     }
     let mut mask = Surface::new(temp.w, temp.h);
     let white = PaintState {
-        fill: Some(Color { r: 255, g: 255, b: 255, a: 255 }),
+        fill: Some(Color {
+            r: 255,
+            g: 255,
+            b: 255,
+            a: 255,
+        }),
         stroke: None,
         fill_url: None,
         ..PaintState::default()
@@ -1367,7 +1373,16 @@ fn apply_mask(
         return;
     }
     let mut msurf = Surface::new(temp.w, temp.h);
-    render_children(doc, mid, m, &PaintState::default(), &mut msurf, font, styles, 0);
+    render_children(
+        doc,
+        mid,
+        m,
+        &PaintState::default(),
+        &mut msurf,
+        font,
+        styles,
+        0,
+    );
     for i in (0..temp.px.len()).step_by(4) {
         let r = msurf.px[i] as u32;
         let g = msurf.px[i + 1] as u32;
@@ -1468,7 +1483,14 @@ fn render_element_body(
                     if let NodeData::Element(ce) = &doc.get(c).data {
                         if conditional_ok(ce) {
                             render_element(
-                                doc, c, child_m, &child_state, surf, font, styles, depth + 1,
+                                doc,
+                                c,
+                                child_m,
+                                &child_state,
+                                surf,
+                                font,
+                                styles,
+                                depth + 1,
                             );
                             break;
                         }

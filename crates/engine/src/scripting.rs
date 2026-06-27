@@ -47,7 +47,9 @@ pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSour
                         let mut source = String::new();
                         for &child in &doc.get(id).children {
                             match &doc.get(child).data {
-                                dom::NodeData::Text(t) | dom::NodeData::Cdata(t) => source.push_str(t),
+                                dom::NodeData::Text(t) | dom::NodeData::Cdata(t) => {
+                                    source.push_str(t)
+                                }
                                 _ => {}
                             }
                         }
