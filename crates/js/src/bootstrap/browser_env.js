@@ -13290,6 +13290,28 @@
       try { if (globalThis.__deliverCookieChangeToWorkers) { globalThis.__deliverCookieChangeToWorkers(name, changed, deleted); } } catch (e) {}
     });
 
+    // Snapshot the whole jar (name -> value) so an out-of-band mutation (e.g. a Set-Cookie response
+    // header from fetch()) can be diffed and observed as a change event, matching real browsers where
+    // HTTP-set cookies fire CookieStore 'change' events.
+    def(globalThis, "__cookieJarSnapshot", function () {
+      var snap = {}; var items = __cookieJarItems();
+      for (var i = 0; i < items.length; i++) { snap[items[i].name] = items[i].value; }
+      return snap;
+    });
+    def(CookieStore.prototype, "__fireCookieJarDiff", function (before) {
+      var after = {}; var items = __cookieJarItems();
+      for (var i = 0; i < items.length; i++) { after[items[i].name] = items[i].value; }
+      var changed = [], deleted = [];
+      for (var k in after) { if (!(k in before) || before[k] !== after[k]) { changed.push(__cookieItem(k, after[k])); } }
+      for (var k2 in before) { if (!(k2 in after)) { deleted.push(__cookieItem(k2, undefined)); } }
+      if (!changed.length && !deleted.length) { return; }
+      this.__fireCookieChange(changed, deleted);
+      try {
+        for (var c = 0; c < changed.length; c++) { globalThis.__deliverCookieChangeToWorkers(changed[c].name, [changed[c]], []); }
+        for (var d = 0; d < deleted.length; d++) { globalThis.__deliverCookieChangeToWorkers(deleted[d].name, [], [deleted[d]]); }
+      } catch (e) {}
+    });
+
     var cookieStore = Object.create(CookieStore.prototype);
     installEvents(cookieStore); // addEventListener/removeEventListener/dispatchEvent + onchange
     cookieStore.__isWindow = true; // a Window cookieStore restricts get/getAll urls to the document path
@@ -13301,6 +13323,24 @@
       cs.__isWindow = false;
       return cs;
     });
+
+    // A fetch() whose response carries Set-Cookie headers mutates the jar out-of-band (JS can't read
+    // the forbidden Set-Cookie header), so observe the change by diffing the jar around the request.
+    (function () {
+      var realFetch = globalThis.fetch;
+      def(globalThis, "fetch", function (input, init) {
+        var before;
+        try { before = globalThis.__cookieJarSnapshot(); } catch (e) { before = null; }
+        var r = realFetch.call(this, input, init);
+        if (before && r && typeof r.then === "function") {
+          return r.then(function (resp) {
+            try { globalThis.cookieStore.__fireCookieJarDiff(before); } catch (e) {}
+            return resp;
+          });
+        }
+        return r;
+      });
+    })();
 
     // Parse the cookie name from a "name=value; attrs" document.cookie write string.
     def(globalThis, "__cookieNameOf", function (v) {
