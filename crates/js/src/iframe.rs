@@ -170,7 +170,11 @@ fn prim_iframe_load(
     };
     let nav_type = {
         let a = args.get(3);
-        if a.is_string() { a.to_rust_string_lossy(scope) } else { "navigate".to_string() }
+        if a.is_string() {
+            a.to_rust_string_lossy(scope)
+        } else {
+            "navigate".to_string()
+        }
     };
     let ok = build_browsing_context(scope, node_id, &url, srcdoc, false, &nav_type);
     rv.set(v8::Boolean::new(scope, ok).into());
@@ -235,7 +239,11 @@ fn build_browsing_context(
                     Some(env) => match extract_envelope_body(&env) {
                         Some(body) => {
                             let final_u = extract_envelope_url(&env).filter(|u| !u.is_empty());
-                            (body, final_u.unwrap_or_else(|| url.to_string()), extract_envelope_charset(&env))
+                            (
+                                body,
+                                final_u.unwrap_or_else(|| url.to_string()),
+                                extract_envelope_charset(&env),
+                            )
                         }
                         None => return false,
                     },
@@ -278,7 +286,11 @@ fn build_browsing_context(
         let had_prev = FRAME_REG.with(|r| r.borrow().iter().any(|f| f.node_id == node_id));
         // A same-origin redirect (the final URL differs from the requested one, same origin) is
         // observable in Navigation Timing; a cross-origin redirect hides the count/timing (→ 0).
-        let redirect_count = if frame_url != url && same_origin(url, &frame_url) { 1 } else { 0 };
+        let redirect_count = if frame_url != url && same_origin(url, &frame_url) {
+            1
+        } else {
+            0
+        };
         {
             let g0 = cscope.get_current_context().global(cscope);
             let knt = v8::String::new(cscope, "__navType").unwrap();
