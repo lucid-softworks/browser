@@ -199,11 +199,10 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
         Some(i) => i,
         None => return false, // no name=value pair
     };
+    // A no-name cookie is valid (`=value`); an empty name is allowed, so `=; expires=…` still flows to
+    // the past-expiry deletion path that removes the stored no-name cookie.
     let name = first[..eq].trim().to_string();
     let value = first[eq + 1..].trim().to_string();
-    if name.is_empty() {
-        return false;
-    }
 
     let mut domain_attr: Option<String> = None;
     let mut path_attr: Option<String> = None;

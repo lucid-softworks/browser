@@ -13063,9 +13063,10 @@
       return null;
     }
     CookieStore.prototype.getAll = function (nameOrOptions) {
+      // null = no name given (return every cookie); "" is a real filter (the no-name cookie).
       var filter = __cookieQueryName(nameOrOptions);
       var items = __cookieJarItems();
-      if (filter != null && filter !== "") {
+      if (filter !== null) {
         items = items.filter(function (it) { return it.name === filter; });
       }
       return Promise.resolve(items);
