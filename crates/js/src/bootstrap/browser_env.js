@@ -55,6 +55,36 @@
     registerProtocolHandler: function () {},
     unregisterProtocolHandler: function () {},
     clipboard: {},
+    // Contact Picker API. We have no contacts backend, but model the spec's preconditions: select()
+    // is top-level-only and requires transient user activation, then validates its properties. With
+    // no picker to open it ultimately rejects (InvalidStateError) rather than returning contacts.
+    contacts: {
+      getProperties: function () { return Promise.resolve(["address", "email", "icon", "name", "tel"]); },
+      select: function (properties) {
+        try {
+          if (globalThis.top && globalThis.top !== globalThis) {
+            return Promise.reject(new globalThis.DOMException(
+              "The contacts API can only be used in the top-level frame.", "InvalidStateError"));
+          }
+          var ua = globalThis.navigator && globalThis.navigator.userActivation;
+          if (!ua || !ua.isActive) {
+            return Promise.reject(new globalThis.DOMException(
+              "The contacts API requires a user gesture.", "SecurityError"));
+          }
+          if (!Array.isArray(properties) || properties.length === 0) {
+            return Promise.reject(new globalThis.TypeError("At least one property must be provided."));
+          }
+          var valid = { address: 1, email: 1, icon: 1, name: 1, tel: 1 };
+          for (var i = 0; i < properties.length; i++) {
+            if (!valid[properties[i]]) {
+              return Promise.reject(new globalThis.TypeError("Invalid contact property: " + properties[i]));
+            }
+          }
+          return Promise.reject(new globalThis.DOMException(
+            "The contacts picker could not be opened.", "InvalidStateError"));
+        } catch (e) { return Promise.reject(e); }
+      }
+    },
     geolocation: {
       getCurrentPosition: function () {},
       watchPosition: function () { return 0; },
