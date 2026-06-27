@@ -844,7 +844,8 @@
     });
     // `className` is a DOMString reflection for HTML/MathML, but an SVGAnimatedString for SVG (defined
     // on SVGElement.prototype by svg.js) — so don't shadow it with an own string property there.
-    if (__namespaceUri(id) !== "http://www.w3.org/2000/svg") {
+    // (elNamespace honours createElementNS metadata, which the raw arena namespace doesn't carry.)
+    if (elNamespace(id) !== "http://www.w3.org/2000/svg") {
       Object.defineProperty(el, "className", {
         get: function () { var v = __getAttr(id, "class"); return v == null ? "" : v; },
         set: function (v) { __setAttr(id, "class", String(v)); },
