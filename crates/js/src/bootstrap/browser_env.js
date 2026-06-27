@@ -1133,6 +1133,9 @@
   def(globalThis, "__fireLifecycleEvents", function () {
     if (__lifecycleFired) { return; }
     __lifecycleFired = true;
+    // Build child browsing contexts for static iframes first (in the drain, where it's safe), so their
+    // realms are ready before this document's load event and its onload handlers run.
+    globalThis.__loadStaticFrames();
     readyState = "interactive";
     globalThis.__finalizeNavTiming("interactive");
     fireOn(document, "readystatechange");
@@ -9338,16 +9341,15 @@
       });
 
       // Load every static iframe in the parsed document — including srcless ones (which get an
-      // about:blank browsing context and fire `load`). Deferred to a task so the synchronous document
-      // fetch in build_browsing_context runs once the event loop / network fetcher is live (a fetch
-      // during the bootstrap install phase returns nothing); a page that touches contentWindow sooner
-      // still triggers a lazy load via the getter.
-      setTimeout(function () {
-        try {
-          var __ifs = document.getElementsByTagName("iframe");
-          for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i]); }
-        } catch (e) {}
-      }, 0);
+      // about:blank browsing context and fire `load`). Not done inline: build_browsing_context's
+      // synchronous document fetch + nested context creation can't run during the bootstrap install
+      // phase (re-entrant). Instead __fireLifecycleEvents calls this at the start of the first drain
+      // (network fetcher live, not re-entrant), so child realms are ready before the parent's load
+      // event fires and onload handlers can read contentWindow.performance/document.
+      globalThis.__loadStaticFrames = function () {
+        var __ifs = document.getElementsByTagName("iframe");
+        for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i]); }
+      };
     }
   } catch (e) {}
 
