@@ -230,9 +230,13 @@ fn build_browsing_context(
                 (String::new(), "about:blank".to_string(), None)
             } else {
                 // Fetch the document HTML via the host fetcher (envelope JSON: {ok,status,body,...}).
+                // The envelope's `url` is the post-redirect final URL — use it as the frame's base.
                 match request_fetcher("GET", url, "", "{}") {
                     Some(env) => match extract_envelope_body(&env) {
-                        Some(body) => (body, url.to_string(), extract_envelope_charset(&env)),
+                        Some(body) => {
+                            let final_u = extract_envelope_url(&env).filter(|u| !u.is_empty());
+                            (body, final_u.unwrap_or_else(|| url.to_string()), extract_envelope_charset(&env))
+                        }
                         None => return false,
                     },
                     None => return false,
@@ -272,6 +276,9 @@ fn build_browsing_context(
         // replacement unloads the old document → non-zero unloadEvent timings), before the env bootstrap
         // so Navigation Timing reflects them.
         let had_prev = FRAME_REG.with(|r| r.borrow().iter().any(|f| f.node_id == node_id));
+        // A same-origin redirect (the final URL differs from the requested one, same origin) is
+        // observable in Navigation Timing; a cross-origin redirect hides the count/timing (→ 0).
+        let redirect_count = if frame_url != url && same_origin(url, &frame_url) { 1 } else { 0 };
         {
             let g0 = cscope.get_current_context().global(cscope);
             let knt = v8::String::new(cscope, "__navType").unwrap();
@@ -280,6 +287,9 @@ fn build_browsing_context(
             let khp = v8::String::new(cscope, "__hadPreviousDoc").unwrap();
             let vhp = v8::Boolean::new(cscope, had_prev);
             g0.set(cscope, khp.into(), vhp.into());
+            let krc = v8::String::new(cscope, "__redirectCount").unwrap();
+            let vrc = v8::Number::new(cscope, redirect_count as f64);
+            g0.set(cscope, krc.into(), vrc.into());
         }
         install_browser_environment(cscope, &frame_url);
         // Seed the host node id so the overlay can wire frameElement/parent messaging.
@@ -543,7 +553,25 @@ fn extract_envelope_charset(env: &str) -> Option<String> {
 }
 
 fn extract_envelope_body(env: &str) -> Option<String> {
-    let key = "\"body\"";
+    extract_envelope_string(env, "\"body\"")
+}
+
+/// Whether two URLs share an origin (scheme + authority), for the redirect-timing same-origin check.
+fn same_origin(a: &str, b: &str) -> bool {
+    fn origin(u: &str) -> Option<(String, String)> {
+        let se = u.find("://")?;
+        let authority = u[se + 3..].split(['/', '?', '#']).next().unwrap_or("");
+        Some((u[..se].to_ascii_lowercase(), authority.to_ascii_lowercase()))
+    }
+    matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// The post-redirect final URL recorded in the response envelope (`"url"` field).
+fn extract_envelope_url(env: &str) -> Option<String> {
+    extract_envelope_string(env, "\"url\"")
+}
+
+fn extract_envelope_string(env: &str, key: &str) -> Option<String> {
     let mut i = env.find(key)? + key.len();
     let bytes = env.as_bytes();
     while i < bytes.len() && bytes[i] != b'"' {

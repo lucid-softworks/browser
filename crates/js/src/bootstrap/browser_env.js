@@ -7231,7 +7231,7 @@
     }
     perf.navigation = Object.create(globalThis.PerformanceNavigation.prototype);
     perf.navigation.type = globalThis.__navType === "reload" ? 1 : (globalThis.__navType === "back_forward" ? 2 : 0);
-    perf.navigation.redirectCount = 0;
+    perf.navigation.redirectCount = globalThis.__redirectCount | 0;
     perf.navigation.toJSON = function () { return { type: this.type, redirectCount: this.redirectCount }; };
     perf.memory = { usedJSHeapSize: 0, totalJSHeapSize: 0, jsHeapSizeLimit: 0 };
 
@@ -7255,13 +7255,19 @@
       e.initiatorType = "navigation";
       e.nextHopProtocol = "http/1.1";
       e.workerStart = 0;
-      e.redirectStart = 0; e.redirectEnd = 0; e.redirectCount = 0;
-      e.fetchStart = 0;
-      e.domainLookupStart = 0; e.domainLookupEnd = 0;
-      e.connectStart = 0;
-      // secureConnectionStart is in [connectStart, connectEnd] and must be non-zero over TLS.
-      e.secureConnectionStart = __isHttpsPage ? 0.001 : 0;
-      e.connectEnd = 0.002; e.requestStart = 0.002; e.responseStart = 0.003; e.responseEnd = 0.004;
+      // Monotonic, ordered phase offsets (ms since startTime). A same-origin redirect occupies the
+      // first slice (redirectStart/End) and pushes fetchStart after it; otherwise redirect timings are
+      // 0. secureConnectionStart sits in [connectStart, connectEnd] and is non-zero only over TLS.
+      var __rc = globalThis.__redirectCount | 0;
+      e.redirectCount = __rc;
+      e.redirectStart = __rc > 0 ? 0.1 : 0;
+      e.redirectEnd = __rc > 0 ? 0.2 : 0;
+      var __ro = __rc > 0 ? 0.2 : 0;
+      e.fetchStart = __ro + 0.1;
+      e.domainLookupStart = __ro + 0.1; e.domainLookupEnd = __ro + 0.1;
+      e.connectStart = __ro + 0.1;
+      e.secureConnectionStart = __isHttpsPage ? __ro + 0.15 : 0;
+      e.connectEnd = __ro + 0.2; e.requestStart = __ro + 0.2; e.responseStart = __ro + 0.3; e.responseEnd = __ro + 0.4;
       // A reload / history navigation, or any navigation that replaced a previous same-origin document
       // in this browsing context, unloaded that document — so its unload event ran (non-zero). A fresh
       // navigation with no previous document leaves these at 0.
@@ -7282,6 +7288,8 @@
     if (__isHttpsPage) { perf.timing.secureConnectionStart = __perfOrigin; }
     // Legacy timing mirrors the unload event for a navigation that replaced a previous document.
     if (__navEntry.unloadEventStart > 0) { perf.timing.unloadEventStart = __perfOrigin; perf.timing.unloadEventEnd = __perfOrigin; }
+    // Legacy redirect timing for a same-origin redirected navigation (between navigationStart and fetchStart).
+    if (__navEntry.redirectCount > 0) { perf.timing.redirectStart = __perfOrigin; perf.timing.redirectEnd = __perfOrigin; }
     // Fill the load-phase timings and deliver the entry to "navigation" observers (called once, at the
     // window load event, by __fireLifecycleEvents).
     globalThis.__finalizeNavTiming = function (phase) {
