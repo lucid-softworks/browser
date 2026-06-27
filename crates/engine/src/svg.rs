@@ -943,7 +943,16 @@ fn flatten_rect(x: f32, y: f32, w: f32, h: f32, rx: f32, ry: f32, m: &Affine) ->
 // ----------------------------------------------------------------------------------------------
 
 fn attr<'a>(el: &'a dom::ElementData, name: &str) -> Option<&'a str> {
-    el.attrs.get(name).map(|s| s.as_str())
+    if let Some(s) = el.attrs.get(name) {
+        return Some(s.as_str());
+    }
+    // SVG keeps camelCase attribute names (viewBox, gradientUnits, …) in their canonical case, but
+    // the rasterizer asks for them in lowercase; fall back to a case-insensitive match. SVG has no
+    // attributes that differ only by case, so this is unambiguous.
+    el.attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 /// Number attribute (strips a trailing `px`); default `d`.
