@@ -1412,6 +1412,21 @@
     return __tag(id) === "a" && __getAttr(id, "name") !== null;
   }));
   collectionProperty("applets", documentCollection(function (id) { return __tag(id) === "applet"; }));
+  // document.open(): replace the document's content so subsequent write() builds a fresh tree. It does
+  // NOT navigate — the Document, its URL, and its navigation-timing entry are unchanged — so we only
+  // reset the node tree (recreating <head>/<body> as write() targets) and return the document.
+  def(document, "open", function () {
+    try {
+      var de = document.documentElement;
+      if (de) {
+        while (de.firstChild) { de.removeChild(de.firstChild); }
+        de.appendChild(document.createElement("head"));
+        de.appendChild(document.createElement("body"));
+      }
+    } catch (e) {}
+    return document;
+  });
+  def(document, "close", function () {});
   // document.write / writeln. We run scripts after the full parse (there is no live insertion point),
   // so the written markup is parsed and appended to <body> (or the documentElement) — enough for the
   // common case of a script writing extra elements (e.g. a <link>/<script>) into the page.
