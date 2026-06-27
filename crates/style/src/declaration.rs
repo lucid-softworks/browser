@@ -231,7 +231,57 @@ pub(crate) fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
     if start.is_none() && matches!(end, GridEnd::Auto) {
         return None;
     }
-    Some(GridPlacement { start, end })
+    Some(GridPlacement {
+        start,
+        start_span: span_from_start,
+        end,
+    })
+}
+
+fn normalize_grid_placement(slot: &mut Option<GridPlacement>) {
+    if slot
+        .as_ref()
+        .is_some_and(|p| p.start.is_none() && p.start_span.is_none() && matches!(p.end, GridEnd::Auto))
+    {
+        *slot = None;
+    }
+}
+
+fn set_grid_start(slot: &mut Option<GridPlacement>, val: &str) {
+    let v = val.trim().to_ascii_lowercase();
+    let mut placement = slot.unwrap_or_default();
+    if v.is_empty() || v == "auto" {
+        placement.start = None;
+        placement.start_span = None;
+    } else if let Some(n) = v.strip_prefix("span") {
+        placement.start = None;
+        placement.start_span = n.trim().parse::<i32>().ok();
+    } else if let Ok(line) = v.parse::<i32>() {
+        placement.start = Some(line);
+        placement.start_span = None;
+    }
+    *slot = Some(placement);
+    normalize_grid_placement(slot);
+}
+
+fn set_grid_end(slot: &mut Option<GridPlacement>, val: &str) {
+    let v = val.trim().to_ascii_lowercase();
+    let mut placement = slot.unwrap_or_default();
+    placement.end = if v.is_empty() || v == "auto" {
+        GridEnd::Auto
+    } else if let Some(n) = v.strip_prefix("span") {
+        n.trim()
+            .parse::<i32>()
+            .ok()
+            .map(GridEnd::Span)
+            .unwrap_or(GridEnd::Auto)
+    } else if let Ok(line) = v.parse::<i32>() {
+        GridEnd::Line(line)
+    } else {
+        GridEnd::Auto
+    };
+    *slot = Some(placement);
+    normalize_grid_placement(slot);
 }
 
 /// Map legacy HTML presentational attributes to CSS declarations ("presentational hints", per the
@@ -898,9 +948,13 @@ pub(crate) fn apply_declaration(
         "grid-column" => {
             style.grid_column = parse_grid_placement(val);
         }
+        "grid-column-start" => set_grid_start(&mut style.grid_column, val),
+        "grid-column-end" => set_grid_end(&mut style.grid_column, val),
         "grid-row" => {
             style.grid_row = parse_grid_placement(val);
         }
+        "grid-row-start" => set_grid_start(&mut style.grid_row, val),
+        "grid-row-end" => set_grid_end(&mut style.grid_row, val),
 
         // --- Box model: margin ---
         "margin" => {

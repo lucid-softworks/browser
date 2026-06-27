@@ -202,6 +202,18 @@ pub(crate) fn layout_grid(
         row_y[r + 1] = row_y[r] + row_heights[r] + if r + 1 < used_rows { cs.row_gap } else { 0.0 };
     }
 
+    boxx.grid_geometry = Some(GridGeometry {
+        column_lines: match cs.direction {
+            style::Direction::Ltr => col_x.iter().map(|x| content.x + *x).collect(),
+            style::Direction::Rtl => col_x
+                .iter()
+                .map(|x| content.x + content.width - *x)
+                .collect(),
+        },
+        row_lines: row_y.iter().map(|y| content.y + *y).collect(),
+        direction: cs.direction,
+    });
+
     // Cross-axis (`align-items`/`align-self`) baseline references per row: the deepest first-line
     // ascent for `baseline` groups, and the deepest descent (margin box below the last baseline) for
     // `last baseline` groups. Items in a group then share a baseline line within their cells.
@@ -446,18 +458,104 @@ pub(crate) fn placement_to_cell(
                 style::GridEnd::Line(e) => {
                     if let Some(s) = pl.start {
                         ((e - s).max(1)) as usize
+                    } else if let Some(span) = pl.start_span {
+                        span.max(1) as usize
                     } else {
                         1
                     }
                 }
                 style::GridEnd::Auto => 1,
             };
-            let start = pl.start.map(|s| {
-                // 1-based line → 0-based track index.
-                let idx = (s - 1).max(0) as usize;
-                idx.min(num.saturating_sub(1))
-            });
+            let start = pl
+                .start
+                .or_else(|| match (pl.start_span, pl.end) {
+                    (Some(span), style::GridEnd::Line(e)) => Some((e - span).max(1)),
+                    _ => None,
+                })
+                .map(|s| {
+                    // 1-based line → 0-based track index.
+                    let idx = (s - 1).max(0) as usize;
+                    idx.min(num.saturating_sub(1))
+                });
             (start, span.min(num.max(1)))
         }
     }
+}
+
+fn line_pos(lines: &[f32], line: i32) -> Option<f32> {
+    let idx = line.clamp(1, lines.len() as i32) as usize - 1;
+    lines.get(idx).copied()
+}
+
+fn grid_axis_edges(
+    placement: Option<style::GridPlacement>,
+    lines: &[f32],
+    start_edge: f32,
+    end_edge: f32,
+    start_sets_min: bool,
+) -> (f32, f32) {
+    let Some(pl) = placement else {
+        return (start_edge.min(end_edge), start_edge.max(end_edge));
+    };
+    let start_line = pl
+        .start
+        .or_else(|| match (pl.start_span, pl.end) {
+            (Some(span), style::GridEnd::Line(e)) => Some((e - span).max(1)),
+            _ => None,
+        })
+        .and_then(|line| line_pos(lines, line));
+    let end_line = match pl.end {
+        style::GridEnd::Line(line) => line_pos(lines, line),
+        style::GridEnd::Span(span) => pl.start.and_then(|start| line_pos(lines, start + span.max(1))),
+        style::GridEnd::Auto => None,
+    };
+
+    let mut min_edge = start_edge.min(end_edge);
+    let mut max_edge = start_edge.max(end_edge);
+    if start_sets_min {
+        if let Some(line) = start_line {
+            min_edge = line;
+        }
+        if let Some(line) = end_line {
+            max_edge = line;
+        }
+    } else {
+        if let Some(line) = start_line {
+            max_edge = line;
+        }
+        if let Some(line) = end_line {
+            min_edge = line;
+        }
+    }
+    (min_edge.min(max_edge), min_edge.max(max_edge))
+}
+
+pub(crate) fn abspos_grid_containing_block(
+    parent: &LayoutBox,
+    child: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> Option<Rect> {
+    let geometry = parent.grid_geometry.as_ref()?;
+    let cs = style_of(child, styles)?;
+    let pad = parent.dimensions.padding_box();
+    let (left, right) = grid_axis_edges(
+        cs.grid_column,
+        &geometry.column_lines,
+        pad.x,
+        pad.x + pad.width,
+        geometry.direction == style::Direction::Ltr,
+    );
+    let (top, bottom) = grid_axis_edges(
+        cs.grid_row,
+        &geometry.row_lines,
+        pad.y,
+        pad.y + pad.height,
+        true,
+    );
+    Some(Rect {
+        x: left,
+        y: top,
+        width: (right - left).max(0.0),
+        height: (bottom - top).max(0.0),
+    })
 }
