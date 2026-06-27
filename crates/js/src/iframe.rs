@@ -224,6 +224,24 @@ fn build_browsing_context(
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
 
+    // A sandboxed <iframe> without `allow-same-origin` has an opaque origin; storage APIs
+    // (e.g. cookieStore) must then throw SecurityError. Read the element's `sandbox` attribute from
+    // the parent document. (Auxiliary windows have synthetic node ids and are never sandboxed here.)
+    let opaque_origin = !is_aux && {
+        let doc = page_state.doc.borrow();
+        match &doc.get(dom::NodeId(node_id as usize)).data {
+            dom::NodeData::Element(e) => e
+                .attrs
+                .get("sandbox")
+                .map(|s| {
+                    !s.split_whitespace()
+                        .any(|t| t.eq_ignore_ascii_case("allow-same-origin"))
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
+    };
+
     // Resolve the frame's document HTML + its base URL (+ the response's charset, if any).
     let (html_src, frame_url, frame_charset) = match &srcdoc {
         Some(s) => (s.clone(), url.to_string(), None),
@@ -302,6 +320,12 @@ fn build_browsing_context(
             let krc = v8::String::new(cscope, "__redirectCount").unwrap();
             let vrc = v8::Number::new(cscope, redirect_count as f64);
             g0.set(cscope, krc.into(), vrc.into());
+            if opaque_origin {
+                if let Some(kop) = v8::String::new(cscope, "__opaqueOrigin") {
+                    let vop = v8::Boolean::new(cscope, true);
+                    g0.set(cscope, kop.into(), vop.into());
+                }
+            }
         }
         install_browser_environment(cscope, &frame_url);
         // Seed the host node id so the overlay can wire frameElement/parent messaging.

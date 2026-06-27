@@ -13155,7 +13155,15 @@
       if (typeof arg === "object") { return arg.name == null ? null : __cookieTrim(arg.name); }
       return null;
     }
+    // In an opaque origin (e.g. a sandboxed iframe without allow-same-origin) the cookie store is
+    // unavailable; the async methods reject with SecurityError.
+    function __cookieOpaqueReject() {
+      return globalThis.__opaqueOrigin
+        ? Promise.reject(new globalThis.DOMException("The cookie store is not available in an opaque origin.", "SecurityError"))
+        : null;
+    }
     CookieStore.prototype.getAll = function (nameOrOptions) {
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       if (nameOrOptions && typeof nameOrOptions === "object" && nameOrOptions.url != null &&
           !__cookieUrlOk(nameOrOptions.url, this.__isWindow)) {
         return Promise.reject(new globalThis.TypeError("CookieStore.getAll url is not allowed."));
@@ -13181,6 +13189,7 @@
       return true;
     }
     CookieStore.prototype.get = function (nameOrOptions) {
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       // get() with no argument is a TypeError; get('') is a valid query for the nameless cookie.
       if (arguments.length === 0) {
         return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or options."));
@@ -13199,6 +13208,7 @@
       return this.getAll(nameOrOptions).then(function (all) { return all.length ? all[0] : null; });
     };
     CookieStore.prototype.set = function (nameOrOptions, value) {
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       var self = this;
       return new Promise(function (resolve, reject) {
         var name, val, opts;
@@ -13281,6 +13291,7 @@
       });
     };
     CookieStore.prototype.delete = function (nameOrOptions) {
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       var self = this;
       return new Promise(function (resolve, reject) {
         var name, opts;
