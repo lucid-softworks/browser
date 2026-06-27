@@ -10424,7 +10424,29 @@
         Object.defineProperty(reg, "cookies", { value: globalThis.__makeCookieStoreManager(scopeHref), enumerable: true, configurable: true });
       }
       reg.onupdatefound = null;
-      def(reg, "update", function () { return Promise.resolve(reg); });
+      // update() re-fetches the script; if its bytes changed, a fresh worker is installed (fires
+      // updatefound and runs the install/activate lifecycle), reusing this registration (so cookie
+      // subscriptions persist). An unchanged script is a no-op.
+      def(reg, "update", function () {
+        var s = reg.__slots();
+        var cur = s.active || s.waiting || s.installing;
+        if (!cur) { return Promise.resolve(reg); }
+        var scriptHref = cur.scriptURL;
+        return globalThis.fetch(scriptHref).then(function (res) {
+          if (!res || !res.ok) { return reg; }
+          return (res.text ? res.text() : "").then(function (source) {
+            if (source === cur.__source) { return reg; } // byte-identical: no update
+            if (__swRegs.indexOf(reg) < 0) { return reg; } // unregistered meanwhile
+            var sw2 = __swMakeWorker(scriptHref);
+            var scope2 = __swEvalWorker(reg, sw2, scriptHref, source);
+            if (!scope2) { return reg; }
+            var s2 = reg.__slots();
+            reg.__setSlots(sw2, s2.waiting, s2.active);
+            __swLifecycle(reg, sw2, scope2, s2.active);
+            return reg;
+          });
+        });
+      });
       def(reg, "unregister", function () {
         var i = __swRegs.indexOf(reg), found = i >= 0;
         if (found) { __swRegs.splice(i, 1); }
@@ -10464,7 +10486,9 @@
             if (gone()) { return; }
             reg.__setSlots(null, sw, priorActive || null);
             sw.__setState("installed");
-            if (priorActive && !sw.__skipWaiting) { return; } // wait behind the active worker
+            // Wait behind the active worker only while it still controls a client; with no controlled
+            // client in scope (or skipWaiting) the new worker activates immediately.
+            if (priorActive && !sw.__skipWaiting && __swMatchesClient(reg.scope)) { return; }
             setTimeout(function () { // turn 3: activate
               if (gone()) { return; }
               if (priorActive && priorActive.__setState) { priorActive.__setState("redundant"); }
@@ -10485,6 +10509,7 @@
     // observes installing === null during its own evaluation. Returns the built scope, or null after
     // marking the worker redundant if the script threw (register() then rejects).
     function __swEvalWorker(reg, sw, scriptHref, source) {
+      sw.__source = source; // retained so registration.update() can detect a byte-changed script
       try { return __swExecuteWorker(reg, sw, scriptHref, source); }
       catch (e) { sw.__setState("redundant"); (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); return null; }
     }
