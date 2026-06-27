@@ -7307,10 +7307,14 @@
         }
       }
     };
-    // WebIDL: `performance` is an attribute (accessor with a getter), not a data property.
+    // WebIDL: `window.performance` is `[Replaceable]` — assigning to it shadows the getter with the
+    // assigned value, but the real Performance object must survive for internal use (Navigation Timing
+    // finalization, the harness's own timing). Keep `perf` as the stable real object; the page-visible
+    // override lives in `__perfReplaced`.
+    var __perfReplaced;
     Object.defineProperty(globalThis, "performance", {
-      get: function () { return perf; },
-      set: function (v) { perf = v; },
+      get: function () { return __perfReplaced !== undefined ? __perfReplaced : perf; },
+      set: function (v) { __perfReplaced = v; },
       enumerable: true, configurable: true
     });
   } else {
