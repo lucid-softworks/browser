@@ -1139,12 +1139,15 @@
       Object.getOwnPropertyNames(proto).forEach(function (k) {
         if (k === "constructor" || k.indexOf("__") === 0) { return; }
         var d = Object.getOwnPropertyDescriptor(proto, k); if (!d || !d.configurable) { return; }
+        // Brand check: a member is only callable on a genuine instance of its interface — i.e. the
+        // interface prototype must be in the receiver's chain (false for the bare prototype and for
+        // objects of a different interface).
         if (d.get || d.set) {
-          if (d.get) { var g0 = d.get; d.get = function () { if (this === proto) { throw new TypeError("Illegal invocation"); } return g0.call(this); }; rename(d.get, "get " + k, 0); }
-          if (d.set) { var s0 = d.set; d.set = function (v) { if (this === proto) { throw new TypeError("Illegal invocation"); } return s0.call(this, v); }; rename(d.set, "set " + k, 1); }
+          if (d.get) { var g0 = d.get; d.get = function () { if (!proto.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } return g0.call(this); }; rename(d.get, "get " + k, 0); }
+          if (d.set) { var s0 = d.set; d.set = function (v) { if (!proto.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } return s0.call(this, v); }; rename(d.set, "set " + k, 1); }
         } else if (typeof d.value === "function") {
           var f0 = d.value, ln = f0.length;
-          d.value = function () { if (this === proto) { throw new TypeError("Illegal invocation"); } return f0.apply(this, arguments); };
+          d.value = function () { if (!proto.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } return f0.apply(this, arguments); };
           rename(d.value, k, ln);
         }
         d.enumerable = true;
