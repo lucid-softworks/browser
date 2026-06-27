@@ -9171,6 +9171,37 @@
       }
       globalThis.__loadFrameEl = __loadFrame;
 
+      // A page-side Location facade for `frame.contentWindow.location`: getters read the frame realm's
+      // real Location (via __frameGet); `href`/`assign`/`replace` navigate the frame element (the same
+      // path as setting `iframe.src`), and `reload` reloads the current URL. This is what lets
+      // `frame.contentWindow.location.href = url` actually navigate (the contentWindow Proxy can only
+      // trap `set location`, not the nested `.href` assignment).
+      function __frameLocationProxy(el) {
+        var frameLoc = function () { try { return __frameGet(el.__node, "location"); } catch (e) { return null; } };
+        function navTo(v) {
+          var loc = frameLoc(), fbase = (loc && loc.href) || "about:blank";
+          if (globalThis.__urlParse(String(v), fbase) == null) {
+            throw new globalThis.DOMException("Failed to set the 'href' property on 'Location': '" + v + "' is not a valid URL.", "SyntaxError");
+          }
+          var abs; try { abs = new globalThis.URL(String(v), fbase).href; } catch (e) { abs = String(v); }
+          el.setAttribute("src", abs); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el);
+        }
+        return new globalThis.Proxy({}, {
+          get: function (t, p) {
+            if (p === "assign" || p === "replace") { return function (u) { navTo(u); }; }
+            if (p === "reload") { return function () { el.__frameLoadedKey = undefined; __loadFrame(el); }; }
+            if (p === "toString") { return function () { var l = frameLoc(); return l ? String(l.href || "") : ""; }; }
+            var l = frameLoc(); return l ? l[p] : undefined;
+          },
+          set: function (t, p, v) {
+            if (p === "href") { navTo(v); return true; }
+            var l = frameLoc(); if (l) { try { l[p] = v; } catch (e) {} }
+            return true;
+          }
+        });
+      }
+      globalThis.__frameLocationProxy = __frameLocationProxy;
+
       // Connection hook (called from document.js insertNode): when an <iframe> with a src/srcdoc is
       // inserted into the tree, load its nested browsing context. Walks the inserted subtree so a
       // frame nested inside an appended fragment also loads. Browsers load iframes on connection.
@@ -9179,7 +9210,10 @@
         try {
           var el = globalThis.__canonNode(globalThis.__wrapNode(nodeId));
           if (el && el.tagName && el.tagName.toLowerCase() === "iframe") {
-            if (el.getAttribute && (el.getAttribute("src") || (el.hasAttribute && el.hasAttribute("srcdoc")))) { __loadFrame(el); }
+            // Load on insertion whether or not there's a src/srcdoc — a srcless iframe gets an
+            // about:blank browsing context and still fires `load` (the navigation-timing step machines
+            // gate their first step on the frame's initial onload).
+            __loadFrame(el);
           }
           var kids = __children(nodeId);
           for (var i = 0; i < kids.length; i++) { globalThis.__frameOnInsert(kids[i]); }
@@ -9214,6 +9248,9 @@
                 el.__cwinReal = new globalThis.Proxy(base, {
                   get: function (t, prop) {
                     if (prop in t) { return t[prop]; }
+                    // `location` returns a navigating facade so `contentWindow.location.href = url`
+                    // (and assign/replace/reload) actually navigate the frame.
+                    if (prop === "location") { return el.__frameLocProxy || (el.__frameLocProxy = __frameLocationProxy(el)); }
                     if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
                     return undefined;
                   },
@@ -9288,13 +9325,11 @@
         return win;
       });
 
-      // Load any static iframes already in the parsed document (those with a src/srcdoc attribute).
+      // Load every static iframe in the parsed document — including srcless ones (which get an
+      // about:blank browsing context and fire `load`).
       try {
         var __ifs = document.getElementsByTagName("iframe");
-        for (var __i = 0; __i < __ifs.length; __i++) {
-          var __f = __ifs[__i];
-          if ((__f.getAttribute && (__f.getAttribute("src") || (__f.hasAttribute && __f.hasAttribute("srcdoc"))))) { __loadFrame(__f); }
-        }
+        for (var __i = 0; __i < __ifs.length; __i++) { __loadFrame(__ifs[__i]); }
       } catch (e) {}
     }
   } catch (e) {}
