@@ -944,7 +944,7 @@
     function reflectStr(proto, prop, attr) { Object.defineProperty(proto, prop, { get: function () { var v = getAttr(this.__node, attr); return v == null ? "" : v; }, set: function (v) { setAttr(this.__node, attr, String(v)); }, enumerable: true, configurable: true }); }
     accProto(G.SVGAElement.prototype, "target", function (el) { return makeAnimatedString(el, "target"); });
     ["download", "ping", "rel", "hreflang", "type", "referrerPolicy"].forEach(function (p) { reflectStr(G.SVGAElement.prototype, p, p === "referrerPolicy" ? "referrerpolicy" : p); });
-    Object.defineProperty(G.SVGAElement.prototype, "relList", { get: function () { return globalThis.__makeTokenList(this.__node, "rel"); }, set: function (v) { setAttr(this.__node, "rel", String(v)); }, enumerable: true, configurable: true });
+    Object.defineProperty(G.SVGAElement.prototype, "relList", { get: function () { var tl = globalThis.__makeTokenList(this.__node, "rel"); try { Object.setPrototypeOf(tl, globalThis.DOMTokenList.prototype); } catch (e) {} return tl; }, set: function (v) { setAttr(this.__node, "rel", String(v)); }, enumerable: true, configurable: true });
     // HTMLHyperlinkElementUtils-style URL decomposition over the resolved href.
     var aHrefURL = function (el) { var h = getAttr(el.__node, "href"); if (h == null) { h = getAttr(el.__node, "xlink:href"); } try { return new globalThis.URL(h == null ? "" : h, el.ownerDocument && (el.ownerDocument.baseURI || el.ownerDocument.URL)); } catch (e) { return null; } };
     ["protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"].forEach(function (p) {
@@ -964,7 +964,9 @@
     accProto(G.SVGFEConvolveMatrixElement.prototype, "targetY", function (el) { return makeAnimatedInteger(el, "targetY", 0); });
     accProto(G.SVGFEConvolveMatrixElement.prototype, "preserveAlpha", function (el) { return makeAnimatedBoolean(el, "preserveAlpha"); });
     // Document.rootElement is the document's root <svg> (or null).
-    Object.defineProperty(G.Document.prototype, "rootElement", { get: function () { if (!G.Document.prototype.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } var de = this.documentElement; return de && de.namespaceURI === SVG_NS ? de : null; }, enumerable: true, configurable: true });
+    var rootElementGet = function () { if (!this || this.nodeType !== 9) { throw new TypeError("Illegal invocation"); } var de = this.documentElement; return de && de.namespaceURI === SVG_NS ? de : null; };
+    Object.defineProperty(rootElementGet, "name", { value: "get rootElement", configurable: true });
+    Object.defineProperty(G.Document.prototype, "rootElement", { get: rootElementGet, enumerable: true, configurable: true });
 
     installTextContentProto(G.SVGTextContentElement.prototype);
     installMarkerProto(G.SVGMarkerElement.prototype);

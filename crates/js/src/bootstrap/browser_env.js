@@ -4848,11 +4848,14 @@
 
   // Apply all reflection accessors for the element `el` (node id `node`, lowercase tag `tag`).
   function applyReflection(el, node, tag) {
-    // Global attributes (HTMLElement) on every HTML element. The SVG/MathML tags skip these.
+    // Global attributes. The HTMLElement ones apply only to HTML elements; SVG/MathML elements get
+    // just the HTMLOrSVGElement subset (nonce/autofocus/tabIndex) — title/lang/dir/etc. are not on them.
+    var __htmlOrSvgGlobal = { nonce: 1, autofocus: 1, tabIndex: 1 };
+    var __isHtmlEl = el.namespaceURI === "http://www.w3.org/1999/xhtml";
     for (var gk in __reflGlobals) {
-      if (Object.prototype.hasOwnProperty.call(__reflGlobals, gk)) {
-        defineReflected(el, node, gk, __reflGlobals[gk]);
-      }
+      if (!Object.prototype.hasOwnProperty.call(__reflGlobals, gk)) { continue; }
+      if (!__isHtmlEl && !__htmlOrSvgGlobal[gk]) { continue; }
+      defineReflected(el, node, gk, __reflGlobals[gk]);
     }
     // ARIA nullable-string reflection (HTMLElement + Element).
     defineReflected(el, node, "role", { type: "nullable string", domAttrName: "role" });
