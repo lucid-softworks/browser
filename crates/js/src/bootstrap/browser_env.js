@@ -9255,6 +9255,9 @@
               postMessage: function () {}, focus: function () {}, blur: function () {}, close: function () {},
               location: { href: "about:blank", toString: function () { return "about:blank"; } },
               name: "",
+              // A same-origin (about:blank) frame shares the parent's cookie jar, so its cookieStore is
+              // the parent's — frame.contentWindow.cookieStore reads/writes the same cookies.
+              cookieStore: globalThis.cookieStore,
             };
             this.__cwin.self = this.__cwin; this.__cwin.window = this.__cwin; this.__cwin.frameElement = this;
             try { this.__cwin.parent = globalThis; this.__cwin.top = globalThis; } catch (e) {}
@@ -9456,6 +9459,14 @@
                     // (and assign/replace/reload) actually navigate the frame.
                     if (prop === "location") { return el.__frameLocProxy || (el.__frameLocProxy = __frameLocationProxy(el)); }
                     if (prop === "history") { return el.__frameHistProxy || (el.__frameHistProxy = __frameHistoryProxy(el)); }
+                    // A same-origin frame (about:blank inherits the parent's origin) shares the cookie
+                    // jar + origin, so expose the parent's cookieStore — the frame realm's own would key
+                    // cookies on "about:blank" and see nothing.
+                    if (prop === "cookieStore") {
+                      var sameOrigin = el.__frameLoadedKey === "about:blank";
+                      if (!sameOrigin) { try { sameOrigin = __frameGet(el.__node, "origin") === globalThis.origin; } catch (e) {} }
+                      if (sameOrigin) { return globalThis.cookieStore; }
+                    }
                     if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
                     return undefined;
                   },
