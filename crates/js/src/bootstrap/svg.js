@@ -86,6 +86,11 @@
     }
     return fn;
   }
+  // Ensure the browser-env base interfaces chain correctly (SVGSVGElement must reach
+  // SVGGraphicsElement so the root <svg> inherits getBBox/transform/SVGTests members).
+  subClass("SVGElement", "Element");
+  subClass("SVGGraphicsElement", "SVGElement");
+  subClass("SVGSVGElement", "SVGGraphicsElement");
   subClass("SVGGeometryElement", "SVGGraphicsElement");
   subClass("SVGPathElement", "SVGGeometryElement");
   subClass("SVGRectElement", "SVGGeometryElement");
@@ -939,7 +944,7 @@
     def(proto, "getEndPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * (i + 1) / len, b.y + b.height); });
     def(proto, "getExtentOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makeRectObj(b.x + b.width * i / len, b.y, b.width / len, b.height); });
     def(proto, "getCharNumAtPosition", function (p) { var b = bbox(this); var len = this.getNumberOfChars() || 1; if (!p || b.width === 0) { return -1; } var idx = Math.floor((p.x - b.x) / (b.width / len)); return idx >= 0 && idx < len ? idx : -1; });
-    def(proto, "selectSubString", function () {});
+    def(proto, "selectSubString", function (charnum, nchars) {});
   }
 
   function makeOrientAngle(el) {
@@ -978,8 +983,8 @@
     def(proto, "animationsPaused", function () { return !!clock.paused; });
     def(proto, "setCurrentTime", function (s) { var v = Number(s); clock.time = isFinite(v) ? v : 0; });
     def(proto, "getCurrentTime", function () { return clock.time; });
-    def(proto, "suspendRedraw", function () { return 0; });
-    def(proto, "unsuspendRedraw", function () {});
+    def(proto, "suspendRedraw", function (maxWaitMilliseconds) { return 0; });
+    def(proto, "unsuspendRedraw", function (id) {});
     def(proto, "unsuspendRedrawAll", function () {});
     def(proto, "forceRedraw", function () {});
     def(proto, "deselectAll", function () {});
@@ -1206,9 +1211,9 @@
     def(proto, "getCurrentTime", function () { return clock.time; });
     def(proto, "getSimpleDuration", function () { var d = parseClock(getAttr(this.__node, "dur")); if (d == null) { throw new globalThis.DOMException("no simple duration", "NotSupportedError"); } return d; });
     def(proto, "beginElement", function () {});
-    def(proto, "beginElementAt", function () {});
+    def(proto, "beginElementAt", function (offset) {});
     def(proto, "endElement", function () {});
-    def(proto, "endElementAt", function () {});
+    def(proto, "endElementAt", function (offset) {});
     Object.defineProperty(proto, "targetElement", {
       get: function () {
         var href = getAttr(this.__node, "href"); if (href == null) { href = getAttr(this.__node, "xlink:href"); }
