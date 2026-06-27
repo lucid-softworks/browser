@@ -118,7 +118,7 @@
   subClass("SVGPatternElement", "SVGElement");
   subClass("SVGMarkerElement", "SVGElement");
   (function () {
-    var C = { SVG_MARKERUNITS_UNKNOWN: 0, SVG_MARKERUNITS_USERSPACEONUSE: 1, SVG_MARKERUNITS_STROKEWIDTH: 2, SVG_MARKER_ORIENT_UNKNOWN: 0, SVG_MARKER_ORIENT_AUTO: 1, SVG_MARKER_ORIENT_ANGLE: 2 };
+    var C = { SVG_MARKERUNITS_UNKNOWN: 0, SVG_MARKERUNITS_USERSPACEONUSE: 1, SVG_MARKERUNITS_STROKEWIDTH: 2, SVG_MARKER_ORIENT_UNKNOWN: 0, SVG_MARKER_ORIENT_AUTO: 1, SVG_MARKER_ORIENT_ANGLE: 2, SVG_MARKER_ORIENT_AUTO_START_REVERSE: 3 };
     for (var k in C) { if (C.hasOwnProperty(k)) { globalThis.SVGMarkerElement[k] = C[k]; globalThis.SVGMarkerElement.prototype[k] = C[k]; } }
   })();
   subClass("SVGClipPathElement", "SVGElement");
@@ -151,7 +151,7 @@
     var T = globalThis.TimeEvent.prototype;
     Object.defineProperty(T, "view", { get: function () { return this.__view || null; }, enumerable: true, configurable: true });
     Object.defineProperty(T, "detail", { get: function () { return this.__detail || 0; }, enumerable: true, configurable: true });
-    def(T, "initTimeEvent", function (typeArg, viewArg, detailArg) { this.__view = viewArg || null; this.__detail = detailArg | 0; });
+    def(T, "initTimeEvent", function (typeArg) { this.__view = arguments[1] || null; this.__detail = arguments[2] | 0; });
     Object.defineProperty(globalThis.ShadowAnimation.prototype, "sourceAnimation", { get: function () { return this.__sourceAnimation || null; }, enumerable: true, configurable: true });
   })();
 
@@ -617,8 +617,6 @@
     femorphology: [["operator", { erode: 1, dilate: 2 }, "erode"]],
     feturbulence: [["type", { fractalNoise: 1, turbulence: 2 }, "turbulence"], ["stitchTiles", { stitch: 1, noStitch: 2 }, "noStitch"]],
     filter: [["filterUnits", ENUM_UNITS, "objectBoundingBox"], ["primitiveUnits", ENUM_UNITS, "userSpaceOnUse"]],
-    lineargradient: [["gradientUnits", ENUM_UNITS, "objectBoundingBox"], ["spreadMethod", { pad: 1, reflect: 2, repeat: 3 }, "pad"]],
-    radialgradient: [["gradientUnits", ENUM_UNITS, "objectBoundingBox"], ["spreadMethod", { pad: 1, reflect: 2, repeat: 3 }, "pad"]],
     clippath: [["clipPathUnits", ENUM_UNITS, "userSpaceOnUse"]],
     mask: [["maskUnits", ENUM_UNITS, "objectBoundingBox"], ["maskContentUnits", ENUM_UNITS, "userSpaceOnUse"]],
     pattern: [["patternUnits", ENUM_UNITS, "objectBoundingBox"], ["patternContentUnits", ENUM_UNITS, "userSpaceOnUse"]],
@@ -897,6 +895,12 @@
       accProto(C.prototype, "preserveAspectRatio", function (el) { return makeAnimatedPAR(); });
     });
 
+    // SVGGradientElement enumerated units (shared by linear & radial gradients).
+    [["gradientUnits", ENUM_UNITS, "objectBoundingBox"], ["spreadMethod", { pad: 1, reflect: 2, repeat: 3 }, "pad"]].forEach(function (s) {
+      accProto(G.SVGGradientElement.prototype, s[0], function (el) { return makeEnumProp(el, s[0], s[1], s[2]); });
+    });
+    // SVGMarkerElement.orient is a plain DOMString reflection (alongside orientType / orientAngle).
+    Object.defineProperty(G.SVGMarkerElement.prototype, "orient", { get: function () { var v = getAttr(this.__node, "orient"); return v == null ? "" : v; }, set: function (v) { setAttr(this.__node, "orient", String(v)); }, enumerable: true, configurable: true });
     // Gradient / pattern transforms.
     accProto(G.SVGGradientElement.prototype, "gradientTransform", function (el) { return makeAnimatedTransformListAttr(el, "gradientTransform"); });
     accProto(G.SVGPatternElement.prototype, "patternTransform", function (el) { return makeAnimatedTransformListAttr(el, "patternTransform"); });
@@ -954,7 +958,7 @@
     def(proto, "getStartPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * i / len, b.y + b.height); });
     def(proto, "getEndPositionOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makePoint(b.x + b.width * (i + 1) / len, b.y + b.height); });
     def(proto, "getExtentOfChar", function (i) { var b = bbox(this); var len = this.getNumberOfChars() || 1; return makeRectObj(b.x + b.width * i / len, b.y, b.width / len, b.height); });
-    def(proto, "getCharNumAtPosition", function (p) { var b = bbox(this); var len = this.getNumberOfChars() || 1; if (!p || b.width === 0) { return -1; } var idx = Math.floor((p.x - b.x) / (b.width / len)); return idx >= 0 && idx < len ? idx : -1; });
+    def(proto, "getCharNumAtPosition", function () { var p = arguments[0]; var b = bbox(this); var len = this.getNumberOfChars() || 1; if (!p || b.width === 0) { return -1; } var idx = Math.floor((p.x - b.x) / (b.width / len)); return idx >= 0 && idx < len ? idx : -1; });
     def(proto, "selectSubString", function (charnum, nchars) {});
   }
 
@@ -1006,7 +1010,7 @@
     def(proto, "createSVGMatrix", function () { return makeMatrix(1, 0, 0, 1, 0, 0); });
     def(proto, "createSVGTransform", function () { return makeTransform("matrix", [1, 0, 0, 1, 0, 0]); });
     def(proto, "createSVGAngle", function () { var st = { v: 0, u: 1 }; var A = Object.create(SVGAngle.prototype); A.__g = function () { return st.v; }; A.__gt = function () { return st.u; }; A.__s = function (x) { st.v = +x; }; return A; });
-    def(proto, "createSVGTransformFromMatrix", function (m) { var T = this.createSVGTransform(); T.setMatrix(m); return T; });
+    def(proto, "createSVGTransformFromMatrix", function () { var m = arguments[0]; var T = this.createSVGTransform(); T.setMatrix(m); return T; });
     def(proto, "getElementById", function (id) { return this.ownerDocument.getElementById(id); });
     var elemViewBox = function (e) {
       var b = bbox(e), m = ctmOf(e);
@@ -1113,7 +1117,7 @@
     A(SVGTransform.prototype, "type", function () { return this.__t.type; });
     A(SVGTransform.prototype, "angle", function () { return this.__t.angle; });
     A(SVGTransform.prototype, "matrix", function () { return this.__t.matrix; });
-    def(SVGTransform.prototype, "setMatrix", function (m) { this.__t.matrix = m; this.__t.type = 1; this.__t.angle = 0; });
+    def(SVGTransform.prototype, "setMatrix", function () { var m = arguments[0]; this.__t.matrix = m; this.__t.type = 1; this.__t.angle = 0; });
     def(SVGTransform.prototype, "setTranslate", function (x, y) { this.__t.matrix = transformMatrix("translate", [x, y]); this.__t.type = 2; this.__t.angle = 0; });
     def(SVGTransform.prototype, "setScale", function (x, y) { this.__t.matrix = transformMatrix("scale", [x, y]); this.__t.type = 3; this.__t.angle = 0; });
     def(SVGTransform.prototype, "setRotate", function (a, cx, cy) { this.__t.matrix = transformMatrix("rotate", [a, cx, cy]); this.__t.type = 4; this.__t.angle = a; });
@@ -1137,7 +1141,7 @@
       def(p, "replaceItem", function (x, i) { var n = this.__l.len(); if (i < 0 || i >= n) { throw new G.DOMException("index", "IndexSizeError"); } return this.__l.replace(x, i); });
     });
     def(G.SVGTransformList.prototype, "consolidate", function () { return this.__l.consolidate ? this.__l.consolidate() : null; });
-    def(G.SVGTransformList.prototype, "createSVGTransformFromMatrix", function (m) { return makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); });
+    def(G.SVGTransformList.prototype, "createSVGTransformFromMatrix", function () { var m = arguments[0]; return makeTransform("matrix", [m.a, m.b, m.c, m.d, m.e, m.f]); });
 
     // SVGAnimated* wrappers: object-valued (baseVal/animVal are stored objects).
     [G.SVGAnimatedLength, G.SVGAnimatedRect, G.SVGAnimatedAngle, G.SVGAnimatedPreserveAspectRatio, G.SVGAnimatedTransformList, G.SVGAnimatedLengthList, G.SVGAnimatedNumberList].forEach(function (C) {
@@ -1532,8 +1536,8 @@
     var Path = globalThis.SVGPathElement.prototype;
     def(Geo, "getTotalLength", function () { return totalLength(this); });
     def(Geo, "getPointAtLength", function (len) { return pointAtLength(this, Number(len) || 0); });
-    def(Geo, "isPointInFill", function (point) { return false; });
-    def(Geo, "isPointInStroke", function (point) { return false; });
+    def(Geo, "isPointInFill", function () { return false; });
+    def(Geo, "isPointInStroke", function () { return false; });
     Object.defineProperty(Geo, "pathLength", {
       get: function () {
         var el = this, c = Object.create(globalThis.SVGAnimatedNumber.prototype);
