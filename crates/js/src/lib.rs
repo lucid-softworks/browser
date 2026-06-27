@@ -173,6 +173,11 @@ struct HostState {
     /// `getBoundingClientRect` / `offsetWidth` / `scrollHeight` etc. The engine recomputes layout;
     /// the worker only serves what was pushed (it cannot reach the engine's layout from here).
     layout_rects: RefCell<HashMap<usize, (f32, f32, f32, f32)>>,
+    /// The `dom_version` at which `layout_rects` were last valid — either pushed by the engine
+    /// (`SessionCmd::SetRects`) or recomputed in-Session ([`forced_layout::ensure_layout_fresh`]).
+    /// A geometry read whose `dom_version` is ahead of this re-lays-out the dirty DOM in-Session, so
+    /// `getBoundingClientRect` etc. reflect script mutations the blocked engine hasn't rendered yet.
+    rects_dom_version: Cell<u64>,
     /// CSSOM *used* inset values per positioned box, keyed by node id, pushed by the engine
     /// alongside `layout_rects`. `(top, right, bottom, left)` in CSS px. Read by `resolved_inset_value`
     /// so `getComputedStyle(el).top` etc. report the used value when the element has a box; absent for
@@ -276,6 +281,7 @@ impl HostState {
             dom_version: Cell::new(0),
             computed_cache: RefCell::new(None),
             layout_rects: RefCell::new(HashMap::new()),
+            rects_dom_version: Cell::new(0),
             used_insets: RefCell::new(HashMap::new()),
             used_margins: RefCell::new(HashMap::new()),
             image_natural: RefCell::new(HashMap::new()),
@@ -318,6 +324,7 @@ fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
 
 mod dom_helpers;
 mod eval_loop;
+mod forced_layout;
 mod iframe;
 mod modules;
 mod primitives;
@@ -3810,16 +3817,15 @@ mod tests {
 
     #[test]
     fn get_bounding_client_rect_shape() {
-        // Without an engine pushing rects (the bare `env_eval` path lays out nothing), the rect is
-        // the zero-rect fallback — but every DOMRect field must be present, finite, and toJSON-able.
-        // Real (non-zero) geometry is exercised in the `engine` crate's layout-rect tests.
+        // Every DOMRect field must be present, finite, and toJSON-able. With in-Session forced layout
+        // the bare `env_eval` path now lays the document out itself (no engine needed), so the body's
+        // rect is real (non-zero width across the default viewport) rather than the old zero fallback.
         let out = env_eval(
             "https://example.com/",
             "var r = document.body.getBoundingClientRect(); \
              var ok = ['x','y','top','left','right','bottom','width','height'] \
                .every(function(k){ return typeof r[k] === 'number' && isFinite(r[k]); }); \
-             ok && typeof r.toJSON === 'function' && \
-             [r.x, r.y, r.top, r.left, r.right, r.bottom, r.width, r.height].join(',') === '0,0,0,0,0,0,0,0'",
+             ok && typeof r.toJSON === 'function' && r.width > 0",
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("true"));

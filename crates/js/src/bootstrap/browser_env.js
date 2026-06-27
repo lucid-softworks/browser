@@ -108,11 +108,15 @@
             setTimeout(function () {
               mock.busy = false;
               var list = multiple ? selected : selected.slice(0, 1);
+              // Emit members in the ContactInfo dictionary's canonical (alphabetical) order, filtered
+              // to the requested properties — a requested-but-absent property is an empty list. The
+              // order matters: callers sort results by JSON.stringify.
+              var order = ["address", "email", "icon", "name", "tel"];
               resolve(list.map(function (c) {
                 var out = {};
-                for (var j = 0; j < properties.length; j++) {
-                  var p = properties[j];
-                  out[p] = (c && c[p] != null) ? c[p] : [];
+                for (var j = 0; j < order.length; j++) {
+                  var p = order[j];
+                  if (properties.indexOf(p) >= 0) { out[p] = (c && c[p] != null) ? c[p] : []; }
                 }
                 return out;
               }));

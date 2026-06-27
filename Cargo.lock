@@ -1128,7 +1128,9 @@ version = "0.1.0"
 dependencies = [
  "css",
  "dom",
+ "fontdue",
  "html",
+ "layout",
  "paint",
  "style",
  "v8",
