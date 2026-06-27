@@ -7809,6 +7809,8 @@
     if (globalThis[name] !== ctor) { def(globalThis, name, ctor); }
     return ctor;
   }
+  // WebIDL accessor functions must be named "get <attr>" / "set <attr>" (idlharness checks .name).
+  function __named(n, f) { try { Object.defineProperty(f, "name", { value: n, writable: false, enumerable: false, configurable: true }); } catch (e) {} return f; }
   var NodeCtor = defClass("Node");
   // Node type constants live on both the constructor and the prototype, so `Node.ELEMENT_NODE` and
   // `someNode.ELEMENT_NODE` (instance access, used by WPT) both resolve.
@@ -10256,6 +10258,20 @@
       var scope = Object.create(globalThis.ServiceWorkerGlobalScope.prototype);
       installEvents(scope);
       scope.self = scope;
+      // In a real worker `globalThis === self`. Our scope shares the page realm, so a bare `globalThis`
+      // would reach the page global and miss worker-scoped names (e.g. testharness's `globalThis.fetch_spec`).
+      // Expose `globalThis` as a proxy that prefers the scope's own properties and falls back to the page
+      // global for shared constructors (URL, Promise, Response, ...).
+      if (typeof globalThis.Proxy === "function") {
+        var __pageGlobal = globalThis;
+        scope.globalThis = new globalThis.Proxy(scope, {
+          get: function (t, p) { return (p in t) ? t[p] : __pageGlobal[p]; },
+          has: function (t, p) { return (p in t) || (p in __pageGlobal); },
+          set: function (t, p, v) { t[p] = v; return true; }
+        });
+      } else {
+        scope.globalThis = scope;
+      }
       // testharness.js (run inside the worker via importScripts) selects its test environment with
       // `'ServiceWorkerGlobalScope' in self && self instanceof ServiceWorkerGlobalScope`; expose the
       // constructor on the scope so a worker-side test reports its results back to the page.
@@ -10264,6 +10280,8 @@
       scope.onmessage = null; scope.onmessageerror = null; scope.oncookiechange = null;
       // The worker's own cookieStore (any same-origin url path is allowed, unlike a Window's).
       try { if (globalThis.__makeWorkerCookieStore) { Object.defineProperty(scope, "cookieStore", { value: globalThis.__makeWorkerCookieStore(), enumerable: true, configurable: true }); } } catch (e) {}
+      // ExtendableCookieChangeEvent is exposed only in service-worker scopes.
+      try { if (globalThis.__ExtendableCookieChangeEvent) { Object.defineProperty(scope, "ExtendableCookieChangeEvent", { value: globalThis.__ExtendableCookieChangeEvent, enumerable: false, writable: true, configurable: true }); } } catch (e) {}
       Object.defineProperty(scope, "registration", { value: reg, enumerable: true, configurable: true });
       Object.defineProperty(scope, "serviceWorker", { value: sw, enumerable: true, configurable: true });
       try { Object.defineProperty(scope, "location", { value: new globalThis.URL(scriptHref), enumerable: true, configurable: true }); } catch (e) {}
@@ -10410,7 +10428,7 @@
         (function (scope) {
           setTimeout(function () {
             var ev;
-            try { ev = new globalThis.ExtendableCookieChangeEvent("cookiechange", { changed: changed, deleted: deleted }); }
+            try { ev = new globalThis.__ExtendableCookieChangeEvent("cookiechange", { changed: changed, deleted: deleted }); }
             catch (e) { return; }
             try { scope.dispatchEvent(ev); } catch (e) {}
             try { if (typeof scope.oncookiechange === "function") { scope.oncookiechange(ev); } } catch (e) {}
@@ -10429,11 +10447,8 @@
       Object.defineProperty(reg, "waiting", { get: function () { return waiting; }, enumerable: true, configurable: true });
       Object.defineProperty(reg, "active", { get: function () { return active; }, enumerable: true, configurable: true });
       Object.defineProperty(reg, "navigationPreload", { value: __swMakeNavPreload(), enumerable: true, configurable: true });
-      // registration.cookies: the CookieStoreManager for cookiechange subscriptions, scoped to this
-      // registration. Defined lazily because CookieStoreManager is installed later in the bootstrap.
-      if (typeof globalThis.__makeCookieStoreManager === "function") {
-        Object.defineProperty(reg, "cookies", { value: globalThis.__makeCookieStoreManager(scopeHref), enumerable: true, configurable: true });
-      }
+      // registration.cookies is a [SameObject] getter on ServiceWorkerRegistration.prototype (see the
+      // CookieStoreManager setup); it lazily creates this registration's manager from reg.scope.
       reg.onupdatefound = null;
       // update() re-fetches the script; if its bytes changed, a fresh worker is installed (fires
       // updatefound and runs the install/activate lifecycle), reusing this registration (so cookie
@@ -12987,8 +13002,31 @@
     defSubclass("PageTransitionEvent", Event, { persisted: false });
     defSubclass("BeforeUnloadEvent", Event, { returnValue: "" });
     defSubclass("MessageEvent", Event, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
-    defSubclass("CookieChangeEvent", Event, { changed: [], deleted: [] }, null,
-      { changed: function (v) { return v == null ? [] : v; }, deleted: function (v) { return v == null ? [] : v; } });
+    // CookieChangeEvent / ExtendableCookieChangeEvent expose `changed`/`deleted` as [SameObject]
+    // readonly FrozenArray attributes — i.e. prototype getters returning a frozen array, not own
+    // instance data properties (which is what defSubclass would create). Build them WebIDL-conformant.
+    function defCookieChangeEvent(ccName, ParentCtor) {
+      function Ctor(type, init) {
+        if (!(this instanceof Ctor)) { throw new globalThis.TypeError("Please use the 'new' operator, this constructor cannot be called as a function."); }
+        if (arguments.length < 1) { throw new globalThis.TypeError("1 argument required, but only 0 present."); }
+        ParentCtor.call(this, type, init);
+        init = init || {};
+        var ch = init.changed == null ? [] : init.changed;
+        var dl = init.deleted == null ? [] : init.deleted;
+        def(this, "__changed", Object.freeze(Array.prototype.slice.call(ch)));
+        def(this, "__deleted", Object.freeze(Array.prototype.slice.call(dl)));
+      }
+      Ctor.prototype = Object.create(ParentCtor.prototype);
+      Object.defineProperty(Ctor.prototype, "constructor", { value: Ctor, enumerable: false, configurable: true, writable: true });
+      // [SameObject] readonly FrozenArray getters with a brand check (accessing on the prototype throws).
+      Object.defineProperty(Ctor.prototype, "changed", { get: __named("get changed", function () { if (this.__changed === undefined) { throw new globalThis.TypeError("Illegal invocation"); } return this.__changed; }), enumerable: true, configurable: true });
+      Object.defineProperty(Ctor.prototype, "deleted", { get: __named("get deleted", function () { if (this.__deleted === undefined) { throw new globalThis.TypeError("Illegal invocation"); } return this.__deleted; }), enumerable: true, configurable: true });
+      def(globalThis, ccName, Ctor);
+      defClass(ccName, ParentCtor); // name, @@toStringTag, interface-object [[Prototype]], frozen prototype
+      try { Object.defineProperty(Ctor, "length", { value: 1, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+      return Ctor;
+    }
+    defCookieChangeEvent("CookieChangeEvent", Event);
     defSubclass("ProgressEvent", Event, { lengthComputable: false, loaded: 0, total: 0 });
     defSubclass("ErrorEvent", Event, { message: "", filename: "", lineno: 0, colno: 0, error: null });
     defSubclass("PromiseRejectionEvent", Event, { promise: null, reason: undefined });
@@ -13019,11 +13057,28 @@
     // worker cookie backend we don't have, so it's a non-functional stub.
     function CookieStore() { throw new globalThis.TypeError("Illegal constructor"); }
     function CookieStoreManager() { throw new globalThis.TypeError("Illegal constructor"); }
-    CookieStore.prototype = Object.create(globalThis.EventTarget.prototype);
-    Object.defineProperty(CookieStore.prototype, "constructor", { value: CookieStore, enumerable: false, configurable: true, writable: true });
-    try { Object.setPrototypeOf(CookieStore, globalThis.EventTarget); } catch (e) {}
     def(globalThis, "CookieStore", CookieStore);
     def(globalThis, "CookieStoreManager", CookieStoreManager);
+    // WebIDL conformance: interface object name/prototype-chain/@@toStringTag (CookieStore : EventTarget;
+    // CookieStoreManager has no parent). Constructors throw "Illegal constructor".
+    defClass("CookieStore", globalThis.EventTarget);
+    defClass("CookieStoreManager");
+    // ServiceWorkerRegistration.cookies [SameObject] readonly: a prototype getter that lazily creates
+    // (and caches) this registration's CookieStoreManager, scoped to reg.scope.
+    try {
+      if (globalThis.ServiceWorkerRegistration && globalThis.ServiceWorkerRegistration.prototype) {
+        Object.defineProperty(globalThis.ServiceWorkerRegistration.prototype, "cookies", {
+          get: __named("get cookies", function () {
+            if (!(this instanceof globalThis.ServiceWorkerRegistration)) { throw new globalThis.TypeError("Illegal invocation"); }
+            if (!this.__cookies && typeof globalThis.__makeCookieStoreManager === "function") {
+              this.__cookies = globalThis.__makeCookieStoreManager(this.scope);
+            }
+            return this.__cookies || null;
+          }),
+          enumerable: true, configurable: true
+        });
+      }
+    } catch (e) {}
 
     // CookieStoreManager (registration.cookies): a per-registration subscription list. Each
     // subscription is { name?, url } with url resolved against the registration scope (defaulting to
@@ -13036,6 +13091,7 @@
       return { name: o.name == null ? undefined : String(o.name), url: url };
     }
     CookieStoreManager.prototype.subscribe = function (subscriptions) {
+      if (!(this instanceof CookieStoreManager)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
       var store = this.__subs || (this.__subs = []);
       var scope = this.__scope;
       if (!Array.isArray(subscriptions)) {
@@ -13061,6 +13117,8 @@
       return Promise.resolve(undefined);
     };
     CookieStoreManager.prototype.unsubscribe = function (subscriptions) {
+      if (!(this instanceof CookieStoreManager)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      if (arguments.length < 1) { return Promise.reject(new globalThis.TypeError("1 argument required, but only 0 present.")); }
       var store = this.__subs || (this.__subs = []);
       var scope = this.__scope;
       var arr = subscriptions || [];
@@ -13073,6 +13131,7 @@
       return Promise.resolve(undefined);
     };
     CookieStoreManager.prototype.getSubscriptions = function () {
+      if (!(this instanceof CookieStoreManager)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
       var store = this.__subs || [];
       // Omit `name` entirely for a nameless subscription (`'name' in item` must be false), per the
       // CookieStoreGetOptions shape — not a present `name: undefined`.
@@ -13163,6 +13222,7 @@
         : null;
     }
     CookieStore.prototype.getAll = function (nameOrOptions) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
       var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       if (nameOrOptions && typeof nameOrOptions === "object" && nameOrOptions.url != null &&
           !__cookieUrlOk(nameOrOptions.url, this.__isWindow)) {
@@ -13189,6 +13249,7 @@
       return true;
     }
     CookieStore.prototype.get = function (nameOrOptions) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
       var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       // get() with no argument is a TypeError; get('') is a valid query for the nameless cookie.
       if (arguments.length === 0) {
@@ -13208,6 +13269,7 @@
       return this.getAll(nameOrOptions).then(function (all) { return all.length ? all[0] : null; });
     };
     CookieStore.prototype.set = function (nameOrOptions, value) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
       var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       var self = this;
       return new Promise(function (resolve, reject) {
@@ -13291,6 +13353,8 @@
       });
     };
     CookieStore.prototype.delete = function (nameOrOptions) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      if (arguments.length < 1) { return Promise.reject(new globalThis.TypeError("1 argument required, but only 0 present.")); }
       var __op = __cookieOpaqueReject(); if (__op) { return __op; }
       var self = this;
       return new Promise(function (resolve, reject) {
@@ -13373,10 +13437,49 @@
       } catch (e) {}
     });
 
+    // WebIDL conformance for the operations: non-enumerable, with the spec arg counts (the smallest
+    // required across overloads) as `.length` and the operation name as `.name`.
+    (function () {
+      function conform(proto, specs) {
+        for (var nm in specs) {
+          var f = proto[nm];
+          if (typeof f !== "function") { continue; }
+          try { Object.defineProperty(f, "length", { value: specs[nm], writable: false, enumerable: false, configurable: true }); } catch (e) {}
+          try { Object.defineProperty(f, "name", { value: nm, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+          // WebIDL operations are enumerable, writable, configurable own props of the interface prototype.
+          Object.defineProperty(proto, nm, { value: f, enumerable: true, writable: true, configurable: true });
+        }
+      }
+      conform(CookieStore.prototype, { get: 0, getAll: 0, set: 1, "delete": 1 });
+      conform(CookieStoreManager.prototype, { subscribe: 1, getSubscriptions: 0, unsubscribe: 1 });
+    })();
+    // CookieStore.onchange [Exposed=Window] — an EventHandler attribute on the prototype that mirrors a
+    // single 'change' listener.
+    Object.defineProperty(CookieStore.prototype, "onchange", {
+      get: __named("get onchange", function () {
+        if (!(this instanceof CookieStore)) { throw new globalThis.TypeError("Illegal invocation"); }
+        return this.__onchange || null;
+      }),
+      set: __named("set onchange", function (h) {
+        if (!(this instanceof CookieStore)) { throw new globalThis.TypeError("Illegal invocation"); }
+        if (this.__onchange) { this.removeEventListener("change", this.__onchange); }
+        this.__onchange = (typeof h === "function") ? h : null;
+        if (this.__onchange) { this.addEventListener("change", this.__onchange); }
+      }),
+      enumerable: true, configurable: true
+    });
+
     var cookieStore = Object.create(CookieStore.prototype);
     installEvents(cookieStore); // addEventListener/removeEventListener/dispatchEvent + onchange
     cookieStore.__isWindow = true; // a Window cookieStore restricts get/getAll urls to the document path
-    def(globalThis, "cookieStore", cookieStore);
+    // Window.cookieStore [SameObject] readonly: a [Global] interface's members live on the global object
+    // itself as accessors (not on Window.prototype, and not as a data property).
+    Object.defineProperty(globalThis, "cookieStore", {
+      get: __named("get cookieStore", function () {
+        if (this !== globalThis) { throw new globalThis.TypeError("Illegal invocation"); }
+        return cookieStore;
+      }), enumerable: true, configurable: true
+    });
     // A worker (e.g. ServiceWorker) gets its own cookieStore that allows any same-origin url path.
     def(globalThis, "__makeWorkerCookieStore", function () {
       var cs = Object.create(CookieStore.prototype);
@@ -13428,8 +13531,13 @@
       s.__extend.push(Promise.resolve(p));
     };
     defSubclass("ExtendableMessageEvent", ExtendableEvent, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
-    defSubclass("ExtendableCookieChangeEvent", ExtendableEvent, { changed: [], deleted: [] }, null,
-      { changed: function (v) { return v == null ? [] : v; }, deleted: function (v) { return v == null ? [] : v; } });
+    defCookieChangeEvent("ExtendableCookieChangeEvent", ExtendableEvent);
+    // ExtendableCookieChangeEvent is [Exposed=ServiceWorker] only: keep an internal reference and
+    // remove it from the (Window/dedicated-worker) global; service-worker scopes re-expose it.
+    try {
+      def(globalThis, "__ExtendableCookieChangeEvent", globalThis.ExtendableCookieChangeEvent);
+      delete globalThis.ExtendableCookieChangeEvent;
+    } catch (e) {}
     var FetchEvent = defSubclass("FetchEvent", ExtendableEvent, {
       request: null, clientId: "", resultingClientId: "", replacesClientId: "",
       preloadResponse: null, handled: null
