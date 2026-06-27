@@ -10368,6 +10368,11 @@
       Object.defineProperty(reg, "waiting", { get: function () { return waiting; }, enumerable: true, configurable: true });
       Object.defineProperty(reg, "active", { get: function () { return active; }, enumerable: true, configurable: true });
       Object.defineProperty(reg, "navigationPreload", { value: __swMakeNavPreload(), enumerable: true, configurable: true });
+      // registration.cookies: the CookieStoreManager for cookiechange subscriptions, scoped to this
+      // registration. Defined lazily because CookieStoreManager is installed later in the bootstrap.
+      if (typeof globalThis.__makeCookieStoreManager === "function") {
+        Object.defineProperty(reg, "cookies", { value: globalThis.__makeCookieStoreManager(scopeHref), enumerable: true, configurable: true });
+      }
       reg.onupdatefound = null;
       def(reg, "update", function () { return Promise.resolve(reg); });
       def(reg, "unregister", function () {
@@ -12933,6 +12938,70 @@
     try { Object.setPrototypeOf(CookieStore, globalThis.EventTarget); } catch (e) {}
     def(globalThis, "CookieStore", CookieStore);
     def(globalThis, "CookieStoreManager", CookieStoreManager);
+
+    // CookieStoreManager (registration.cookies): a per-registration subscription list. Each
+    // subscription is { name?, url } with url resolved against the registration scope (defaulting to
+    // the scope itself). We don't deliver cookiechange events to the worker, but the subscription
+    // bookkeeping (subscribe/unsubscribe/getSubscriptions) is fully modeled.
+    function __cookieSubKey(scope, opt) {
+      var o = opt || {};
+      var url;
+      try { url = new globalThis.URL(o.url == null ? scope : String(o.url), scope).href; } catch (e) { url = scope; }
+      return { name: o.name == null ? undefined : String(o.name), url: url };
+    }
+    CookieStoreManager.prototype.subscribe = function (subscriptions) {
+      var store = this.__subs || (this.__subs = []);
+      var scope = this.__scope;
+      if (!Array.isArray(subscriptions)) {
+        return Promise.reject(new globalThis.TypeError("subscriptions must be a sequence."));
+      }
+      // Validate all before mutating: each subscription's url must be within the registration scope.
+      var keys = [];
+      for (var i = 0; i < subscriptions.length; i++) {
+        var k = __cookieSubKey(scope, subscriptions[i]);
+        if (k.url.lastIndexOf(scope, 0) !== 0) {
+          return Promise.reject(new globalThis.TypeError("subscription url must be within the registration scope."));
+        }
+        keys.push(k);
+      }
+      // subscribe is idempotent: an identical { name, url } is not added twice.
+      for (var j = 0; j < keys.length; j++) {
+        var dup = false;
+        for (var m = 0; m < store.length; m++) {
+          if (store[m].name === keys[j].name && store[m].url === keys[j].url) { dup = true; break; }
+        }
+        if (!dup) { store.push(keys[j]); }
+      }
+      return Promise.resolve(undefined);
+    };
+    CookieStoreManager.prototype.unsubscribe = function (subscriptions) {
+      var store = this.__subs || (this.__subs = []);
+      var scope = this.__scope;
+      var arr = subscriptions || [];
+      for (var i = 0; i < arr.length; i++) {
+        var k = __cookieSubKey(scope, arr[i]);
+        for (var j = store.length - 1; j >= 0; j--) {
+          if (store[j].name === k.name && store[j].url === k.url) { store.splice(j, 1); }
+        }
+      }
+      return Promise.resolve(undefined);
+    };
+    CookieStoreManager.prototype.getSubscriptions = function () {
+      var store = this.__subs || [];
+      // Omit `name` entirely for a nameless subscription (`'name' in item` must be false), per the
+      // CookieStoreGetOptions shape — not a present `name: undefined`.
+      return Promise.resolve(store.map(function (s) {
+        var o = { url: s.url };
+        if (s.name !== undefined) { o.name = s.name; }
+        return o;
+      }));
+    };
+    def(globalThis, "__makeCookieStoreManager", function (scopeHref) {
+      var m = Object.create(CookieStoreManager.prototype);
+      m.__scope = scopeHref;
+      m.__subs = [];
+      return m;
+    });
 
     function __utf8Len(s) {
       var n = 0;
