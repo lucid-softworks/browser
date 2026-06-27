@@ -9181,6 +9181,16 @@
       var IFP2 = globalThis.HTMLIFrameElement.prototype;
       globalThis.__framesByNode = globalThis.__framesByNode || {};
 
+      // window.frames: an indexed collection of the child browsing contexts (each iframe's
+      // contentWindow), in document order; window.length is the count.
+      function __frameWindows() {
+        var ifs = document.getElementsByTagName("iframe"), out = { length: ifs.length };
+        for (var i = 0; i < ifs.length; i++) { out[i] = ifs[i].contentWindow; }
+        return out;
+      }
+      Object.defineProperty(globalThis, "frames", { get: __frameWindows, enumerable: true, configurable: true });
+      Object.defineProperty(globalThis, "length", { get: function () { return document.getElementsByTagName("iframe").length; }, enumerable: true, configurable: true });
+
       function __loadFrame(el, navType, syncLoad) {
         if (!el || typeof el.__node !== "number") { return; }
         var srcdoc = (el.getAttribute && el.hasAttribute && el.hasAttribute("srcdoc")) ? el.getAttribute("srcdoc") : null;
