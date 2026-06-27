@@ -640,7 +640,7 @@
     SVGFETurbulenceElement: { SVG_TURBULENCE_TYPE_UNKNOWN: 0, SVG_TURBULENCE_TYPE_FRACTALNOISE: 1, SVG_TURBULENCE_TYPE_TURBULENCE: 2, SVG_STITCHTYPE_UNKNOWN: 0, SVG_STITCHTYPE_STITCH: 1, SVG_STITCHTYPE_NOSTITCH: 2 },
     SVGGradientElement: { SVG_SPREADMETHOD_UNKNOWN: 0, SVG_SPREADMETHOD_PAD: 1, SVG_SPREADMETHOD_REFLECT: 2, SVG_SPREADMETHOD_REPEAT: 3 },
     SVGComponentTransferFunctionElement: { SVG_FECOMPONENTTRANSFER_TYPE_UNKNOWN: 0, SVG_FECOMPONENTTRANSFER_TYPE_IDENTITY: 1, SVG_FECOMPONENTTRANSFER_TYPE_TABLE: 2, SVG_FECOMPONENTTRANSFER_TYPE_DISCRETE: 3, SVG_FECOMPONENTTRANSFER_TYPE_LINEAR: 4, SVG_FECOMPONENTTRANSFER_TYPE_GAMMA: 5 },
-    SVGTextPathElement: { SVG_TEXTPATH_METHODTYPE_UNKNOWN: 0, SVG_TEXTPATH_METHODTYPE_ALIGN: 1, SVG_TEXTPATH_METHODTYPE_STRETCH: 2, SVG_TEXTPATH_SPACINGTYPE_UNKNOWN: 0, SVG_TEXTPATH_SPACINGTYPE_AUTO: 1, SVG_TEXTPATH_SPACINGTYPE_EXACT: 2 },
+    SVGTextPathElement: { TEXTPATH_METHODTYPE_UNKNOWN: 0, TEXTPATH_METHODTYPE_ALIGN: 1, TEXTPATH_METHODTYPE_STRETCH: 2, TEXTPATH_SPACINGTYPE_UNKNOWN: 0, TEXTPATH_SPACINGTYPE_AUTO: 1, TEXTPATH_SPACINGTYPE_EXACT: 2 },
     SVGTextContentElement: { LENGTHADJUST_UNKNOWN: 0, LENGTHADJUST_SPACING: 1, LENGTHADJUST_SPACINGANDGLYPHS: 2 }
   };
   (function () {
@@ -923,7 +923,18 @@
     // DOMString attribute reflections that document.js would otherwise install as own props.
     function reflectStr(proto, prop, attr) { Object.defineProperty(proto, prop, { get: function () { var v = getAttr(this.__node, attr); return v == null ? "" : v; }, set: function (v) { setAttr(this.__node, attr, String(v)); }, enumerable: true, configurable: true }); }
     accProto(G.SVGAElement.prototype, "target", function (el) { return makeAnimatedString(el, "target"); });
-    ["download", "ping", "rel", "hreflang", "type", "referrerPolicy", "text"].forEach(function (p) { reflectStr(G.SVGAElement.prototype, p, p === "referrerPolicy" ? "referrerpolicy" : p); });
+    ["download", "ping", "rel", "hreflang", "type", "referrerPolicy"].forEach(function (p) { reflectStr(G.SVGAElement.prototype, p, p === "referrerPolicy" ? "referrerpolicy" : p); });
+    Object.defineProperty(G.SVGAElement.prototype, "relList", { get: function () { return globalThis.__makeTokenList(this.__node, "rel"); }, set: function (v) { setAttr(this.__node, "rel", String(v)); }, enumerable: true, configurable: true });
+    // HTMLHyperlinkElementUtils-style URL decomposition over the resolved href.
+    var aHrefURL = function (el) { var h = getAttr(el.__node, "href"); if (h == null) { h = getAttr(el.__node, "xlink:href"); } try { return new globalThis.URL(h == null ? "" : h, el.ownerDocument && (el.ownerDocument.baseURI || el.ownerDocument.URL)); } catch (e) { return null; } };
+    ["protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash"].forEach(function (p) {
+      Object.defineProperty(G.SVGAElement.prototype, p, {
+        get: function () { var u = aHrefURL(this); return u ? u[p] : ""; },
+        set: function (v) { var u = aHrefURL(this); if (u) { try { u[p] = v; setAttr(this.__node, "href", u.href); } catch (e) {} } },
+        enumerable: true, configurable: true
+      });
+    });
+    Object.defineProperty(G.SVGAElement.prototype, "origin", { get: function () { var u = aHrefURL(this); return u ? u.origin : ""; }, enumerable: true, configurable: true });
     ["type", "media", "title"].forEach(function (p) { reflectStr(G.SVGStyleElement.prototype, p, p); });
     ["type", "crossOrigin"].forEach(function (p) { reflectStr(G.SVGScriptElement.prototype, p, p === "crossOrigin" ? "crossorigin" : p); });
 

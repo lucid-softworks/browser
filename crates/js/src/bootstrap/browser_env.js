@@ -2741,8 +2741,10 @@
   // attribute (so external className/setAttribute changes are reflected); the mutating
   // methods run the spec "update steps" which serialize the ordered set back to `class`.
   function makeClassList(node) { return makeTokenList(node, "class", null); }
+  globalThis.__makeTokenList = function (node, attrName) { return makeTokenList(node, attrName, null); };
   // A DOMTokenList over an arbitrary reflected attribute (`attrName`). `supported` is an optional
   // allow-list of tokens for `supports()` (null => supports() throws TypeError, like `class`).
+  // Exposed as __makeTokenList so svg.js can back SVGAElement.relList over the `rel` attribute.
   function makeTokenList(node, attrName, supported) {
     // ASCII whitespace per the HTML spec: TAB, LF, FF, CR, SPACE.
     function splitTokens(s) {
@@ -4860,9 +4862,10 @@
     }
     // ARIA element reflection (aria*Element / aria*Elements) — Element / FrozenArray<Element>.
     applyAomElementReflection(el, node);
-    // Per-element attributes.
+    // Per-element attributes — only for HTML-namespace elements. (A same-named foreign element, e.g.
+    // SVG <a>, has its own IDL reflected on its interface prototype by svg.js, not as own props here.)
     var tbl = __reflTables[tag];
-    if (tbl) {
+    if (tbl && el.namespaceURI === "http://www.w3.org/1999/xhtml") {
       for (var k in tbl) {
         if (Object.prototype.hasOwnProperty.call(tbl, k)) { defineReflected(el, node, k, tbl[k]); }
       }
@@ -5353,8 +5356,8 @@
             enumerable: true, configurable: true
           });
         }
-        // relList: on HTML a/area/link, and on SVG a.
-        if ((ns === HTML && (ln === "a" || ln === "area" || ln === "link")) || (ns === SVG && ln === "a")) {
+        // relList: on HTML a/area/link. (SVG <a>.relList is defined on SVGAElement.prototype.)
+        if (ns === HTML && (ln === "a" || ln === "area" || ln === "link")) {
           install("relList", "rel");
         }
         if (ns === HTML && ln === "output") { install("htmlFor", "for"); }
@@ -5523,7 +5526,7 @@
         // HTMLHyperlinkElementUtils URL-decomposition accessors on <a>/<area>: protocol/host/...
         // derived from the resolved href. These also make the WPT reflection harness' resolveUrl()
         // (which decomposes a throwaway <a>) compute correct expected values for `url`-type attrs.
-        if (__formTag === "a" || __formTag === "area") {
+        if ((__formTag === "a" || __formTag === "area") && el.namespaceURI === "http://www.w3.org/1999/xhtml") {
           var __hrefParts = function () {
             var raw = __getAttr(node, "href");
             var resolved = (raw == null) ? "" : __resolveURL(raw);
