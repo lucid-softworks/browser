@@ -10244,7 +10244,7 @@
       // constructor on the scope so a worker-side test reports its results back to the page.
       Object.defineProperty(scope, "ServiceWorkerGlobalScope", { value: globalThis.ServiceWorkerGlobalScope, enumerable: false, configurable: true });
       scope.oninstall = null; scope.onactivate = null; scope.onfetch = null;
-      scope.onmessage = null; scope.onmessageerror = null;
+      scope.onmessage = null; scope.onmessageerror = null; scope.oncookiechange = null;
       Object.defineProperty(scope, "registration", { value: reg, enumerable: true, configurable: true });
       Object.defineProperty(scope, "serviceWorker", { value: sw, enumerable: true, configurable: true });
       try { Object.defineProperty(scope, "location", { value: new globalThis.URL(scriptHref), enumerable: true, configurable: true }); } catch (e) {}
@@ -10361,6 +10361,35 @@
       def(npm, "getState", function () { return Promise.resolve({ enabled: enabled, headerValue: headerValue }); });
       return npm;
     }
+
+    // Deliver a cookiechange to every active service worker whose registration.cookies has a
+    // subscription matching the changed cookie name. Fires an ExtendableCookieChangeEvent (and the
+    // oncookiechange handler) on the worker scope. Called from the CookieStore change path.
+    def(globalThis, "__deliverCookieChangeToWorkers", function (name, changed, deleted) {
+      for (var i = 0; i < __swRegs.length; i++) {
+        var reg = __swRegs[i];
+        var subs = reg.cookies && reg.cookies.__subs;
+        if (!subs || !subs.length) { continue; }
+        var match = false;
+        for (var j = 0; j < subs.length; j++) {
+          if (subs[j].name === undefined || subs[j].name === name) { match = true; break; }
+        }
+        if (!match) { continue; }
+        var sl = reg.__slots ? reg.__slots() : null;
+        var sw = sl ? (sl.active || sl.waiting || sl.installing) : null;
+        var scope = sw && sw.__scope;
+        if (!scope) { continue; }
+        (function (scope) {
+          setTimeout(function () {
+            var ev;
+            try { ev = new globalThis.ExtendableCookieChangeEvent("cookiechange", { changed: changed, deleted: deleted }); }
+            catch (e) { return; }
+            try { scope.dispatchEvent(ev); } catch (e) {}
+            try { if (typeof scope.oncookiechange === "function") { scope.oncookiechange(ev); } } catch (e) {}
+          }, 0);
+        })(scope);
+      }
+    });
 
     function __swMakeRegistration(scopeHref, updateViaCache) {
       var reg = Object.create(globalThis.ServiceWorkerRegistration.prototype);
@@ -13197,8 +13226,12 @@
     def(CookieStore.prototype, "__fireCookieDiff", function (name, before) {
       var after = __cookieValueOf(name);
       if (after === before) { return; }
-      if (after === undefined) { this.__fireCookieChange([], [__cookieItem(name, undefined)]); }
-      else { this.__fireCookieChange([__cookieItem(name, after)], []); }
+      var changed = [], deleted = [];
+      if (after === undefined) { deleted = [__cookieItem(name, undefined)]; }
+      else { changed = [__cookieItem(name, after)]; }
+      this.__fireCookieChange(changed, deleted);
+      // Also deliver a cookiechange to service workers subscribed to this cookie.
+      try { if (globalThis.__deliverCookieChangeToWorkers) { globalThis.__deliverCookieChangeToWorkers(name, changed, deleted); } } catch (e) {}
     });
 
     var cookieStore = Object.create(CookieStore.prototype);
@@ -13230,6 +13263,8 @@
       s.__extend.push(Promise.resolve(p));
     };
     defSubclass("ExtendableMessageEvent", ExtendableEvent, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
+    defSubclass("ExtendableCookieChangeEvent", ExtendableEvent, { changed: [], deleted: [] }, null,
+      { changed: function (v) { return v == null ? [] : v; }, deleted: function (v) { return v == null ? [] : v; } });
     var FetchEvent = defSubclass("FetchEvent", ExtendableEvent, {
       request: null, clientId: "", resultingClientId: "", replacesClientId: "",
       preloadResponse: null, handled: null
