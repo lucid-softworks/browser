@@ -93,6 +93,9 @@
   subClass("SVGSVGElement", "SVGGraphicsElement");
   // SVG2 aliases the geometry value types to the CSSOM DOM types; chain our implementations so that
   // `viewBox.baseVal instanceof DOMRect`, `createSVGMatrix() instanceof DOMMatrix`, etc. hold.
+  subClass("DOMRect", "DOMRectReadOnly");
+  subClass("DOMPoint", "DOMPointReadOnly");
+  subClass("DOMMatrix", "DOMMatrixReadOnly");
   subClass("SVGRect", "DOMRect");
   subClass("SVGPoint", "DOMPoint");
   subClass("SVGMatrix", "DOMMatrix");
@@ -178,7 +181,14 @@
     mpath: "SVGMPathElement", feimage: "SVGFEImageElement", feblend: "SVGFEBlendElement",
     fegaussianblur: "SVGFEGaussianBlurElement", feflood: "SVGFEFloodElement", femerge: "SVGFEMergeElement",
     fecolormatrix: "SVGFEColorMatrixElement", fecomposite: "SVGFECompositeElement",
-    feoffset: "SVGFEOffsetElement", feturbulence: "SVGFETurbulenceElement"
+    feoffset: "SVGFEOffsetElement", feturbulence: "SVGFETurbulenceElement",
+    feconvolvematrix: "SVGFEConvolveMatrixElement", femorphology: "SVGFEMorphologyElement",
+    fedisplacementmap: "SVGFEDisplacementMapElement", fediffuselighting: "SVGFEDiffuseLightingElement",
+    fespecularlighting: "SVGFESpecularLightingElement", fedropshadow: "SVGFEDropShadowElement",
+    fetile: "SVGFETileElement", fecomponenttransfer: "SVGFEComponentTransferElement",
+    femergenode: "SVGFEMergeNodeElement", fefuncr: "SVGFEFuncRElement", fefuncg: "SVGFEFuncGElement",
+    fefuncb: "SVGFEFuncBElement", fefunca: "SVGFEFuncAElement", fepointlight: "SVGFEPointLightElement",
+    fespotlight: "SVGFESpotLightElement", fedistantlight: "SVGFEDistantLightElement"
   };
 
   var UNIT_TYPE = { "": 1, "px": 5, "%": 2, "em": 3, "ex": 4, "cm": 6, "mm": 7, "in": 8, "pt": 9, "pc": 10 };
@@ -531,14 +541,15 @@
     return anim;
   }
 
-  // SVGNumberList / SVGLengthList (live, read-only items) and their SVGAnimated* wrappers.
-  function makeItemList(getVec, listProto, itemProto) {
-    var L = Object.create(listProto.prototype);
+  // SVGNumberList / SVGLengthList (live, read-only items) and their SVGAnimated* wrappers. `isNumber`
+  // picks the list/item interfaces, resolved through globalThis so it survives finalizeInterfaces.
+  function makeItemList(getVec, isNumber) {
+    var L = Object.create(globalThis[isNumber ? "SVGNumberList" : "SVGLengthList"].prototype);
     L.__l = {
       len: function () { return getVec().length; },
       get: function (i) {
         var v = getVec();
-        if (itemProto === globalThis.SVGNumber) { var n = Object.create(globalThis.SVGNumber.prototype); n.__v = v[i]; return n; }
+        if (isNumber) { var n = Object.create(globalThis.SVGNumber.prototype); n.__v = v[i]; return n; }
         return makeLength(function () { return v[i]; }, function () { return String(v[i]); }, function () { return 1; }, null);
       },
       clear: function () {}, init: function (x) { return x; }, append: function (x) { return x; },
@@ -546,12 +557,12 @@
     };
     return L;
   }
-  function makeAnimatedItemList(el, attr, listProto, itemProto) {
+  function makeAnimatedItemList(el, attr, isNumber) {
     var node = el.__node;
     function baseVec() { var s = getAttr(node, attr); return s == null || s === "" ? [] : vecParse(s); }
-    var anim = Object.create((listProto === globalThis.SVGNumberList ? globalThis.SVGAnimatedNumberList : globalThis.SVGAnimatedLengthList).prototype);
-    anim.__base = makeItemList(baseVec, listProto, itemProto);
-    anim.__anim = makeItemList(function () { return svgAnimVec(el, attr, baseVec()); }, listProto, itemProto);
+    var anim = Object.create(globalThis[isNumber ? "SVGAnimatedNumberList" : "SVGAnimatedLengthList"].prototype);
+    anim.__base = makeItemList(baseVec, isNumber);
+    anim.__anim = makeItemList(function () { return svgAnimVec(el, attr, baseVec()); }, isNumber);
     return anim;
   }
 
@@ -911,8 +922,8 @@
     accProto(G.SVGPatternElement.prototype, "patternTransform", function (el) { return makeAnimatedTransformListAttr(el, "patternTransform"); });
 
     // SVGTextPositioningElement: x/y/dx/dy length-lists + rotate number-list.
-    [["x", G.SVGLengthList, SVGLength], ["y", G.SVGLengthList, SVGLength], ["dx", G.SVGLengthList, SVGLength], ["dy", G.SVGLengthList, SVGLength], ["rotate", G.SVGNumberList, G.SVGNumber]].forEach(function (spec) {
-      accProto(G.SVGTextPositioningElement.prototype, spec[0], function (el) { return makeAnimatedItemList(el, spec[0], spec[1], spec[2]); });
+    [["x", false], ["y", false], ["dx", false], ["dy", false], ["rotate", true]].forEach(function (spec) {
+      accProto(G.SVGTextPositioningElement.prototype, spec[0], function (el) { return makeAnimatedItemList(el, spec[0], spec[1]); });
     });
 
     // SVGStopElement.offset (SVGAnimatedNumber).
@@ -946,6 +957,14 @@
     Object.defineProperty(G.SVGAElement.prototype, "origin", { get: function () { var u = aHrefURL(this); return u ? u.origin : ""; }, enumerable: true, configurable: true });
     ["type", "media", "title"].forEach(function (p) { reflectStr(G.SVGStyleElement.prototype, p, p); });
     ["type", "crossOrigin"].forEach(function (p) { reflectStr(G.SVGScriptElement.prototype, p, p === "crossOrigin" ? "crossorigin" : p); });
+    // feConvolveMatrix integer / boolean attributes.
+    accProto(G.SVGFEConvolveMatrixElement.prototype, "orderX", function (el) { return makeAnimatedInteger(el, "orderX", 0); });
+    accProto(G.SVGFEConvolveMatrixElement.prototype, "orderY", function (el) { return makeAnimatedInteger(el, "orderY", 0); });
+    accProto(G.SVGFEConvolveMatrixElement.prototype, "targetX", function (el) { return makeAnimatedInteger(el, "targetX", 0); });
+    accProto(G.SVGFEConvolveMatrixElement.prototype, "targetY", function (el) { return makeAnimatedInteger(el, "targetY", 0); });
+    accProto(G.SVGFEConvolveMatrixElement.prototype, "preserveAlpha", function (el) { return makeAnimatedBoolean(el, "preserveAlpha"); });
+    // Document.rootElement is the document's root <svg> (or null).
+    Object.defineProperty(G.Document.prototype, "rootElement", { get: function () { if (!G.Document.prototype.isPrototypeOf(this)) { throw new TypeError("Illegal invocation"); } var de = this.documentElement; return de && de.namespaceURI === SVG_NS ? de : null; }, enumerable: true, configurable: true });
 
     installTextContentProto(G.SVGTextContentElement.prototype);
     installMarkerProto(G.SVGMarkerElement.prototype);

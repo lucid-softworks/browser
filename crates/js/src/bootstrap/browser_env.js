@@ -5522,7 +5522,9 @@
             });
           }
         }
-        __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 });
+        // SVG <a>.href is an SVGAnimatedString (SVGURIReference) on the interface prototype, not an
+        // own DOMString URL reflection — so only reflect href for HTML hyperlink elements here.
+        if (el.namespaceURI === "http://www.w3.org/1999/xhtml") { __reflectURL("href", { a: 1, link: 1, area: 1, base: 1 }); }
         // HTMLHyperlinkElementUtils URL-decomposition accessors on <a>/<area>: protocol/host/...
         // derived from the resolved href. These also make the WPT reflection harness' resolveUrl()
         // (which decomposes a throwaway <a>) compute correct expected values for `url`-type attrs.
