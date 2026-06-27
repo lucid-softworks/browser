@@ -296,7 +296,11 @@ pub(crate) fn parse_compound(s: &str) -> Option<Compound> {
                     continue;
                 }
                 i = ni;
-                let tag = tag.trim().to_string();
+                // read_css_ident swallows the namespace prefix (`*` and `|` aren't ident stops), so a
+                // type selector arrives as e.g. `*|body` / `svg|rect` / `|div`. Our DOM carries no
+                // element namespaces, so reduce any namespace prefix to the local name (matching the
+                // attribute-namespace handling); `*|*` collapses to the universal `*`.
+                let tag = strip_attr_ns(tag.trim()).to_string();
                 if !tag.is_empty() {
                     c.tag = Some(tag);
                     c.any = true;

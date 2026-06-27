@@ -12895,6 +12895,15 @@
     if (!node) { return true; }
     type = String(type);
 
+    // SVG content isn't in the box tree, so the engine's hit-test lands on the <svg> element. For a
+    // pointer/mouse event, refine the target to the actual shape under the point so listeners on SVG
+    // shapes fire (and the event bubbles up from the shape, as in a real browser).
+    if (mouseTypes[type] && props && typeof props.clientX === "number" &&
+        node.__localName === "svg" && typeof globalThis.__svgHitTest === "function") {
+      var shape = globalThis.__svgHitTest(node, props.clientX, props.clientY);
+      if (shape) { node = shape; }
+    }
+
     var Ctor = mouseTypes[type] ? globalThis.MouseEvent : globalThis.Event;
     var ev;
     try { ev = new Ctor(type, { bubbles: true, cancelable: true }); }

@@ -1588,6 +1588,42 @@
   }
   globalThis.__svgMakeMatrix = makeMatrix;
 
+  // Hit-test SVG content: SVG shapes are rasterized, not laid out as boxes, so the engine's box-tree
+  // hit-test lands on the <svg> element. Given a client point, descend the SVG subtree and return the
+  // topmost (last-in-document, deepest) shape whose geometry's bbox contains the point — mapping each
+  // shape's user-space bbox through its CTM into the <svg>'s local viewport (the same transform
+  // checkIntersection uses), then into client coords via the <svg>'s border box. Returns null on miss.
+  var SVG_SHAPE_TAGS = { rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1, polygon: 1, path: 1, text: 1, image: 1, use: 1 };
+  globalThis.__svgHitTest = function (svgEl, clientX, clientY) {
+    if (!svgEl || svgEl.__localName !== "svg") { return null; }
+    var rect; try { rect = svgEl.getBoundingClientRect(); } catch (e) { return null; }
+    if (!rect) { return null; }
+    var lx = clientX - rect.left, ly = clientY - rect.top;
+    function localBox(el) {
+      var b = bbox(el), m = ctmOf(el);
+      var xs = [b.x, b.x + b.width], ys = [b.y, b.y + b.height];
+      var mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
+      for (var i = 0; i < 2; i++) {
+        for (var j = 0; j < 2; j++) {
+          var px = m.a * xs[i] + m.c * ys[j] + m.e, py = m.b * xs[i] + m.d * ys[j] + m.f;
+          if (px < mnx) { mnx = px; } if (px > mxx) { mxx = px; }
+          if (py < mny) { mny = py; } if (py > mxy) { mxy = py; }
+        }
+      }
+      return { l: mnx, t: mny, r: mxx, b: mxy };
+    }
+    function visit(el) {
+      var kids = el.children;
+      if (kids) { for (var i = kids.length - 1; i >= 0; i--) { var h = visit(kids[i]); if (h) { return h; } } }
+      if (el !== svgEl && el.namespaceURI === SVG_NS && SVG_SHAPE_TAGS[el.__localName]) {
+        var box; try { box = localBox(el); } catch (e) { box = null; }
+        if (box && lx >= box.l && lx < box.r && ly >= box.t && ly < box.b) { return el; }
+      }
+      return null;
+    }
+    return visit(svgEl);
+  };
+
   // -------------------------------------------------------------------------------------------
   // Color resolution + getComputedStyle override for SVG presentation properties.
   // -------------------------------------------------------------------------------------------
