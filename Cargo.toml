@@ -37,3 +37,9 @@ needless_range_loop = "allow"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# Patch ureq to accept obs-text (0x80–0xFF) header-value bytes, which RFC 7230 §3.2.6 allows but
+# upstream 2.12.1 drops — without this a Set-Cookie response header carrying UTF-8 (e.g. a BOM) is
+# silently discarded. The vendored copy is byte-identical to crates.io 2.12.1 except that one rule.
+[patch.crates-io]
+ureq = { path = "vendor/ureq" }

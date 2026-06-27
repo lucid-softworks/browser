@@ -27,6 +27,8 @@ struct StoredCookie {
     http_only: bool,
     /// Absolute expiry in unix seconds; `None` is a session cookie (no expiry).
     expires: Option<u64>,
+    /// The lowercased SameSite attribute (`strict`/`lax`/`none`), if any.
+    same_site: Option<String>,
     /// Monotonic insertion order, used to order the `Cookie` header and as a stable tie-break.
     creation: u64,
 }
@@ -199,11 +201,10 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
         Some(i) => i,
         None => return false, // no name=value pair
     };
+    // A no-name cookie is valid (`=value`); an empty name is allowed, so `=; expires=…` still flows to
+    // the past-expiry deletion path that removes the stored no-name cookie.
     let name = first[..eq].trim().to_string();
     let value = first[eq + 1..].trim().to_string();
-    if name.is_empty() {
-        return false;
-    }
 
     let mut domain_attr: Option<String> = None;
     let mut path_attr: Option<String> = None;
@@ -235,8 +236,16 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
             "secure" => secure = true,
             "httponly" => http_only = true,
             "max-age" => {
-                if let Ok(n) = val.parse::<i64>() {
+                let t = val.trim();
+                if let Ok(n) = t.parse::<i64>() {
                     max_age = Some(n);
+                } else if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
+                    max_age = Some(i64::MAX); // positive value too large to parse → clamp below
+                } else if t.starts_with('-')
+                    && t.len() > 1
+                    && t[1..].bytes().all(|b| b.is_ascii_digit())
+                {
+                    max_age = Some(-1); // negative value too large → already expired
                 }
             }
             "expires" => expires_attr = parse_cookie_date(val),
@@ -244,17 +253,21 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
             _ => {}
         }
     }
-    // A `document.cookie` write (non-HTTP API) cannot set the HttpOnly attribute.
-    if !from_http {
-        http_only = false;
+    // A `document.cookie` write (non-HTTP API) that specifies HttpOnly is ignored entirely — the
+    // cookie is not stored (RFC 6265bis §5.7 step 11).
+    if !from_http && http_only {
+        return false;
     }
 
     let now = now_secs();
+    // A cookie's lifetime is capped at 400 days (RFC 6265bis §5.5); clamp Max-Age and Expires.
+    const MAX_AGE_SECS: u64 = 400 * 24 * 60 * 60;
+    let max_expiry = now.saturating_add(MAX_AGE_SECS);
     // Max-Age takes precedence over Expires (RFC 6265 §5.3). Non-positive Max-Age = expired.
     let expires = match max_age {
         Some(ma) if ma <= 0 => Some(0),
-        Some(ma) => Some(now.saturating_add(ma as u64)),
-        None => expires_attr,
+        Some(ma) => Some(now.saturating_add(ma as u64).min(max_expiry)),
+        None => expires_attr.map(|e| e.min(max_expiry)),
     };
 
     // Resolve domain. A Domain attribute that does not domain-match the request host is rejected.
@@ -302,16 +315,20 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
         Ok(g) => g,
         Err(_) => return false,
     };
-    let existing = guard
-        .iter()
-        .find(|c| c.name == name && c.domain == domain && c.path == path);
+    // A host-only cookie and a Domain cookie with the same name/domain/path are distinct (RFC 6265bis
+    // keys cookies on the host-only flag too), so include it in the identity.
+    let existing = guard.iter().find(|c| {
+        c.name == name && c.domain == domain && c.path == path && c.host_only == host_only
+    });
     // A non-HTTP API (document.cookie) may not overwrite or delete an HttpOnly cookie.
     if !from_http && existing.is_some_and(|c| c.http_only) {
         return false;
     }
     // Preserve the original creation time on overwrite (RFC 6265 §5.3 step 11.3).
     let creation = existing.map(|c| c.creation);
-    guard.retain(|c| !(c.name == name && c.domain == domain && c.path == path));
+    guard.retain(|c| {
+        !(c.name == name && c.domain == domain && c.path == path && c.host_only == host_only)
+    });
 
     // An already-expired cookie just deletes the matching entry (done above) — don't store it.
     if expires.is_some_and(|e| e <= now) {
@@ -326,6 +343,7 @@ fn store_cookie(url: &str, cookie_str: &str, from_http: bool) -> bool {
         secure,
         http_only,
         expires,
+        same_site,
         creation: creation.unwrap_or_else(next_creation),
     });
     true
@@ -354,6 +372,8 @@ pub struct WebDriverCookie {
     pub secure: bool,
     pub http_only: bool,
     pub expiry: Option<u64>,
+    /// SameSite attribute, capitalized for WebDriver (`Strict`/`Lax`/`None`); `None`/absent → `Lax`.
+    pub same_site: String,
 }
 
 /// Return all (unexpired) cookies currently stored.
@@ -374,6 +394,11 @@ pub fn get_all_cookies() -> Vec<WebDriverCookie> {
             secure: c.secure,
             http_only: c.http_only,
             expiry: c.expires,
+            same_site: match c.same_site.as_deref() {
+                Some("strict") => "Strict".to_string(),
+                Some("none") => "None".to_string(),
+                _ => "Lax".to_string(),
+            },
         })
         .collect()
 }
@@ -1940,10 +1965,10 @@ mod tests {
         // A document.cookie write may not overwrite the HttpOnly cookie.
         assert!(!set_cookie(page, "k=dom; Path=/"));
         assert!(has(&cookies_for_request(page), "k=server"));
-        // And document.cookie can't create an HttpOnly cookie (attribute ignored).
+        // And document.cookie can't create an HttpOnly cookie — the write is ignored entirely.
         clear_cookies();
-        assert!(set_cookie(page, "j=1; Path=/; HttpOnly"));
-        assert!(has(&cookies_for_document(page), "j=1")); // visible → not HttpOnly
+        assert!(!set_cookie(page, "j=1; Path=/; HttpOnly"));
+        assert!(!has(&cookies_for_document(page), "j=1")); // not stored at all
     }
 
     #[test]

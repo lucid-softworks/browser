@@ -1334,7 +1334,7 @@
       return childNodesList;
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "parentNode", { get: function () { return nf(__parent(id)); }, enumerable: true, configurable: true });
-    Object.defineProperty(el, "parentElement", { get: function () { var p = __parent(id); return p >= 0 ? nf(p) : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "parentElement", { get: function () { var p = __parent(id); return (p >= 0 && __nodeType(p) === 1) ? nf(p) : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "firstChild", { get: function () { var k = __children(id); return k.length ? nf(k[0]) : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "lastChild", { get: function () { var k = __children(id); return k.length ? nf(k[k.length - 1]) : null; }, enumerable: true, configurable: true });
     Object.defineProperty(el, "firstElementChild", { get: function () { var c = childList(true); return c.length ? c[0] : null; }, enumerable: true, configurable: true });

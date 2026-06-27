@@ -499,6 +499,7 @@ fn get_all_cookies_cmd(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
                     ("path", Json::Str(c.path)),
                     ("secure", Json::Bool(c.secure)),
                     ("httpOnly", Json::Bool(c.http_only)),
+                    ("sameSite", Json::Str(c.same_site)),
                 ];
                 if let Some(exp) = c.expiry {
                     m.push(("expiry", Json::Num(exp as f64)));
@@ -521,6 +522,7 @@ fn get_named_cookie_cmd(id: &str, name: &str, sessions: &Mutex<Sessions>) -> WdR
                 ("path", Json::Str(c.path)),
                 ("secure", Json::Bool(c.secure)),
                 ("httpOnly", Json::Bool(c.http_only)),
+                ("sameSite", Json::Str(c.same_site)),
             ];
             if let Some(exp) = c.expiry {
                 m.push(("expiry", Json::Num(exp as f64)));
@@ -1141,8 +1143,6 @@ fn element_click(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResult {
         "(function(){{ var __n = {node}; if (!__n) return '__WD_NOELEM__'; var r = __n.getBoundingClientRect(); return JSON.stringify({{x: r.left + r.width/2, y: r.top + r.height/2}}); }})()"
     );
     with_session(id, sessions, |s| {
-        // Ensure layout is built so dispatch_click can hit-test.
-        let _ = s.engine.render();
         let raw = s.engine.console_eval(&rect_expr);
         if raw == "__WD_NOELEM__" {
             return Err(WdError::no_such_element());
@@ -1150,6 +1150,9 @@ fn element_click(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResult {
         let v = parse(&raw).ok_or_else(|| WdError::javascript_error("bad rect"))?;
         let cx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
         let cy = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.0) as f32;
+        // Build layout AFTER the rect eval (console_eval invalidates layout_cache) so dispatch_click
+        // can hit-test against a fresh box tree.
+        let _ = s.engine.render();
         // dispatch_click takes device px; rect is CSS px, so multiply by scale.
         s.engine.dispatch_click(cx * s.scale, cy * s.scale);
         for _ in 0..5 {

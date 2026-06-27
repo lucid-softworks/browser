@@ -982,6 +982,8 @@ pub(crate) fn prim_rect(
 ) {
     let node = arg_node(scope, &args, 0);
     let state = host_state(scope);
+    // Reflect script DOM mutations the (blocked) engine hasn't rendered: re-lay-out in-Session if dirty.
+    crate::forced_layout::ensure_layout_fresh(&state);
     let rect = node.and_then(|n| state.layout_rects.borrow().get(&n.0).copied());
     let (ax, ay, w, h) = match rect {
         Some(r) => r,
@@ -1186,6 +1188,7 @@ pub(crate) fn prim_elem_metrics(
 ) {
     let node = arg_node(scope, &args, 0);
     let state = host_state(scope);
+    crate::forced_layout::ensure_layout_fresh(&state);
     let rect = node.and_then(|n| state.layout_rects.borrow().get(&n.0).copied());
     // Client box (padding box: content + padding, excluding borders) computed from the cascade.
     // `clientWidth`/`clientHeight` exclude borders/scrollbars, so they cannot reuse the border-box

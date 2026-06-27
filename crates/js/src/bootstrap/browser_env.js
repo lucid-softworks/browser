@@ -42,7 +42,18 @@
     webdriver: false,
     plugins: [],
     mimeTypes: [],
-    userActivation: { hasBeenActive: false, isActive: false },
+    // Transient user activation, backed by a timestamp stamped on trusted input (see
+    // __dispatchSyntheticEvent). isActive holds for the ~5s transient window after a gesture;
+    // hasBeenActive is sticky once the page has ever been activated.
+    userActivation: {
+      get isActive() {
+        var s = globalThis.__uaStamp;
+        if (typeof s !== "number") { return false; }
+        var now = (typeof globalThis.__loopNow === "function") ? globalThis.__loopNow() : Date.now();
+        return now - s < 5000;
+      },
+      get hasBeenActive() { return typeof globalThis.__uaStamp === "number"; }
+    },
     sendBeacon: function (url) {
       // Validate the URL (resolved against the document base) and throw on an invalid one, per spec;
       // otherwise inert (no beacon is actually sent).
@@ -55,6 +66,65 @@
     registerProtocolHandler: function () {},
     unregisterProtocolHandler: function () {},
     clipboard: {},
+    // Contact Picker API. We have no contacts backend, but model the spec's preconditions: select()
+    // is top-level-only and requires transient user activation, then validates its properties. With
+    // no picker to open it ultimately rejects (InvalidStateError) rather than returning contacts.
+    contacts: {
+      getProperties: function () { return Promise.resolve(["address", "email", "icon", "name", "tel"]); },
+      select: function (properties, options) {
+        try {
+          if (globalThis.top && globalThis.top !== globalThis) {
+            return Promise.reject(new globalThis.DOMException(
+              "The contacts API can only be used in the top-level frame.", "InvalidStateError"));
+          }
+          var ua = globalThis.navigator && globalThis.navigator.userActivation;
+          if (!ua || !ua.isActive) {
+            return Promise.reject(new globalThis.DOMException(
+              "The contacts API requires a user gesture.", "SecurityError"));
+          }
+          if (!Array.isArray(properties) || properties.length === 0) {
+            return Promise.reject(new globalThis.TypeError("At least one property must be provided."));
+          }
+          var valid = { address: 1, email: 1, icon: 1, name: 1, tel: 1 };
+          for (var i = 0; i < properties.length; i++) {
+            if (!valid[properties[i]]) {
+              return Promise.reject(new globalThis.TypeError("Invalid contact property: " + properties[i]));
+            }
+          }
+          var mock = globalThis.__contactsMock;
+          if (mock && mock.busy) {
+            return Promise.reject(new globalThis.DOMException(
+              "Contacts are already being selected.", "InvalidStateError"));
+          }
+          // With no real picker, the test backend (WebContactsTest.setSelectedContacts) supplies the
+          // result. An unconfigured backend or a null result means the picker couldn't be opened.
+          if (!mock || !mock.configured || mock.contacts === null) {
+            return Promise.reject(new globalThis.TypeError("The contacts picker could not be opened."));
+          }
+          mock.busy = true;
+          var multiple = !!(options && options.multiple);
+          var selected = mock.contacts;
+          return new Promise(function (resolve) {
+            setTimeout(function () {
+              mock.busy = false;
+              var list = multiple ? selected : selected.slice(0, 1);
+              // Emit members in the ContactInfo dictionary's canonical (alphabetical) order, filtered
+              // to the requested properties — a requested-but-absent property is an empty list. The
+              // order matters: callers sort results by JSON.stringify.
+              var order = ["address", "email", "icon", "name", "tel"];
+              resolve(list.map(function (c) {
+                var out = {};
+                for (var j = 0; j < order.length; j++) {
+                  var p = order[j];
+                  if (properties.indexOf(p) >= 0) { out[p] = (c && c[p] != null) ? c[p] : []; }
+                }
+                return out;
+              }));
+            }, 0);
+          });
+        } catch (e) { return Promise.reject(e); }
+      }
+    },
     geolocation: {
       getCurrentPosition: function () {},
       watchPosition: function () { return 0; },
@@ -402,8 +472,14 @@
   ["protocol", "host", "hostname", "port", "pathname", "origin"].forEach(function (name) {
     Object.defineProperty(location, name, { get: function () { return locationState[name]; }, enumerable: true, configurable: true });
   });
-  // `location` already exists (a minimal stub from install_globals); overwrite it.
-  globalThis.location = location;
+  // `location` already exists (a minimal stub from install_globals); overwrite it. Per WebIDL the
+  // attribute has [PutForwards=href], so `self.location = "..."` navigates (sets href) rather than
+  // replacing the Location object.
+  Object.defineProperty(globalThis, "location", {
+    get: function () { return location; },
+    set: function (v) { location.href = String(v); },
+    enumerable: true, configurable: true
+  });
   // window.origin / self.origin: the global's origin (tracks navigation via location.origin).
   Object.defineProperty(globalThis, "origin", {
     get: function () { return location.origin; },
@@ -1209,7 +1285,14 @@
   // domain/path/secure/httpOnly matching via the native bridge.
   Object.defineProperty(document, "cookie", {
     get: function () { try { return __cookie(); } catch (e) { return ""; } },
-    set: function (v) { try { __setCookie(String(v)); } catch (e) {} },
+    set: function (v) {
+      // A document.cookie write is observable by the Cookie Store API's change event — but only when
+      // it actually changes the jar value (capture before/after around the write to diff).
+      var nm = null, before;
+      try { nm = globalThis.__cookieNameOf(String(v)); before = globalThis.__cookieValueOf(nm); } catch (e) {}
+      try { __setCookie(String(v)); } catch (e) {}
+      try { if (nm != null && globalThis.__cookieStoreFireDiff) { globalThis.__cookieStoreFireDiff(nm, before); } } catch (e) {}
+    },
     enumerable: true, configurable: true
   });
 
@@ -7726,6 +7809,8 @@
     if (globalThis[name] !== ctor) { def(globalThis, name, ctor); }
     return ctor;
   }
+  // WebIDL accessor functions must be named "get <attr>" / "set <attr>" (idlharness checks .name).
+  function __named(n, f) { try { Object.defineProperty(f, "name", { value: n, writable: false, enumerable: false, configurable: true }); } catch (e) {} return f; }
   var NodeCtor = defClass("Node");
   // Node type constants live on both the constructor and the prototype, so `Node.ELEMENT_NODE` and
   // `someNode.ELEMENT_NODE` (instance access, used by WPT) both resolve.
@@ -9172,6 +9257,9 @@
               postMessage: function () {}, focus: function () {}, blur: function () {}, close: function () {},
               location: { href: "about:blank", toString: function () { return "about:blank"; } },
               name: "",
+              // A same-origin (about:blank) frame shares the parent's cookie jar, so its cookieStore is
+              // the parent's — frame.contentWindow.cookieStore reads/writes the same cookies.
+              cookieStore: globalThis.cookieStore,
             };
             this.__cwin.self = this.__cwin; this.__cwin.window = this.__cwin; this.__cwin.frameElement = this;
             try { this.__cwin.parent = globalThis; this.__cwin.top = globalThis; } catch (e) {}
@@ -9373,6 +9461,14 @@
                     // (and assign/replace/reload) actually navigate the frame.
                     if (prop === "location") { return el.__frameLocProxy || (el.__frameLocProxy = __frameLocationProxy(el)); }
                     if (prop === "history") { return el.__frameHistProxy || (el.__frameHistProxy = __frameHistoryProxy(el)); }
+                    // A same-origin frame (about:blank inherits the parent's origin) shares the cookie
+                    // jar + origin, so expose the parent's cookieStore — the frame realm's own would key
+                    // cookies on "about:blank" and see nothing.
+                    if (prop === "cookieStore") {
+                      var sameOrigin = el.__frameLoadedKey === "about:blank";
+                      if (!sameOrigin) { try { sameOrigin = __frameGet(el.__node, "origin") === globalThis.origin; } catch (e) {} }
+                      if (sameOrigin) { return globalThis.cookieStore; }
+                    }
                     if (typeof prop === "string") { try { return __frameGet(el.__node, prop); } catch (e) { return undefined; } }
                     return undefined;
                   },
@@ -10162,12 +10258,30 @@
       var scope = Object.create(globalThis.ServiceWorkerGlobalScope.prototype);
       installEvents(scope);
       scope.self = scope;
+      // In a real worker `globalThis === self`. Our scope shares the page realm, so a bare `globalThis`
+      // would reach the page global and miss worker-scoped names (e.g. testharness's `globalThis.fetch_spec`).
+      // Expose `globalThis` as a proxy that prefers the scope's own properties and falls back to the page
+      // global for shared constructors (URL, Promise, Response, ...).
+      if (typeof globalThis.Proxy === "function") {
+        var __pageGlobal = globalThis;
+        scope.globalThis = new globalThis.Proxy(scope, {
+          get: function (t, p) { return (p in t) ? t[p] : __pageGlobal[p]; },
+          has: function (t, p) { return (p in t) || (p in __pageGlobal); },
+          set: function (t, p, v) { t[p] = v; return true; }
+        });
+      } else {
+        scope.globalThis = scope;
+      }
       // testharness.js (run inside the worker via importScripts) selects its test environment with
       // `'ServiceWorkerGlobalScope' in self && self instanceof ServiceWorkerGlobalScope`; expose the
       // constructor on the scope so a worker-side test reports its results back to the page.
       Object.defineProperty(scope, "ServiceWorkerGlobalScope", { value: globalThis.ServiceWorkerGlobalScope, enumerable: false, configurable: true });
       scope.oninstall = null; scope.onactivate = null; scope.onfetch = null;
-      scope.onmessage = null; scope.onmessageerror = null;
+      scope.onmessage = null; scope.onmessageerror = null; scope.oncookiechange = null;
+      // The worker's own cookieStore (any same-origin url path is allowed, unlike a Window's).
+      try { if (globalThis.__makeWorkerCookieStore) { Object.defineProperty(scope, "cookieStore", { value: globalThis.__makeWorkerCookieStore(), enumerable: true, configurable: true }); } } catch (e) {}
+      // ExtendableCookieChangeEvent is exposed only in service-worker scopes.
+      try { if (globalThis.__ExtendableCookieChangeEvent) { Object.defineProperty(scope, "ExtendableCookieChangeEvent", { value: globalThis.__ExtendableCookieChangeEvent, enumerable: false, writable: true, configurable: true }); } } catch (e) {}
       Object.defineProperty(scope, "registration", { value: reg, enumerable: true, configurable: true });
       Object.defineProperty(scope, "serviceWorker", { value: sw, enumerable: true, configurable: true });
       try { Object.defineProperty(scope, "location", { value: new globalThis.URL(scriptHref), enumerable: true, configurable: true }); } catch (e) {}
@@ -10183,10 +10297,23 @@
         finally { __swBypassFetch = prev; }
       });
       var runInScope = function (src, url) {
+        // `with (self)` scopes bare globals to the worker scope (as the dedicated-worker path does):
+        // testharness exposes test/promise_test/etc. on `self`, so a worker test's bare `promise_test`
+        // must resolve to the SCOPE's testharness — not the page's window globals — or its tests would
+        // register on the page and the scope's fetch_tests_from_worker would never complete.
+        // Top-level declarations in an importScripts'd file must become worker globals visible across
+        // files (a real worker runs scripts at global scope). Inside the with-block they're function-
+        // local, so detect top-level function/var/let/const/class names and publish each onto `self`.
+        var names = {};
+        var re = /^[ \t]*(?:async[ \t]+)?function[ \t]*\*?[ \t]*([A-Za-z_$][\w$]*)|^[ \t]*(?:var|let|const)[ \t]+([A-Za-z_$][\w$]*)|^[ \t]*class[ \t]+([A-Za-z_$][\w$]*)/gm;
+        var m;
+        while ((m = re.exec(src))) { var nm = m[1] || m[2] || m[3]; if (nm) { names[nm] = true; } }
+        var publish = "";
+        for (var nm2 in names) { publish += "\ntry{self[" + JSON.stringify(nm2) + "]=" + nm2 + "}catch(e){}"; }
         var fn = (globalThis.Function)(
           "self", "registration", "clients", "location", "caches", "skipWaiting",
           "importScripts", "fetch", "addEventListener", "removeEventListener", "dispatchEvent",
-          src + "\n//# sourceURL=" + url + "\n"
+          "with (self) {\n" + src + "\n" + publish + "\n}\n//# sourceURL=" + url + "\n"
         );
         fn.call(scope, scope, reg, clients, scope.location, caches, scope.skipWaiting,
           scope.importScripts, scope.fetch, scope.addEventListener, scope.removeEventListener, scope.dispatchEvent);
@@ -10281,6 +10408,35 @@
       return npm;
     }
 
+    // Deliver a cookiechange to every active service worker whose registration.cookies has a
+    // subscription matching the changed cookie name. Fires an ExtendableCookieChangeEvent (and the
+    // oncookiechange handler) on the worker scope. Called from the CookieStore change path.
+    def(globalThis, "__deliverCookieChangeToWorkers", function (name, changed, deleted) {
+      for (var i = 0; i < __swRegs.length; i++) {
+        var reg = __swRegs[i];
+        var subs = reg.cookies && reg.cookies.__subs;
+        if (!subs || !subs.length) { continue; }
+        var match = false;
+        for (var j = 0; j < subs.length; j++) {
+          if (subs[j].name === undefined || subs[j].name === name) { match = true; break; }
+        }
+        if (!match) { continue; }
+        var sl = reg.__slots ? reg.__slots() : null;
+        var sw = sl ? (sl.active || sl.waiting || sl.installing) : null;
+        var scope = sw && sw.__scope;
+        if (!scope) { continue; }
+        (function (scope) {
+          setTimeout(function () {
+            var ev;
+            try { ev = new globalThis.__ExtendableCookieChangeEvent("cookiechange", { changed: changed, deleted: deleted }); }
+            catch (e) { return; }
+            try { scope.dispatchEvent(ev); } catch (e) {}
+            try { if (typeof scope.oncookiechange === "function") { scope.oncookiechange(ev); } } catch (e) {}
+          }, 0);
+        })(scope);
+      }
+    });
+
     function __swMakeRegistration(scopeHref, updateViaCache) {
       var reg = Object.create(globalThis.ServiceWorkerRegistration.prototype);
       installEvents(reg);
@@ -10291,8 +10447,32 @@
       Object.defineProperty(reg, "waiting", { get: function () { return waiting; }, enumerable: true, configurable: true });
       Object.defineProperty(reg, "active", { get: function () { return active; }, enumerable: true, configurable: true });
       Object.defineProperty(reg, "navigationPreload", { value: __swMakeNavPreload(), enumerable: true, configurable: true });
+      // registration.cookies is a [SameObject] getter on ServiceWorkerRegistration.prototype (see the
+      // CookieStoreManager setup); it lazily creates this registration's manager from reg.scope.
       reg.onupdatefound = null;
-      def(reg, "update", function () { return Promise.resolve(reg); });
+      // update() re-fetches the script; if its bytes changed, a fresh worker is installed (fires
+      // updatefound and runs the install/activate lifecycle), reusing this registration (so cookie
+      // subscriptions persist). An unchanged script is a no-op.
+      def(reg, "update", function () {
+        var s = reg.__slots();
+        var cur = s.active || s.waiting || s.installing;
+        if (!cur) { return Promise.resolve(reg); }
+        var scriptHref = cur.scriptURL;
+        return globalThis.fetch(scriptHref).then(function (res) {
+          if (!res || !res.ok) { return reg; }
+          return (res.text ? res.text() : "").then(function (source) {
+            if (source === cur.__source) { return reg; } // byte-identical: no update
+            if (__swRegs.indexOf(reg) < 0) { return reg; } // unregistered meanwhile
+            var sw2 = __swMakeWorker(scriptHref);
+            var scope2 = __swEvalWorker(reg, sw2, scriptHref, source);
+            if (!scope2) { return reg; }
+            var s2 = reg.__slots();
+            reg.__setSlots(sw2, s2.waiting, s2.active);
+            __swLifecycle(reg, sw2, scope2, s2.active);
+            return reg;
+          });
+        });
+      });
       def(reg, "unregister", function () {
         var i = __swRegs.indexOf(reg), found = i >= 0;
         if (found) { __swRegs.splice(i, 1); }
@@ -10332,7 +10512,9 @@
             if (gone()) { return; }
             reg.__setSlots(null, sw, priorActive || null);
             sw.__setState("installed");
-            if (priorActive && !sw.__skipWaiting) { return; } // wait behind the active worker
+            // Wait behind the active worker only while it still controls a client; with no controlled
+            // client in scope (or skipWaiting) the new worker activates immediately.
+            if (priorActive && !sw.__skipWaiting && __swMatchesClient(reg.scope)) { return; }
             setTimeout(function () { // turn 3: activate
               if (gone()) { return; }
               if (priorActive && priorActive.__setState) { priorActive.__setState("redundant"); }
@@ -10353,6 +10535,7 @@
     // observes installing === null during its own evaluation. Returns the built scope, or null after
     // marking the worker redundant if the script threw (register() then rejects).
     function __swEvalWorker(reg, sw, scriptHref, source) {
+      sw.__source = source; // retained so registration.update() can detect a byte-changed script
       try { return __swExecuteWorker(reg, sw, scriptHref, source); }
       catch (e) { sw.__setState("redundant"); (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); return null; }
     }
@@ -11104,6 +11287,16 @@
     });
   }
 
+  // Contact Picker test backend. WPT's contacts tests require the UA to expose a `WebContactsTest`
+  // whose setSelectedContacts() primes the result that navigator.contacts.select() returns (real UAs
+  // ship this only in test builds; we have no contacts backend, so this IS the backend for tests).
+  globalThis.__contactsMock = { configured: false, contacts: null, busy: false };
+  globalThis.WebContactsTest = function WebContactsTest() {};
+  globalThis.WebContactsTest.prototype.setSelectedContacts = function (contacts) {
+    globalThis.__contactsMock.configured = true;
+    globalThis.__contactsMock.contacts = contacts;
+  };
+
   // Minimal Web Animations `Animation` for `Element.animate()`. We don't run/composite animations,
   // so this models only the lifecycle: `finished`/`ready` promises and play-state, with the effect
   // treated as completing after its `delay + duration`. Enough for the common "await a throwaway
@@ -11126,6 +11319,15 @@
     anim.finished = new Promise(function (resolve) { settle = resolve; });
     // Swallow rejection-less completion; cancel just resolves the lifecycle for our purposes.
     anim.ready = Promise.resolve(anim);
+    // Animation is an EventTarget: fire `finish`/`cancel` to both the `on*` attribute handler and any
+    // addEventListener listeners (the common "await finish to sync a frame" idiom uses either).
+    var animListeners = {};
+    function fireAnimEvent(type, onProp) {
+      var ev; try { ev = new globalThis.Event(type); } catch (e) { ev = { type: type }; }
+      if (typeof anim[onProp] === "function") { try { anim[onProp].call(anim, ev); } catch (e) {} }
+      var l = animListeners[type];
+      if (l) { for (var i = 0; i < l.length; i++) { try { l[i].call(anim, ev); } catch (e) {} } }
+    }
     var done = false;
     function finishNow() {
       if (done) { return; }
@@ -11133,7 +11335,7 @@
       anim.playState = "finished";
       anim.currentTime = delay + dur;
       settle(anim);
-      if (typeof anim.onfinish === "function") { try { anim.onfinish.call(anim, { type: "finish" }); } catch (e) {} }
+      fireAnimEvent("finish", "onfinish");
     }
     anim.play = function () { anim.playState = "running"; };
     anim.pause = function () { anim.playState = "paused"; };
@@ -11145,14 +11347,25 @@
       anim.playState = "idle";
       anim.currentTime = null;
       settle(anim); // resolve rather than reject: nothing awaits a cancellation here
-      if (typeof anim.oncancel === "function") { try { anim.oncancel.call(anim, { type: "cancel" }); } catch (e) {} }
+      fireAnimEvent("cancel", "oncancel");
     };
     anim.updatePlaybackRate = fn;
     anim.commitStyles = fn;   // we don't interpolate, so there are no computed values to commit
     anim.persist = fn;
-    anim.addEventListener = fn;
-    anim.removeEventListener = fn;
-    anim.dispatchEvent = function () { return false; };
+    anim.addEventListener = function (type, cb) {
+      if (typeof cb !== "function") { return; }
+      (animListeners[type] || (animListeners[type] = [])).push(cb);
+    };
+    anim.removeEventListener = function (type, cb) {
+      var l = animListeners[type];
+      if (l) { var i = l.indexOf(cb); if (i >= 0) { l.splice(i, 1); } }
+    };
+    anim.dispatchEvent = function (ev) {
+      if (!ev || !ev.type) { return false; }
+      var l = animListeners[ev.type];
+      if (l) { for (var i = 0; i < l.slice().length; i++) { try { l[i].call(anim, ev); } catch (e) {} } }
+      return true;
+    };
     setTimeout(finishNow, delay + dur);
     return anim;
   });
@@ -12789,6 +13002,31 @@
     defSubclass("PageTransitionEvent", Event, { persisted: false });
     defSubclass("BeforeUnloadEvent", Event, { returnValue: "" });
     defSubclass("MessageEvent", Event, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
+    // CookieChangeEvent / ExtendableCookieChangeEvent expose `changed`/`deleted` as [SameObject]
+    // readonly FrozenArray attributes — i.e. prototype getters returning a frozen array, not own
+    // instance data properties (which is what defSubclass would create). Build them WebIDL-conformant.
+    function defCookieChangeEvent(ccName, ParentCtor) {
+      function Ctor(type, init) {
+        if (!(this instanceof Ctor)) { throw new globalThis.TypeError("Please use the 'new' operator, this constructor cannot be called as a function."); }
+        if (arguments.length < 1) { throw new globalThis.TypeError("1 argument required, but only 0 present."); }
+        ParentCtor.call(this, type, init);
+        init = init || {};
+        var ch = init.changed == null ? [] : init.changed;
+        var dl = init.deleted == null ? [] : init.deleted;
+        def(this, "__changed", Object.freeze(Array.prototype.slice.call(ch)));
+        def(this, "__deleted", Object.freeze(Array.prototype.slice.call(dl)));
+      }
+      Ctor.prototype = Object.create(ParentCtor.prototype);
+      Object.defineProperty(Ctor.prototype, "constructor", { value: Ctor, enumerable: false, configurable: true, writable: true });
+      // [SameObject] readonly FrozenArray getters with a brand check (accessing on the prototype throws).
+      Object.defineProperty(Ctor.prototype, "changed", { get: __named("get changed", function () { if (this.__changed === undefined) { throw new globalThis.TypeError("Illegal invocation"); } return this.__changed; }), enumerable: true, configurable: true });
+      Object.defineProperty(Ctor.prototype, "deleted", { get: __named("get deleted", function () { if (this.__deleted === undefined) { throw new globalThis.TypeError("Illegal invocation"); } return this.__deleted; }), enumerable: true, configurable: true });
+      def(globalThis, ccName, Ctor);
+      defClass(ccName, ParentCtor); // name, @@toStringTag, interface-object [[Prototype]], frozen prototype
+      try { Object.defineProperty(Ctor, "length", { value: 1, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+      return Ctor;
+    }
+    defCookieChangeEvent("CookieChangeEvent", Event);
     defSubclass("ProgressEvent", Event, { lengthComputable: false, loaded: 0, total: 0 });
     defSubclass("ErrorEvent", Event, { message: "", filename: "", lineno: 0, colno: 0, error: null });
     defSubclass("PromiseRejectionEvent", Event, { promise: null, reason: undefined });
@@ -12811,6 +13049,475 @@
       this.initUIEvent(type, bubbles, cancelable, view, 0);
       def(this, "data", data == null ? "" : String(data));
     };
+
+    // --- Cookie Store API (window) -----------------------------------------------------------
+    // Async cookie access backed by the document cookie jar (__cookie/__setCookie). The jar only
+    // round-trips name=value, so read CookieListItems carry spec defaults for the other members.
+    // The ServiceWorker side (registration.cookies / CookieStoreManager subscriptions) needs a
+    // worker cookie backend we don't have, so it's a non-functional stub.
+    function CookieStore() { throw new globalThis.TypeError("Illegal constructor"); }
+    function CookieStoreManager() { throw new globalThis.TypeError("Illegal constructor"); }
+    def(globalThis, "CookieStore", CookieStore);
+    def(globalThis, "CookieStoreManager", CookieStoreManager);
+    // WebIDL conformance: interface object name/prototype-chain/@@toStringTag (CookieStore : EventTarget;
+    // CookieStoreManager has no parent). Constructors throw "Illegal constructor".
+    defClass("CookieStore", globalThis.EventTarget);
+    defClass("CookieStoreManager");
+    // ServiceWorkerRegistration.cookies [SameObject] readonly: a prototype getter that lazily creates
+    // (and caches) this registration's CookieStoreManager, scoped to reg.scope.
+    try {
+      if (globalThis.ServiceWorkerRegistration && globalThis.ServiceWorkerRegistration.prototype) {
+        Object.defineProperty(globalThis.ServiceWorkerRegistration.prototype, "cookies", {
+          get: __named("get cookies", function () {
+            if (!(this instanceof globalThis.ServiceWorkerRegistration)) { throw new globalThis.TypeError("Illegal invocation"); }
+            if (!this.__cookies && typeof globalThis.__makeCookieStoreManager === "function") {
+              this.__cookies = globalThis.__makeCookieStoreManager(this.scope);
+            }
+            return this.__cookies || null;
+          }),
+          enumerable: true, configurable: true
+        });
+      }
+    } catch (e) {}
+
+    // CookieStoreManager (registration.cookies): a per-registration subscription list. Each
+    // subscription is { name?, url } with url resolved against the registration scope (defaulting to
+    // the scope itself). We don't deliver cookiechange events to the worker, but the subscription
+    // bookkeeping (subscribe/unsubscribe/getSubscriptions) is fully modeled.
+    function __cookieSubKey(scope, opt) {
+      var o = opt || {};
+      var url;
+      try { url = new globalThis.URL(o.url == null ? scope : String(o.url), scope).href; } catch (e) { url = scope; }
+      return { name: o.name == null ? undefined : String(o.name), url: url };
+    }
+    CookieStoreManager.prototype.subscribe = function (subscriptions) {
+      if (!(this instanceof CookieStoreManager)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      var store = this.__subs || (this.__subs = []);
+      var scope = this.__scope;
+      if (!Array.isArray(subscriptions)) {
+        return Promise.reject(new globalThis.TypeError("subscriptions must be a sequence."));
+      }
+      // Validate all before mutating: each subscription's url must be within the registration scope.
+      var keys = [];
+      for (var i = 0; i < subscriptions.length; i++) {
+        var k = __cookieSubKey(scope, subscriptions[i]);
+        if (k.url.lastIndexOf(scope, 0) !== 0) {
+          return Promise.reject(new globalThis.TypeError("subscription url must be within the registration scope."));
+        }
+        keys.push(k);
+      }
+      // subscribe is idempotent: an identical { name, url } is not added twice.
+      for (var j = 0; j < keys.length; j++) {
+        var dup = false;
+        for (var m = 0; m < store.length; m++) {
+          if (store[m].name === keys[j].name && store[m].url === keys[j].url) { dup = true; break; }
+        }
+        if (!dup) { store.push(keys[j]); }
+      }
+      return Promise.resolve(undefined);
+    };
+    CookieStoreManager.prototype.unsubscribe = function (subscriptions) {
+      if (!(this instanceof CookieStoreManager)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      if (arguments.length < 1) { return Promise.reject(new globalThis.TypeError("1 argument required, but only 0 present.")); }
+      var store = this.__subs || (this.__subs = []);
+      var scope = this.__scope;
+      var arr = subscriptions || [];
+      for (var i = 0; i < arr.length; i++) {
+        var k = __cookieSubKey(scope, arr[i]);
+        for (var j = store.length - 1; j >= 0; j--) {
+          if (store[j].name === k.name && store[j].url === k.url) { store.splice(j, 1); }
+        }
+      }
+      return Promise.resolve(undefined);
+    };
+    CookieStoreManager.prototype.getSubscriptions = function () {
+      if (!(this instanceof CookieStoreManager)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      var store = this.__subs || [];
+      // Omit `name` entirely for a nameless subscription (`'name' in item` must be false), per the
+      // CookieStoreGetOptions shape — not a present `name: undefined`.
+      return Promise.resolve(store.map(function (s) {
+        var o = { url: s.url };
+        if (s.name !== undefined) { o.name = s.name; }
+        return o;
+      }));
+    };
+    def(globalThis, "__makeCookieStoreManager", function (scopeHref) {
+      var m = Object.create(CookieStoreManager.prototype);
+      m.__scope = scopeHref;
+      m.__subs = [];
+      return m;
+    });
+
+    function __utf8Len(s) {
+      var n = 0;
+      for (var i = 0; i < s.length; i++) {
+        var c = s.charCodeAt(i);
+        if (c < 0x80) { n += 1; }
+        else if (c < 0x800) { n += 2; }
+        else if (c >= 0xd800 && c <= 0xdbff) { n += 4; i++; }
+        else { n += 3; }
+      }
+      return n;
+    }
+    // A CookieListItem as exposed by get()/getAll() and change events: our flat jar only round-trips
+    // name=value, and the spec's read item exposes exactly { name, value } (the other attributes are
+    // verified out-of-band via testdriver in the window tests, not on the returned object).
+    function __cookieItem(name, value) {
+      return { name: name, value: value };
+    }
+    function __cookieJarItems() {
+      var raw = "";
+      try { raw = __cookie() || ""; } catch (e) {}
+      var out = [];
+      if (raw === "") { return out; }
+      var parts = raw.split(/;\s*/);
+      for (var i = 0; i < parts.length; i++) {
+        if (parts[i] === "") { continue; }
+        var eq = parts[i].indexOf("=");
+        var name = eq >= 0 ? parts[i].slice(0, eq) : "";
+        var value = eq >= 0 ? parts[i].slice(eq + 1) : parts[i];
+        out.push(__cookieItem(name, value));
+      }
+      return out;
+    }
+    // The current value of `name` in the jar, or undefined when absent. Used to diff before/after a
+    // mutation so a change event fires only on a real change (a no-op write isn't observed).
+    function __cookieValueOf(name) {
+      var items = __cookieJarItems();
+      for (var i = 0; i < items.length; i++) { if (items[i].name === name) { return items[i].value; } }
+      return undefined;
+    }
+    // A cookie `domain` is valid only when it has no leading dot and domain-matches the current host:
+    // either equal to it, or a parent of it (host is a subdomain of domain). null/"" = host-only.
+    function __cookieDomainOk(domain) {
+      if (domain == null) { return true; }
+      domain = String(domain);
+      if (domain === "") { return true; }
+      if (domain.charAt(0) === ".") { return false; }
+      var host = "";
+      try { host = String(globalThis.location.hostname); } catch (e) {}
+      host = host.toLowerCase();
+      domain = domain.toLowerCase();
+      // A cookie's Domain may not be a public suffix (eTLD). Approximate the PSL: a single-label
+      // domain (no embedded dot) that isn't the full host is a suffix like "com"/"test" — reject it.
+      // (WPT runs under the ".test" eTLD.)
+      if (domain.indexOf(".") < 0 && domain !== host) { return false; }
+      return host === domain || (host.length > domain.length + 1 && host.slice(-(domain.length + 1)) === "." + domain);
+    }
+    // Resolve get/getAll/delete's (name | options) overload to a name filter (null = match any). The
+    // query name is trimmed of ASCII whitespace only — NOT a leading/trailing U+FEFF (BOM), which JS
+    // String.trim would strip but cookies preserve.
+    function __cookieTrim(s) { return String(s).replace(/^[ \t\r\n\f]+|[ \t\r\n\f]+$/g, ""); }
+    function __cookieQueryName(arg) {
+      if (arg == null) { return null; }
+      if (typeof arg === "string") { return __cookieTrim(arg); }
+      if (typeof arg === "object") { return arg.name == null ? null : __cookieTrim(arg.name); }
+      return null;
+    }
+    // In an opaque origin (e.g. a sandboxed iframe without allow-same-origin) the cookie store is
+    // unavailable; the async methods reject with SecurityError.
+    function __cookieOpaqueReject() {
+      return globalThis.__opaqueOrigin
+        ? Promise.reject(new globalThis.DOMException("The cookie store is not available in an opaque origin.", "SecurityError"))
+        : null;
+    }
+    CookieStore.prototype.getAll = function (nameOrOptions) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
+      if (nameOrOptions && typeof nameOrOptions === "object" && nameOrOptions.url != null &&
+          !__cookieUrlOk(nameOrOptions.url, this.__isWindow)) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.getAll url is not allowed."));
+      }
+      // null = no name given (return every cookie); "" is a real filter (the no-name cookie).
+      var filter = __cookieQueryName(nameOrOptions);
+      var items = __cookieJarItems();
+      if (filter !== null) {
+        items = items.filter(function (it) { return it.name === filter; });
+      }
+      return Promise.resolve(items);
+    };
+    // A cookie creation/query URL must resolve and be same-origin. In a Window it must also match the
+    // document's path (a window may only address its own URL, fragment aside); a worker may use any
+    // same-origin path. Returns false when disallowed (the caller then rejects with TypeError).
+    function __cookieUrlOk(url, isWindow) {
+      var u;
+      try { u = new globalThis.URL(String(url), globalThis.location.href); } catch (e) { return false; }
+      try { if (u.origin !== globalThis.location.origin) { return false; } } catch (e) { return false; }
+      if (isWindow) {
+        try { if (u.pathname !== globalThis.location.pathname) { return false; } } catch (e) { return false; }
+      }
+      return true;
+    }
+    CookieStore.prototype.get = function (nameOrOptions) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
+      // get() with no argument is a TypeError; get('') is a valid query for the nameless cookie.
+      if (arguments.length === 0) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or options."));
+      }
+      var url;
+      if (nameOrOptions && typeof nameOrOptions === "object") {
+        url = nameOrOptions.url;
+        // get(options) with neither a name nor a url is a TypeError.
+        if (nameOrOptions.name == null && url == null) {
+          return Promise.reject(new globalThis.TypeError("CookieStore.get requires a name or url."));
+        }
+      }
+      if (url != null && !__cookieUrlOk(url, this.__isWindow)) {
+        return Promise.reject(new globalThis.TypeError("CookieStore.get url is not allowed."));
+      }
+      return this.getAll(nameOrOptions).then(function (all) { return all.length ? all[0] : null; });
+    };
+    CookieStore.prototype.set = function (nameOrOptions, value) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        var name, val, opts;
+        if (typeof nameOrOptions === "object" && nameOrOptions !== null) {
+          opts = nameOrOptions;
+          name = opts.name == null ? "" : String(opts.name);
+          val = opts.value == null ? "" : String(opts.value);
+        } else {
+          opts = {};
+          name = nameOrOptions == null ? "" : String(nameOrOptions);
+          val = value == null ? "" : String(value);
+        }
+        // Leading/trailing ASCII whitespace is stripped from the name and value.
+        name = __cookieTrim(name);
+        val = __cookieTrim(val);
+        if (name.indexOf("=") >= 0) { reject(new globalThis.TypeError("Cookie name cannot contain '='.")); return; }
+        if (name.indexOf(";") >= 0 || val.indexOf(";") >= 0) { reject(new globalThis.TypeError("Cookie name/value cannot contain ';'.")); return; }
+        // Control characters (U+0000–U+001F and U+007F) are invalid in a cookie name or value.
+        if (/[\u0000-\u001f\u007f]/.test(name) || /[\u0000-\u001f\u007f]/.test(val)) {
+          reject(new globalThis.TypeError("Cookie name/value contains a control character.")); return;
+        }
+        // A nameless cookie can't also be valueless, nor carry an '=' in its value (it would be
+        // indistinguishable from a name=value cookie).
+        if (name === "" && (val === "" || val.indexOf("=") >= 0)) {
+          reject(new globalThis.TypeError("Cookie with empty name must have a non-empty value without '='.")); return;
+        }
+        if (!__cookieDomainOk(opts.domain)) {
+          reject(new globalThis.TypeError("Cookie domain must domain-match the current host and have no leading dot.")); return;
+        }
+        if (__utf8Len(name) + __utf8Len(val) > 4096) { reject(new globalThis.TypeError("Cookie name and value exceed 4096 bytes.")); return; }
+        // Cookie name prefixes: __Secure- requires a secure origin; __Host- additionally forbids a
+        // domain and requires path "/".
+        var secureOrigin = false; try { secureOrigin = globalThis.location.protocol === "https:"; } catch (e) {}
+        var pathOpt = opts.path == null ? "/" : String(opts.path);
+        // A path must be absolute, and path/domain are each capped at 1024 bytes.
+        if (pathOpt !== "" && pathOpt.charAt(0) !== "/") {
+          reject(new globalThis.TypeError("Cookie path must start with '/'.")); return;
+        }
+        if (__utf8Len(pathOpt) > 1024) { reject(new globalThis.TypeError("Cookie path is too long.")); return; }
+        if (opts.domain != null && __utf8Len(String(opts.domain)) > 1024) {
+          reject(new globalThis.TypeError("Cookie domain is too long.")); return;
+        }
+        // Name prefixes are case-insensitive and apply after leading whitespace. __Http-/__Host-Http-
+        // require HttpOnly, which the Cookie Store cannot set, so they always reject. __Secure- needs a
+        // secure origin; __Host- also forbids a domain and requires path "/".
+        var lname = name.replace(/^\s+/, "").toLowerCase();
+        if (lname.lastIndexOf("__http-", 0) === 0 || lname.lastIndexOf("__host-http-", 0) === 0) {
+          reject(new globalThis.TypeError("__Http-/__Host-Http- cookies require HttpOnly.")); return;
+        }
+        if (lname.lastIndexOf("__secure-", 0) === 0 && !secureOrigin) {
+          reject(new globalThis.TypeError("__Secure- cookies require a secure origin.")); return;
+        }
+        if (lname.lastIndexOf("__host-", 0) === 0 && (!secureOrigin || opts.domain != null || pathOpt !== "/")) {
+          reject(new globalThis.TypeError("__Host- cookies require a secure origin, no domain, and path '/'.")); return;
+        }
+        if (opts.maxAge != null && opts.expires != null) {
+          reject(new globalThis.TypeError("Cookie cannot set both maxAge and expires.")); return;
+        }
+        var str = name + "=" + val + "; path=" + pathOpt;
+        if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
+        // The cookie store caps a cookie's lifetime at 400 days; clamp both Max-Age and Expires.
+        var MAX_AGE_SEC = 400 * 24 * 60 * 60;
+        if (opts.maxAge != null) {
+          var ma = Math.trunc(Number(opts.maxAge));
+          if (ma > MAX_AGE_SEC) { ma = MAX_AGE_SEC; }
+          str += "; max-age=" + ma;
+        } else if (opts.expires != null) {
+          var exp = Number(opts.expires);
+          var maxExp = Date.now() + MAX_AGE_SEC * 1000;
+          if (exp > maxExp) { exp = maxExp; }
+          var d = new Date(exp);
+          if (!isNaN(d.getTime())) { str += "; expires=" + d.toUTCString(); }
+        }
+        try { if (globalThis.location.protocol === "https:") { str += "; secure"; } } catch (e) {}
+        str += "; samesite=" + (opts.sameSite == null ? "strict" : String(opts.sameSite));
+        var before = __cookieValueOf(name);
+        try { __setCookie(str); } catch (e) { reject(e); return; }
+        resolve(undefined);
+        self.__fireCookieDiff(name, before);
+      });
+    };
+    CookieStore.prototype.delete = function (nameOrOptions) {
+      if (!(this instanceof CookieStore)) { return Promise.reject(new globalThis.TypeError("Illegal invocation")); }
+      if (arguments.length < 1) { return Promise.reject(new globalThis.TypeError("1 argument required, but only 0 present.")); }
+      var __op = __cookieOpaqueReject(); if (__op) { return __op; }
+      var self = this;
+      return new Promise(function (resolve, reject) {
+        var name, opts;
+        if (typeof nameOrOptions === "object" && nameOrOptions !== null) {
+          opts = nameOrOptions; name = opts.name == null ? "" : String(opts.name);
+        } else { opts = {}; name = nameOrOptions == null ? "" : String(nameOrOptions); }
+        name = __cookieTrim(name);
+        if (name.indexOf("=") >= 0 || name.indexOf(";") >= 0) { reject(new globalThis.TypeError("Invalid cookie name.")); return; }
+        if (!__cookieDomainOk(opts.domain)) {
+          reject(new globalThis.TypeError("Cookie domain must domain-match the current host and have no leading dot.")); return;
+        }
+        var delPath = opts.path == null ? "/" : String(opts.path);
+        if (delPath !== "" && delPath.charAt(0) !== "/") {
+          reject(new globalThis.TypeError("Cookie path must start with '/'.")); return;
+        }
+        // __Host-/__Host-Http-/__Http- prefixes (case-insensitive) impose the same constraints on delete.
+        var dlname = name.toLowerCase();
+        if (dlname.lastIndexOf("__host-", 0) === 0 && opts.domain != null) {
+          reject(new globalThis.TypeError("__Host- cookies cannot specify a domain.")); return;
+        }
+        var str = name + "=; path=" + delPath + "; expires=Thu, 01 Jan 1970 00:00:00 GMT";
+        if (opts.domain != null) { str += "; domain=" + String(opts.domain); }
+        // The deletion write must itself satisfy any __Secure-/__Host- prefix rules (which require
+        // Secure), or the store rejects it and the cookie is never removed. Add Secure on https.
+        var delSecure = false; try { delSecure = globalThis.location.protocol === "https:"; } catch (e) {}
+        if (delSecure) { str += "; secure"; }
+        var before = __cookieValueOf(name);
+        try { __setCookie(str); } catch (e) { reject(e); return; }
+        resolve(undefined);
+        self.__fireCookieDiff(name, before);
+      });
+    };
+    // The change event fires asynchronously after the store mutation. We dispatch it on a microtask
+    // (not a macrotask) so it is delivered in step with the promise-chained test flow: a cleanup
+    // delete's change is consumed before the next operation's observer registers, rather than leaking
+    // a stale event into it.
+    def(CookieStore.prototype, "__fireCookieChange", function (changed, deleted) {
+      var self = this;
+      Promise.resolve().then(function () {
+        var ev;
+        try { ev = new globalThis.CookieChangeEvent("change", { changed: changed, deleted: deleted }); }
+        catch (e) { return; }
+        try { self.dispatchEvent(ev); } catch (e) {}
+      });
+    });
+    // Fire a change event only if the jar value for `name` actually changed from `before` (captured
+    // before the mutation). A no-op write — duplicate value, or setting an already-expired cookie —
+    // is not observed. Absent -> present is a change; present -> absent is a deletion.
+    def(CookieStore.prototype, "__fireCookieDiff", function (name, before) {
+      var after = __cookieValueOf(name);
+      if (after === before) { return; }
+      var changed = [], deleted = [];
+      if (after === undefined) { deleted = [__cookieItem(name, undefined)]; }
+      else { changed = [__cookieItem(name, after)]; }
+      this.__fireCookieChange(changed, deleted);
+      // Also deliver a cookiechange to service workers subscribed to this cookie.
+      try { if (globalThis.__deliverCookieChangeToWorkers) { globalThis.__deliverCookieChangeToWorkers(name, changed, deleted); } } catch (e) {}
+    });
+
+    // Snapshot the whole jar (name -> value) so an out-of-band mutation (e.g. a Set-Cookie response
+    // header from fetch()) can be diffed and observed as a change event, matching real browsers where
+    // HTTP-set cookies fire CookieStore 'change' events.
+    def(globalThis, "__cookieJarSnapshot", function () {
+      var snap = {}; var items = __cookieJarItems();
+      for (var i = 0; i < items.length; i++) { snap[items[i].name] = items[i].value; }
+      return snap;
+    });
+    def(CookieStore.prototype, "__fireCookieJarDiff", function (before) {
+      var after = {}; var items = __cookieJarItems();
+      for (var i = 0; i < items.length; i++) { after[items[i].name] = items[i].value; }
+      var changed = [], deleted = [];
+      for (var k in after) { if (!(k in before) || before[k] !== after[k]) { changed.push(__cookieItem(k, after[k])); } }
+      for (var k2 in before) { if (!(k2 in after)) { deleted.push(__cookieItem(k2, undefined)); } }
+      if (!changed.length && !deleted.length) { return; }
+      this.__fireCookieChange(changed, deleted);
+      try {
+        for (var c = 0; c < changed.length; c++) { globalThis.__deliverCookieChangeToWorkers(changed[c].name, [changed[c]], []); }
+        for (var d = 0; d < deleted.length; d++) { globalThis.__deliverCookieChangeToWorkers(deleted[d].name, [], [deleted[d]]); }
+      } catch (e) {}
+    });
+
+    // WebIDL conformance for the operations: non-enumerable, with the spec arg counts (the smallest
+    // required across overloads) as `.length` and the operation name as `.name`.
+    (function () {
+      function conform(proto, specs) {
+        for (var nm in specs) {
+          var f = proto[nm];
+          if (typeof f !== "function") { continue; }
+          try { Object.defineProperty(f, "length", { value: specs[nm], writable: false, enumerable: false, configurable: true }); } catch (e) {}
+          try { Object.defineProperty(f, "name", { value: nm, writable: false, enumerable: false, configurable: true }); } catch (e) {}
+          // WebIDL operations are enumerable, writable, configurable own props of the interface prototype.
+          Object.defineProperty(proto, nm, { value: f, enumerable: true, writable: true, configurable: true });
+        }
+      }
+      conform(CookieStore.prototype, { get: 0, getAll: 0, set: 1, "delete": 1 });
+      conform(CookieStoreManager.prototype, { subscribe: 1, getSubscriptions: 0, unsubscribe: 1 });
+    })();
+    // CookieStore.onchange [Exposed=Window] — an EventHandler attribute on the prototype that mirrors a
+    // single 'change' listener.
+    Object.defineProperty(CookieStore.prototype, "onchange", {
+      get: __named("get onchange", function () {
+        if (!(this instanceof CookieStore)) { throw new globalThis.TypeError("Illegal invocation"); }
+        return this.__onchange || null;
+      }),
+      set: __named("set onchange", function (h) {
+        if (!(this instanceof CookieStore)) { throw new globalThis.TypeError("Illegal invocation"); }
+        if (this.__onchange) { this.removeEventListener("change", this.__onchange); }
+        this.__onchange = (typeof h === "function") ? h : null;
+        if (this.__onchange) { this.addEventListener("change", this.__onchange); }
+      }),
+      enumerable: true, configurable: true
+    });
+
+    var cookieStore = Object.create(CookieStore.prototype);
+    installEvents(cookieStore); // addEventListener/removeEventListener/dispatchEvent + onchange
+    cookieStore.__isWindow = true; // a Window cookieStore restricts get/getAll urls to the document path
+    // Window.cookieStore [SameObject] readonly: a [Global] interface's members live on the global object
+    // itself as accessors (not on Window.prototype, and not as a data property).
+    Object.defineProperty(globalThis, "cookieStore", {
+      get: __named("get cookieStore", function () {
+        if (this !== globalThis) { throw new globalThis.TypeError("Illegal invocation"); }
+        return cookieStore;
+      }), enumerable: true, configurable: true
+    });
+    // A worker (e.g. ServiceWorker) gets its own cookieStore that allows any same-origin url path.
+    def(globalThis, "__makeWorkerCookieStore", function () {
+      var cs = Object.create(CookieStore.prototype);
+      installEvents(cs);
+      cs.__isWindow = false;
+      return cs;
+    });
+
+    // A fetch() whose response carries Set-Cookie headers mutates the jar out-of-band (JS can't read
+    // the forbidden Set-Cookie header), so observe the change by diffing the jar around the request.
+    (function () {
+      var realFetch = globalThis.fetch;
+      def(globalThis, "fetch", function (input, init) {
+        var before;
+        try { before = globalThis.__cookieJarSnapshot(); } catch (e) { before = null; }
+        var r = realFetch.call(this, input, init);
+        if (before && r && typeof r.then === "function") {
+          return r.then(function (resp) {
+            try { globalThis.cookieStore.__fireCookieJarDiff(before); } catch (e) {}
+            return resp;
+          });
+        }
+        return r;
+      });
+    })();
+
+    // Parse the cookie name from a "name=value; attrs" document.cookie write string.
+    def(globalThis, "__cookieNameOf", function (v) {
+      var s = String(v);
+      var semi = s.indexOf(";");
+      var pair = semi >= 0 ? s.slice(0, semi) : s;
+      var eq = pair.indexOf("=");
+      return (eq >= 0 ? pair.slice(0, eq) : "").trim();
+    });
+    def(globalThis, "__cookieValueOf", __cookieValueOf);
+    def(globalThis, "__cookieStoreFireDiff", function (name, before) {
+      try { cookieStore.__fireCookieDiff(name, before); } catch (e) {}
+    });
     // Service Worker events (see issue #56). ExtendableEvent.waitUntil collects lifetime-extending
     // promises onto the event's internal state; the SW lifecycle awaits them. FetchEvent.respondWith
     // stashes the response promise for the fetch-interception path (stage 3).
@@ -12824,6 +13531,13 @@
       s.__extend.push(Promise.resolve(p));
     };
     defSubclass("ExtendableMessageEvent", ExtendableEvent, { data: null, origin: "", lastEventId: "", source: null, ports: [] });
+    defCookieChangeEvent("ExtendableCookieChangeEvent", ExtendableEvent);
+    // ExtendableCookieChangeEvent is [Exposed=ServiceWorker] only: keep an internal reference and
+    // remove it from the (Window/dedicated-worker) global; service-worker scopes re-expose it.
+    try {
+      def(globalThis, "__ExtendableCookieChangeEvent", globalThis.ExtendableCookieChangeEvent);
+      delete globalThis.ExtendableCookieChangeEvent;
+    } catch (e) {}
     var FetchEvent = defSubclass("FetchEvent", ExtendableEvent, {
       request: null, clientId: "", resultingClientId: "", replacesClientId: "",
       preloadResponse: null, handled: null
@@ -12894,6 +13608,22 @@
     try { node = canon(__wrapNode(nodeId)); } catch (e) { node = null; }
     if (!node) { return true; }
     type = String(type);
+
+    // These trusted input events are activation-triggering: stamp transient user activation so
+    // navigator.userActivation + activation-gated APIs (e.g. the Contact Picker) see the gesture.
+    if (type === "mousedown" || type === "pointerdown" || type === "click" ||
+        type === "keydown" || type === "touchstart" || type === "touchend") {
+      globalThis.__uaStamp = (typeof globalThis.__loopNow === "function") ? globalThis.__loopNow() : Date.now();
+    }
+
+    // SVG content isn't in the box tree, so the engine's hit-test lands on the <svg> element. For a
+    // pointer/mouse event, refine the target to the actual shape under the point so listeners on SVG
+    // shapes fire (and the event bubbles up from the shape, as in a real browser).
+    if (mouseTypes[type] && props && typeof props.clientX === "number" &&
+        node.__localName === "svg" && typeof globalThis.__svgHitTest === "function") {
+      var shape = globalThis.__svgHitTest(node, props.clientX, props.clientY);
+      if (shape) { node = shape; }
+    }
 
     var Ctor = mouseTypes[type] ? globalThis.MouseEvent : globalThis.Event;
     var ev;
