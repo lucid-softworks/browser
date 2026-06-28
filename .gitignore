@@ -19,6 +19,10 @@
 /wpt/
 dist/
 
+# Scratch area lists generated for wpt-run-missing.sh (local, per-run)
+/scripts/.missing_areas.txt
+/scripts/.remaining_areas.txt
+
 # Local review / analysis notes (maintainer reviews, investigation docs, etc.)
 # These are not part of the source and should stay out of the public history.
 review-*.md
