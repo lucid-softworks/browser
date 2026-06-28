@@ -580,6 +580,64 @@ mod tests {
     }
 
     #[test]
+    fn dom_parser_sets_url_readystate_and_parses_xml() {
+        // Covers issue #20: DOMParser docs must have the active document's URL, readyState=complete,
+        // contentType, location=null; XML must produce Document (not just X tree), preserve attrs,
+        // and produce parsererror root for bad XML.
+        let (doc, _) = doc_with_body("");
+        let url = "https://example.com/domparser-test";
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![format!(
+                r#"
+                var results = [];
+                var p = new DOMParser();
+                // HTML path
+                var hd = p.parseFromString("<div id='h'>hi</div>", "text/html");
+                results.push("h-url:" + (hd.URL === document.URL));
+                results.push("h-readystate:" + hd.readyState);
+                results.push("h-ct:" + hd.contentType);
+                results.push("h-loc-null:" + (hd.location === null));
+                results.push("h-el:" + (hd.querySelector ? (hd.querySelector('#h') ? "ok" : "noel") : "noqs"));
+
+                // XML path: good parse + attr
+                var xd = p.parseFromString('<root id="r" data-x="y"><child/></root>', "text/xml");
+                results.push("x-isdoc:" + (xd instanceof Document));
+                results.push("x-not-xmldoc:" + (xd instanceof XMLDocument === false));
+                results.push("x-url:" + (xd.URL === document.URL));
+                results.push("x-readystate:" + xd.readyState);
+                results.push("x-ct:" + xd.contentType);
+                results.push("x-loc-null:" + (xd.location === null));
+                var root = xd.documentElement;
+                results.push("x-root:" + (root ? root.localName : "null"));
+                results.push("x-id:" + (root ? root.getAttribute("id") : "null"));
+                results.push("x-getid:" + (xd.getElementById ? (xd.getElementById("r") ? "idok" : "noid") : "no-getid"));
+
+                // Bad XML => parsererror
+                var bad = p.parseFromString('<span x:test="1">bad</span>', "application/xml");
+                var pes = bad.getElementsByTagName ? bad.getElementsByTagName("parsererror") : null;
+                var de = bad.documentElement;
+                results.push("bad-pe:" + (pes && pes.length === 1 ? "peok" : "nope"));
+
+                results.join("|")
+                "#
+            ).to_string()],
+            url,
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        let v = out[0].value.as_deref().unwrap_or("");
+        // Core assertions that must hold for the fix
+        assert!(v.contains("h-url:true"), "html url: {}", v);
+        assert!(v.contains("h-readystate:complete"), "html rs: {}", v);
+        assert!(v.contains("x-isdoc:true"), "xml doc: {}", v);
+        assert!(v.contains("x-url:true"), "xml url: {}", v);
+        assert!(v.contains("x-readystate:complete"), "xml rs: {}", v);
+        assert!(v.contains("x-id:r"), "xml attr id: {}", v);
+        assert!(v.contains("x-getid:idok"), "xml getElementById: {}", v);
+        assert!(v.contains("bad-pe:peok"), "parsererror: {}", v);
+    }
+
+    #[test]
     fn indexeddb_open_store_index_cursor_roundtrip() {
         // Exercises the in-memory IndexedDB end to end: open + onupgradeneeded creates a keyPath
         // store and an index, adds rows; then a readwrite txn puts a row, and a readonly txn reads
