@@ -18,3 +18,9 @@
 # Local checkout of the web-platform-tests suite (cloned for conformance runs)
 /wpt/
 dist/
+
+# Local review / analysis notes (maintainer reviews, investigation docs, etc.)
+# These are not part of the source and should stay out of the public history.
+review-*.md
+*-review*.md
+review_*.md
