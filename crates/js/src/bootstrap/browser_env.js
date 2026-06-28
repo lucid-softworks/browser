@@ -7510,7 +7510,7 @@
 
     function XAttr(ns, prefix, local, value) { this.namespaceURI = ns || null; this.prefix = prefix || null; this.localName = local; this.value = value; this.name = prefix ? prefix + ":" + local : local; this.nodeType = 2; }
 
-    function splitQ(qname) { var c = qname.indexOf(":"); return c > 0 ? [qname.slice(0, c), qname.slice(c + 1)] : [null, qname]; }
+    function splitQ(qname) { var c = qname.indexOf(":"); if (c > 0) return [qname.slice(0, c), qname.slice(c + 1)]; if (c === 0) return ["", qname.slice(1)]; return [null, qname]; }
 
     function XElement(doc, ns, prefix, local) { XNode.call(this, 1, doc); this.namespaceURI = ns || null; this.prefix = prefix || null; this.localName = local; this._attrs = []; }
     XElement.prototype = Object.create(XNode.prototype);
@@ -7542,6 +7542,9 @@
     XPI.prototype = Object.create(XNode.prototype); XPI.prototype.constructor = XPI;
     function XDoctype(doc, name, pub, sys) { XNode.call(this, 10, doc); this.name = name; this.publicId = pub || ""; this.systemId = sys || ""; }
     XDoctype.prototype = Object.create(XNode.prototype); XDoctype.prototype.constructor = XDoctype;
+    function XDocumentFragment(doc) { XNode.call(this, 11, doc); }
+    XDocumentFragment.prototype = Object.create(XNode.prototype); XDocumentFragment.prototype.constructor = XDocumentFragment;
+    Object.defineProperty(XDocumentFragment.prototype, "nodeName", { value: "#document-fragment", enumerable: true, configurable: true });
 
     function XDocument() { XNode.call(this, 9, null); }
     XDocument.prototype = Object.create(XNode.prototype); XDocument.prototype.constructor = XDocument;
@@ -7551,12 +7554,30 @@
     XDocument.prototype.createComment = function (d) { return new XComment(this, String(d)); };
     XDocument.prototype.createCDATASection = function (d) { return new XCData(this, String(d)); };
     XDocument.prototype.createProcessingInstruction = function (t, d) { return new XPI(this, t, d); };
+    XDocument.prototype.createDocumentFragment = function () { return new XDocumentFragment(this); };
     Object.defineProperty(XDocument.prototype, "documentElement", { get: function () { for (var i = 0; i < this.childNodes.length; i++) { if (this.childNodes[i].nodeType === 1) { return this.childNodes[i]; } } return null; } });
+    Object.defineProperty(XDocument.prototype, "doctype", { get: function () { for (var i = 0; i < this.childNodes.length; i++) { if (this.childNodes[i].nodeType === 10) { return this.childNodes[i]; } } return null; }, enumerable: true, configurable: true });
     Object.defineProperty(XDocument.prototype, "nodeName", { value: "#document", enumerable: true, configurable: true });
     // A DOMParser-produced document is always UTF-8, regardless of any encoding declaration inside.
     Object.defineProperty(XDocument.prototype, "characterSet", { get: function () { return "UTF-8"; } });
     Object.defineProperty(XDocument.prototype, "charset", { get: function () { return "UTF-8"; } });
     Object.defineProperty(XDocument.prototype, "inputEncoding", { get: function () { return "UTF-8"; } });
+    // Provide implementation (and other common Document props) so X docs have a fuller surface.
+    // Delegates to the creating realm's document.implementation when possible.
+    Object.defineProperty(XDocument.prototype, "implementation", {
+      get: function () {
+        var base = (globalThis.document && globalThis.document.implementation) || null;
+        if (base && typeof base.createHTMLDocument === "function") {
+          return {
+            createHTMLDocument: base.createHTMLDocument.bind(base),
+            createDocument: (typeof base.createDocument === "function" ? base.createDocument.bind(base) : function () { return null; }),
+            hasFeature: (typeof base.hasFeature === "function" ? base.hasFeature.bind(base) : function () { return true; })
+          };
+        }
+        return { createHTMLDocument: function () { return globalThis.document; }, createDocument: function () { return null; }, hasFeature: function () { return true; } };
+      },
+      enumerable: true, configurable: true
+    });
 
     // Basic query helpers so DOMParser XML documents support getElementById/query used by tests
     // (arena docs delegate to real impl; this pure model must stand alone for XML roundtrips).
@@ -7593,21 +7614,101 @@
     };
     XElement.prototype.getElementsByTagName = XDocument.prototype.getElementsByTagName;
     XElement.prototype.getElementById = XDocument.prototype.getElementById;
+    XDocument.prototype.getElementsByTagNameNS = function (ns, localName) {
+      ns = (ns == null || ns === "") ? null : String(ns);
+      localName = String(localName);
+      var out = [];
+      var anyNS = (ns === "*");
+      var anyLocal = (localName === "*");
+      function walk(n) {
+        if (!n) return;
+        if (n.nodeType === 1) {
+          var nns = n.namespaceURI || null;
+          var nlocal = n.localName;
+          if ((anyNS || nns === ns) && (anyLocal || nlocal === localName)) out.push(n);
+        }
+        var kids = n.childNodes || [];
+        for (var j = 0; j < kids.length; j++) walk(kids[j]);
+      }
+      walk(this);
+      return makeLiveList(out);
+    };
+    XElement.prototype.getElementsByTagNameNS = XDocument.prototype.getElementsByTagNameNS;
+    // Minimal but extended querySelector for X tree (used by DOMParser XML results and roundtrips).
+    // Covers id, tag, attribute presence/equality, tag[attr], and basic descendant/child (approx).
+    // Enough for WPT metadata/parsererror usage and common code; not a full CSS selector engine.
+    function findFirstByAttr(ctx, aname, aval /*null means presence only*/) {
+      aname = String(aname);
+      function walk(n) {
+        if (!n || !n.childNodes) return null;
+        if (n.nodeType === 1 && n.hasAttribute && n.hasAttribute(aname)) {
+          if (aval == null || n.getAttribute(aname) === aval) return n;
+        }
+        for (var j = 0; j < n.childNodes.length; j++) {
+          var f = walk(n.childNodes[j]); if (f) return f;
+        }
+        return null;
+      }
+      return walk(ctx);
+    }
     function simpleQS(sel, ctx) {
       sel = String(sel || "").trim();
       if (!sel) return null;
-      if (sel[0] === "#") {
-        var id = sel.slice(1);
+      var m;
+      // #id
+      if ((m = /^#([A-Za-z0-9_-]+)$/.exec(sel))) {
         var doc = ctx && ctx.ownerDocument ? ctx.ownerDocument : ctx;
-        return (doc && doc.getElementById) ? doc.getElementById(id) : null;
+        return (doc && doc.getElementById) ? doc.getElementById(m[1]) : null;
       }
+      // [attr] or [attr=val]
+      if ((m = /^\[([^\]=]+?)\s*(?:=\s*["']?([^"'\]]+)["']?)?\]$/.exec(sel))) {
+        var an = m[1].trim();
+        var av = (m[2] != null ? m[2] : null);
+        return findFirstByAttr(ctx, an, av);
+      }
+      // tag or tag[attr=val]
+      if ((m = /^([A-Za-z0-9_-]+)(?:\[([^\]=]+?)(?:\s*=\s*["']?([^"'\]]+)["']?)?\])?$/.exec(sel))) {
+        var tname = m[1];
+        var list = (ctx && ctx.getElementsByTagName) ? ctx.getElementsByTagName(tname) : [];
+        if (!m[2]) return list[0] || null;
+        var aan = m[2].trim(), aav = m[3] != null ? m[3] : null;
+        for (var li = 0; li < list.length; li++) {
+          var el = list[li];
+          if (el.hasAttribute && el.hasAttribute(aan) && (aav == null || el.getAttribute(aan) === aav)) return el;
+        }
+        return null;
+      }
+      // descendant/child: use last segment (small doc trees in DOMParser use cases)
+      if (sel.indexOf(" ") >= 0 || sel.indexOf(">") >= 0) {
+        var last = sel.replace(/>/g, " ").trim().split(/\s+/).pop();
+        return simpleQS(last, ctx);
+      }
+      // bare tag fallback
       var list = (ctx && ctx.getElementsByTagName) ? ctx.getElementsByTagName(sel) : [];
       return list[0] || null;
     }
     XDocument.prototype.querySelector = function (s) { return simpleQS(s, this); };
     XElement.prototype.querySelector = function (s) { return simpleQS(s, this); };
-    XDocument.prototype.querySelectorAll = function (s) { var one = this.querySelector(s); return makeLiveList(one ? [one] : []); };
-    XElement.prototype.querySelectorAll = function (s) { var one = this.querySelector(s); return makeLiveList(one ? [one] : []); };
+    XDocument.prototype.querySelectorAll = function (s) {
+      s = String(s || "").trim();
+      if (!s) return makeLiveList([]);
+      var m;
+      if ((m = /^#([A-Za-z0-9_-]+)$/.exec(s))) {
+        var one = (this.getElementById ? this.getElementById(m[1]) : null);
+        return makeLiveList(one ? [one] : []);
+      }
+      if ((m = /^\[([^\]=]+?)\s*(?:=\s*["']?([^"'\]]+)["']?)?\]$/.exec(s))) {
+        var an2 = m[1].trim(), av2 = m[2] != null ? m[2] : null;
+        var outA = [];
+        function wa(n){ if(!n)return; if(n.nodeType===1 && n.hasAttribute && n.hasAttribute(an2) && (av2==null || n.getAttribute(an2)===av2)) outA.push(n); (n.childNodes||[]).forEach(wa); }
+        wa(this); return makeLiveList(outA);
+      }
+      if (/^[A-Za-z0-9_-]+$/.test(s)) {
+        return this.getElementsByTagName(s);
+      }
+      var one = this.querySelector(s); return makeLiveList(one ? [one] : []);
+    };
+    XElement.prototype.querySelectorAll = XDocument.prototype.querySelectorAll;
 
     // --- Parser: a small namespace-aware XML reader ----------------------------------------------
     function parse(str) {
@@ -7635,8 +7736,37 @@
           if (str.substr(i, 4) === "<!--") { var e = str.indexOf("-->", i + 4); if (e < 0) { e = n - 3; } cur().appendChild(doc.createComment(str.slice(i + 4, e))); i = e + 3; continue; }
           if (str.substr(i, 9) === "<![CDATA[") { var e2 = str.indexOf("]]>", i + 9); if (e2 < 0) { e2 = n - 3; } cur().appendChild(doc.createCDATASection(str.slice(i + 9, e2))); i = e2 + 3; continue; }
           if (str.substr(i, 2) === "<?") { var e3 = str.indexOf("?>", i + 2); if (e3 < 0) { e3 = n - 2; } var body = str.slice(i + 2, e3); var sp = body.search(/\s/); var tgt = sp < 0 ? body : body.slice(0, sp); var dat = sp < 0 ? "" : body.slice(sp + 1); if (tgt.toLowerCase() !== "xml") { cur().appendChild(doc.createProcessingInstruction(tgt, dat)); } i = e3 + 2; continue; }
-          if (str.substr(i, 2) === "<!") { var e4 = str.indexOf(">", i); if (e4 < 0) { e4 = n - 1; } i = e4 + 1; continue; }
-          if (str[i + 1] === "/") { var e5 = str.indexOf(">", i); if (e5 < 0) { e5 = n - 1; } if (open.length) { open.pop(); } else { error = true; } i = e5 + 1; continue; }
+          if (str.substr(i, 2) === "<!") {
+            var e4 = str.indexOf(">", i); if (e4 < 0) { e4 = n - 1; }
+            // Parse DOCTYPE so that .doctype and document children include it (for completeness and roundtrips).
+            var dtContent = str.slice(i + 2, e4).trim();
+            if (/^DOCTYPE/i.test(dtContent)) {
+              var dtm = /^DOCTYPE\s+([A-Za-z0-9:_.-]+)(?:\s+(PUBLIC|SYSTEM)\s+(?:"([^"]*)"|'([^']*)'))?(?:\s+(?:"([^"]*)"|'([^']*)'))?/i.exec(dtContent);
+              var dtName = dtm ? dtm[1] : "html";
+              var pubId = "", sysId = "";
+              if (dtm) {
+                if ((dtm[2] || "").toUpperCase() === "PUBLIC") { pubId = dtm[3] || dtm[4] || ""; sysId = dtm[5] || dtm[6] || ""; }
+                else if ((dtm[2] || "").toUpperCase() === "SYSTEM") { sysId = dtm[3] || dtm[4] || ""; }
+                else { sysId = dtm[5] || dtm[6] || ""; }
+              }
+              cur().appendChild(new XDoctype(doc, dtName, pubId, sysId));
+            }
+            i = e4 + 1; continue;
+          }
+          if (str[i + 1] === "/") {
+            // End tag: parse name and verify match for well-formedness (staggered/mismatched tags).
+            var e5 = str.indexOf(">", i); if (e5 < 0) { e5 = n - 1; }
+            var closeSlice = str.slice(i + 2, e5).trim();
+            var closeM = /^[^\s>]+/.exec(closeSlice);
+            var closeName = closeM ? closeM[0] : "";
+            var top = open.length ? open[open.length - 1] : null;
+            if (top) {
+              var topName = top.prefix ? (top.prefix + ":" + top.localName) : top.localName;
+              if (closeName && closeName !== topName && closeName !== top.localName) { error = true; }
+              open.pop();
+            } else { error = true; }
+            i = e5 + 1; continue;
+          }
           // start tag
           i++;
           var nameM = /^[^\s/>]+/.exec(str.slice(i));
@@ -7644,12 +7774,28 @@
             i += dummy[0].length; continue; }
           var rawName = nameM[0]; i += rawName.length;
           var rawAttrs = [];
+          // Stricter attr parsing for XML well-formedness (bare names, unquoted vals, bad prefixes are errors).
+          var attrNameRe = /^\s*([^\s=/>]+)/;
+          var valRe = /^=\s*(?:"([^"]*)"|'([^']*)'|([^\s>\/]*))/;
           while (i < n && str[i] !== ">" && str[i] !== "/") {
-            var am = /^\s*([^\s=/>]+)\s*(=\s*("([^"]*)"|'([^']*)'))?/.exec(str.slice(i));
+            var am = attrNameRe.exec(str.slice(i));
             if (!am || am[0].length === 0) { i++; continue; }
             i += am[0].length;
-            var av = am[4] != null ? am[4] : (am[5] != null ? am[5] : "");
-            rawAttrs.push([am[1], decodeEnt(av)]);
+            var aname = am[1];
+            if (aname[0] === ":" || aname.indexOf("::") >= 0) { error = true; }
+            var aval = "";
+            var vm = valRe.exec(str.slice(i));
+            if (vm) {
+              i += vm[0].length;
+              aval = (vm[1] != null ? vm[1] : (vm[2] != null ? vm[2] : (vm[3] || "")));
+              if (vm[3] != null) { error = true; } // unquoted value (XML requires quoted AttValue)
+            } else {
+              // XML attrs require = "value"; bare "novalue" or " =val" without name are errors.
+              error = true;
+            }
+            rawAttrs.push([aname, decodeEnt(aval)]);
+            // skip any trailing ws before next or >
+            var ws = /^\s*/.exec(str.slice(i)); if (ws) i += ws[0].length;
           }
           var selfClose = str[i] === "/";
           var gt = str.indexOf(">", i); i = (gt < 0 ? n : gt + 1);
@@ -7661,6 +7807,8 @@
             else if (an.slice(0, 6) === "xmlns:") { nsdecl[an.slice(6)] = rawAttrs[ai][1]; }
           }
           var es = splitQ(rawName);
+          if (es[0] === "" || es[0] === ":") { error = true; }
+          if (es[0] && !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(es[0])) { error = true; } // bad prefix e.g. "8:test"
           var elNs = lookup(es[0] || "", nsdecl);
           if (elNs === undefined) { error = true; elNs = null; }
           var el = new XElement(doc, elNs, es[0], es[1]);
@@ -7668,8 +7816,21 @@
           for (var aj = 0; aj < rawAttrs.length; aj++) {
             var qn = rawAttrs[aj][0], val = rawAttrs[aj][1];
             if (qn === "xmlns") { el.setAttributeNS(XMLNS_NS, "xmlns", val); }
-            else if (qn.slice(0, 6) === "xmlns:") { el.setAttributeNS(XMLNS_NS, qn, val); }
-            else { var qs = splitQ(qn); var ans = null; if (qs[0]) { var looked = lookup(qs[0], nsdecl); if (looked === undefined) { error = true; ans = null; } else { ans = looked; } } el.setAttributeNS(ans, qn, val); }
+            else if (qn.slice(0, 6) === "xmlns:") {
+              var pfx = qn.slice(6);
+              if (!pfx || pfx === "xmlns" || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(pfx)) { error = true; }
+              el.setAttributeNS(XMLNS_NS, qn, val);
+            }
+            else {
+              var qs = splitQ(qn);
+              var ans = null;
+              if (qs[0]) {
+                if (qs[0] === "" || !/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(qs[0])) { error = true; }
+                var looked = lookup(qs[0], nsdecl);
+                if (looked === undefined) { error = true; ans = null; } else { ans = looked; }
+              }
+              el.setAttributeNS(ans, qn, val);
+            }
           }
           cur().appendChild(el);
           if (!selfClose) { open.push(el); }
@@ -7801,6 +7962,24 @@
     // Capture for later rewire (Document global is defined after this IIFE in bootstrap).
     var __xdProto = XDocument.prototype;
     var __xnProto = XNode.prototype;
+    // === Why the prototype rewire is necessary (maintainer note) ===
+    // XDocument et al live in a pure-JS model (no arena __node ids) because XML requires full
+    // namespace-aware attr/element semantics that the current HTML-only arena DOM does not expose.
+    // We want:
+    //   - `xd instanceof Document === true`
+    //   - inherited Document methods / getters to be visible
+    //   - our overrides (documentElement, getElementById, etc) and XNode getters (firstChild etc)
+    //     to take precedence.
+    // Problem: the __xml IIFE runs early in bootstrap, before `Document` / `HTMLDocument` ctors
+    // are installed (see defClass + DocumentCtor later). We also cannot do `class XDocument extends Document`
+    // because the real Document is a native-backed host object; its instances expect arena state.
+    // Solution: after Document is defined, __rewireXDocProto does:
+    //   1. setPrototypeOf(XDoc.proto, Document.proto)  => instanceof works, proto chain for lookups
+    //   2. copy own properties (incl. non-enum getters) from our XNode/XDoc so they are not lost
+    //      behind the real proto's shadowing versions.
+    // This is called twice: once early, once after defClass("Document"...).
+    // It is a bit of a hack; changes to arena Document or XNode can require updates here.
+    // (We already had to special-case firstChild in the past.)
     function __rewireXDocProto() {
       var DocP = globalThis.Document && globalThis.Document.prototype;
       if (!__xdProto || !DocP) return;
@@ -7826,70 +8005,84 @@
 
   // --- a few more constructors pages feature-detect ----------------------------------------
   if (typeof globalThis.DOMParser !== "function") {
-    def(globalThis, "DOMParser", function () {
-      this.parseFromString = function (str, type) {
-        var t = String(type || "").toLowerCase();
-        // The document's URL must be the URL of the relevant global's associated Document (the
-        // active document at parse time). readyState must be "complete". See DOM Parsing spec and
-        // DOMParser WPT (URL, readyState, metadata, parsererror).
-        var activeURL = (document && (document.URL || document.documentURI)) || "about:blank";
-        function setParsedDocProps(d, contentType) {
-          try {
-            Object.defineProperty(d, "URL", { get: function () { return activeURL; }, enumerable: true, configurable: true });
-            Object.defineProperty(d, "documentURI", { get: function () { return activeURL; }, enumerable: true, configurable: true });
-            Object.defineProperty(d, "baseURI", { get: function () { return activeURL; }, enumerable: true, configurable: true });
-            Object.defineProperty(d, "readyState", { get: function () { return "complete"; }, enumerable: true, configurable: true });
-            Object.defineProperty(d, "location", { value: null, enumerable: true, configurable: true });
-            if (contentType) {
-              Object.defineProperty(d, "contentType", { value: contentType, enumerable: true, configurable: true });
-            }
-          } catch (e) {}
-        }
-        // text/html parses into a FRESH, independent HTML document (not the live one). Build an empty
-        // html/head/body skeleton, then let the engine's HTML parser distribute the string's content
-        // into the new head and body.
-        if (t === "text/html") {
-          var d = document.implementation.createHTMLDocument();
-          try {
-            var hid = d.head && typeof d.head.__node === "number" ? d.head.__node : -1;
-            var bid = d.body && typeof d.body.__node === "number" ? d.body.__node : -1;
-            if (typeof globalThis.__parseHtmlSections === "function" && (hid >= 0 || bid >= 0)) {
-              globalThis.__parseHtmlSections(hid, bid, String(str));
-            } else if (d.body) {
-              d.body.innerHTML = String(str);   // fallback if the parse primitive is unavailable
-            }
-          } catch (e) {}
-          setParsedDocProps(d, "text/html");
-          return d;
-        }
-        // XML flavours: parse into an independent namespace-aware XML document.
-        if (t.indexOf("xml") >= 0 || t === "application/xhtml+xml" || t === "image/svg+xml") {
-          var p = __xml.parse(String(str));
-          var xd = (p && p.doc) || new __xml.XDocument();
-          if (p && p.error || !xd.documentElement) {
-            // Per spec: on well-formedness error, document has no children; insert a parsererror
-            // element in the magic namespace. Clear anything our lenient parser built.
-            while (xd.firstChild) { xd.removeChild(xd.firstChild); }
-            var peNS = "http://www.mozilla.org/newlayout/xml/parsererror.xml";
-            var pe;
-            if (typeof xd.createElementNS === "function") {
-              pe = xd.createElementNS(peNS, "parsererror");
-            } else {
-              pe = new __xml.XElement(xd, peNS, null, "parsererror");
-            }
-            if (pe && pe.appendChild) { pe.appendChild(xd.createTextNode("XML Parsing Error")); }
-            xd.appendChild(pe);
+    // DOMParser must produce documents whose .URL/.documentURI/.baseURI == the URL of the
+    // "relevant global's associated Document" at the time of construction (or per cross-realm .call
+    // rules exercised by WPT). We capture on the instance at `new DOMParser()` time using the
+    // lexical `document` of the realm that ran the constructor. parseFromString then prefers the
+    // receiver's captured URL so that cross-realm `.call(parserFromOtherRealm)` still yields the
+    // parser's creator document URL (satisfies several iframe cross cases in the WPT url tests).
+    function DOMParser() {
+      var d = (typeof document !== "undefined" ? document : null);
+      var u = (d && (d.URL || d.documentURI)) || "about:blank";
+      // non-enumerable to not pollute
+      Object.defineProperty(this, "_creatorDocURL", { value: u, enumerable: false, configurable: true });
+    }
+    DOMParser.prototype.parseFromString = function (str, type) {
+      var t = String(type || "").toLowerCase();
+      // The document's URL must be the URL of the relevant global's associated Document (the
+      // active document at parse time). readyState must be "complete". See DOM Parsing spec and
+      // DOMParser WPT (URL, readyState, metadata, parsererror).
+      var activeURL = (this && this._creatorDocURL) ||
+                      (document && (document.URL || document.documentURI)) || "about:blank";
+      function setParsedDocProps(d, contentType) {
+        try {
+          Object.defineProperty(d, "URL", { get: function () { return activeURL; }, enumerable: true, configurable: true });
+          Object.defineProperty(d, "documentURI", { get: function () { return activeURL; }, enumerable: true, configurable: true });
+          Object.defineProperty(d, "baseURI", { get: function () { return activeURL; }, enumerable: true, configurable: true });
+          Object.defineProperty(d, "readyState", { get: function () { return "complete"; }, enumerable: true, configurable: true });
+          Object.defineProperty(d, "location", { value: null, enumerable: true, configurable: true });
+          if (contentType) {
+            Object.defineProperty(d, "contentType", { value: contentType, enumerable: true, configurable: true });
           }
-          // XDocument.prototype chain was wired at definition time to satisfy instanceof Document.
-          // Ensure basic identity for tests (in case).
-          if (!xd.nodeName) { xd.nodeName = "#document"; }
-          if (xd.nodeType == null) { xd.nodeType = 9; }
-          setParsedDocProps(xd, t || "application/xml");
-          return xd;
+        } catch (e) {}
+      }
+      // text/html parses into a FRESH, independent HTML document (not the live one). Build an empty
+      // html/head/body skeleton, then let the engine's HTML parser distribute the string's content
+      // into the new head and body.
+      if (t === "text/html") {
+        var d = document.implementation.createHTMLDocument();
+        try {
+          var hid = d.head && typeof d.head.__node === "number" ? d.head.__node : -1;
+          var bid = d.body && typeof d.body.__node === "number" ? d.body.__node : -1;
+          if (typeof globalThis.__parseHtmlSections === "function" && (hid >= 0 || bid >= 0)) {
+            globalThis.__parseHtmlSections(hid, bid, String(str));
+          } else if (d.body) {
+            d.body.innerHTML = String(str);   // fallback if the parse primitive is unavailable
+          }
+        } catch (e) {}
+        setParsedDocProps(d, "text/html");
+        return d;
+      }
+      // XML flavours: parse into an independent namespace-aware XML document.
+      // We explicitly list the XML types per spec + WPT (including xhtml+svg which must not fall
+      // to the html path or return the live document).
+      if (t === "text/xml" || t === "application/xml" || t === "application/xhtml+xml" || t === "image/svg+xml" || /\+xml$/.test(t)) {
+        var p = __xml.parse(String(str));
+        var xd = (p && p.doc) || new __xml.XDocument();
+        if (p && p.error || !xd.documentElement) {
+          // Per spec: on well-formedness error, document has no children; insert a parsererror
+          // element in the magic namespace. Clear anything our lenient parser built.
+          while (xd.firstChild) { xd.removeChild(xd.firstChild); }
+          var peNS = "http://www.mozilla.org/newlayout/xml/parsererror.xml";
+          var pe;
+          if (typeof xd.createElementNS === "function") {
+            pe = xd.createElementNS(peNS, "parsererror");
+          } else {
+            pe = new __xml.XElement(xd, peNS, null, "parsererror");
+          }
+          if (pe && pe.appendChild) { pe.appendChild(xd.createTextNode("XML Parsing Error")); }
+          xd.appendChild(pe);
         }
-        return document;
-      };
-    });
+        // XDocument.prototype chain was wired at definition time to satisfy instanceof Document.
+        // Ensure basic identity for tests (in case).
+        if (!xd.nodeName) { xd.nodeName = "#document"; }
+        if (xd.nodeType == null) { xd.nodeType = 9; }
+        setParsedDocProps(xd, t || "application/xml");
+        return xd;
+      }
+      return document;
+    };
+    def(globalThis, "DOMParser", DOMParser);
   }
   if (typeof globalThis.XMLSerializer !== "function") {
     def(globalThis, "XMLSerializer", function () {

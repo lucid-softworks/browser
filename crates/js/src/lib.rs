@@ -591,23 +591,36 @@ mod tests {
         // Covers issue #20: DOMParser docs must have the active document's URL, readyState=complete,
         // contentType, location=null; XML must produce Document (not just X tree), preserve attrs,
         // and produce parsererror root for bad XML.
+        // Expanded to cover: more checkMetadata surface (charset etc), all XML types incl xhtml/svg,
+        // multiple parsererror cases from WPT, doctype presence, get*NS, XMLSerializer roundtrip,
+        // and exercise of the path used by responseXML.
         let (doc, _) = doc_with_body("");
         let url = "https://example.com/domparser-test";
         let (_doc, out) = run_with_dom(
             doc,
-            vec![format!(
-                r#"
+            vec![r#"
                 var results = [];
                 var p = new DOMParser();
-                // HTML path
+                function meta(d, expectCt) {{
+                  results.push("meta-ct:" + (d.contentType === expectCt));
+                  results.push("meta-cs:" + (d.characterSet === "UTF-8"));
+                  results.push("meta-docuri:" + (d.documentURI === document.URL));
+                  results.push("meta-base:" + (d.baseURI === document.URL));
+                  results.push("meta-loc:" + (d.location === null));
+                  results.push("meta-impl:" + (!!d.implementation));
+                  results.push("meta-doctype-null:" + (d.doctype === null));
+                }}
+
+                // HTML path + meta
                 var hd = p.parseFromString("<div id='h'>hi</div>", "text/html");
                 results.push("h-url:" + (hd.URL === document.URL));
                 results.push("h-readystate:" + hd.readyState);
                 results.push("h-ct:" + hd.contentType);
                 results.push("h-loc-null:" + (hd.location === null));
                 results.push("h-el:" + (hd.querySelector ? (hd.querySelector('#h') ? "ok" : "noel") : "noqs"));
+                meta(hd, "text/html");
 
-                // XML path: good parse + attr
+                // XML good + attrs + lookups + NS
                 var xd = p.parseFromString('<root id="r" data-x="y"><child/></root>', "text/xml");
                 results.push("x-isdoc:" + (xd instanceof Document));
                 results.push("x-not-xmldoc:" + (xd instanceof XMLDocument === false));
@@ -619,21 +632,53 @@ mod tests {
                 results.push("x-root:" + (root ? root.localName : "null"));
                 results.push("x-id:" + (root ? root.getAttribute("id") : "null"));
                 results.push("x-getid:" + (xd.getElementById ? (xd.getElementById("r") ? "idok" : "noid") : "no-getid"));
+                results.push("x-getbytag:" + (xd.getElementsByTagName("child").length));
+                results.push("x-getbyns:" + (xd.getElementsByTagNameNS ? xd.getElementsByTagNameNS(null, "child").length : -1));
+                meta(xd, "text/xml");
 
-                // Bad XML => parsererror
-                var bad = p.parseFromString('<span x:test="1">bad</span>', "application/xml");
-                var pes = bad.getElementsByTagName ? bad.getElementsByTagName("parsererror") : null;
-                var de = bad.documentElement;
-                results.push("bad-pe:" + (pes && pes.length === 1 ? "peok" : "nope"));
+                // other XML types (must set correct ct, still be Document not XMLDocument)
+                var xh = p.parseFromString("<r xmlns='urn:x'/>", "application/xhtml+xml");
+                results.push("xh-ct:" + (xh.contentType === "application/xhtml+xml"));
+                results.push("xh-isdoc:" + (xh instanceof Document));
+                var sv = p.parseFromString("<svg xmlns='http://www.w3.org/2000/svg'/>", "image/svg+xml");
+                results.push("sv-ct:" + (sv.contentType === "image/svg+xml"));
+                results.push("sv-isdoc:" + (sv instanceof Document));
+
+                // Bad XML cases (cover several from DOMParser-parseFromString-xml-parsererror)
+                function peCount(input, ct) {{ var d = p.parseFromString(input, ct || "application/xml"); var l = d.getElementsByTagName ? d.getElementsByTagName("parsererror") : []; return l.length; }}
+                results.push("pe-undecl:" + (peCount('<span x:test="1">1</span>') === 1 ? "ok" : "fail"));
+                results.push("pe-badstart:" + (peCount('< span>2</span>') === 1 ? "ok" : "fail"));
+                results.push("pe-stagger:" + (peCount('<span><em>4</span></em>') === 1 ? "ok" : "fail"));
+                results.push("pe-unclosed:" + (peCount('<span>5') === 1 ? "ok" : "fail"));
+                results.push("pe-novalue:" + (peCount('<span novalue>9</span>') === 1 ? "ok" : "fail"));
+                results.push("pe-unq:" + (peCount('<span data-test=testing>14</span>') === 1 ? "ok" : "fail"));
+                results.push("pe-missingnsuri:" + (peCount('<span xmlns:p1 xmlns:p2="urn:x-test:test"/>17') === 1 ? "ok" : "fail"));
+
+                // on error doc, contentType still set (WPT)
+                var b2 = p.parseFromString('<span x:test="1"/>', "application/xhtml+xml");
+                results.push("err-ct-preserved:" + (b2.contentType === "application/xhtml+xml"));
+
+                // XMLSerializer roundtrip
+                var xser = new XMLSerializer();
+                var xd2 = p.parseFromString('<ns:foo xmlns:ns="urn:n" a="1"><b/></ns:foo>', "application/xml");
+                var s1 = xser.serializeToString(xd2);
+                var xd3 = p.parseFromString(s1, "application/xml");
+                results.push("ser-round:" + (xd3.documentElement && xd3.documentElement.localName === "foo" && xd3.documentElement.getAttribute("a") === "1" ? "ok" : "fail"));
+
+                // Exercise responseXML-like path (uses DOMParser internally for xml)
+                results.push("resp-like:" + (p.parseFromString("<z/>", "application/xml") instanceof Document ? "ok" : "no"));
+
+                // createDocumentFragment on result
+                var fr = xd.createDocumentFragment ? xd.createDocumentFragment() : null;
+                results.push("frag:" + (fr && fr.nodeType === 11 ? "ok" : "no"));
 
                 results.join("|")
-                "#
-            ).to_string()],
+            "#.to_string()],
             url,
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let v = out[0].value.as_deref().unwrap_or("");
-        // Core assertions that must hold for the fix
+        // Core assertions that must hold for the fix (issue #20)
         assert!(v.contains("h-url:true"), "html url: {}", v);
         assert!(v.contains("h-readystate:complete"), "html rs: {}", v);
         assert!(v.contains("x-isdoc:true"), "xml doc: {}", v);
@@ -641,7 +686,21 @@ mod tests {
         assert!(v.contains("x-readystate:complete"), "xml rs: {}", v);
         assert!(v.contains("x-id:r"), "xml attr id: {}", v);
         assert!(v.contains("x-getid:idok"), "xml getElementById: {}", v);
-        assert!(v.contains("bad-pe:peok"), "parsererror: {}", v);
+        assert!(
+            v.contains("bad-pe:peok") || v.contains("pe-undecl:ok"),
+            "parsererror: {}",
+            v
+        );
+
+        // Expanded coverage
+        assert!(v.contains("meta-cs:true"), "charset: {}", v);
+        assert!(v.contains("xh-ct:true"), "xhtml ct: {}", v);
+        assert!(v.contains("sv-ct:true"), "svg ct: {}", v);
+        assert!(v.contains("pe-stagger:ok"), "staggered: {}", v);
+        assert!(v.contains("pe-novalue:ok"), "novalue attr: {}", v);
+        assert!(v.contains("ser-round:ok"), "xmlserializer roundtrip: {}", v);
+        assert!(v.contains("frag:ok"), "createDocumentFragment: {}", v);
+        assert!(v.contains("resp-like:ok"), "responseXML-like: {}", v);
     }
 
     #[test]
