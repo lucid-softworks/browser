@@ -506,7 +506,9 @@ fn grid_axis_edges(
         .and_then(|line| line_pos(lines, line));
     let end_line = match pl.end {
         style::GridEnd::Line(line) => line_pos(lines, line),
-        style::GridEnd::Span(span) => pl.start.and_then(|start| line_pos(lines, start + span.max(1))),
+        style::GridEnd::Span(span) => pl
+            .start
+            .and_then(|start| line_pos(lines, start + span.max(1))),
         style::GridEnd::Auto => None,
     };
 

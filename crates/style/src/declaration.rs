@@ -239,10 +239,9 @@ pub(crate) fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
 }
 
 fn normalize_grid_placement(slot: &mut Option<GridPlacement>) {
-    if slot
-        .as_ref()
-        .is_some_and(|p| p.start.is_none() && p.start_span.is_none() && matches!(p.end, GridEnd::Auto))
-    {
+    if slot.as_ref().is_some_and(|p| {
+        p.start.is_none() && p.start_span.is_none() && matches!(p.end, GridEnd::Auto)
+    }) {
         *slot = None;
     }
 }

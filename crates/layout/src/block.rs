@@ -605,7 +605,10 @@ pub(crate) fn resolve_out_of_flow(
     // are `auto`) is its hypothetical in-flow origin — approximated by this parent's content-box
     // top-left. Captured before the loop so each child sees the same parent content rect.
     let parent_content = boxx.dimensions.content;
-    let is_grid_parent = matches!(display_of(boxx, styles), style::Display::Grid | style::Display::InlineGrid);
+    let is_grid_parent = matches!(
+        display_of(boxx, styles),
+        style::Display::Grid | style::Display::InlineGrid
+    );
     // If this box is a flex container, abspos children take their static position from its
     // justify-content / align-items (resolved per child's align-self) rather than the top-left.
     let flex_parent: Option<style::ComputedStyle> = match display_of(boxx, styles) {
@@ -640,8 +643,11 @@ pub(crate) fn resolve_out_of_flow(
         match position_of(&boxx.children[i], styles) {
             style::Position::Absolute => {
                 let fa = flex_align_for(&boxx.children[i]);
-                let grid_cb =
-                    is_grid_parent.then(|| crate::grid::abspos_grid_containing_block(boxx, &boxx.children[i], styles)).flatten();
+                let grid_cb = is_grid_parent
+                    .then(|| {
+                        crate::grid::abspos_grid_containing_block(boxx, &boxx.children[i], styles)
+                    })
+                    .flatten();
                 let cb = grid_cb.unwrap_or(ctx.positioned);
                 let static_rect = grid_cb.unwrap_or(parent_content);
                 let child = &mut boxx.children[i];

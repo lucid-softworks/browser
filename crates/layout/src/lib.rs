@@ -2298,10 +2298,24 @@ mod tests {
         let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
         let content = gbox.dimensions.content;
         let c = cbox.dimensions.content;
-        assert!((c.x - (content.x + 50.0)).abs() < 0.5, "x={} want {}", c.x, content.x + 50.0);
-        assert!((c.y - (content.y + 50.0)).abs() < 0.5, "y={} want {}", c.y, content.y + 50.0);
+        assert!(
+            (c.x - (content.x + 50.0)).abs() < 0.5,
+            "x={} want {}",
+            c.x,
+            content.x + 50.0
+        );
+        assert!(
+            (c.y - (content.y + 50.0)).abs() < 0.5,
+            "y={} want {}",
+            c.y,
+            content.y + 50.0
+        );
         assert!((c.width - 250.0).abs() < 0.5, "width={} want 250", c.width);
-        assert!((c.height - 250.0).abs() < 0.5, "height={} want 250", c.height);
+        assert!(
+            (c.height - 250.0).abs() < 0.5,
+            "height={} want 250",
+            c.height
+        );
     }
 
     #[test]
