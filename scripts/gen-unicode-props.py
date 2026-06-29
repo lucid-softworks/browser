@@ -160,10 +160,8 @@ def main():
                 keys.append(f"{pn}={vs}")
         bind(keys, ranges)
 
-    # Special lone properties.
-    bind(["Any"], [(0, MAX_CP)])
-    bind(["ASCII"], [(0, 0x7F)])
-    bind(["Assigned"], complement(gc.get("Cn", [])))
+    # NOTE: Any / ASCII / Assigned are UTS#18 properties but NOT valid ECMAScript `\p{}` names —
+    # `/\p{Any}/u` must be a SyntaxError — so they are deliberately omitted.
 
     # --- Script (Script=value only) ---
     # The `Unknown` (Zzzz) script covers every code point in no explicit script.
