@@ -4367,6 +4367,82 @@ mod tests {
     }
 
     #[test]
+    fn document_legacy_collections_cover_dom_tree_accessors() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+                var img = document.body.appendChild(document.createElement("img"));
+                var form = document.body.appendChild(document.createElement("form"));
+                var embed = document.body.appendChild(document.createElement("embed"));
+                var script = document.body.appendChild(document.createElement("script"));
+                var link = document.body.appendChild(document.createElement("a"));
+                link.setAttribute("href", "/x");
+                var anchor = document.body.appendChild(document.createElement("a"));
+                anchor.setAttribute("name", "top");
+                var images = document.images;
+                var counts = [
+                  images.length,
+                  document.forms.length,
+                  document.embeds.length,
+                  document.plugins.length,
+                  document.links.length,
+                  document.scripts.length,
+                  document.anchors.length
+                ].join(",");
+                img.remove();
+                counts + "|" + Object.prototype.toString.call(images) + "|" + images.length
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("1,1,1,1,1,1,1|[object HTMLCollection]|0")
+        );
+    }
+
+    #[test]
+    fn document_named_property_getter_returns_iframe_window() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+                var frame = document.body.appendChild(document.createElement("iframe"));
+                frame.setAttribute("name", "test1");
+                [
+                  "test1" in document,
+                  document.test1 === frame.contentWindow,
+                  document["test1"] === frame.contentWindow,
+                  Object.getOwnPropertyDescriptor(document, "test1").get.call(document) === frame.contentWindow
+                ].join("|")
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("true|true|true|true"));
+    }
+
+    #[test]
+    fn document_named_property_getter_returns_collection_for_multiple_matches() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+                var a = document.body.appendChild(document.createElement("form"));
+                var b = document.body.appendChild(document.createElement("form"));
+                a.setAttribute("name", "login");
+                b.setAttribute("name", "login");
+                var named = document.login;
+                [
+                  "login" in document,
+                  named instanceof HTMLCollection,
+                  named.length,
+                  named[0] === a,
+                  named[1] === b
+                ].join("|")
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("true|true|2|true|true"));
+    }
+
+    #[test]
     fn ready_state_advances_to_complete_after_drain() {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(

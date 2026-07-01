@@ -467,12 +467,14 @@
     if (__nodeType(nodeId) === 11) {
       var moving = __children(nodeId).slice();
       for (var i = 0; i < moving.length; i++) { __insertBefore(parentId, moving[i], refId); }
+      if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       if (globalThis.__ceOnInsert) { for (var k = 0; k < moving.length; k++) { try { globalThis.__ceOnInsert(moving[k]); } catch (e) {} } }
       if (globalThis.__frameOnInsert) { for (var fk = 0; fk < moving.length; fk++) { try { globalThis.__frameOnInsert(moving[fk]); } catch (e) {} } }
       if (globalThis.__adoptOnInsert) { for (var m = 0; m < moving.length; m++) { try { globalThis.__adoptOnInsert(moving[m]); } catch (e) {} } }
       return nodeId;
     }
     __insertBefore(parentId, nodeId, refId);
+    if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
     // Custom Elements: a newly-connected element (and its subtree) may need upgrading + connectedCallback.
     if (globalThis.__ceOnInsert) { try { globalThis.__ceOnInsert(nodeId); } catch (e) {} }
     // Iframes: a newly-connected <iframe> with src/srcdoc starts loading its nested browsing context.
@@ -886,6 +888,7 @@
       // `value` is a non-nullable DOMString in WebIDL: undefined -> "undefined", null -> "null".
       var newVal = String(value);
       __setAttr(id, nm, newVal);
+      if ((nm === "id" || nm === "name") && globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       // Mutating an aria element-reflection content attribute directly clears any explicitly set
       // attr-element slot, so the IDL getter falls back to ID lookup (see __aomNoteAttrChange).
       if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
@@ -897,6 +900,7 @@
       var ceOld = (typeof globalThis.__ceNoteAttrChange === "function") ? __getAttr(id, nm) : null;
       __detachCachedAttr(nm);
       __removeAttr(id, nm); delete __attrNs[nm]; delete __attrNodeCache[nm];
+      if ((nm === "id" || nm === "name") && globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
       // Only a real removal is a mutation; removing an absent attribute is a no-op (oldValue null).
       if (ceOld != null && typeof globalThis.__ceNoteAttrChange === "function") { globalThis.__ceNoteAttrChange(el, nm, ceOld, null); }
@@ -1155,6 +1159,7 @@
       var cid = requireNodeArg(child, "removeChild");
       if (__parent(cid) !== id) { notFoundError("The node to be removed is not a child of this node."); }
       __removeChild(id, cid);
+      if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       return child;
     });
     def(el, "insertBefore", function (newNode, refNode) {
@@ -1182,10 +1187,11 @@
         ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1;
       }
       __removeChild(id, oid);
+      if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       insertNode(id, nid, ref);
       return oldNode;
     });
-    def(el, "remove", function () { var p = __parent(id); if (p >= 0) { __removeChild(p, id); } });
+    def(el, "remove", function () { var p = __parent(id); if (p >= 0) { __removeChild(p, id); if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); } } });
     def(el, "append", function () { parentAppend(id, arguments); });
     def(el, "prepend", function () { parentPrepend(id, arguments); });
     def(el, "replaceChildren", function () { parentReplaceChildren(id, arguments); });
@@ -1736,6 +1742,110 @@
     get: function () { return __docSheetListProxy; },
     enumerable: true, configurable: true
   });
+
+  var documentNamedCache = Object.create(null);
+  var documentNamedInstalled = Object.create(null);
+  def(globalThis, "__documentNamedInvalidate", function () {
+    documentNamedCache = Object.create(null);
+    for (var name in documentNamedInstalled) {
+      try {
+        var desc = Object.getOwnPropertyDescriptor(document, name);
+        if (desc && desc.get && desc.get.__documentNamedGetter) { delete document[name]; }
+      } catch (e) {}
+    }
+    documentNamedInstalled = Object.create(null);
+    installDocumentNamedProperties();
+  });
+  function documentNamedItems(name) {
+    var out = [];
+    var key = String(name);
+    if (!key) { return out; }
+    if (Object.prototype.hasOwnProperty.call(documentNamedCache, key)) {
+      return documentNamedCache[key].slice();
+    }
+    function visit(nid) {
+      var kids = __children(nid);
+      for (var i = 0; i < kids.length; i++) {
+        var kid = kids[i];
+        if (__nodeType(kid) === 1) {
+          var tag = __tag(kid);
+          var attrName = __getAttr(kid, "name");
+          var attrId = __getAttr(kid, "id");
+          var nameMatches = attrName === key;
+          var idMatches = attrId === key;
+          if ((tag === "iframe" && nameMatches) ||
+              ((tag === "embed" || tag === "form" || tag === "img" || tag === "object") &&
+               (nameMatches || idMatches))) {
+            out.push(wrap(kid));
+          }
+        }
+        visit(kid);
+      }
+    }
+    visit(0);
+    documentNamedCache[key] = out;
+    return out.slice();
+  }
+  function canBeDocumentNamedProperty(prop) {
+    return typeof prop === "string" && prop.length > 0 && prop.slice(0, 2) !== "__";
+  }
+  function documentNamedValue(name) {
+    var items = documentNamedItems(name);
+    if (!items.length) { return undefined; }
+    if (items.length === 1) {
+      var one = items[0];
+      if (one && one.tagName && String(one.tagName).toLowerCase() === "iframe") {
+        return one.contentWindow;
+      }
+      return one;
+    }
+    return globalThis.__makeHTMLCollection(function () { return documentNamedItems(name); });
+  }
+  function documentSupportedNames() {
+    var names = [];
+    var seen = Object.create(null);
+    function add(name) {
+      if (name && !seen[name]) { names.push(name); seen[name] = true; }
+    }
+    function visit(nid) {
+      var kids = __children(nid);
+      for (var i = 0; i < kids.length; i++) {
+        var kid = kids[i];
+        if (__nodeType(kid) === 1) {
+          var tag = __tag(kid);
+          if (tag === "iframe") {
+            add(__getAttr(kid, "name"));
+          } else if (tag === "embed" || tag === "form" || tag === "img" || tag === "object") {
+            add(__getAttr(kid, "name"));
+            add(__getAttr(kid, "id"));
+          }
+        }
+        visit(kid);
+      }
+    }
+    visit(0);
+    return names;
+  }
+  function installDocumentNamedProperties() {
+    var names = documentSupportedNames();
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i];
+      if (!canBeDocumentNamedProperty(name) || name in document) { continue; }
+      (function (key) {
+        var getter = function () { return documentNamedValue(key); };
+        getter.__documentNamedGetter = true;
+        try {
+          Object.defineProperty(document, key, {
+            get: getter,
+            enumerable: false,
+            configurable: true
+          });
+          documentNamedInstalled[key] = true;
+        } catch (e) {}
+      })(name);
+    }
+  }
+  installDocumentNamedProperties();
 
   globalThis.document = document;
 })();
