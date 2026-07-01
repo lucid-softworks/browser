@@ -85,25 +85,26 @@ def zone_files():
     return out
 
 def read_canonical():
-    """Canonical zone names from zone1970.tab / zone.tab."""
-    canon = set()
-    for tab in ("zone1970.tab", "zone.tab"):
+    """Canonical zone names, preferring the modern zone1970.tab (which uses the current names, e.g.
+    Asia/Kolkata not Asia/Calcutta) over the legacy zone.tab."""
+    def read(tab):
+        s = set()
         path = os.path.join(ZONEINFO, tab)
-        if not os.path.exists(path):
-            continue
-        for line in open(path):
-            if line.startswith("#") or not line.strip():
-                continue
-            cols = line.rstrip("\n").split("\t")
-            if len(cols) >= 3:
-                canon.add(cols[2])
-    return canon
+        if os.path.exists(path):
+            for line in open(path):
+                if line.startswith("#") or not line.strip():
+                    continue
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) >= 3:
+                    s.add(cols[2])
+        return s
+    return read("zone1970.tab"), read("zone.tab")
 
 def main():
     files = zone_files()
-    canonical_set = read_canonical()
+    primary, secondary = read_canonical()
     # Etc/UTC and UTC are always canonical anchors.
-    canonical_set |= {"UTC", "Etc/UTC", "Etc/GMT"}
+    primary |= {"UTC", "Etc/UTC", "Etc/GMT"}
 
     by_hash = {}
     parsed = {}
@@ -121,7 +122,10 @@ def main():
         if "UTC" in names:
             rep = "UTC"
         else:
-            rep = next((n for n in names_sorted if n in canonical_set), None)
+            # Prefer a modern (zone1970.tab) canonical name over a legacy (zone.tab) one.
+            rep = next((n for n in names_sorted if n in primary), None)
+            if rep is None:
+                rep = next((n for n in names_sorted if n in secondary), None)
         if rep is None:
             # No tab entry: prefer a name without legacy prefixes.
             rep = next((n for n in names_sorted if "/" in n and not n.startswith(("US/", "Brazil/", "Canada/", "Chile/", "Mexico/", "Australia/", "Etc/"))), names_sorted[0])
