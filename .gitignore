@@ -32,3 +32,6 @@ dist/
 review-*.md
 *-review*.md
 review_*.md
+
+# Classic V8 benchmark suite (downloaded on demand by scripts/run-v8bench.sh).
+/v8-v7/
