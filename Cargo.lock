@@ -1458,7 +1458,7 @@ dependencies = [
  "rustls-pemfile",
  "tungstenite",
  "ureq",
- "webpki-roots 0.26.11",
+ "webpki-roots 1.0.8",
  "wurl",
 ]
 
