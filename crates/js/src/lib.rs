@@ -2719,6 +2719,77 @@ mod tests {
     }
 
     #[test]
+    fn range_surround_contents_wraps_selection_and_selects_parent() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var text = p.appendChild(document.createTextNode('abcd'));
+                   var wrapper = document.createElement('strong');
+                   wrapper.appendChild(document.createTextNode('discarded'));
+                   var r = document.createRange(); r.setStart(text, 1); r.setEnd(text, 3);
+                   r.surroundContents(wrapper);
+                   [p.childNodes.length, p.childNodes[0].data,
+                    p.childNodes[1] === wrapper, wrapper.textContent, p.childNodes[2].data,
+                    r.startContainer === p, r.startOffset,
+                    r.endContainer === p, r.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("3|a|true|bc|d|true|1|true|2"));
+    }
+
+    #[test]
+    fn range_surround_contents_rejects_partial_elements_before_mutating() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var bold = p.appendChild(document.createElement('b'));
+                   var text = bold.appendChild(document.createTextNode('ab'));
+                   p.appendChild(document.createElement('i')).textContent = 'cd';
+                   var r = document.createRange(); r.setStart(text, 1); r.setEnd(p, 1);
+                   var wrapper = document.createElement('span');
+                   var name = ''; try { r.surroundContents(wrapper); } catch (e) { name = e.name; }
+                   [name, p.firstChild === bold, text.data, wrapper.parentNode === null].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("InvalidStateError|true|ab|true")
+        );
+    }
+
+    #[test]
+    fn range_extraction_rejects_contained_doctype_before_mutating() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var other = document.implementation.createHTMLDocument('');
+                   var originalDoctype = other.doctype;
+                   var originalElement = other.documentElement;
+                   var r = other.createRange(); r.setStart(other, 0); r.setEnd(other, 1);
+                   var name = ''; try { r.extractContents(); } catch (e) { name = e.name; }
+                   [name, other.childNodes.length,
+                    other.firstChild === originalDoctype,
+                    other.lastChild === originalElement,
+                    r.startContainer === other, r.startOffset, r.endOffset].join('|')"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("HierarchyRequestError|2|true|true|true|0|1")
+        );
+    }
+
+    #[test]
     fn document_element_inner_html_preserves_head_and_body() {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(

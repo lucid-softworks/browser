@@ -9637,7 +9637,14 @@
     if (!__isInclAncestor(scId, ecId)) { for (var i = 0; i < kids.length; i++) { if (__nodePartiallyContained(kids[i], scId, ecId)) { firstPC = kids[i]; break; } } }
     if (!__isInclAncestor(ecId, scId)) { for (var j = kids.length - 1; j >= 0; j--) { if (__nodePartiallyContained(kids[j], scId, ecId)) { lastPC = kids[j]; break; } } }
     var contained = [];
-    for (var k = 0; k < kids.length; k++) { if (__nodeContainedIn(kids[k], scId, so, ecId, eo)) { contained.push(kids[k]); } }
+    for (var k = 0; k < kids.length; k++) {
+      if (__nodeContainedIn(kids[k], scId, so, ecId, eo)) {
+        if (__nodeType(kids[k]) === 10) {
+          throw new globalThis.DOMException("A DocumentType node cannot be extracted into a fragment.", "HierarchyRequestError");
+        }
+        contained.push(kids[k]);
+      }
+    }
     // Leading partial boundary.
     if (firstPC >= 0 && __isCharData(__nodeType(firstPC))) {
       var df = __textContent(scId) || "";
@@ -9732,6 +9739,40 @@
     if (__sameNode(this._sc, this._ec) && this._so === this._eo) {
       __setRangeEnd(this, parent, newOffset);
     }
+  };
+  Range.prototype.surroundContents = function (newParent) {
+    __reqNode(newParent, "surroundContents");
+
+    // A non-Text node is partially contained when it is an inclusive ancestor of exactly one
+    // boundary container. The only candidates are on the two paths below the common ancestor.
+    var commonId = __idOf(this.commonAncestorContainer);
+    var currentId = __idOf(this._sc);
+    while (currentId >= 0 && currentId !== commonId) {
+      var currentType = __nodeType(currentId);
+      if (currentType !== 3 && currentType !== 4) {
+        throw new globalThis.DOMException("The Range partially contains a non-Text node.", "InvalidStateError");
+      }
+      currentId = __parent(currentId);
+    }
+    currentId = __idOf(this._ec);
+    while (currentId >= 0 && currentId !== commonId) {
+      var endType = __nodeType(currentId);
+      if (endType !== 3 && endType !== 4) {
+        throw new globalThis.DOMException("The Range partially contains a non-Text node.", "InvalidStateError");
+      }
+      currentId = __parent(currentId);
+    }
+
+    var parentType = __nodeType(__idOf(newParent));
+    if (parentType === 9 || parentType === 10 || parentType === 11) {
+      throw new globalThis.DOMException("The new parent has an invalid node type.", "InvalidNodeTypeError");
+    }
+
+    var fragment = this.extractContents();
+    while (newParent.firstChild !== null) { newParent.removeChild(newParent.firstChild); }
+    this.insertNode(newParent);
+    newParent.appendChild(fragment);
+    this.selectNode(newParent);
   };
   Range.prototype.cloneRange = function () { var r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; };
   Range.prototype.detach = function () {};
