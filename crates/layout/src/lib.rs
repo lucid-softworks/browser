@@ -397,6 +397,101 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_block_margins_collapse_to_the_larger_margin() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let a = doc.append_element(body, "div");
+        let b = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    bottom: 30.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    top: 50.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let a_bottom = rect_of(&root_box, a).y + rect_of(&root_box, a).height;
+        let b_top = rect_of(&root_box, b).y;
+        assert_eq!(b_top - a_bottom, 50.0);
+    }
+
+    #[test]
+    fn margins_collapse_through_an_empty_block() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let a = doc.append_element(body, "div");
+        let empty = doc.append_element(body, "div");
+        let b = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    bottom: 10.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            empty,
+            style::ComputedStyle {
+                display_block: true,
+                margin: style::Edges {
+                    top: 30.0,
+                    bottom: 40.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    top: 25.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let a_bottom = rect_of(&root_box, a).y + rect_of(&root_box, a).height;
+        let b_top = rect_of(&root_box, b).y;
+        assert_eq!(b_top - a_bottom, 40.0);
+    }
+
+    #[test]
     fn padding_and_border_offset_content_rect() {
         let mut doc = dom::Document::new();
         let root = doc.root();

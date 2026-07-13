@@ -288,9 +288,45 @@ pub(crate) fn layout_block(
     apply_relative_offset(boxx, containing, ctx.scrollport, styles);
 }
 
-/// Lay out a block's block-level children top-to-bottom. Returns the total content height
-/// (sum of child margin-box heights). No margin collapsing (kept simple). Out-of-flow children
-/// are skipped here (they take no space) and resolved later.
+#[derive(Default)]
+struct CollapsingMargin {
+    largest_positive: f32,
+    smallest_negative: f32,
+}
+
+impl CollapsingMargin {
+    fn add(&mut self, margin: f32) {
+        self.largest_positive = self.largest_positive.max(margin);
+        self.smallest_negative = self.smallest_negative.min(margin);
+    }
+
+    fn value(&self) -> f32 {
+        self.largest_positive + self.smallest_negative
+    }
+
+    fn replace(&mut self, margin: f32) {
+        *self = Self::default();
+        self.add(margin);
+    }
+}
+
+fn margin_collapses_through(boxx: &LayoutBox) -> bool {
+    let d = boxx.dimensions;
+    d.content.height.abs() <= f32::EPSILON
+        && [
+            d.padding.top,
+            d.padding.bottom,
+            d.border.top,
+            d.border.bottom,
+        ]
+        .into_iter()
+        .all(|v| v.abs() <= f32::EPSILON)
+        && boxx.children.is_empty()
+}
+
+/// Lay out a block's block-level children top-to-bottom. Returns the total content height.
+/// Adjacent vertical margins collapse, including both margins of an empty block. Out-of-flow
+/// children are skipped here (they take no space) and resolved later.
 pub(crate) fn layout_block_children(
     boxx: &mut LayoutBox,
     ctx: Ctx,
@@ -323,7 +359,9 @@ pub(crate) fn layout_block_children(
         let lh = boxx.children[li].dimensions.margin_box().height;
         content_offset = (lh - boxx.dimensions.border.top).max(0.0);
     }
-    let mut cursor_y = content.y + content_offset;
+    let mut collapse_anchor = content.y + content_offset;
+    let mut pending_margin = CollapsingMargin::default();
+    let mut cursor_y = collapse_anchor;
     // Floats placed by this container (its own block formatting context). Empty for the common
     // float-free page, in which case every helper below is a cheap no-op and the flow is unchanged.
     let mut floats = FloatCtx::new(content.x, content.x + content.width);
@@ -337,14 +375,14 @@ pub(crate) fn layout_block_children(
 
         let float = float_of(child, styles);
         let clear = clear_of(child, styles);
-        // `clear` drops a box below the relevant earlier floats before it's placed.
-        let start_y = if floats.is_empty() {
-            cursor_y
-        } else {
-            floats.clear_to(clear, cursor_y)
-        };
 
         if float != style::Float::None {
+            // `clear` drops a float below the relevant earlier floats before it's placed.
+            let start_y = if floats.is_empty() {
+                cursor_y
+            } else {
+                floats.clear_to(clear, cursor_y)
+            };
             layout_float_child(
                 child,
                 content,
@@ -361,12 +399,25 @@ pub(crate) fn layout_block_children(
             continue;
         }
 
+        let collapsible = matches!(child.content, BoxContent::Block)
+            && !child_is_inline_level(child, styles)
+            && clear == style::Clear::None;
+        let child_top_margin = child.dimensions.margin.top;
+        if collapsible {
+            pending_margin.add(child_top_margin);
+            cursor_y = collapse_anchor + pending_margin.value() - child_top_margin;
+        } else {
+            cursor_y = collapse_anchor + pending_margin.value();
+        }
+        if !floats.is_empty() {
+            cursor_y = floats.clear_to(clear, cursor_y);
+        }
+
         // In-flow content stacks below previous siblings. A block-level box keeps the container's
         // FULL content width beside floats (per CSS, only its line boxes shorten — narrowing the box
         // would wrongly re-resolve a percentage `width` against the reduced band). But inline-level
         // content (inline-block/-flex/-grid, or an anonymous box holding inline content) flows
         // *beside* earlier floats, so we narrow its containing rect to the float band at this y.
-        cursor_y = start_y;
         let containing = if !floats.is_empty() && child_is_inline_level(child, styles) {
             // Query the band over a nominal 1px height at the top so a float starting exactly at this
             // y is detected; the inline content then begins at the band's left edge.
@@ -431,7 +482,20 @@ pub(crate) fn layout_block_children(
                 );
             }
         }
-        cursor_y += child.dimensions.margin_box().height;
+        if collapsible && margin_collapses_through(child) {
+            pending_margin.add(child.dimensions.margin.bottom);
+            cursor_y = collapse_anchor + pending_margin.value();
+        } else if collapsible {
+            // Use the normal-flow position, not the box's final y: relative/sticky positioning may
+            // have visually shifted its geometry but must not move following siblings.
+            collapse_anchor = cursor_y + child_top_margin + child.dimensions.border_box().height;
+            pending_margin.replace(child.dimensions.margin.bottom);
+            cursor_y = collapse_anchor + pending_margin.value();
+        } else {
+            collapse_anchor = cursor_y + child.dimensions.margin_box().height;
+            pending_margin = CollapsingMargin::default();
+            cursor_y = collapse_anchor;
+        }
     }
     // The container must be tall enough to contain its floats (it owns their formatting context).
     floats.max_bottom(cursor_y) - content.y
