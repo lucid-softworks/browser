@@ -85,6 +85,7 @@ pub fn layout_document(
     let ctx = Ctx {
         positioned: viewport,
         viewport,
+        scrollport: None,
     };
     layout_block(&mut root, containing, ctx, styles, measurer);
     root

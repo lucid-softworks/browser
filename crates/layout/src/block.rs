@@ -200,14 +200,13 @@ pub(crate) fn layout_block(
     // If this box is positioned (relative/absolute/fixed/sticky), it becomes the containing
     // block for its absolutely-positioned descendants. Update the context's `positioned` rect to
     // this box's padding box for children.
-    let child_ctx = if !matches!(position_of(boxx, styles), style::Position::Static) {
-        Ctx {
-            positioned: boxx.dimensions.padding_box(),
-            viewport: ctx.viewport,
-        }
-    } else {
-        ctx
-    };
+    let mut child_ctx = ctx;
+    if !matches!(position_of(boxx, styles), style::Position::Static) {
+        child_ctx.positioned = boxx.dimensions.padding_box();
+    }
+    if style_of(boxx, styles).is_some_and(|cs| cs.overflow_scrollport) {
+        child_ctx.scrollport = Some(boxx.dimensions.content);
+    }
 
     // Dispatch on the display mode of this box.
     let display = display_of(boxx, styles);
@@ -278,6 +277,7 @@ pub(crate) fn layout_block(
         Ctx {
             positioned: boxx.dimensions.padding_box(),
             viewport: child_ctx.viewport,
+            scrollport: child_ctx.scrollport,
         }
     } else {
         child_ctx
@@ -285,7 +285,7 @@ pub(crate) fn layout_block(
     resolve_out_of_flow(boxx, resolve_ctx, styles, measurer);
 
     // Apply a `position: relative` offset (after normal flow, without affecting siblings).
-    apply_relative_offset(boxx, containing, styles);
+    apply_relative_offset(boxx, containing, ctx.scrollport, styles);
 }
 
 /// Lay out a block's block-level children top-to-bottom. Returns the total content height
@@ -904,6 +904,7 @@ pub(crate) fn layout_out_of_flow(
     let child_ctx = Ctx {
         positioned: boxx.dimensions.padding_box(),
         viewport: ctx.viewport,
+        scrollport: ctx.scrollport,
     };
 
     let display = display_of(boxx, styles);
@@ -1017,40 +1018,80 @@ pub(crate) fn layout_out_of_flow(
     let resolve_ctx = Ctx {
         positioned: boxx.dimensions.padding_box(),
         viewport: ctx.viewport,
+        scrollport: ctx.scrollport,
     };
     resolve_out_of_flow(boxx, resolve_ctx, styles, measurer);
 }
 
-/// Apply a `position: relative` offset to `boxx` and its whole subtree by the resolved
-/// (left/right, top/bottom) insets, without affecting siblings.
+/// Apply relative or sticky positioning to `boxx` and its whole subtree without affecting siblings.
 pub(crate) fn apply_relative_offset(
     boxx: &mut LayoutBox,
     containing: Rect,
+    scrollport: Option<Rect>,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) {
     let cs = match style_of(boxx, styles) {
         Some(cs) => cs,
         None => return,
     };
-    if cs.position != style::Position::Relative {
+    if !matches!(
+        cs.position,
+        style::Position::Relative | style::Position::Sticky
+    ) {
         return;
     }
     // Percentage insets resolve against the containing block (width for left/right, height for
     // top/bottom); `*_spec` carries them symbolically until now. Fall back to the pre-resolved px
     // field for any path that set only it (e.g. the `inset` shorthand).
-    let dx = if let Some(l) = cs.left_spec.resolve_px(containing.width).or(cs.left) {
-        l
-    } else if let Some(r) = cs.right_spec.resolve_px(containing.width).or(cs.right) {
-        -r
+    let inset_containing = if cs.position == style::Position::Sticky {
+        scrollport.unwrap_or(containing)
     } else {
-        0.0
+        containing
     };
-    let dy = if let Some(t) = cs.top_spec.resolve_px(containing.height).or(cs.top) {
-        t
-    } else if let Some(b) = cs.bottom_spec.resolve_px(containing.height).or(cs.bottom) {
-        -b
+    let left = cs.left_spec.resolve_px(inset_containing.width).or(cs.left);
+    let right = cs
+        .right_spec
+        .resolve_px(inset_containing.width)
+        .or(cs.right);
+    let top = cs.top_spec.resolve_px(inset_containing.height).or(cs.top);
+    let bottom = cs
+        .bottom_spec
+        .resolve_px(inset_containing.height)
+        .or(cs.bottom);
+    let (dx, dy) = if cs.position == style::Position::Sticky {
+        let margin_box = boxx.dimensions.margin_box();
+        let dx = if let Some(left) = left {
+            (inset_containing.x + left - margin_box.x)
+                .max(0.0)
+                .min(containing.x + containing.width - margin_box.x - margin_box.width)
+        } else if let Some(right) = right {
+            (inset_containing.x + inset_containing.width
+                - right
+                - (margin_box.x + margin_box.width))
+                .min(0.0)
+                .max(containing.x - margin_box.x)
+        } else {
+            0.0
+        };
+        let dy = if let Some(top) = top {
+            (inset_containing.y + top - margin_box.y)
+                .max(0.0)
+                .min(containing.y + containing.height - margin_box.y - margin_box.height)
+        } else if let Some(bottom) = bottom {
+            (inset_containing.y + inset_containing.height
+                - bottom
+                - (margin_box.y + margin_box.height))
+                .min(0.0)
+                .max(containing.y - margin_box.y)
+        } else {
+            0.0
+        };
+        (dx, dy)
     } else {
-        0.0
+        (
+            left.or_else(|| right.map(|r| -r)).unwrap_or(0.0),
+            top.or_else(|| bottom.map(|b| -b)).unwrap_or(0.0),
+        )
     };
     if dx != 0.0 || dy != 0.0 {
         shift_subtree(boxx, dx, dy);

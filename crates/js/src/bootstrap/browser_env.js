@@ -6340,6 +6340,83 @@
     // Live element-metric getters backed by __elemMetrics(this.__node) (0 when null). Only install
     // on real element wrappers (numeric node id) and don't clobber a page-defined accessor.
     if (typeof node === "number") {
+      // offsetTop/offsetLeft are synchronous CSSOM reads, while the native engine applies element
+      // scroll offsets between script turns. Resolve sticky positioning here as well so a scroll
+      // assignment followed immediately by an offset read observes the new sticky position.
+      function __stickyOffset(el, field, fallback) {
+        var vertical = field === "ot";
+        var cs;
+        try { cs = getComputedStyle(el); } catch (e) { return fallback; }
+        if (!cs || cs.position !== "sticky") { return fallback; }
+        function value(style, name) {
+          var direct = style && style[name];
+          if (direct) { return direct; }
+          try { return style && style.getPropertyValue(name); } catch (e) { return ""; }
+        }
+
+        var parent = el.parentElement;
+        if (!parent) { return fallback; }
+        var previous = el.previousElementSibling;
+        var parentStyle;
+        try { parentStyle = getComputedStyle(parent); } catch (e) { parentStyle = null; }
+        var parentPositioned = parentStyle && parentStyle.position && parentStyle.position !== "static";
+        var parentOrigin = Number(parent[vertical ? "offsetTop" : "offsetLeft"]) || 0;
+        var normal = previous
+          ? Number(previous[vertical ? "offsetTop" : "offsetLeft"]) +
+              Number(previous[vertical ? "offsetHeight" : "offsetWidth"]) +
+              (parentPositioned ? parentOrigin : 0)
+          : parentOrigin;
+
+        var scroller = parent;
+        while (scroller) {
+          var scrollerStyle;
+          try { scrollerStyle = getComputedStyle(scroller); } catch (e) { scrollerStyle = null; }
+          var overflow = value(scrollerStyle, vertical ? "overflow-y" : "overflow-x");
+          if (!overflow || overflow === "visible") {
+            overflow = value(scrollerStyle, "overflow");
+          }
+          if (!overflow || overflow === "visible") {
+            overflow = value(scroller.style, vertical ? "overflow-y" : "overflow-x") ||
+              value(scroller.style, "overflow");
+          }
+          if (overflow && overflow !== "visible" && overflow !== "clip") { break; }
+          scroller = scroller.parentElement;
+        }
+        if (!scroller) { return fallback; }
+
+        var startName = vertical ? "top" : "left";
+        var endName = vertical ? "bottom" : "right";
+        var startText = value(cs, startName) || value(el.style, startName);
+        var endText = value(cs, endName) || value(el.style, endName);
+        var start = !startText || startText === "auto" ? null : parseFloat(startText);
+        var end = !endText || endText === "auto" ? null : parseFloat(endText);
+        var scroll = Number(scroller[vertical ? "scrollTop" : "scrollLeft"]) || 0;
+        var viewport = Number(scroller[vertical ? "clientHeight" : "clientWidth"]) || 0;
+        var size = Number(el[vertical ? "offsetHeight" : "offsetWidth"]) || 0;
+        var parentStart = Number(parent[vertical ? "offsetTop" : "offsetLeft"]) || 0;
+        var parentSize = Number(parent[vertical ? "clientHeight" : "clientWidth"]) || 0;
+        var result = normal;
+        if (start !== null && isFinite(start)) {
+          result = Math.max(result, scroll + start);
+        } else if (end !== null && isFinite(end)) {
+          result = Math.min(result, scroll + viewport - end - size);
+        }
+        result = Math.max(parentStart, Math.min(result, parentStart + parentSize - size));
+
+        // The calculation above is in the scroll container's content coordinates. CSSOM reports
+        // offsets relative to the nearest positioned ancestor, which matters for nested stickies.
+        var offsetAncestor = el.parentElement;
+        while (offsetAncestor && offsetAncestor !== scroller) {
+          var ancestorStyle;
+          try { ancestorStyle = getComputedStyle(offsetAncestor); } catch (e) { ancestorStyle = null; }
+          if (ancestorStyle && ancestorStyle.position && ancestorStyle.position !== "static") {
+            result -= Number(offsetAncestor[vertical ? "offsetTop" : "offsetLeft"]) || 0;
+            break;
+          }
+          offsetAncestor = offsetAncestor.parentElement;
+        }
+        return result;
+      }
       var __metricProps = {
         offsetWidth: "ow", offsetHeight: "oh", offsetTop: "ot", offsetLeft: "ol",
         clientWidth: "cw", clientHeight: "ch", // padding box: content + padding, no borders
@@ -6354,6 +6431,7 @@
             get: function () {
               var m = __elemMetrics(this.__node);
               var v = m ? m[field] : 0;
+              if (field === "ot" || field === "ol") { v = __stickyOffset(this, field, v); }
               // The document root (<html>) often has no pushed box, so its width/height metrics read
               // 0. clientWidth/clientHeight of the root must be the viewport size (CSSOM-View), so
               // fall back to innerWidth/innerHeight there.
