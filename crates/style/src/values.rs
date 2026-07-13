@@ -396,6 +396,10 @@ pub struct ComputedStyle {
     pub width_pct: Option<f32>,
     /// `height` as a fraction; resolved against the containing block's (definite) content height.
     pub height_pct: Option<f32>,
+    /// Whether CSS explicitly supplied each size, including `auto`. Replaced elements use this to
+    /// distinguish CSS `height:auto` from a missing declaration that may use the HTML attribute.
+    pub width_authored: bool,
+    pub height_authored: bool,
     /// Physical intrinsic-size substitutes used when size containment suppresses an axis.
     pub contain_intrinsic_width: Option<f32>,
     pub contain_intrinsic_height: Option<f32>,
@@ -406,6 +410,10 @@ pub struct ComputedStyle {
     /// Whether `aspect-ratio` specifies a ratio (not just `auto`). Used for the CSSOM resolved value
     /// of `min-width`/`min-height: auto`, which stays `auto` when a box has a preferred aspect ratio.
     pub aspect_ratio_set: bool,
+    /// Preferred width / height ratio and whether `auto` requests a replaced element's natural
+    /// ratio instead of the supplied fallback ratio.
+    pub aspect_ratio: Option<f32>,
+    pub aspect_ratio_auto: bool,
     /// `min-width` constraint (`None` = 0/unset). Resolved against the containing block in layout.
     pub min_width: Option<SizeConstraint>,
     /// `max-width` constraint (`None`/`none` = no maximum).

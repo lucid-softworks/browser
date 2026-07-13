@@ -172,13 +172,19 @@ pub(crate) fn layout_block(
     // Definite content height (box-sizing aware): `border-box` heights include padding+border, so
     // strip them. Set on the content rect now — BEFORE laying out children — so a percentage-height
     // child resolves against this box's definite height (threaded as the child's `containing.height`).
-    let definite_content_h = explicit_h.map(|h| {
-        if border_box {
-            (h - (padding.top + padding.bottom + border.top + border.bottom)).max(0.0)
-        } else {
-            h
-        }
-    });
+    let pb_v = padding.top + padding.bottom + border.top + border.bottom;
+    let definite_content_h = explicit_h
+        .map(|h| if border_box { (h - pb_v).max(0.0) } else { h })
+        .or_else(|| {
+            let cs = style_of(boxx, styles)?;
+            let ratio = cs.aspect_ratio.filter(|ratio| *ratio > 0.0)?;
+            explicit_w?;
+            Some(if border_box && !cs.aspect_ratio_auto {
+                ((content_width + pb_h) / ratio - pb_v).max(0.0)
+            } else {
+                (content_width / ratio).max(0.0)
+            })
+        });
     boxx.dimensions.content = Rect {
         x,
         y,
@@ -783,13 +789,30 @@ pub(crate) fn layout_out_of_flow(
     let inset_top = cs.top_spec.resolve_px(cb.height).or(cs.top);
     let inset_bottom = cs.bottom_spec.resolve_px(cb.height).or(cs.bottom);
 
-    let explicit_w = cs
+    let specified_w = cs
         .width
         .or_else(|| cs.width_pct.map(|p| (cb.width * p).max(0.0)));
-    let explicit_h = cs.height.or_else(|| {
+    let specified_h = cs.height.or_else(|| {
         cs.height_pct
             .filter(|_| cb.height > 0.0)
             .map(|p| (cb.height * p).max(0.0))
+    });
+    let own_h_edges = padding.left + padding.right + border.left + border.right;
+    let own_v_edges = padding.top + padding.bottom + border.top + border.bottom;
+    let border_box = cs.box_sizing == style::BoxSizing::BorderBox;
+    let explicit_w = specified_w.map(|width| {
+        if border_box {
+            (width - own_h_edges).max(0.0)
+        } else {
+            width
+        }
+    });
+    let explicit_h = specified_h.map(|height| {
+        if border_box {
+            (height - own_v_edges).max(0.0)
+        } else {
+            height
+        }
     });
 
     // Content width:
@@ -802,6 +825,12 @@ pub(crate) fn layout_out_of_flow(
         replaced_w
     } else if let Some(w) = explicit_w {
         w
+    } else if let (Some(height), Some(ratio)) = (explicit_h, cs.aspect_ratio) {
+        if border_box && !cs.aspect_ratio_auto {
+            ((height + own_v_edges) * ratio - own_h_edges).max(0.0)
+        } else {
+            (height * ratio).max(0.0)
+        }
     } else if let (Some(l), Some(r)) = (inset_left, inset_right) {
         (cb.width - l - r - horizontal).max(0.0)
     } else {

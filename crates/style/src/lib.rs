@@ -2881,6 +2881,25 @@ mod tests {
     }
 
     #[test]
+    fn aspect_ratio_retains_value_and_auto_mode() {
+        let fallback = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { aspect-ratio: auto 2 / 1 }",
+            |e| e.tag == "div",
+        );
+        assert_eq!(fallback.aspect_ratio, Some(2.0));
+        assert!(fallback.aspect_ratio_auto);
+
+        let preferred = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { aspect-ratio: 3 / 2 }",
+            |e| e.tag == "div",
+        );
+        assert_eq!(preferred.aspect_ratio, Some(1.5));
+        assert!(!preferred.aspect_ratio_auto);
+    }
+
+    #[test]
     fn contain_intrinsic_size_is_not_inherited_without_keyword() {
         let parent = cs_of(
             "<html><body><div><span></span></div></body></html>",

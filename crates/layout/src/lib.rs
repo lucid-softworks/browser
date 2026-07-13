@@ -594,6 +594,30 @@ mod tests {
     }
 
     #[test]
+    fn aspect_ratio_derives_auto_height_from_width() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let item = doc.append_element(body, "div");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            item,
+            style::ComputedStyle {
+                display_block: true,
+                width: Some(120.0),
+                aspect_ratio_set: true,
+                aspect_ratio: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let rect = rect_of(&root_box, item);
+        assert_eq!((rect.width, rect.height), (120.0, 60.0));
+    }
+
+    #[test]
     fn floats_pack_left_to_right_then_wrap() {
         // Three float:left divs of width 300 in an 800px body: two fit on the first row, the third
         // wraps below. The container grows to contain them. (wikipedia.org footer project grid.)

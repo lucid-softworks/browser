@@ -1790,6 +1790,7 @@ pub(crate) fn apply_declaration(
 
         // --- Box model: width / height ---
         "width" => {
+            style.width_authored = true;
             style.width = parse_length_fs(val, style.font_size);
             style.width_pct = if style.width.is_none() {
                 parse_percent(val).map(|p| p / 100.0)
@@ -1798,6 +1799,7 @@ pub(crate) fn apply_declaration(
             };
         }
         "height" => {
+            style.height_authored = true;
             style.height = parse_length_fs(val, style.font_size);
             style.height_pct = if style.height.is_none() {
                 parse_percent(val).map(|p| p / 100.0)
@@ -1806,10 +1808,24 @@ pub(crate) fn apply_declaration(
             };
         }
         "aspect-ratio" => {
-            // A ratio is present unless the value is just `auto` (or a global keyword). Detecting a
-            // digit suffices: `1/1`, `0/1`, `auto 1/1` all have one; `auto` doesn't.
             let v = val.trim().to_ascii_lowercase();
-            style.aspect_ratio_set = v != "auto" && v.bytes().any(|b| b.is_ascii_digit());
+            style.aspect_ratio_auto = v.split_whitespace().any(|token| token == "auto");
+            let ratio_text = v.replace("auto", "");
+            style.aspect_ratio = ratio_text
+                .split_once('/')
+                .and_then(|(width, height)| {
+                    let width = width.trim().parse::<f32>().ok()?;
+                    let height = height.trim().parse::<f32>().ok()?;
+                    (width >= 0.0 && height > 0.0).then_some(width / height)
+                })
+                .or_else(|| {
+                    ratio_text
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|ratio| *ratio > 0.0)
+                });
+            style.aspect_ratio_set = style.aspect_ratio.is_some();
         }
 
         // --- Sizing constraints (min/max) ---
