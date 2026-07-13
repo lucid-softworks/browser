@@ -2657,6 +2657,27 @@ mod tests {
     }
 
     #[test]
+    fn range_insert_node_preserves_offsets_when_moving_boundary_child() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var text = document.createTextNode('text');
+                   p.appendChild(text);
+                   var r = document.createRange();
+                   r.setStart(p, 0); r.setEnd(p, 1);
+                   r.insertNode(text);
+                   [p.childNodes.length, p.firstChild === text,
+                    r.startContainer === p, r.startOffset,
+                    r.endContainer === p, r.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|true|true|0|true|1"));
+    }
+
+    #[test]
     fn range_insert_node_rejects_parentless_text_boundary() {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(

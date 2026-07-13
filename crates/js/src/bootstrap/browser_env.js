@@ -9720,6 +9720,11 @@
     }
     if (__sameNode(node, reference)) { reference = reference.nextSibling; }
 
+    // Pre-insert removes a parented node before determining its new index. Do that explicitly so
+    // live ranges receive the removal adjustment as well as the later insertion adjustment; the
+    // arena's implicit move cannot update a Range owned by a different iframe realm.
+    if (node.parentNode !== null) { node.parentNode.removeChild(node); }
+
     var newOffset = reference === null
       ? __rangeLength(parent)
       : __children(parentId).indexOf(__idOf(reference));
