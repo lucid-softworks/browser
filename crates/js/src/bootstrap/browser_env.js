@@ -2340,7 +2340,7 @@
       "text-emphasis text-emphasis-color text-emphasis-style text-emphasis-position text-combine-upright " +
       "hyphens hyphenate-character hyphenate-limit-chars hanging-punctuation line-break " +
       "text-align-all text-align-last text-autospace text-fit text-group-align text-spacing " +
-      "text-spacing-trim word-space-transform overflow-anchor overflow-clip-margin scrollbar-gutter " +
+      "text-spacing-trim word-space-transform overlay overflow-anchor overflow-clip-margin scrollbar-gutter " +
       "scrollbar-width scrollbar-color scroll-snap-type scroll-snap-align scroll-snap-stop touch-action " +
       "flood-color flood-opacity stop-color stop-opacity lighting-color color-interpolation " +
       "color-interpolation-filters fill fill-opacity fill-rule stroke stroke-width stroke-opacity " +
@@ -2632,6 +2632,7 @@
       }
       return collapseCount <= 1 && wrapCount <= 1;
     }
+    if (name === "overlay") return /^(none|auto)$/.test(vl);
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
     // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are

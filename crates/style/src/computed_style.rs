@@ -389,6 +389,8 @@ impl ComputedStyle {
                 Position::Sticky => "sticky",
             }
             .to_string(),
+            // Author `auto` is overridden by the UA rule while the element is outside the top layer.
+            "overlay" => "none".to_string(),
             // `content` is meaningful for pseudo-elements; `None` (no generated content) serializes
             // as the initial `normal`, otherwise as a quoted string.
             "content" => match &self.content {
@@ -768,6 +770,7 @@ impl ComputedStyle {
         const NAMES: &[&str] = &[
             "display",
             "position",
+            "overlay",
             "color",
             "background-color",
             "border-color",
