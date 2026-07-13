@@ -1903,6 +1903,9 @@
       for (var i = 0; i < lhs.length; i++) out.push([lhs[i], v]);
       return out;
     }
+    // A shorthand containing a pending substitution stays as a shorthand until computed-value time;
+    // eagerly expanding it would change legacy-alias behavior and lose the original token stream.
+    if (/(?:var|env)\s*\(/i.test(value)) return null;
     if (BOX_SHORTHANDS[name] && name !== "border-radius") {
       var b = expandBox(value); if (!b) return null;
       return [[lhs[0], b[0]], [lhs[1], b[1]], [lhs[2], b[2]], [lhs[3], b[3]]];
@@ -1972,6 +1975,16 @@
       out2.push(["list-style-image", ls["list-style-image"] !== undefined ? ls["list-style-image"] : "none"]);
       return out2;
     }
+    if (name === "flex-flow") {
+      var flow = splitCssTokens(value), direction = "row", wrap = "nowrap";
+      for (var ff = 0; ff < flow.length; ff++) {
+        var ft = flow[ff].toLowerCase();
+        if (/^(row|row-reverse|column|column-reverse)$/.test(ft)) direction = ft;
+        else if (/^(nowrap|wrap|wrap-reverse)$/.test(ft)) wrap = ft;
+        else return null;
+      }
+      return [["flex-direction", direction], ["flex-wrap", wrap]];
+    }
     if (name === "flex") {
       var fl = parseFlex(value);
       if (!fl) return null;
@@ -1987,13 +2000,20 @@
     if (vl === "none") return { grow: "0", shrink: "0", basis: "auto" };
     if (vl === "auto") return { grow: "1", shrink: "1", basis: "auto" };
     var toks = splitCssTokens(v);
-    function isNum(t) { return /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(t); }
+    function calcKind(t) {
+      if (!/^calc\(/i.test(t)) return null;
+      // Units inside sign() affect its sign but not the type of the surrounding expression.
+      var outsideSign = t.replace(/sign\([^)]*\)/gi, "1");
+      return /(?:\d|\.)\s*(?:%|[a-z]+)/i.test(outsideSign) ? "basis" : "number";
+    }
+    function isNum(t) { return /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(t) || calcKind(t) === "number"; }
     var grow = null, shrink = null, basis = null;
     for (var i = 0; i < toks.length; i++) {
       var t = toks[i];
       if (isNum(t)) {
         if (grow === null) grow = t;
         else if (shrink === null) shrink = t;
+        else if (basis === null && Number(t) === 0 && !/^calc\(/i.test(t)) basis = "0px";
         else return null;
       } else {
         if (basis !== null) return null;
@@ -2005,8 +2025,21 @@
     // (the "one value, flexible" case) which browsers serialize as `0px`.
     if (grow === null) grow = "1";
     if (shrink === null) shrink = "1";
-    if (basis === null) basis = "0px";
-    return { grow: normalizeNumberToken(grow), shrink: normalizeNumberToken(shrink), basis: basis };
+    if (basis === null) basis = "0%";
+    function canonFlexCalc(token, factor) {
+      if (!/^calc\(/i.test(token)) return token;
+      if (factor) {
+        var folded = __calc.serialize(token);
+        if (folded != null) token = folded;
+      }
+      return token.replace(/sign\(([^()]*)\)\s*\*\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[a-z%]+)?)/gi,
+        function (_m, expression, scalar) { return scalar + " * sign(" + expression + ")"; });
+    }
+    return {
+      grow: /^calc\(/i.test(grow) ? canonFlexCalc(grow, true) : normalizeNumberToken(grow),
+      shrink: /^calc\(/i.test(shrink) ? canonFlexCalc(shrink, true) : normalizeNumberToken(shrink),
+      basis: canonFlexCalc(basis, false)
+    };
   }
   // Serialize a shorthand from the current longhand values (`getLong(name)`). Returns "" if it
   // cannot be represented (a longhand missing or values inconsistent).
@@ -2090,6 +2123,13 @@
       // A CSS-wide keyword in any longhand can't combine (handled by the early-return above).
       // Canonical: `grow shrink basis`.
       return fg + " " + fsk + " " + fb;
+    }
+    if (name === "flex-flow") {
+      var fd = g("flex-direction"), fw = g("flex-wrap");
+      if (fd === "row" && fw === "nowrap") return "row";
+      if (fw === "nowrap") return fd;
+      if (fd === "row") return fw;
+      return fd + " " + fw;
     }
     // `marker`: the common longhand value when all three markers agree, else "".
     if (name === "marker") {
@@ -2444,6 +2484,28 @@
       }
       return false;
     }
+    if (name === "flex-basis") {
+      if (/^(auto|content|fit-content|min-content|max-content)$/.test(vl)) return true;
+      if (/^calc\(/i.test(v)) return true;
+      return isValidLengthLike(v, false);
+    }
+    if (name === "flex") return parseFlex(v) !== null;
+    if (name === "flex-grow" || name === "flex-shrink") {
+      if (/^calc\(/i.test(v)) return true;
+      return /^\+?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(v) && !/\.$/.test(v);
+    }
+    if (name === "flex-direction") return /^(row|row-reverse|column|column-reverse)$/.test(vl);
+    if (name === "flex-wrap") return /^(nowrap|wrap|wrap-reverse)$/.test(vl);
+    if (name === "flex-flow") {
+      var flowTokens = vl.split(/\s+/), directionSeen = false, wrapSeen = false;
+      if (flowTokens.length < 1 || flowTokens.length > 2) return false;
+      for (var fi = 0; fi < flowTokens.length; fi++) {
+        if (/^(row|row-reverse|column|column-reverse)$/.test(flowTokens[fi]) && !directionSeen) directionSeen = true;
+        else if (/^(nowrap|wrap|wrap-reverse)$/.test(flowTokens[fi]) && !wrapSeen) wrapSeen = true;
+        else return false;
+      }
+      return true;
+    }
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
     // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
@@ -2473,10 +2535,11 @@
           vl === "fit-content" || vl === "thin" || vl === "medium" || vl === "thick" || /^fit-content\(/i.test(v)) return true;
       return isValidLengthLike(v, false);
     }
-    if (name === "z-index" || name === "order") {
+    if (name === "z-index") {
       if (vl === "auto") return true;
       return /^[-+]?\d+$/.test(v);
     }
+    if (name === "order") return /^[-+]?\d+$/.test(v);
     // <alpha-value>: <number> | <percentage> (single token, no trailing dot). The value is not
     // clamped at parse time (computed value clamps).
     if (name === "opacity" || name === "fill-opacity" || name === "stroke-opacity" ||
@@ -2621,8 +2684,20 @@
       return;
     }
     var nv = normalizeCssValue(val);
+    if (/^calc\(/i.test(nv) && (name === "flex-grow" || name === "flex-shrink")) {
+      var foldedFlexFactor = __calc.serialize(nv);
+      if (foldedFlexFactor != null) nv = foldedFlexFactor;
+    }
+    if (/^calc\(/i.test(nv) && (name === "flex-grow" || name === "flex-shrink" || name === "flex-basis")) {
+      nv = nv.replace(/sign\(([^()]*)\)\s*\*\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[a-z%]+)?)/gi,
+        function (_m, expression, scalar) { return scalar + " * sign(" + expression + ")"; });
+    }
     if ((name === "align-self" || name === "justify-self" || name === "align-content") && nv.toLowerCase() === "first baseline") {
       nv = "baseline";
+    }
+    if ((name === "flex-grow" || name === "flex-shrink") && !/^calc\(/i.test(nv) &&
+        !isCssWideKeyword(nv) && !/(?:var|env)\s*\(/i.test(nv)) {
+      nv = String(Number(nv));
     }
     // The `font` shorthand serializes size/line-height with spaces around the slash: `10px / 1`.
     // It also resets every font-variant longhand to its initial (which serializes as absent inline).
@@ -2837,7 +2912,20 @@
   }
   function styleAttr(node) { var v = document.__getAttr(node, "style"); return v == null ? "" : v; }
   // Normalize a CSS property name for the CSSStyleDeclaration API (lowercase; custom props as-is).
-  function normPropName(p) { p = String(p); if (isCustomProp(p)) { return p; } /* custom props are case-sensitive, kept verbatim */ p = camelToKebab(p); return p.toLowerCase(); }
+  function normPropName(p) {
+    p = String(p);
+    if (isCustomProp(p)) return p; // custom props are case-sensitive, kept verbatim
+    p = camelToKebab(p).toLowerCase();
+    var webkitFlexAliases = {
+      "-webkit-align-content":"align-content", "-webkit-align-items":"align-items",
+      "-webkit-align-self":"align-self", "-webkit-flex":"flex",
+      "-webkit-flex-basis":"flex-basis", "-webkit-flex-direction":"flex-direction",
+      "-webkit-flex-flow":"flex-flow", "-webkit-flex-grow":"flex-grow",
+      "-webkit-flex-shrink":"flex-shrink", "-webkit-flex-wrap":"flex-wrap",
+      "-webkit-justify-content":"justify-content", "-webkit-order":"order"
+    };
+    return lookup(webkitFlexAliases, p) || p;
+  }
   // Build a CSSStyleDeclaration over a backing store. `get()` returns the current declaration block
   // text; `set(text)` writes it back. Used for both inline styles (style attr) and rule blocks.
   // `restrict(longhandName)` (optional) gates which longhand properties this declaration block may

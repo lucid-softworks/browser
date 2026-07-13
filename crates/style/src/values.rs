@@ -455,6 +455,8 @@ pub struct ComputedStyle {
     /// resolved in layout. `None` unless a percentage was given. Takes effect when `flex_basis` (px)
     /// is `None`.
     pub flex_basis_pct: Option<f32>,
+    /// Canonical computed `flex-basis`, including intrinsic keywords and percentage-bearing calc().
+    pub flex_basis_css: String,
     pub align_self: AlignSelf,
     /// Canonical computed self-alignment values; layout folds these into `align_self` where needed.
     pub align_self_css: String,

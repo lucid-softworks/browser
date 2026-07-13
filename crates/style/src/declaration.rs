@@ -58,6 +58,58 @@ fn content_layout_value(value: &str) -> Option<JustifyContent> {
     }
 }
 
+/// Resolve the small `sign(<cqw> +/- <length>)` form used by computed-value math. Container query
+/// units are relative to the nearest query container; the cascade's parent style is that container
+/// for the flex parsing cases, so its computed width supplies the basis.
+fn resolve_sign_cqw(value: &str, container_width: Option<f32>, font_size: f32) -> String {
+    let Some(width) = container_width else {
+        return value.to_string();
+    };
+    let mut out = value.to_string();
+    while let Some(start) = out.find("sign(") {
+        let inner_start = start + "sign(".len();
+        let Some(rel_end) = out[inner_start..].find(')') else {
+            break;
+        };
+        let end = inner_start + rel_end;
+        let tokens: Vec<&str> = out[inner_start..end].split_whitespace().collect();
+        if tokens.len() != 3 {
+            break;
+        }
+        let Some(cqw) = tokens[0]
+            .strip_suffix("cqw")
+            .and_then(|n| n.parse::<f32>().ok())
+        else {
+            break;
+        };
+        let Some(rhs) = parse_length_fs(tokens[2], font_size) else {
+            break;
+        };
+        let lhs = width * cqw / 100.0;
+        let result = match tokens[1] {
+            "+" => lhs + rhs,
+            "-" => lhs - rhs,
+            _ => break,
+        };
+        let sign = if result > 0.0 {
+            "1"
+        } else if result < 0.0 {
+            "-1"
+        } else {
+            "0"
+        };
+        out.replace_range(start..=end, sign);
+    }
+    out
+}
+
+fn parse_flex_factor(value: &str, container_width: Option<f32>, font_size: f32) -> Option<f32> {
+    value.trim().parse::<f32>().ok().or_else(|| {
+        let resolved = resolve_sign_cqw(&value.to_ascii_lowercase(), container_width, font_size);
+        eval_length(&resolved, font_size)
+    })
+}
+
 /// Canonicalize an align/justify-items value while retaining the full CSSOM grammar that the
 /// layout-facing enums intentionally collapse.
 pub(crate) fn parse_items_value(
@@ -134,18 +186,24 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
         style.flex_grow = 0.0;
         style.flex_shrink = 0.0;
         style.flex_basis = None;
+        style.flex_basis_pct = None;
+        style.flex_basis_css = "auto".to_string();
         return;
     }
     if v == "auto" {
         style.flex_grow = 1.0;
         style.flex_shrink = 1.0;
         style.flex_basis = None;
+        style.flex_basis_pct = None;
+        style.flex_basis_css = "auto".to_string();
         return;
     }
     if v == "initial" {
         style.flex_grow = 0.0;
         style.flex_shrink = 1.0;
         style.flex_basis = None;
+        style.flex_basis_pct = None;
+        style.flex_basis_css = "auto".to_string();
         return;
     }
 
@@ -193,6 +251,7 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
             // `flex: 1` → basis 0 unless an explicit basis was given.
             if basis.is_none() {
                 style.flex_basis = Some(0.0);
+                style.flex_basis_css = "0%".to_string();
             }
         }
         _ => {
@@ -200,6 +259,7 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
             style.flex_shrink = nums[1].max(0.0);
             if basis.is_none() {
                 style.flex_basis = Some(0.0);
+                style.flex_basis_css = "0%".to_string();
             }
         }
     }
@@ -207,6 +267,11 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
         style.flex_basis = b;
     }
     style.flex_basis_pct = basis_pct;
+    if let Some(pct) = basis_pct {
+        style.flex_basis_css = format!("{}%", num(pct * 100.0));
+    } else if let Some(px_value) = style.flex_basis {
+        style.flex_basis_css = px(px_value.max(0.0));
+    }
 }
 
 /// Parse a `gap` value: 1 value → both row & column; 2 values → row column.
@@ -998,23 +1063,71 @@ pub(crate) fn apply_declaration(
         // --- Flex item ---
         "flex" => apply_flex_shorthand(style, val),
         "flex-grow" => {
-            if let Ok(n) = val.trim().parse::<f32>() {
+            if let Some(n) = parse_flex_factor(val, parent.width, style.font_size) {
                 style.flex_grow = n.max(0.0);
             }
         }
         "flex-shrink" => {
-            if let Ok(n) = val.trim().parse::<f32>() {
+            if let Some(n) = parse_flex_factor(val, parent.width, style.font_size) {
                 style.flex_shrink = n.max(0.0);
             }
         }
         "flex-basis" => {
             let v = val.trim().to_ascii_lowercase();
-            if let Some(p) = v.strip_suffix('%') {
+            if v == "inherit" {
+                style.flex_basis = parent.flex_basis;
+                style.flex_basis_pct = parent.flex_basis_pct;
+                style.flex_basis_css = parent.flex_basis_css.clone();
+            } else if matches!(v.as_str(), "initial" | "unset" | "auto") {
+                style.flex_basis = None;
+                style.flex_basis_pct = None;
+                style.flex_basis_css = "auto".to_string();
+            } else if matches!(
+                v.as_str(),
+                "content" | "fit-content" | "min-content" | "max-content"
+            ) {
+                style.flex_basis = None;
+                style.flex_basis_pct = None;
+                style.flex_basis_css = v;
+            } else if let Some(p) = v.strip_suffix('%') {
                 style.flex_basis = None;
                 style.flex_basis_pct = p.trim().parse::<f32>().ok().map(|x| x / 100.0);
+                if let Some(pct) = style.flex_basis_pct {
+                    style.flex_basis_css = format!("{}%", num(pct * 100.0));
+                }
+            } else if v.starts_with("calc(") {
+                let resolved = resolve_sign_cqw(&v, parent.width, style.font_size);
+                match parse_inset_value(&resolved, style.font_size) {
+                    InsetValue::Length(length) => {
+                        let length = length.max(0.0);
+                        style.flex_basis = Some(length);
+                        style.flex_basis_pct = None;
+                        style.flex_basis_css = px(length);
+                    }
+                    InsetValue::Percent(pct) => {
+                        style.flex_basis = None;
+                        style.flex_basis_pct = Some(pct / 100.0);
+                        style.flex_basis_css = format!("{}%", num(pct));
+                    }
+                    InsetValue::Calc { pct, px: length } => {
+                        style.flex_basis = None;
+                        style.flex_basis_pct = Some(pct / 100.0);
+                        style.flex_basis_css = if length == 0.0 {
+                            format!("{}%", num(pct))
+                        } else if length > 0.0 {
+                            format!("calc({}% + {}px)", num(pct), num(length))
+                        } else {
+                            format!("calc({}% - {}px)", num(pct), num(-length))
+                        };
+                    }
+                    InsetValue::Auto => {}
+                }
             } else {
-                style.flex_basis = if v == "auto" { None } else { parse_length(val) };
+                style.flex_basis = parse_length_fs(val, style.font_size).map(|x| x.max(0.0));
                 style.flex_basis_pct = None;
+                if let Some(length) = style.flex_basis {
+                    style.flex_basis_css = px(length);
+                }
             }
         }
         "align-self" => {

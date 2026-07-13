@@ -1982,6 +1982,32 @@ mod tests {
     }
 
     #[test]
+    fn webkit_flex_properties_are_true_aliases() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var s = document.querySelectorAll('div')[0].style;
+                s.setProperty('-webkit-flex', 'inherit');
+                var a = [s.getPropertyValue('-webkit-flex'), s.getPropertyValue('flex'), s.cssText];
+                s.cssText = '';
+                s.setProperty('-webkit-flex-grow', 'inherit');
+                a = a.concat([s.getPropertyValue('-webkit-flex-grow'), s.getPropertyValue('flex-grow'), s.cssText]);
+                s.cssText = '';
+                s.setProperty('-webkit-flex', 'var(--v)');
+                a.concat([s.getPropertyValue('flex')]).join('|');
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("inherit|inherit|flex: inherit;|inherit|inherit|flex-grow: inherit;|var(--v)")
+        );
+    }
+
+    #[test]
     fn static_element_inset_resolves_to_auto() {
         // getComputedStyle of a `position: static` element: insets resolve to the computed value;
         // `auto` (the default) stays `auto`.
@@ -2201,14 +2227,14 @@ mod tests {
         let (_d, out) = run_with_dom(
             doc,
             vec![
-                // flex: 0 -> grow 0, shrink 1, basis 0px; cssText collapses to the flex shorthand.
+                // flex: 0 -> grow 0, shrink 1, basis 0%; cssText collapses to the flex shorthand.
                 "var s = document.createElement('div').style; s.cssText = 'flex: 0'; s.cssText"
                     .to_string(),
             ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("flex: 0 1 0px;"));
+        assert_eq!(out[0].value.as_deref(), Some("flex: 0 1 0%;"));
     }
 
     #[test]

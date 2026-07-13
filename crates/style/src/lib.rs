@@ -2458,6 +2458,25 @@ mod tests {
     }
 
     #[test]
+    fn flex_computed_values_serialize_canonically() {
+        let cs = cs_of(
+            "<html><body><div style='font-size:40px;flex:2 3;flex-basis:calc(10px + 0.5em)'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.get_property("flex-basis"), "30px");
+        assert_eq!(cs.get_property("flex"), "2 3 30px");
+
+        let cs = cs_of(
+            "<html><body><div style='flex-basis:min-content;flex-flow:column wrap-reverse'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.get_property("flex-basis"), "min-content");
+        assert_eq!(cs.get_property("flex-flow"), "column wrap-reverse");
+    }
+
+    #[test]
     fn alignment_items_keep_cssom_values_and_legacy_inheritance() {
         let sheet = css::parse(
             "#a { align-items: safe self-end; justify-items: legacy center } #b { align-items: first baseline }",

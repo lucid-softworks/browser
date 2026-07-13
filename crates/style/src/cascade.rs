@@ -897,6 +897,7 @@ pub(crate) fn compute_element_style<'a>(
         flex_shrink: 1.0,
         flex_basis: None,
         flex_basis_pct: None,
+        flex_basis_css: "auto".to_string(),
         align_self: AlignSelf::Auto,
         align_self_css: "auto".to_string(),
         justify_self: "auto".to_string(),

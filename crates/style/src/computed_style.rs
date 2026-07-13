@@ -75,6 +75,7 @@ impl Default for ComputedStyle {
             flex_shrink: 1.0,
             flex_basis: None,
             flex_basis_pct: None,
+            flex_basis_css: "auto".to_string(),
             align_self: AlignSelf::Auto,
             align_self_css: "auto".to_string(),
             justify_self: "auto".to_string(),
@@ -553,6 +554,11 @@ impl ComputedStyle {
                 FlexWrap::WrapReverse => "wrap-reverse",
             }
             .to_string(),
+            "flex-flow" => format!(
+                "{} {}",
+                self.get_property("flex-direction"),
+                self.get_property("flex-wrap")
+            ),
             "justify-content" => self.justify_content_css.clone(),
             "align-items" => self.align_items_css.clone(),
             "justify-items" => self.justify_items.clone(),
@@ -561,7 +567,13 @@ impl ComputedStyle {
             // --- flex item ---
             "flex-grow" => num(self.flex_grow),
             "flex-shrink" => num(self.flex_shrink),
-            "flex-basis" => self.flex_basis.map(px).unwrap_or_else(|| "auto".to_string()),
+            "flex-basis" => self.flex_basis_css.clone(),
+            "flex" => format!(
+                "{} {} {}",
+                num(self.flex_grow),
+                num(self.flex_shrink),
+                self.flex_basis_css
+            ),
             "align-self" => self.align_self_css.clone(),
             "justify-self" => self.justify_self.clone(),
             "order" => self.order.to_string(),
