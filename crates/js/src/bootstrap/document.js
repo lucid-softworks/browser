@@ -634,6 +634,37 @@
 
   // Build a fresh element wrapper object for a node id. Carries `__node` plus accessors/methods
   // that delegate to the native primitives. Returns null for id === -1.
+  function normalizeNode(rootId) {
+    var children = __children(rootId).slice();
+    for (var i = 0; i < children.length; i++) {
+      var childId = children[i];
+      if (__parent(childId) !== rootId) { continue; }
+      if (__nodeType(childId) !== 3) {
+        normalizeNode(childId);
+        continue;
+      }
+      var data = __textContent(childId);
+      if (data.length === 0) {
+        __removeChild(rootId, childId);
+        continue;
+      }
+      while (true) {
+        var siblings = __children(rootId);
+        var index = siblings.indexOf(childId);
+        var nextId = index >= 0 && index + 1 < siblings.length ? siblings[index + 1] : -1;
+        if (nextId < 0 || __nodeType(nextId) !== 3) { break; }
+        var nextData = __textContent(nextId);
+        if (typeof globalThis.__rangesMergeText === "function") {
+          globalThis.__rangesMergeText(childId, nextId, rootId, index + 1, data.length);
+        }
+        data += nextData;
+        __setTextContent(childId, data);
+        __removeChild(rootId, nextId);
+      }
+    }
+  }
+  def(globalThis, "__normalizeNode", normalizeNode);
+
   function wrap(id) {
     if (typeof id !== "number" || id < 0) { return null; }
     var el = {};
@@ -1012,6 +1043,7 @@
       def(attr, "lookupPrefix", function (ns) { return nodeLookupPrefix(id, ns); });
       def(attr, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(id, ns); });
       def(attr, "isSameNode", function (other) { return this === other; });
+      def(attr, "normalize", function () {});
       try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
       __attrNodeCache[attrName] = attr;
       return attr;
@@ -1197,6 +1229,7 @@
       if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       return child;
     });
+    def(el, "normalize", function () { normalizeNode(id); });
     def(el, "insertBefore", function (newNode, refNode) {
       var cid = requireNodeArg(newNode, "insertBefore");
       var refId = (refNode == null) ? -1 : nodeIdOf(refNode);
@@ -1557,6 +1590,7 @@
       var oe = this.ownerElement; return oe && oe.isDefaultNamespace ? oe.isDefaultNamespace(ns) : (ns == null || ns === "");
     });
     def(attr, "isSameNode", function (other) { return this === other; });
+    def(attr, "normalize", function () {});
     try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
     return attr;
   }

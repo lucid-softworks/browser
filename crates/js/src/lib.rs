@@ -3138,6 +3138,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn node_normalize_merges_text_and_preserves_ranges() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var div = document.createElement('div');
+              var first = div.appendChild(document.createTextNode('a'));
+              var second = div.appendChild(document.createTextNode('bc'));
+              div.appendChild(document.createTextNode(''));
+              var inside = document.createRange(); inside.setStart(second, 1); inside.setEnd(second, 2);
+              var between = document.createRange(); between.setStart(div, 1); between.collapse(true);
+              div.normalize();
+              [div.childNodes.length, first.data,
+               inside.startContainer === first, inside.startOffset, inside.endOffset,
+               between.startContainer === first, between.startOffset].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|abc|true|2|3|true|1"));
+    }
+
     // --- Browser environment (`install_browser_env`) ------------------------------------
 
     /// Convenience: run one expression source against a fresh doc+body at the given URL and

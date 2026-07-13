@@ -6384,6 +6384,7 @@
       Object.defineProperty(doc, "isConnected", { get: function () { return true; }, configurable: true, enumerable: true });
       def(doc, "contains", function (other) { return nodeContains(doc, other); });
       def(doc, "isSameNode", function (other) { return other === doc; });
+      def(doc, "normalize", function () { globalThis.__normalizeNode(docId); });
       def(doc, "compareDocumentPosition", function (other) {
         if (!other || typeof other.__node !== "number") {
           throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
@@ -6713,6 +6714,12 @@
       }
       var self = (typeof document.__node === "number") ? document.__node : 0;
       return __cmpDocPos(self, other.__node);
+    });
+  }
+  if (typeof document.normalize !== "function") {
+    def(document, "normalize", function () {
+      var id = typeof document.__node === "number" ? document.__node : 0;
+      globalThis.__normalizeNode(id);
     });
   }
 
@@ -7634,6 +7641,18 @@
     XNode.prototype.removeChild = function (c) { var i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); c.parentNode = null; } return c; };
     XNode.prototype.replaceChild = function (nw, old) { var i = this.childNodes.indexOf(old); if (i < 0) { return old; } if (nw.parentNode) { nw.parentNode.removeChild(nw); } nw.parentNode = this; this.childNodes[i] = nw; old.parentNode = null; return old; };
     XNode.prototype.hasChildNodes = function () { return this.childNodes.length > 0; };
+    XNode.prototype.normalize = function () {
+      var i = 0;
+      while (i < this.childNodes.length) {
+        var child = this.childNodes[i];
+        if (child.nodeType !== 3) { if (child.normalize) { child.normalize(); } i++; continue; }
+        if (child.data.length === 0) { this.removeChild(child); continue; }
+        while (i + 1 < this.childNodes.length && this.childNodes[i + 1].nodeType === 3) {
+          var next = this.childNodes[i + 1]; child.data += next.data; this.removeChild(next);
+        }
+        i++;
+      }
+    };
     XNode.prototype.append = function () { var d = this.ownerDocument || this; for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.appendChild(typeof c === "string" ? d.createTextNode(c) : c); } };
     XNode.prototype.prepend = function () { var d = this.ownerDocument || this; var ref = this.childNodes[0] || null; for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.insertBefore(typeof c === "string" ? d.createTextNode(c) : c, ref); } };
     XNode.prototype.isEqualNode = function (o) { return globalThis.__nodesEqual(this, o); };
@@ -9142,6 +9161,20 @@
     }
   }
   def(globalThis, "__rangesRemove", __rangesRemove);
+
+  // Node.normalize merge step: before the redundant text node is removed, retarget boundaries in
+  // that node (and boundaries at its parent slot) into the surviving text node.
+  function __rangesMergeText(targetId, sourceId, parentId, sourceIndex, targetLength) {
+    var target = __nodeFor(targetId);
+    for (var i = 0; i < __liveRanges.length; i++) {
+      var r = __liveRanges[i];
+      if (__idOf(r._sc) === sourceId) { r._sc = target; r._so += targetLength; }
+      else if (__idOf(r._sc) === parentId && r._so === sourceIndex) { r._sc = target; r._so = targetLength; }
+      if (__idOf(r._ec) === sourceId) { r._ec = target; r._eo += targetLength; }
+      else if (__idOf(r._ec) === parentId && r._eo === sourceIndex) { r._ec = target; r._eo = targetLength; }
+    }
+  }
+  def(globalThis, "__rangesMergeText", __rangesMergeText);
 
   // The Text "split" range steps (run AFTER the new node is inserted, BEFORE the trailing data is
   // removed): boundaries in `node` past `offset` move into `newNode`; boundaries at the parent slot
