@@ -23,6 +23,8 @@ const ELEMENT_KEY: &str = "element-6066-11e4-a52e-4f735466cecf";
 struct ParkedWindow {
     engine: engine::Engine,
     url: String,
+    history: Vec<String>,
+    history_index: usize,
 }
 
 /// A driven browser session. The engine has one V8 isolate per *window*, and WebDriver is
@@ -33,6 +35,10 @@ struct ParkedWindow {
 struct Session {
     engine: engine::Engine,
     url: String,
+    /// Top-level navigation entries for the current window.
+    history: Vec<String>,
+    /// Index of the active entry in `history`.
+    history_index: usize,
     width: u32,
     height: u32,
     scale: f32,
@@ -64,7 +70,9 @@ impl Session {
             handle.clone(),
             ParkedWindow {
                 engine,
-                url: String::new(),
+                url: "about:blank".to_string(),
+                history: vec!["about:blank".to_string()],
+                history_index: 0,
             },
         );
         self.order.push(handle.clone());
@@ -82,11 +90,15 @@ impl Session {
             .ok_or_else(WdError::no_such_window)?;
         let prev_engine = std::mem::replace(&mut self.engine, park.engine);
         let prev_url = std::mem::replace(&mut self.url, park.url);
+        let prev_history = std::mem::replace(&mut self.history, park.history);
+        let prev_history_index = std::mem::replace(&mut self.history_index, park.history_index);
         self.parked.insert(
             std::mem::replace(&mut self.handle, target.to_string()),
             ParkedWindow {
                 engine: prev_engine,
                 url: prev_url,
+                history: prev_history,
+                history_index: prev_history_index,
             },
         );
         Ok(())
@@ -100,6 +112,8 @@ impl Session {
             if let Some(park) = self.parked.remove(&next) {
                 self.engine = park.engine; // drops the closed window's engine
                 self.url = park.url;
+                self.history = park.history;
+                self.history_index = park.history_index;
                 self.handle = next;
             }
         }
@@ -313,11 +327,8 @@ fn dispatch(method: &str, path: &str, body: &str, sessions: &Mutex<Sessions>) ->
         ("GET", ["session", id, "title"]) => get_title(id, sessions),
         ("GET", ["session", id, "source"]) => get_source(id, sessions),
         ("POST", ["session", id, "refresh"]) => refresh(id, sessions),
-        ("POST", ["session", _id, "back"]) => Ok(Json::Null), // stub: no history wired
-        ("POST", ["session", id, "forward"]) => {
-            // stub: no history wired — validate session so clients get a sane error.
-            with_session(id, sessions, |_| Ok(Json::Null))
-        }
+        ("POST", ["session", id, "back"]) => traverse_history(id, -1, sessions),
+        ("POST", ["session", id, "forward"]) => traverse_history(id, 1, sessions),
 
         ("POST", ["session", id, "execute", "sync"]) => execute_sync(id, body, sessions),
         ("POST", ["session", id, "execute", "async"]) => execute_async(id, body, sessions),
@@ -435,7 +446,9 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let handle = "window-0".to_string();
     let session = Session {
         engine,
-        url: String::new(),
+        url: "about:blank".to_string(),
+        history: vec!["about:blank".to_string()],
+        history_index: 0,
         width,
         height,
         scale,
@@ -622,30 +635,44 @@ fn navigate(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
         .to_string();
 
     with_session(id, sessions, |s| {
-        s.engine.load_url(&url);
+        s.history.truncate(s.history_index + 1);
+        s.history.push(url.clone());
+        s.history_index = s.history.len() - 1;
         s.url = url.clone();
-        // Tick the event loop until document.readyState === "complete" or a timeout.
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(8) {
-            for _ in 0..5 {
-                s.engine.tick();
-            }
-            let ready = s.engine.console_eval("document.readyState");
-            if ready == "complete" {
-                break;
-            }
-            // A failed / non-HTML / error-status navigation has no live document, so readyState can
-            // never reach "complete" — polling would just burn the whole timeout (a major drag on the
-            // suite, since every erroring test paid ~the full wait). Stop as soon as there's no page.
-            if ready == "(no live page)" {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        load_and_wait(s, &url, Duration::from_secs(8));
+        Ok(Json::Null)
+    })
+}
+
+/// Load a top-level document and wait for its initial event-loop work to settle.
+fn load_and_wait(session: &mut Session, url: &str, timeout: Duration) {
+    session.engine.load_url(url);
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        for _ in 0..5 {
+            session.engine.tick();
         }
-        // A few extra ticks for deferred scripts/microtasks.
-        for _ in 0..10 {
-            s.engine.tick();
+        let ready = session.engine.console_eval("document.readyState");
+        if ready == "complete" || ready == "(no live page)" {
+            break;
         }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..10 {
+        session.engine.tick();
+    }
+}
+
+fn traverse_history(id: &str, delta: isize, sessions: &Mutex<Sessions>) -> WdResult {
+    with_session(id, sessions, |s| {
+        let next = s.history_index.saturating_add_signed(delta);
+        if next >= s.history.len() || next == s.history_index {
+            return Ok(Json::Null);
+        }
+        s.history_index = next;
+        let url = s.history[next].clone();
+        s.url = url.clone();
+        load_and_wait(s, &url, Duration::from_secs(8));
         Ok(Json::Null)
     })
 }
@@ -679,19 +706,7 @@ fn get_source(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
 fn refresh(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
     with_session(id, sessions, |s| {
         let url = s.url.clone();
-        if !url.is_empty() {
-            s.engine.load_url(&url);
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(20) {
-                for _ in 0..5 {
-                    s.engine.tick();
-                }
-                if s.engine.console_eval("document.readyState") == "complete" {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
+        load_and_wait(s, &url, Duration::from_secs(20));
         Ok(Json::Null)
     })
 }

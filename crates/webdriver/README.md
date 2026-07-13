@@ -72,8 +72,8 @@ curl -s -X POST localhost:4444/session/browser-wd-00000001/execute/sync \
 | Get Title | `GET /session/{id}/title` | ✅ |
 | Get Page Source | `GET /session/{id}/source` | ✅ (`document.documentElement.outerHTML`) |
 | Refresh | `POST /session/{id}/refresh` | ✅ (reloads current URL) |
-| Back | `POST /session/{id}/back` | ⚠️ **stub** (no history wired; returns null) |
-| Forward | `POST /session/{id}/forward` | ⚠️ **stub** (no history wired; returns null) |
+| Back | `POST /session/{id}/back` | ✅ |
+| Forward | `POST /session/{id}/forward` | ✅ |
 | Execute Script | `POST /session/{id}/execute/sync` | ✅ |
 | Execute Async Script | `POST /session/{id}/execute/async` | ✅ |
 | Find Element | `POST /session/{id}/element` | ✅ (`css selector`, `tag name`, `id`, `class name`, `link text`, `partial link text`) |
@@ -102,7 +102,6 @@ Responses are `{"value": <result>}` with HTTP 200 on success. Errors are
 
 - **Send keys** (`element/value`) is best-effort: it sets `.value` and fires `input`/`change`
   rather than dispatching real key events per character.
-- **Back / Forward** are stubs (the engine has no history stack wired up yet).
 - **Element screenshot** crops the full-page framebuffer to the element rect rather than rendering
   the element in isolation.
 - **`data:` URLs** are not supported by the `net` layer; navigate to `http(s)://`, `file://`, or

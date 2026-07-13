@@ -6,8 +6,6 @@ README status section, not in this file. See `docs/CSS-TODO.md` for CSS-specific
 
 ## P0 — conformance and core browser behavior
 
-- [ ] **WebDriver history navigation** — wire `/back` and `/forward` to a per-session history
-  stack and return `invalid session id` consistently.
 - [ ] **Nested scroll containers** — make `overflow: auto/scroll` establish a clipped scrollport;
   implement element `scrollTop`/`scrollLeft`, `scroll()`, `scrollTo()`, and `scrollBy()`.
 - [ ] **Form submit navigation** — perform GET/POST navigation after an uncancelled submit.

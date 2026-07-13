@@ -107,6 +107,43 @@ fn full_webdriver_flow() {
         "title body: {body}"
     );
 
+    // A second navigation creates history; back and forward restore each document.
+    let page2 = "<html><head><title>Second Page</title></head><body>Later</body></html>";
+    let path2 = std::env::temp_dir().join("wd_flow_test_second.html");
+    std::fs::write(&path2, page2).unwrap();
+    let file_url2 = format!("file://{}", path2.display());
+    let nav_body2 = Json::Obj(
+        [("url".to_string(), Json::Str(file_url2))]
+            .into_iter()
+            .collect(),
+    )
+    .to_string();
+    let (st, body) = request(
+        port,
+        "POST",
+        &format!("/session/{sid}/url"),
+        Some(&nav_body2),
+    );
+    assert_eq!(st, 200, "second navigate body: {body}");
+    let (st, body) = request(port, "POST", &format!("/session/{sid}/back"), Some("{}"));
+    assert_eq!(st, 200, "back body: {body}");
+    let (_, body) = request(port, "GET", &format!("/session/{sid}/title"), None);
+    assert_eq!(value(&body).as_str(), Some("Hi There"));
+    let (st, body) = request(port, "POST", &format!("/session/{sid}/forward"), Some("{}"));
+    assert_eq!(st, 200, "forward body: {body}");
+    let (_, body) = request(port, "GET", &format!("/session/{sid}/title"), None);
+    assert_eq!(value(&body).as_str(), Some("Second Page"));
+    let (st, body) = request(port, "POST", "/session/missing/back", Some("{}"));
+    assert_eq!(st, 404, "invalid-session back body: {body}");
+    assert_eq!(
+        value(&body).get("error").and_then(|e| e.as_str()),
+        Some("invalid session id")
+    );
+
+    // Return to the first page for the element assertions below.
+    let (st, body) = request(port, "POST", &format!("/session/{sid}/back"), Some("{}"));
+    assert_eq!(st, 200, "second back body: {body}");
+
     // Find Element (css).
     let find_body = r##"{"using":"css selector","value":"#greet"}"##;
     let (st, body) = request(

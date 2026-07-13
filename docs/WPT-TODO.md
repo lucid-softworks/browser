@@ -14,7 +14,6 @@ feature is currently absent.
 
 ## Provisional high-value areas
 
-- [ ] `webdriver/` navigation: back/forward history and invalid-session behavior.
 - [ ] CSS overflow and CSSOM View: nested scrollports, element offsets, clipping, and hit testing.
 - [ ] HTML popovers and top-layer behavior.
 - [ ] Custom elements and `ElementInternals` form association.
