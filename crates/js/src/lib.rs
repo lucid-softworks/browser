@@ -3132,7 +3132,10 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("false|false|true|true|false|false|true|true"));
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("false|false|true|true|false|false|true|true")
+        );
     }
 
     #[test]
@@ -3180,6 +3183,34 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("1|abc|true|2|3|true|1"));
+    }
+
+    #[test]
+    fn node_mutations_validate_and_replace_document_children() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var parent = document.createElement('div');
+              var type = ''; try { parent.insertBefore(document.createTextNode('x'), {}); } catch (e) { type = e.name; }
+              var first = parent.appendChild(document.createElement('a'));
+              parent.appendChild(document.createElement('b')); parent.insertBefore(first, first);
+              var d1 = document.implementation.createHTMLDocument('one');
+              var d2 = document.implementation.createHTMLDocument('two');
+              var old = d1.doctype, replacement = d2.doctype;
+              d1.replaceChild(replacement, old);
+              [type, parent.firstChild === first, d1.childNodes.length,
+               d1.firstChild === replacement, d2.childNodes.length,
+               old.parentNode === null, replacement.parentNode === d1].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("TypeError|true|2|true|1|true|true")
+        );
     }
 
     // --- Browser environment (`install_browser_env`) ------------------------------------

@@ -6318,7 +6318,13 @@
     // created via the validating factory; we override its ownerDocument to the requested document.
     function makeDoctypeFor(ownerDoc, name, pub, sys) {
       var dt = globalThis.__createDocumentTypeNode(String(name), pub == null ? "" : String(pub), sys == null ? "" : String(sys));
-      try { Object.defineProperty(dt, "ownerDocument", { value: ownerDoc, configurable: true, enumerable: true }); } catch (e) {}
+      try { def(dt, "__creationDocument", ownerDoc); } catch (e) {}
+      try {
+        Object.defineProperty(dt, "ownerDocument", {
+          get: function () { return typeof globalThis.__ownerDocumentOf === "function" ? globalThis.__ownerDocumentOf(dt) : ownerDoc; },
+          configurable: true, enumerable: true
+        });
+      } catch (e) {}
       return dt;
     }
     // Back an off-document facade with a real (detached) arena Document node, so the Node mutation
@@ -6346,12 +6352,18 @@
         return n;
       }
       function nf(msg) { throw new (globalThis.DOMException)(msg, "NotFoundError"); }
-      def(doc, "appendChild", function (child) { var c = reqNode(child, "appendChild"); globalThis.__insertNode(docId, c, -1); return child; });
+      def(doc, "appendChild", function (child) {
+        var c = reqNode(child, "appendChild");
+        globalThis.__ensurePreInsertValid(docId, c, -1, -1);
+        globalThis.__insertDomNode(docId, c, -1); return child;
+      });
       def(doc, "insertBefore", function (newNode, refNode) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
         var c = reqNode(newNode, "insertBefore");
         var r = (refNode == null) ? -1 : ((refNode && typeof refNode.__node === "number") ? refNode.__node : -1);
-        if (refNode != null && r < 0) { nf("The reference child is not a child of this node."); }
-        globalThis.__insertNode(docId, c, r); return newNode;
+        if (refNode != null && r < 0) { throw new TypeError("Failed to execute 'insertBefore': parameter 2 is not of type 'Node'."); }
+        globalThis.__ensurePreInsertValid(docId, c, r, -1);
+        globalThis.__insertDomNode(docId, c, r); return newNode;
       });
       def(doc, "removeChild", function (child) {
         var c = reqNode(child, "removeChild");
@@ -6364,7 +6376,9 @@
         var sibs = globalThis.__children(docId); var idx = sibs.indexOf(o);
         var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
         if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
-        globalThis.__removeChild(docId, o); globalThis.__insertNode(docId, n, ref); return oldNode;
+        globalThis.__ensurePreInsertValid(docId, n, ref, o);
+        if (n === o) { return oldNode; }
+        globalThis.__removeChild(docId, o); globalThis.__insertDomNode(docId, n, ref); return oldNode;
       });
       function kids() { return globalThis.__children(docId); }
       var childNodesList = globalThis.__makeNodeList(function () {
@@ -6472,6 +6486,10 @@
       ro("baseURI", "about:blank");
       ro("location", null);
     }
+    function markCreationDocument(doc, node) {
+      if (node && typeof node === "object") { try { def(node, "__creationDocument", doc); } catch (e) {} }
+      return node;
+    }
     // The first HTML-namespace <title> element in tree order (the "title element" the HTML spec's
     // document.title getter reads), or null. Walks the facade's live arena tree.
     function findTitleElement(doc) {
@@ -6533,20 +6551,20 @@
         lookupPrefix: function () { var de = this.documentElement; return de && de.lookupPrefix ? de.lookupPrefix.apply(de, arguments) : null; },
         isDefaultNamespace: function (ns) { var de = this.documentElement; return de && de.isDefaultNamespace ? de.isDefaultNamespace.apply(de, arguments) : (ns == null || ns === ""); },
         createElement: isXML
-          ? function (name) { var e = globalThis.__createElementCasePreserving(elNs, name); def(e, "__nonHtmlDocument", true); return e; }
-          : function (tag) { return document.createElement(tag); },
-        createElementNS: function (ns, qn) { var e = document.createElementNS(ns, qn); if (isXML) { def(e, "__nonHtmlDocument", true); } return e; },
+          ? function (name) { var e = globalThis.__createElementCasePreserving(elNs, name); def(e, "__nonHtmlDocument", true); return markCreationDocument(doc, e); }
+          : function (tag) { return markCreationDocument(doc, document.createElement(tag)); },
+        createElementNS: function (ns, qn) { var e = document.createElementNS(ns, qn); if (isXML) { def(e, "__nonHtmlDocument", true); } return markCreationDocument(doc, e); },
         createAttribute: isXML
           ? function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm, nm); }
           : function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm.toLowerCase(), nm.toLowerCase()); },
         createAttributeNS: function (ns, qn) { var ex = globalThis.__validateAndExtractName(ns, qn); return globalThis.__makeAttrNode(ex.namespace, ex.prefix, ex.localName, String(qn)); },
-        createTextNode: function (s) { return document.createTextNode(s); },
-        createComment: function (s) { return document.createComment(s); },
+        createTextNode: function (s) { return markCreationDocument(doc, document.createTextNode(s)); },
+        createComment: function (s) { return markCreationDocument(doc, document.createComment(s)); },
         createCDATASection: isXML
           ? function (data) { return globalThis.__canonNode(globalThis.__wrapNode(globalThis.__createCData(String(data == null ? "" : data)))); }
           : function () { throw new globalThis.DOMException("This DOM method is only valid on XML documents.", "NotSupportedError"); },
-        createDocumentFragment: function () { return document.createDocumentFragment(); },
-        createProcessingInstruction: function (target, data) { return document.createProcessingInstruction(target, data); },
+        createDocumentFragment: function () { return markCreationDocument(doc, document.createDocumentFragment()); },
+        createProcessingInstruction: function (target, data) { return markCreationDocument(doc, document.createProcessingInstruction(target, data)); },
         importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
         getElementById: function (id) { var de = this.documentElement; return de && de.querySelector ? de.querySelector('#' + id) : null; },
         querySelector: function (s) { var de = this.documentElement; return de && de.querySelector ? de.querySelector(s) : null; },
@@ -6608,8 +6626,8 @@
           // Cloning a document does NOT run the createHTMLDocument algorithm (no doctype/html/head/
           // body/title get synthesised); a shallow clone is a brand-new empty HTML document.
           cloneNode: function () { return buildBareDocument("html", HTML_NS, "text/html"); },
-          createElement: function (tag) { return document.createElement(tag); },
-          createElementNS: function (ns, tag) { return document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag); },
+          createElement: function (tag) { return markCreationDocument(doc, document.createElement(tag)); },
+          createElementNS: function (ns, tag) { return markCreationDocument(doc, document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag)); },
           createAttribute: function (name) {
             var nm = String(name);
             if (nm.length === 0) { globalThis.__invalidCharacterError(); }
@@ -6619,12 +6637,12 @@
             var ex = globalThis.__validateAndExtractName(ns, qn);
             return globalThis.__makeAttrNode(ex.namespace, ex.prefix, ex.localName, String(qn));
           },
-          createTextNode: function (s) { return document.createTextNode(s); },
-          createComment: function (s) { return document.createComment(s); },
+          createTextNode: function (s) { return markCreationDocument(doc, document.createTextNode(s)); },
+          createComment: function (s) { return markCreationDocument(doc, document.createComment(s)); },
           // An HTML document refuses createCDATASection (the XML createDocument path overrides this).
           createCDATASection: function () { throw new globalThis.DOMException("This DOM method is only valid on XML documents.", "NotSupportedError"); },
-          createDocumentFragment: function () { return document.createDocumentFragment(); },
-          createProcessingInstruction: function (target, data) { return document.createProcessingInstruction(target, data); },
+          createDocumentFragment: function () { return markCreationDocument(doc, document.createDocumentFragment()); },
+          createProcessingInstruction: function (target, data) { return markCreationDocument(doc, document.createProcessingInstruction(target, data)); },
           importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
           getElementById: function (id) { return htmlEl.querySelector ? htmlEl.querySelector('#' + id) : null; },
           querySelector: function (s) { return htmlEl.querySelector ? htmlEl.querySelector(s) : null; },
@@ -6744,17 +6762,21 @@
       get: function () { return childNodesList; }, enumerable: true, configurable: true
     });
     def(document, "appendChild", function (child) {
-      var id = docNode(); var c = reqNode(child, "appendChild"); __insertNode(id, c, -1); return child;
+      var id = docNode(); var c = reqNode(child, "appendChild");
+      globalThis.__ensurePreInsertValid(id, c, -1, -1);
+      globalThis.__insertDomNode(id, c, -1); return child;
     });
     if (typeof document.hasChildNodes !== "function") {
       def(document, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
     }
     if (document.nodeName === undefined) { def(document, "nodeName", "#document"); }
     def(document, "insertBefore", function (newNode, refNode) {
+      if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
       var id = docNode(); var c = reqNode(newNode, "insertBefore");
       var r = (refNode == null) ? -1 : ((refNode && typeof refNode.__node === "number") ? refNode.__node : -1);
-      if (refNode != null && r < 0) { notFound("The reference child is not a child of this node."); }
-      __insertNode(id, c, r); return newNode;
+      if (refNode != null && r < 0) { throw new TypeError("Failed to execute 'insertBefore': parameter 2 is not of type 'Node'."); }
+      globalThis.__ensurePreInsertValid(id, c, r, -1);
+      globalThis.__insertDomNode(id, c, r); return newNode;
     });
     def(document, "removeChild", function (child) {
       var id = docNode(); var c = reqNode(child, "removeChild");
@@ -6767,7 +6789,9 @@
       var sibs = __children(id); var idx = sibs.indexOf(o);
       var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
       if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
-      __removeChild(id, o); __insertNode(id, n, ref); return oldNode;
+      globalThis.__ensurePreInsertValid(id, n, ref, o);
+      if (n === o) { return oldNode; }
+      __removeChild(id, o); globalThis.__insertDomNode(id, n, ref); return oldNode;
     });
   })();
   // Legacy event factory. Maps a (case-insensitive) interface name to an uninitialized event of
@@ -8301,6 +8325,47 @@
   // hasChildNodes() on the shared Node prototype, so non-element nodes (document, text, comment,
   // doctype, …) answer it too. Element wrappers install their own faster override in enrichElement.
   def(NodeCtor.prototype, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
+  (function (proto) {
+    function nodeArg(value, method) {
+      if (!value || typeof value.nodeType !== "number") {
+        throw new TypeError("Failed to execute '" + method + "': parameter is not of type 'Node'.");
+      }
+    }
+    function own(self, name, args, fallback) {
+      var descriptor = Object.getOwnPropertyDescriptor(self, name);
+      if (descriptor && typeof descriptor.value === "function" && descriptor.value !== proto[name]) {
+        return descriptor.value.apply(self, args);
+      }
+      return fallback();
+    }
+    def(proto, "insertBefore", function (node, child) {
+      if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
+      nodeArg(node, "insertBefore");
+      if (child !== null && child !== undefined) { nodeArg(child, "insertBefore"); }
+      var self = this, args = arguments;
+      return own(self, "insertBefore", args, function () {
+        throw new globalThis.DOMException("This node type cannot contain children.", "HierarchyRequestError");
+      });
+    });
+    def(proto, "appendChild", function (node) {
+      nodeArg(node, "appendChild"); var self = this, args = arguments;
+      return own(self, "appendChild", args, function () {
+        throw new globalThis.DOMException("This node type cannot contain children.", "HierarchyRequestError");
+      });
+    });
+    def(proto, "replaceChild", function (node, child) {
+      nodeArg(node, "replaceChild"); nodeArg(child, "replaceChild"); var self = this, args = arguments;
+      return own(self, "replaceChild", args, function () {
+        throw new globalThis.DOMException("This node type cannot contain children.", "HierarchyRequestError");
+      });
+    });
+    def(proto, "removeChild", function (child) {
+      nodeArg(child, "removeChild"); var self = this, args = arguments;
+      return own(self, "removeChild", args, function () {
+        throw new globalThis.DOMException("The node is not a child of this node.", "NotFoundError");
+      });
+    });
+  })(NodeCtor.prototype);
   defClass("EventTarget");
   defClass("CharacterData", NodeCtor);
   var TextCtor = defClass("Text", globalThis.CharacterData);
@@ -9715,9 +9780,10 @@
               querySelectorAll: function (s) { return body.querySelectorAll(s); },
               getElementById: function (id) { try { return body.querySelector('#' + id); } catch (e) { return null; } },
               getElementsByTagName: function (t) { return body.getElementsByTagName(t); },
-              createElement: function (t) { return document.createElement(t); },
-              createTextNode: function (t) { return document.createTextNode(t); },
-              createDocumentFragment: function () { return document.createDocumentFragment(); },
+              createElement: function (t) { var n = document.createElement(t); def(n, "__creationDocument", doc); return n; },
+              createTextNode: function (t) { var n = document.createTextNode(t); def(n, "__creationDocument", doc); return n; },
+              createComment: function (t) { var n = document.createComment(t); def(n, "__creationDocument", doc); return n; },
+              createDocumentFragment: function () { var n = document.createDocumentFragment(); def(n, "__creationDocument", doc); return n; },
               adoptedStyleSheets: [], styleSheets: { length: 0, item: function () { return null; } },
               defaultView: null,
               // document.open/write/close populate the frame's body (so the page can build the
@@ -9761,6 +9827,7 @@
               postMessage: function () {}, focus: function () {}, blur: function () {}, close: function () {},
               location: { href: "about:blank", toString: function () { return "about:blank"; } },
               name: "",
+              DOMException: globalThis.DOMException,
               // A same-origin (about:blank) frame shares the parent's cookie jar, so its cookieStore is
               // the parent's — frame.contentWindow.cookieStore reads/writes the same cookies.
               cookieStore: globalThis.cookieStore,
@@ -10291,7 +10358,7 @@
     def(globalThis, "__ownerDocumentOf", function (node) {
       try {
         var id = node && node.__node;
-        if (typeof id !== "number") { return document; }
+        if (typeof id !== "number") { return (node && node.__creationDocument) || document; }
         var cur = id, guard = 0;
         while (cur >= 0 && guard++ < 100000) {
           var w = globalThis.__elFor(cur);
@@ -10306,7 +10373,7 @@
           cur = __parent(cur);
         }
       } catch (e) {}
-      return document;
+      return (node && node.__creationDocument) || document;
     });
 
     // <template>.content — a DocumentFragment facade over the template element's children.

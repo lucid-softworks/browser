@@ -439,7 +439,7 @@
 
   // Pre-insertion validity (subset relevant here): parent must be a Document/Fragment/Element, the
   // node must not be an inclusive ancestor of parent, and `ref` (if given) must be a child of parent.
-  function ensurePreInsertValid(parentId, nodeId, refId) {
+  function ensurePreInsertValid(parentId, nodeId, refId, replacedId) {
     var pt = __nodeType(parentId);
     if (pt !== 1 && pt !== 9 && pt !== 11) {
       hierarchyRequestError("Cannot insert into a node that is not a Document, DocumentFragment, or Element.");
@@ -447,23 +447,41 @@
     if (nodeId >= 0 && isInclusiveAncestor(nodeId, parentId)) {
       hierarchyRequestError("The new child element contains the parent.");
     }
+    if (refId >= 0 && __parent(refId) !== parentId) {
+      notFoundError("The reference child is not a child of this node.");
+    }
     var nt = nodeId >= 0 ? __nodeType(nodeId) : -1;
     if (nt === 9) { hierarchyRequestError("Nodes of type Document may not be inserted."); }
     // A DocumentType may only live in a Document; a Text node may not be a child of a Document.
     if (nt === 10 && pt !== 9) { hierarchyRequestError("Only a Document may contain a DocumentType."); }
     if (nt === 3 && pt === 9) { hierarchyRequestError("A Text node may not be a child of a Document."); }
-    if (nodeId >= 0 && (nt === 1 || nt === 3 || nt === 8 || nt === 11) && (pt === 9)) {
-      // Documents have additional constraints, but our tree is HTML-shaped; allow elements/fragments.
-    }
-    if (refId >= 0 && __parent(refId) !== parentId) {
-      notFoundError("The reference child is not a child of this node.");
+    if (pt === 9) {
+      var sequence = __children(parentId).filter(function (child) {
+        return child !== nodeId && child !== replacedId;
+      });
+      var insertion = refId < 0 ? sequence.length : sequence.indexOf(refId);
+      if (insertion < 0) { insertion = sequence.length; }
+      var incoming = nt === 11 ? __children(nodeId).slice() : [nodeId];
+      sequence.splice.apply(sequence, [insertion, 0].concat(incoming));
+      var elements = 0, doctypes = 0, elementIndex = -1, doctypeIndex = -1;
+      for (var si = 0; si < sequence.length; si++) {
+        var st = __nodeType(sequence[si]);
+        if (st === 1) { elements++; elementIndex = si; }
+        else if (st === 10) { doctypes++; doctypeIndex = si; }
+        else if (st !== 7 && st !== 8) { hierarchyRequestError("This node type cannot be inserted into a Document."); }
+      }
+      if (elements > 1 || doctypes > 1 || (doctypeIndex >= 0 && elementIndex >= 0 && doctypeIndex > elementIndex)) {
+        hierarchyRequestError("The operation would yield an invalid Document tree.");
+      }
     }
   }
+  def(globalThis, "__ensurePreInsertValid", ensurePreInsertValid);
 
   // Insert `nodeId` (possibly a DocumentFragment, whose children are moved) into `parentId` before
   // `refId` (-1 = append). Returns the inserted node id. Validity must be checked by the caller.
   function insertNode(parentId, nodeId, refId) {
     if (nodeId < 0) { return nodeId; }
+    if (nodeId === refId) { return nodeId; }
     if (__nodeType(nodeId) === 11) {
       var moving = __children(nodeId).slice();
       for (var i = 0; i < moving.length; i++) { __insertBefore(parentId, moving[i], refId); }
@@ -483,6 +501,7 @@
     if (globalThis.__adoptOnInsert) { try { globalThis.__adoptOnInsert(nodeId); } catch (e) {} }
     return nodeId;
   }
+  def(globalThis, "__insertDomNode", insertNode);
 
   // The set of arg node-ids (used to skip them when picking a viable reference sibling).
   function argNodeIdSet(args) {
@@ -1275,7 +1294,12 @@
       return child;
     });
     def(el, "removeChild", function (child) {
-      var cid = requireNodeArg(child, "removeChild");
+      var cid = nodeIdOf(child);
+      // Lightweight frame documents are still Nodes even though they do not occupy an arena slot.
+      // They cannot be a child of an arena element, so removal reaches the normal NotFoundError.
+      if (cid < 0 && (!child || typeof child.nodeType !== "number")) {
+        throw new TypeError("Failed to execute 'removeChild': parameter is not of type 'Node'.");
+      }
       if (__parent(cid) !== id) { notFoundError("The node to be removed is not a child of this node."); }
       __removeChild(id, cid);
       if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
@@ -1283,17 +1307,20 @@
     });
     def(el, "normalize", function () { normalizeNode(id); });
     def(el, "insertBefore", function (newNode, refNode) {
+      if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
       var cid = requireNodeArg(newNode, "insertBefore");
       var refId = (refNode == null) ? -1 : nodeIdOf(refNode);
-      if (refNode != null && refId < 0) { notFoundError("The reference child is not a child of this node."); }
+      if (refNode != null && refId < 0) { throw new TypeError("Failed to execute 'insertBefore': parameter 2 is not of type 'Node'."); }
       ensurePreInsertValid(id, cid, refId);
       insertNode(id, cid, refId);
       return newNode;
     });
     def(el, "replaceChild", function (newNode, oldNode) {
       var nid = requireNodeArg(newNode, "replaceChild"), oid = requireNodeArg(oldNode, "replaceChild");
-      if (__parent(oid) !== id) { notFoundError("The node to be replaced is not a child of this node."); }
+      var pt = __nodeType(id);
+      if (pt !== 1 && pt !== 9 && pt !== 11) { hierarchyRequestError(); }
       if (isInclusiveAncestor(nid, id)) { hierarchyRequestError("The new child element contains the parent."); }
+      if (__parent(oid) !== id) { notFoundError("The node to be replaced is not a child of this node."); }
       // The replacement must itself be insertable here: not a Document, and (since the parent is an
       // Element) not a DocumentType. Checked before any mutation so a failure leaves the tree intact.
       var nnt = __nodeType(nid);
@@ -1306,6 +1333,8 @@
         var ni = sibs.indexOf(nid);
         ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1;
       }
+      ensurePreInsertValid(id, nid, ref, oid);
+      if (nid === oid) { return oldNode; }
       __removeChild(id, oid);
       if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       insertNode(id, nid, ref);
