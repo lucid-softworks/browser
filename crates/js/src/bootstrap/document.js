@@ -851,7 +851,7 @@
       // trailing data. Per the DOM "split" algorithm, the new node is inserted (live-range insert
       // step), the split-specific live-range steps run, then the trailing data is removed from this
       // node (live-range replace-data step).
-      if (__nodeType(id) === 3) {
+      if (__nodeType(id) === 3 || __nodeType(id) === 4) {
         def(el, "splitText", function (offset) {
           if (arguments.length < 1) { throw new TypeError("Failed to execute 'splitText' on 'Text': 1 argument required, but only 0 present."); }
           offset = offset >>> 0;

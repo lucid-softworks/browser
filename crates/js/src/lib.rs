@@ -2578,6 +2578,23 @@ mod tests {
     }
 
     #[test]
+    fn cdata_section_inherits_text_split_text() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var xd = document.implementation.createDocument(null, 'root');
+                   var cdata = xd.createCDATASection('abcd');
+                   xd.documentElement.appendChild(cdata);
+                   var tail = cdata.splitText(2);
+                   [cdata.data, tail.data, tail.nodeType, tail.previousSibling === cdata].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("ab|cd|3|true"));
+    }
+
+    #[test]
     fn document_element_inner_html_preserves_head_and_body() {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(
