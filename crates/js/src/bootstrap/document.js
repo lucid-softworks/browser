@@ -916,6 +916,7 @@
       if (elIsHtml()) { nm = asciiLower(nm); }
       return __getAttr(id, nm) != null;
     });
+    def(el, "hasAttributes", function () { return __attrNames(id).length !== 0; });
     def(el, "getAttributeNames", function () { return __attrNames(id); });
 
     // Namespaced attribute accessors. The arena keys attrs by their qualified name; we keep the

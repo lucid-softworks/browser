@@ -3074,6 +3074,25 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("a,b,c"));
     }
 
+    #[test]
+    fn element_has_attributes_tracks_attribute_list() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              var values = [el.hasAttributes()];
+              el.setAttribute('data-value', 'yes'); values.push(el.hasAttributes());
+              el.removeAttribute('data-value'); values.push(el.hasAttributes());
+              values.join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("false|true|false"));
+    }
+
     // --- Browser environment (`install_browser_env`) ------------------------------------
 
     /// Convenience: run one expression source against a fresh doc+body at the given URL and
