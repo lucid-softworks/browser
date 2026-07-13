@@ -138,32 +138,6 @@ impl Engine {
         }
         self.focused_node = new_focus;
 
-        // Checkbox / radio toggle: if the click landed on (or inside, e.g. a <label for>) a
-        // checkable input that isn't disabled, toggle it (fires input + change).
-        if let Some(target) = checkable_target(&snapshot, node) {
-            let (s, c) = session.toggle_checkbox(target.0);
-            snapshot = s;
-            snapshot.prune_invalid();
-            console.extend(c);
-        }
-
-        // <details>/<summary>: a click on a summary toggles the parent <details> open/closed.
-        if let Some(details) = details_toggle_target(&snapshot, node) {
-            let (s, c) = session.toggle_details(details.0);
-            snapshot = s;
-            snapshot.prune_invalid();
-            console.extend(c);
-        }
-
-        // Submit: a click on a submit button (<input type=submit>, <button type=submit>, or a
-        // <button> with no type) inside a form fires `submit` on the nearest ancestor <form>.
-        if let Some(form) = submit_target_form(&snapshot, node) {
-            let (s, c) = session.fire_event(form.0, "submit");
-            snapshot = s;
-            snapshot.prune_invalid();
-            console.extend(c);
-        }
-
         if let LoadState::Loaded {
             doc, console: c, ..
         } = &mut self.state

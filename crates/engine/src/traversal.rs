@@ -1081,78 +1081,8 @@ pub(crate) fn node_value(doc: &dom::Document, id: dom::NodeId) -> Option<String>
     }
 }
 
-/// Resolve the checkable `<input type=checkbox|radio>` that a click on `node` should toggle, if
-/// any: the nearest ancestor-or-self checkable input, OR — when `node` is (inside) a `<label for>`
-/// — the input that label points at. Returns `None` for disabled controls or when none is found.
-pub(crate) fn checkable_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
-    fn is_checkable(doc: &dom::Document, id: dom::NodeId) -> bool {
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("input") && !e.attrs.contains_key("disabled") {
-                let ty = e
-                    .attrs
-                    .get("type")
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .unwrap_or_default();
-                return ty == "checkbox" || ty == "radio";
-            }
-        }
-        false
-    }
-    // Ancestor-or-self walk for a checkable input, or a <label for>.
-    let mut cur = Some(node);
-    while let Some(id) = cur {
-        if id.0 >= doc.len() {
-            break;
-        }
-        if is_checkable(doc, id) {
-            return Some(id);
-        }
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("label") {
-                if let Some(for_id) = e.attrs.get("for") {
-                    if let Some(target) = find_by_attr_id(doc, doc.root(), for_id) {
-                        if is_checkable(doc, target) {
-                            return Some(target);
-                        }
-                    }
-                }
-            }
-        }
-        cur = doc.get(id).parent;
-    }
-    None
-}
-
-/// If the click landed on (or inside) a `<summary>`, return its nearest ancestor `<details>` so it
-/// can be toggled open/closed. `None` otherwise.
-pub(crate) fn details_toggle_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
-    let mut cur = Some(node);
-    while let Some(id) = cur {
-        if id.0 >= doc.len() {
-            break;
-        }
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("summary") {
-                let mut p = doc.get(id).parent;
-                while let Some(pid) = p {
-                    if pid.0 < doc.len() {
-                        if let dom::NodeData::Element(pe) = &doc.get(pid).data {
-                            if pe.tag.eq_ignore_ascii_case("details") {
-                                return Some(pid);
-                            }
-                        }
-                    }
-                    p = doc.get(pid).parent;
-                }
-                return None;
-            }
-        }
-        cur = doc.get(id).parent;
-    }
-    None
-}
-
 /// Depth-first search for the first element whose `id` attribute equals `id`.
+#[cfg(test)]
 pub(crate) fn find_by_attr_id(
     doc: &dom::Document,
     root: dom::NodeId,
@@ -1213,44 +1143,4 @@ pub(crate) fn ancestor_form(doc: &dom::Document, node: dom::NodeId) -> Option<do
         cur = doc.get(id).parent;
     }
     None
-}
-
-/// If the click on `node` lands on (or inside) a submit control — `<input type=submit>`,
-/// `<button type=submit>`, or a `<button>` with no/empty `type` — that sits inside a `<form>`,
-/// return that nearest ancestor form. Otherwise `None`.
-pub(crate) fn submit_target_form(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
-    fn is_submit_control(doc: &dom::Document, id: dom::NodeId) -> bool {
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.attrs.contains_key("disabled") {
-                return false;
-            }
-            let ty = e
-                .attrs
-                .get("type")
-                .map(|s| s.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if e.tag.eq_ignore_ascii_case("button") {
-                // A <button> defaults to type=submit.
-                return ty.is_empty() || ty == "submit";
-            }
-            if e.tag.eq_ignore_ascii_case("input") {
-                return ty == "submit";
-            }
-        }
-        false
-    }
-    // Find the nearest ancestor-or-self submit control.
-    let mut cur = Some(node);
-    let mut control = None;
-    while let Some(id) = cur {
-        if id.0 >= doc.len() {
-            break;
-        }
-        if is_submit_control(doc, id) {
-            control = Some(id);
-            break;
-        }
-        cur = doc.get(id).parent;
-    }
-    control.and_then(|c| ancestor_form(doc, c))
 }
