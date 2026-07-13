@@ -375,10 +375,8 @@ pub(crate) fn parse_calc_percent(val: &str, font_size: f32) -> Option<InsetValue
                 if let Some(p) = tok.strip_suffix('%').and_then(|n| n.parse::<f32>().ok()) {
                     pct += sign * p;
                     found_pct = true;
-                } else if let Some(l) = parse_length_fs(tok, font_size) {
-                    px += sign * l;
                 } else {
-                    return None;
+                    px += sign * parse_length_fs(tok, font_size)?;
                 }
                 sign = 1.0;
             }

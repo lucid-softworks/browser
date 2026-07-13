@@ -554,10 +554,8 @@ pub(crate) fn parse_gradient(
         (false, rest)
     } else if let Some(rest) = strip_func(&lower, v, "radial-gradient") {
         (true, rest)
-    } else if let Some(rest) = strip_func(&lower, v, "repeating-radial-gradient") {
-        (true, rest)
     } else {
-        return None;
+        (true, strip_func(&lower, v, "repeating-radial-gradient")?)
     };
 
     let mut parts = split_top_commas(body);
