@@ -2868,6 +2868,39 @@ mod tests {
     }
 
     #[test]
+    fn contain_intrinsic_size_sets_both_physical_axes() {
+        let cs = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { contain: size; contain-intrinsic-size: 100px auto 50px }",
+            |e| e.tag == "div",
+        );
+        assert!(cs.contain_width && cs.contain_height);
+        assert_eq!(cs.contain_intrinsic_width, Some(100.0));
+        assert_eq!(cs.contain_intrinsic_height, Some(50.0));
+        assert_eq!(cs.get_property("contain-intrinsic-size"), "100px auto 50px");
+    }
+
+    #[test]
+    fn contain_intrinsic_size_is_not_inherited_without_keyword() {
+        let parent = cs_of(
+            "<html><body><div><span></span></div></body></html>",
+            "div { contain-intrinsic-size: 25px 30px }",
+            |e| e.tag == "span",
+        );
+        assert_eq!(parent.get_property("contain-intrinsic-size"), "none");
+
+        let inherited = cs_of(
+            "<html><body><div><span></span></div></body></html>",
+            "div { contain-intrinsic-size: 25px 30px } span { contain-intrinsic-size: inherit }",
+            |e| e.tag == "span",
+        );
+        assert_eq!(
+            inherited.get_property("contain-intrinsic-size"),
+            "25px 30px"
+        );
+    }
+
+    #[test]
     fn parse_inset_value_retains_percent_and_calc() {
         assert_eq!(parse_inset_value("auto", 16.0), InsetValue::Auto);
         assert_eq!(parse_inset_value("10%", 16.0), InsetValue::Percent(10.0));

@@ -1207,11 +1207,30 @@ pub(crate) fn prim_elem_metrics(
     // `clientWidth`/`clientHeight` exclude borders/scrollbars, so they cannot reuse the border-box
     // `ow`/`oh`.
     let client_box = node.and_then(|n| {
-        with_cascade_map(&state, |_doc, map| {
-            map.get(&n).map(|cs| {
-                let cw = cs.width.unwrap_or(0.0) + cs.padding.left + cs.padding.right;
-                let ch = cs.height.unwrap_or(0.0) + cs.padding.top + cs.padding.bottom;
-                (cw, ch)
+        rect.map(|(_, _, w, h)| {
+            with_cascade_map(&state, |_doc, map| {
+                map.get(&n).map_or((w, h), |cs| {
+                    let laid_out = (
+                        (w - cs.border.left - cs.border.right).max(0.0),
+                        (h - cs.border.top - cs.border.bottom).max(0.0),
+                    );
+                    let specified = (
+                        cs.width.unwrap_or(0.0) + cs.padding.left + cs.padding.right,
+                        cs.height.unwrap_or(0.0) + cs.padding.top + cs.padding.bottom,
+                    );
+                    (
+                        if cs.contain_width {
+                            laid_out.0
+                        } else {
+                            specified.0
+                        },
+                        if cs.contain_height {
+                            laid_out.1
+                        } else {
+                            specified.1
+                        },
+                    )
+                })
             })
         })
     });

@@ -51,6 +51,10 @@ impl Default for ComputedStyle {
             aspect_ratio_set: false,
             height_pct: None,
             height: None,
+            contain_intrinsic_width: None,
+            contain_intrinsic_height: None,
+            contain_width: false,
+            contain_height: false,
             min_width: None,
             max_width: None,
             min_height: None,
@@ -318,6 +322,15 @@ impl ComputedStyle {
                 _ => format!("{collapse} {wrap}"),
             };
         }
+        if name == "contain-intrinsic-size" && !self.extra_properties.contains_key(&name) {
+            let width = self.get_property("contain-intrinsic-width");
+            let height = self.get_property("contain-intrinsic-height");
+            return if width == height {
+                width
+            } else {
+                format!("{width} {height}")
+            };
+        }
         if let Some(value) = self.extra_properties.get(&name) {
             return value.clone();
         }
@@ -344,6 +357,13 @@ impl ComputedStyle {
             "text-align-all" => Some("start"),
             "text-indent" | "word-spacing" => Some("0px"),
             "text-wrap" | "text-wrap-mode" => Some("wrap"),
+            "contain-intrinsic-width"
+            | "contain-intrinsic-height"
+            | "contain-intrinsic-inline-size"
+            | "contain-intrinsic-block-size"
+            | "contain-intrinsic-size" => Some("none"),
+            "contain" => Some("none"),
+            "content-visibility" => Some("visible"),
             _ => None,
         };
         if let Some(value) = extra_initial {
@@ -771,6 +791,11 @@ impl ComputedStyle {
             "display",
             "position",
             "overlay",
+            "contain-intrinsic-size",
+            "contain-intrinsic-width",
+            "contain-intrinsic-height",
+            "contain-intrinsic-inline-size",
+            "contain-intrinsic-block-size",
             "color",
             "background-color",
             "border-color",

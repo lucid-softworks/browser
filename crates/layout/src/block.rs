@@ -205,42 +205,56 @@ pub(crate) fn layout_block(
 
     // Dispatch on the display mode of this box.
     let display = display_of(boxx, styles);
-    let content_height = match display {
-        style::Display::Flex | style::Display::InlineFlex => {
-            layout_flex(boxx, child_ctx, styles, measurer)
-        }
-        style::Display::Grid | style::Display::InlineGrid => {
-            layout_grid(boxx, child_ctx, styles, measurer)
-        }
-        style::Display::Table => layout_table(boxx, child_ctx, styles, measurer),
-        _ if style_of(boxx, styles)
-            .and_then(|cs| cs.column_count)
-            .is_some() =>
-        {
-            layout_multicol(boxx, child_ctx, styles, measurer)
-        }
-        _ => {
-            // Block / inline-block / (anonymous, root): normal block-or-inline formatting.
-            let any_block = boxx.children.iter().any(|c| {
-                matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
-                    || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
-                        && image_is_block(c, styles))
-            });
-            if any_block {
-                layout_block_children(boxx, child_ctx, styles, measurer)
-            } else if !boxx.children.is_empty() {
-                let align = text_align_of(boxx.node, styles);
-                let indent = text_indent_of(boxx.node, styles);
-                layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
-            } else {
-                0.0
+    let content_hidden = style_of(boxx, styles).is_some_and(|cs| {
+        cs.extra_properties
+            .get("content-visibility")
+            .is_some_and(|v| v == "hidden")
+    });
+    let content_height = if content_hidden {
+        0.0
+    } else {
+        match display {
+            style::Display::Flex | style::Display::InlineFlex => {
+                layout_flex(boxx, child_ctx, styles, measurer)
+            }
+            style::Display::Grid | style::Display::InlineGrid => {
+                layout_grid(boxx, child_ctx, styles, measurer)
+            }
+            style::Display::Table => layout_table(boxx, child_ctx, styles, measurer),
+            _ if style_of(boxx, styles)
+                .and_then(|cs| cs.column_count)
+                .is_some() =>
+            {
+                layout_multicol(boxx, child_ctx, styles, measurer)
+            }
+            _ => {
+                // Block / inline-block / (anonymous, root): normal block-or-inline formatting.
+                let any_block = boxx.children.iter().any(|c| {
+                    matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+                        || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
+                            && image_is_block(c, styles))
+                });
+                if any_block {
+                    layout_block_children(boxx, child_ctx, styles, measurer)
+                } else if !boxx.children.is_empty() {
+                    let align = text_align_of(boxx.node, styles);
+                    let indent = text_indent_of(boxx.node, styles);
+                    layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
+                } else {
+                    0.0
+                }
             }
         }
     };
 
     // A definite height (explicit px or resolved percentage, box-sizing already applied) wins over the
     // content-derived height.
-    let final_height = definite_content_h.unwrap_or(content_height);
+    let final_height = definite_content_h.unwrap_or_else(|| {
+        style_of(boxx, styles)
+            .filter(|cs| cs.contain_height)
+            .and_then(|cs| cs.contain_intrinsic_height)
+            .unwrap_or(content_height)
+    });
     // Clamp the used height to min-height / max-height (% against the containing block height).
     let final_height = clamp_height(boxx, final_height, containing.height, styles);
     boxx.dimensions.content.height = final_height;

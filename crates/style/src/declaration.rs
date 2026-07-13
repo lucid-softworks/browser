@@ -841,6 +841,65 @@ pub(crate) fn has_system_color(val: &str) -> bool {
         .any(|t| crate::colors::is_system_color_keyword(&t.to_ascii_lowercase()))
 }
 
+/// Parse one `contain-intrinsic-*` longhand. The boolean records the `auto` remembered-size form;
+/// layout currently uses its fallback size, while CSSOM retains the distinction.
+fn parse_contain_intrinsic_axis(val: &str, font_size: f32) -> Option<(Option<f32>, String)> {
+    let lower = val
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let (auto, size) = lower
+        .strip_prefix("auto ")
+        .map_or((false, lower.as_str()), |v| (true, v));
+    let canonical = if size == "none" {
+        "none".to_string()
+    } else {
+        let value = parse_length_fs(size, font_size)?;
+        if value < 0.0 {
+            return None;
+        }
+        px(value)
+    };
+    Some((
+        if size == "none" {
+            None
+        } else {
+            parse_length_fs(size, font_size)
+        },
+        if auto {
+            format!("auto {canonical}")
+        } else {
+            canonical
+        },
+    ))
+}
+
+fn set_contain_intrinsic_axis(style: &mut ComputedStyle, physical_width: bool, val: &str) {
+    let Some((size, canonical)) = parse_contain_intrinsic_axis(val, style.font_size) else {
+        return;
+    };
+    let name = if physical_width {
+        "contain-intrinsic-width"
+    } else {
+        "contain-intrinsic-height"
+    };
+    style.extra_properties.insert(name.to_string(), canonical);
+    if physical_width {
+        style.contain_intrinsic_width = size;
+    } else {
+        style.contain_intrinsic_height = size;
+    }
+}
+
+fn contain_intrinsic_cascade_value(val: &str, parent: &ComputedStyle, name: &str) -> String {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "inherit" => parent.get_property(name),
+        "initial" | "unset" | "revert" | "revert-layer" => "none".to_string(),
+        _ => val.to_string(),
+    }
+}
+
 pub(crate) fn apply_declaration(
     style: &mut ComputedStyle,
     prop: &str,
@@ -946,6 +1005,121 @@ pub(crate) fn apply_declaration(
         }
     }
     match prop {
+        "contain-intrinsic-width" => {
+            let value = contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-width");
+            set_contain_intrinsic_axis(style, true, &value)
+        }
+        "contain-intrinsic-height" => {
+            let value = contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-height");
+            set_contain_intrinsic_axis(style, false, &value)
+        }
+        "contain-intrinsic-inline-size" => {
+            let width = style.writing_mode == WritingMode::HorizontalTb;
+            set_contain_intrinsic_axis(style, width, val);
+            let physical = if width {
+                "contain-intrinsic-width"
+            } else {
+                "contain-intrinsic-height"
+            };
+            let computed = style.get_property(physical);
+            style
+                .extra_properties
+                .insert("contain-intrinsic-inline-size".to_string(), computed);
+        }
+        "contain-intrinsic-block-size" => {
+            let width = style.writing_mode != WritingMode::HorizontalTb;
+            set_contain_intrinsic_axis(style, width, val);
+            let physical = if width {
+                "contain-intrinsic-width"
+            } else {
+                "contain-intrinsic-height"
+            };
+            let computed = style.get_property(physical);
+            style
+                .extra_properties
+                .insert("contain-intrinsic-block-size".to_string(), computed);
+        }
+        "contain-intrinsic-size" => {
+            let wide = val.trim().to_ascii_lowercase();
+            if matches!(
+                wide.as_str(),
+                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+            ) {
+                let width = contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-width");
+                let height =
+                    contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-height");
+                set_contain_intrinsic_axis(style, true, &width);
+                set_contain_intrinsic_axis(style, false, &height);
+                let computed_width = style.get_property("contain-intrinsic-width");
+                let computed_height = style.get_property("contain-intrinsic-height");
+                style.extra_properties.insert(
+                    "contain-intrinsic-size".to_string(),
+                    if computed_width == computed_height {
+                        computed_width
+                    } else {
+                        format!("{computed_width} {computed_height}")
+                    },
+                );
+                return;
+            }
+            let tokens: Vec<&str> = val.split_whitespace().collect();
+            let first_len = if tokens
+                .first()
+                .is_some_and(|t| t.eq_ignore_ascii_case("auto"))
+            {
+                2
+            } else {
+                1
+            };
+            if tokens.len() >= first_len {
+                let first = tokens[..first_len].join(" ");
+                let second = if tokens.len() == first_len {
+                    first.clone()
+                } else {
+                    tokens[first_len..].join(" ")
+                };
+                if parse_contain_intrinsic_axis(&first, style.font_size).is_some()
+                    && parse_contain_intrinsic_axis(&second, style.font_size).is_some()
+                {
+                    set_contain_intrinsic_axis(style, true, &first);
+                    set_contain_intrinsic_axis(style, false, &second);
+                    let width = style.get_property("contain-intrinsic-width");
+                    let height = style.get_property("contain-intrinsic-height");
+                    style.extra_properties.insert(
+                        "contain-intrinsic-size".to_string(),
+                        if width == height {
+                            width
+                        } else {
+                            format!("{width} {height}")
+                        },
+                    );
+                }
+            }
+        }
+        "contain" => {
+            let lower = val.to_ascii_lowercase();
+            let tokens: Vec<&str> = lower.split_whitespace().collect();
+            style.contain_width = tokens.iter().any(|t| matches!(*t, "size" | "strict"));
+            style.contain_height = style.contain_width;
+            if tokens.contains(&"inline-size") || tokens.contains(&"content") {
+                if style.writing_mode == WritingMode::HorizontalTb {
+                    style.contain_width = true;
+                } else {
+                    style.contain_height = true;
+                }
+            }
+            style.extra_properties.insert("contain".to_string(), lower);
+        }
+        "content-visibility" => {
+            let lower = val.trim().to_ascii_lowercase();
+            if lower == "hidden" {
+                style.contain_width = true;
+                style.contain_height = true;
+            }
+            style
+                .extra_properties
+                .insert("content-visibility".to_string(), lower);
+        }
         "font-variant-emoji" => {
             style.font_variant_emoji_emoji = val.trim().eq_ignore_ascii_case("emoji");
         }

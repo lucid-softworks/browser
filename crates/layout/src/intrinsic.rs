@@ -13,6 +13,13 @@ pub(crate) fn intrinsic_width(
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
 ) -> f32 {
+    if let Some(cs) = style_of(boxx, styles) {
+        if cs.contain_width {
+            let p = boxx.dimensions.padding;
+            let b = boxx.dimensions.border;
+            return cs.contain_intrinsic_width.unwrap_or(0.0) + p.left + p.right + b.left + b.right;
+        }
+    }
     if let Some(w) = explicit_width(boxx, styles) {
         let p = boxx.dimensions.padding;
         let b = boxx.dimensions.border;

@@ -866,6 +866,10 @@ pub(crate) fn compute_element_style<'a>(
         aspect_ratio_set: false,
         height_pct: None,
         height: None,
+        contain_intrinsic_width: None,
+        contain_intrinsic_height: None,
+        contain_width: false,
+        contain_height: false,
         min_width: None,
         max_width: None,
         min_height: None,
@@ -949,6 +953,19 @@ pub(crate) fn compute_element_style<'a>(
         // `color-scheme` inherits (initial `Normal`).
         color_scheme: parent.color_scheme,
     };
+    // These CSSOM-only entries are non-inherited; `extra_properties` otherwise begins as the
+    // inherited text-property set.
+    for property in [
+        "contain",
+        "content-visibility",
+        "contain-intrinsic-size",
+        "contain-intrinsic-width",
+        "contain-intrinsic-height",
+        "contain-intrinsic-inline-size",
+        "contain-intrinsic-block-size",
+    ] {
+        style.extra_properties.remove(property);
+    }
     if parent_hidden {
         style.display_none = true;
         style.display = Display::None;

@@ -396,6 +396,13 @@ pub struct ComputedStyle {
     pub width_pct: Option<f32>,
     /// `height` as a fraction; resolved against the containing block's (definite) content height.
     pub height_pct: Option<f32>,
+    /// Physical intrinsic-size substitutes used when size containment suppresses an axis.
+    pub contain_intrinsic_width: Option<f32>,
+    pub contain_intrinsic_height: Option<f32>,
+    /// Whether `contain` applies physical width/height size containment. `content-visibility:
+    /// hidden` also suppresses both axes and uses the same substitutes.
+    pub contain_width: bool,
+    pub contain_height: bool,
     /// Whether `aspect-ratio` specifies a ratio (not just `auto`). Used for the CSSOM resolved value
     /// of `min-width`/`min-height: auto`, which stays `auto` when a box has a preferred aspect ratio.
     pub aspect_ratio_set: bool,

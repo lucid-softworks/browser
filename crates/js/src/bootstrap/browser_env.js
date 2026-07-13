@@ -1636,6 +1636,7 @@
     "color", "background-color", "background-image", "background-position-x", "background-position-y",
     "background-size", "background-repeat", "background-attachment", "background-origin", "background-clip",
     "width", "height", "min-width", "min-height", "max-width", "max-height",
+    "contain-intrinsic-width", "contain-intrinsic-height", "contain-intrinsic-inline-size", "contain-intrinsic-block-size",
     "margin-top", "margin-right", "margin-bottom", "margin-left",
     "padding-top", "padding-right", "padding-bottom", "padding-left",
     "top", "right", "bottom", "left", "position", "display", "float", "clear", "visibility", "opacity",
@@ -1810,6 +1811,7 @@
     if (name === "place-self") return ["align-self", "justify-self"];
     if (name === "white-space") return ["white-space-collapse", "text-wrap-mode"];
     if (name === "columns") return ["column-width", "column-count"];
+    if (name === "contain-intrinsic-size") return ["contain-intrinsic-width", "contain-intrinsic-height"];
     // SVG `marker` shorthand sets all three marker longhands to the same value.
     if (name === "marker") return ["marker-start", "marker-mid", "marker-end"];
     return null;
@@ -1907,6 +1909,18 @@
     // A shorthand containing a pending substitution stays as a shorthand until computed-value time;
     // eagerly expanding it would change legacy-alias behavior and lose the original token stream.
     if (/(?:var|env)\s*\(/i.test(value)) return null;
+    if (name === "contain-intrinsic-size") {
+      var cis = splitCssTokens(value), parts = [], ci = 0;
+      while (ci < cis.length && parts.length < 2) {
+        if (cis[ci].toLowerCase() === "auto") {
+          if (ci + 1 >= cis.length) return null;
+          parts.push("auto " + cis[ci + 1]); ci += 2;
+        } else { parts.push(cis[ci]); ci++; }
+      }
+      if (ci !== cis.length || parts.length < 1 || parts.length > 2) return null;
+      if (parts.length === 1) parts.push(parts[0]);
+      return [[lhs[0], parts[0]], [lhs[1], parts[1]]];
+    }
     if (BOX_SHORTHANDS[name] && name !== "border-radius") {
       var b = expandBox(value); if (!b) return null;
       return [[lhs[0], b[0]], [lhs[1], b[1]], [lhs[2], b[2]], [lhs[3], b[3]]];
@@ -2152,6 +2166,10 @@
       if (wsc === "break-spaces" && wsm === "wrap") return "break-spaces";
       return wsc + " " + wsm;
     }
+    if (name === "contain-intrinsic-size") {
+      var cisw = g("contain-intrinsic-width"), cish = g("contain-intrinsic-height");
+      return cisw === cish ? cisw : cisw + " " + cish;
+    }
     // `marker`: the common longhand value when all three markers agree, else "".
     if (name === "marker") {
       var m0 = g("marker-start"), m1 = g("marker-mid"), m2 = g("marker-end");
@@ -2284,7 +2302,7 @@
       "border-top", "border-right", "border-bottom", "border-left", "border-radius", "border-image",
       "outline", "overflow", "overscroll-behavior", "gap", "list-style", "text-decoration",
       "flex", "flex-flow", "place-content", "place-items", "place-self", "columns", "column-rule",
-      "font", "font-variant", "background", "scroll-margin", "scroll-padding"
+      "font", "font-variant", "background", "scroll-margin", "scroll-padding", "contain-intrinsic-size"
     ];
     for (var k = 0; k < shorthands.length; k++) {
       add(shorthands[k]);
@@ -2350,6 +2368,7 @@
       "font-feature-settings font-variation-settings font-kerning font-optical-sizing font-language-override " +
       "font-size-adjust font-synthesis font-display src unicode-range ascent-override descent-override " +
       "line-gap-override size-adjust contain content-visibility container container-type container-name " +
+      "contain-intrinsic-size contain-intrinsic-width contain-intrinsic-height contain-intrinsic-inline-size contain-intrinsic-block-size " +
       "counter-set inset gap row-gap column-gap place-items place-content place-self justify-items " +
       "x y cx cy r rx ry " +
       "image-rendering image-orientation shape-outside shape-inside shape-subtract shape-margin shape-image-threshold " +
@@ -2633,6 +2652,28 @@
       return collapseCount <= 1 && wrapCount <= 1;
     }
     if (name === "overlay") return /^(none|auto)$/.test(vl);
+    if (/^contain-intrinsic-(?:width|height|inline-size|block-size)$/.test(name)) {
+      var cisv = splitCssTokens(v);
+      if (cisv.length === 2 && cisv[0].toLowerCase() === "auto") cisv.shift();
+      if (cisv.length !== 1) return false;
+      if (cisv[0].toLowerCase() === "none") return true;
+      if (cisv[0].indexOf("%") >= 0) return false;
+      return /^calc\(/i.test(cisv[0]) ? __calc.valid(cisv[0]) : isLenPct(cisv[0], false);
+    }
+    if (name === "contain-intrinsic-size") {
+      var cist = splitCssTokens(v), groups = 0, cii = 0;
+      while (cii < cist.length && groups < 2) {
+        if (cist[cii].toLowerCase() === "auto") {
+          if (cii + 1 >= cist.length) return false;
+          cii += 2;
+        } else { cii++; }
+        groups++;
+      }
+      if (cii !== cist.length || groups < 1 || groups > 2) return false;
+      var expandedCis = expandShorthand(name, v);
+      return expandedCis != null && isValidValue("contain-intrinsic-width", expandedCis[0][1]) &&
+        isValidValue("contain-intrinsic-height", expandedCis[1][1]);
+    }
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
     // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
@@ -2923,7 +2964,8 @@
       "inset-inline-start", "inset-inline-end", "text-indent", "letter-spacing", "word-spacing",
       "column-gap", "row-gap", "border-top-left-radius", "border-top-right-radius",
       "border-bottom-left-radius", "border-bottom-right-radius", "flex-basis",
-      "x", "y", "cx", "cy", "r", "rx", "ry"]);
+      "x", "y", "cx", "cy", "r", "rx", "ry",
+      "contain-intrinsic-width", "contain-intrinsic-height", "contain-intrinsic-inline-size", "contain-intrinsic-block-size"]);
     for (var i = 0; i < names.length; i++) { o[names[i]] = 1; }
     return o;
   })();
