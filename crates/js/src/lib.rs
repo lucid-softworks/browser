@@ -2678,6 +2678,30 @@ mod tests {
     }
 
     #[test]
+    fn range_insert_node_rejects_moving_existing_document_doctype() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var other = document.implementation.createHTMLDocument('');
+                   var tail = other.createComment('tail'); other.appendChild(tail);
+                   var r = other.createRange(); r.setStart(other, 1); r.setEnd(tail, 2);
+                   var name = ''; try { r.insertNode(other.doctype); } catch (e) { name = e.name; }
+                   [name, other.firstChild === other.doctype,
+                    r.startContainer === other, r.startOffset,
+                    r.endContainer === tail, r.endOffset].join('|')"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("HierarchyRequestError|true|true|1|true|2")
+        );
+    }
+
+    #[test]
     fn range_insert_node_rejects_parentless_text_boundary() {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(

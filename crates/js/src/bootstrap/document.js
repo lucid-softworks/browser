@@ -474,7 +474,10 @@
     if (nt === 3 && pt === 9) { hierarchyRequestError("A Text node may not be a child of a Document."); }
     if (pt === 9) {
       var sequence = __children(parentId).filter(function (child) {
-        return child !== nodeId && child !== replacedId;
+        // Pre-insertion validity is checked before an existing incoming node is removed. Retain it
+        // here so moving a Document's own element or doctype still observes the already-present
+        // child and fails. Replacement validation additionally omits the child being replaced.
+        return child !== replacedId;
       });
       var insertion = refId < 0 ? sequence.length : sequence.indexOf(refId);
       if (insertion < 0) { insertion = sequence.length; }
