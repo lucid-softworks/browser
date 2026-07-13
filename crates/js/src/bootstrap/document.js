@@ -687,6 +687,12 @@
       return __nodeType(id) === 1 ? __tag(id) : null;
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "nodeType", { get: function () { return __nodeType(id); }, enumerable: true, configurable: true });
+    // Legacy identity alias from Node. A node can be surfaced through more than one wrapper, so
+    // arena-backed nodes compare by their stable node id rather than wrapper object identity alone.
+    def(el, "isSameNode", function (other) {
+      if (this === other) { return true; }
+      return other != null && typeof other.__node === "number" && other.__node === id;
+    });
 
     Object.defineProperty(el, "textContent", {
       // Per spec: null for Document (9) and DocumentType (10); for everything else (Element,
@@ -977,6 +983,7 @@
       def(attr, "lookupNamespaceURI", function (prefix) { return nodeLookupNamespaceURI(id, prefix); });
       def(attr, "lookupPrefix", function (ns) { return nodeLookupPrefix(id, ns); });
       def(attr, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(id, ns); });
+      def(attr, "isSameNode", function (other) { return this === other; });
       try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
       __attrNodeCache[attrName] = attr;
       return attr;
@@ -1519,6 +1526,7 @@
     def(attr, "isDefaultNamespace", function (ns) {
       var oe = this.ownerElement; return oe && oe.isDefaultNamespace ? oe.isDefaultNamespace(ns) : (ns == null || ns === "");
     });
+    def(attr, "isSameNode", function (other) { return this === other; });
     try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
     return attr;
   }

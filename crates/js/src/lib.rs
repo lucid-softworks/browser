@@ -1098,6 +1098,9 @@ mod tests {
                     var ke = new KeyboardEvent("z"); ke.initKeyboardEvent("keydown", true, true, window, "Enter", 0, true, false, false, false);
                     r.push("ke:" + ke.type + ":" + ke.key + ":" + ke.ctrlKey);
                     r.push("doc:" + (document.getRootNode() === document) + ":" + document.isSameNode(document));
+                    var detached = document.implementation.createHTMLDocument("");
+                    var attr = document.createAttribute("data-value");
+                    r.push("identity:" + detached.isSameNode(detached) + ":" + detached.isSameNode(document) + ":" + attr.isSameNode(attr) + ":" + attr.isSameNode(document.createAttribute("data-value")));
                     r.join("|")"#
                 .to_string()],
             "https://example.com/",
@@ -1105,7 +1108,7 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(
             out[0].value.as_deref(),
-            Some("me:click:30:40:true:true|ue:custom:5|ke:keydown:Enter:true|doc:true:true")
+            Some("me:click:30:40:true:true|ue:custom:5|ke:keydown:Enter:true|doc:true:true|identity:true:false:true:false")
         );
     }
 

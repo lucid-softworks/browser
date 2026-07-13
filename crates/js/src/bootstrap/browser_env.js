@@ -6372,6 +6372,7 @@
       Object.defineProperty(doc, "nextSibling", { get: function () { return null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "ownerDocument", { get: function () { return null; }, configurable: true, enumerable: true });
       def(doc, "contains", function (other) { return nodeContains(doc, other); });
+      def(doc, "isSameNode", function (other) { return other === doc; });
       def(doc, "compareDocumentPosition", function (other) {
         if (!other || typeof other.__node !== "number") {
           throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
