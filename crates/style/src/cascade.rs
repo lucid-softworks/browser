@@ -881,6 +881,7 @@ pub(crate) fn compute_element_style<'a>(
         flex_direction: FlexDirection::Row,
         flex_wrap: FlexWrap::NoWrap,
         justify_content: JustifyContent::FlexStart,
+        justify_content_css: "normal".to_string(),
         align_items: AlignItems::Stretch,
         align_items_css: "normal".to_string(),
         // `justify-items: legacy <position>` is the one form that passes to descendants; all other
@@ -891,6 +892,7 @@ pub(crate) fn compute_element_style<'a>(
             "normal".to_string()
         },
         align_content: None,
+        align_content_css: "normal".to_string(),
         flex_grow: 0.0,
         flex_shrink: 1.0,
         flex_basis: None,

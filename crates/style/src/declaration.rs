@@ -1,15 +1,60 @@
 use crate::*;
 
-/// Parse a `justify-content` / `align-content` keyword.
-pub(crate) fn parse_justify(val: &str) -> Option<JustifyContent> {
-    match val.trim().to_ascii_lowercase().as_str() {
-        "flex-start" | "start" | "left" => Some(JustifyContent::FlexStart),
-        "flex-end" | "end" | "right" => Some(JustifyContent::FlexEnd),
-        "center" => Some(JustifyContent::Center),
+/// Canonicalize an `align-content` / `justify-content` value for CSSOM while retaining the
+/// layout-facing enum separately.
+fn parse_content_value(val: &str, justify: bool) -> Option<String> {
+    let value = val
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let canonical = if value == "first baseline" {
+        "baseline"
+    } else {
+        value.as_str()
+    };
+    if matches!(
+        canonical,
+        "normal"
+            | "stretch"
+            | "space-between"
+            | "space-around"
+            | "space-evenly"
+            | "start"
+            | "end"
+            | "center"
+            | "flex-start"
+            | "flex-end"
+    ) || (justify && matches!(canonical, "left" | "right"))
+        || (!justify && matches!(canonical, "baseline" | "last baseline"))
+    {
+        return Some(canonical.to_string());
+    }
+    let tokens: Vec<&str> = canonical.split_whitespace().collect();
+    if tokens.len() == 2
+        && matches!(tokens[0], "safe" | "unsafe")
+        && (matches!(
+            tokens[1],
+            "start" | "end" | "center" | "flex-start" | "flex-end"
+        ) || (justify && matches!(tokens[1], "left" | "right")))
+    {
+        return Some(canonical.to_string());
+    }
+    None
+}
+
+fn content_layout_value(value: &str) -> Option<JustifyContent> {
+    let position = value.split_whitespace().last().unwrap_or("normal");
+    match value {
         "space-between" => Some(JustifyContent::SpaceBetween),
         "space-around" => Some(JustifyContent::SpaceAround),
         "space-evenly" => Some(JustifyContent::SpaceEvenly),
-        _ => None,
+        _ => match position {
+            "end" | "flex-end" | "right" => Some(JustifyContent::FlexEnd),
+            "center" => Some(JustifyContent::Center),
+            "start" | "flex-start" | "left" => Some(JustifyContent::FlexStart),
+            _ => None,
+        },
     }
 }
 
@@ -890,8 +935,17 @@ pub(crate) fn apply_declaration(
             }
         }
         "justify-content" => {
-            if let Some(j) = parse_justify(val) {
-                style.justify_content = j;
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.justify_content_css.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_content_value(val, true),
+            };
+            if let Some(computed) = computed {
+                if let Some(j) = content_layout_value(&computed) {
+                    style.justify_content = j;
+                }
+                style.justify_content_css = computed;
             }
         }
         "align-items" => {
@@ -929,8 +983,15 @@ pub(crate) fn apply_declaration(
             }
         }
         "align-content" => {
-            if let Some(j) = parse_justify(val) {
-                style.align_content = Some(j);
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.align_content_css.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_content_value(val, false),
+            };
+            if let Some(computed) = computed {
+                style.align_content = content_layout_value(&computed);
+                style.align_content_css = computed;
             }
         }
 

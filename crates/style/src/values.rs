@@ -434,6 +434,8 @@ pub struct ComputedStyle {
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
     pub justify_content: JustifyContent,
+    /// Canonical computed content-distribution values; layout uses the compact enum alongside them.
+    pub justify_content_css: String,
     pub align_items: AlignItems,
     /// Canonical computed `align-items` value. Kept separately because layout folds values such as
     /// `safe end` / `self-start` into its smaller alignment enum.
@@ -442,6 +444,7 @@ pub struct ComputedStyle {
     pub justify_items: String,
     /// Cross-axis distribution of flex lines (multi-line). `None` = default (stretch-ish).
     pub align_content: Option<JustifyContent>,
+    pub align_content_css: String,
 
     // --- Flex item properties ---
     pub flex_grow: f32,

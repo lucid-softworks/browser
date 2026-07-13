@@ -2433,6 +2433,17 @@
       }
       return vl === "first baseline";
     }
+    if (name === "align-content" || name === "justify-content") {
+      var contentTokens = vl.split(/\s+/);
+      if (/^(normal|stretch|space-between|space-around|space-evenly|start|end|center|flex-start|flex-end)$/.test(vl)) return true;
+      if (name === "justify-content" && /^(left|right)$/.test(vl)) return true;
+      if (name === "align-content" && /^(baseline|first baseline|last baseline)$/.test(vl)) return true;
+      if (contentTokens.length === 2 && /^(safe|unsafe)$/.test(contentTokens[0])) {
+        if (/^(start|end|center|flex-start|flex-end)$/.test(contentTokens[1])) return true;
+        if (name === "justify-content" && /^(left|right)$/.test(contentTokens[1])) return true;
+      }
+      return false;
+    }
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
     // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
@@ -2610,7 +2621,7 @@
       return;
     }
     var nv = normalizeCssValue(val);
-    if ((name === "align-self" || name === "justify-self") && nv.toLowerCase() === "first baseline") {
+    if ((name === "align-self" || name === "justify-self" || name === "align-content") && nv.toLowerCase() === "first baseline") {
       nv = "baseline";
     }
     // The `font` shorthand serializes size/line-height with spaces around the slash: `10px / 1`.

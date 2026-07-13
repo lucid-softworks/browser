@@ -65,10 +65,12 @@ impl Default for ComputedStyle {
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,
+            justify_content_css: "normal".to_string(),
             align_items: AlignItems::Stretch,
             align_items_css: "normal".to_string(),
             justify_items: "normal".to_string(),
             align_content: None,
+            align_content_css: "normal".to_string(),
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
@@ -551,13 +553,10 @@ impl ComputedStyle {
                 FlexWrap::WrapReverse => "wrap-reverse",
             }
             .to_string(),
-            "justify-content" => justify_content_str(self.justify_content).to_string(),
+            "justify-content" => self.justify_content_css.clone(),
             "align-items" => self.align_items_css.clone(),
             "justify-items" => self.justify_items.clone(),
-            "align-content" => match self.align_content {
-                Some(jc) => justify_content_str(jc).to_string(),
-                None => "normal".to_string(),
-            },
+            "align-content" => self.align_content_css.clone(),
 
             // --- flex item ---
             "flex-grow" => num(self.flex_grow),

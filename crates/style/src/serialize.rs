@@ -220,17 +220,6 @@ pub(crate) fn size_constraint_str(c: SizeConstraint) -> String {
     }
 }
 
-pub(crate) fn justify_content_str(jc: JustifyContent) -> &'static str {
-    match jc {
-        JustifyContent::FlexStart => "flex-start",
-        JustifyContent::FlexEnd => "flex-end",
-        JustifyContent::Center => "center",
-        JustifyContent::SpaceBetween => "space-between",
-        JustifyContent::SpaceAround => "space-around",
-        JustifyContent::SpaceEvenly => "space-evenly",
-    }
-}
-
 /// Serialize four edges the way `getComputedStyle` returns the shorthand: collapsed when sides are
 /// equal, otherwise the full `top right bottom left` form.
 pub(crate) fn edges_str(e: Edges) -> String {
