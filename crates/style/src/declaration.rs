@@ -15,7 +15,12 @@ pub(crate) fn parse_justify(val: &str) -> Option<JustifyContent> {
 
 /// Canonicalize an align/justify-items value while retaining the full CSSOM grammar that the
 /// layout-facing enums intentionally collapse.
-pub(crate) fn parse_items_value(val: &str, justify: bool) -> Option<String> {
+pub(crate) fn parse_items_value(
+    val: &str,
+    justify: bool,
+    allow_auto: bool,
+    allow_legacy: bool,
+) -> Option<String> {
     let value = val
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -39,7 +44,10 @@ pub(crate) fn parse_items_value(val: &str, justify: bool) -> Option<String> {
         "flex-start",
         "flex-end",
     ];
-    if single.contains(&canonical) || (justify && matches!(canonical, "left" | "right")) {
+    if single.contains(&canonical)
+        || (justify && matches!(canonical, "left" | "right"))
+        || (allow_auto && canonical == "auto")
+    {
         return Some(canonical.to_string());
     }
     let tokens: Vec<&str> = canonical.split_whitespace().collect();
@@ -53,6 +61,14 @@ pub(crate) fn parse_items_value(val: &str, justify: bool) -> Option<String> {
         return Some(canonical.to_string());
     }
     if justify
+        && tokens.len() == 2
+        && matches!(tokens[0], "safe" | "unsafe")
+        && matches!(tokens[1], "left" | "right")
+    {
+        return Some(canonical.to_string());
+    }
+    if allow_legacy
+        && justify
         && tokens.len() == 2
         && tokens[0] == "legacy"
         && matches!(tokens[1], "left" | "right" | "center")
@@ -883,7 +899,7 @@ pub(crate) fn apply_declaration(
             let computed = match lower.as_str() {
                 "inherit" => Some(parent.align_items_css.clone()),
                 "initial" | "unset" => Some("normal".to_string()),
-                _ => parse_items_value(val, false),
+                _ => parse_items_value(val, false, false, false),
             };
             if let Some(computed) = computed {
                 let position = computed.split_whitespace().last().unwrap_or("normal");
@@ -907,7 +923,7 @@ pub(crate) fn apply_declaration(
             if let Some(computed) = match lower.as_str() {
                 "inherit" => Some(parent.justify_items.clone()),
                 "initial" | "unset" => Some("normal".to_string()),
-                _ => parse_items_value(val, true),
+                _ => parse_items_value(val, true, false, true),
             } {
                 style.justify_items = computed;
             }
@@ -940,16 +956,41 @@ pub(crate) fn apply_declaration(
                 style.flex_basis_pct = None;
             }
         }
-        "align-self" => match val.trim().to_ascii_lowercase().as_str() {
-            "auto" => style.align_self = AlignSelf::Auto,
-            "stretch" => style.align_self = AlignSelf::Stretch,
-            "flex-start" | "start" => style.align_self = AlignSelf::FlexStart,
-            "flex-end" | "end" => style.align_self = AlignSelf::FlexEnd,
-            "center" => style.align_self = AlignSelf::Center,
-            "baseline" | "first baseline" => style.align_self = AlignSelf::Baseline,
-            "last baseline" => style.align_self = AlignSelf::LastBaseline,
-            _ => {}
-        },
+        "align-self" => {
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.align_self_css.clone()),
+                "initial" | "unset" => Some("auto".to_string()),
+                _ => parse_items_value(val, false, true, false),
+            };
+            if let Some(computed) = computed {
+                let position = computed.split_whitespace().last().unwrap_or("auto");
+                style.align_self = if computed == "last baseline" {
+                    AlignSelf::LastBaseline
+                } else {
+                    match position {
+                        "auto" => AlignSelf::Auto,
+                        "stretch" | "normal" => AlignSelf::Stretch,
+                        "flex-start" | "start" | "self-start" => AlignSelf::FlexStart,
+                        "flex-end" | "end" | "self-end" => AlignSelf::FlexEnd,
+                        "center" => AlignSelf::Center,
+                        "baseline" => AlignSelf::Baseline,
+                        _ => style.align_self,
+                    }
+                };
+                style.align_self_css = computed;
+            }
+        }
+        "justify-self" => {
+            let lower = val.trim().to_ascii_lowercase();
+            if let Some(computed) = match lower.as_str() {
+                "inherit" => Some(parent.justify_self.clone()),
+                "initial" | "unset" => Some("auto".to_string()),
+                _ => parse_items_value(val, true, true, false),
+            } {
+                style.justify_self = computed;
+            }
+        }
         "order" => {
             if let Ok(n) = val.trim().parse::<i32>() {
                 style.order = n;

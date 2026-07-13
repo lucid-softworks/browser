@@ -74,6 +74,8 @@ impl Default for ComputedStyle {
             flex_basis: None,
             flex_basis_pct: None,
             align_self: AlignSelf::Auto,
+            align_self_css: "auto".to_string(),
+            justify_self: "auto".to_string(),
             order: 0,
             row_gap: 0.0,
             column_gap: 0.0,
@@ -561,16 +563,8 @@ impl ComputedStyle {
             "flex-grow" => num(self.flex_grow),
             "flex-shrink" => num(self.flex_shrink),
             "flex-basis" => self.flex_basis.map(px).unwrap_or_else(|| "auto".to_string()),
-            "align-self" => match self.align_self {
-                AlignSelf::Auto => "auto",
-                AlignSelf::Stretch => "stretch",
-                AlignSelf::FlexStart => "flex-start",
-                AlignSelf::FlexEnd => "flex-end",
-                AlignSelf::Center => "center",
-                AlignSelf::Baseline => "baseline",
-                AlignSelf::LastBaseline => "last baseline",
-            }
-            .to_string(),
+            "align-self" => self.align_self_css.clone(),
+            "justify-self" => self.justify_self.clone(),
             "order" => self.order.to_string(),
 
             // --- gaps ---
@@ -772,6 +766,7 @@ impl ComputedStyle {
             "flex-shrink",
             "flex-basis",
             "align-self",
+            "justify-self",
             "order",
             "row-gap",
             "column-gap",

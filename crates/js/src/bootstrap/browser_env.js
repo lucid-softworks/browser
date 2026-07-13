@@ -2423,6 +2423,16 @@
     if (isCssWideKeyword(v)) return true;
     var vl = v.toLowerCase();
     if (/(^|[^a-z-])(var|env)\s*\(/i.test(v)) return true; // can't validate around substitutions
+    if (name === "align-self" || name === "justify-self") {
+      var selfTokens = vl.split(/\s+/);
+      if (/^(auto|normal|stretch|baseline|last baseline|start|end|self-start|self-end|center|flex-start|flex-end)$/.test(vl)) return true;
+      if (name === "justify-self" && /^(left|right)$/.test(vl)) return true;
+      if (selfTokens.length === 2 && /^(safe|unsafe)$/.test(selfTokens[0])) {
+        if (/^(start|end|self-start|self-end|center|flex-start|flex-end)$/.test(selfTokens[1])) return true;
+        if (name === "justify-self" && /^(left|right)$/.test(selfTokens[1])) return true;
+      }
+      return vl === "first baseline";
+    }
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
     // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
@@ -2600,6 +2610,9 @@
       return;
     }
     var nv = normalizeCssValue(val);
+    if ((name === "align-self" || name === "justify-self") && nv.toLowerCase() === "first baseline") {
+      nv = "baseline";
+    }
     // The `font` shorthand serializes size/line-height with spaces around the slash: `10px / 1`.
     // It also resets every font-variant longhand to its initial (which serializes as absent inline).
     if (name === "font" && !isCssWideKeyword(nv)) {

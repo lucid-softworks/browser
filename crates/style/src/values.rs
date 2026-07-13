@@ -453,6 +453,9 @@ pub struct ComputedStyle {
     /// is `None`.
     pub flex_basis_pct: Option<f32>,
     pub align_self: AlignSelf,
+    /// Canonical computed self-alignment values; layout folds these into `align_self` where needed.
+    pub align_self_css: String,
+    pub justify_self: String,
     pub order: i32,
 
     // --- Gaps (flex & grid) ---

@@ -2476,6 +2476,25 @@ mod tests {
     }
 
     #[test]
+    fn self_alignment_keeps_cssom_values_and_explicit_inheritance() {
+        let sheet = css::parse(
+            "#a { align-self: safe self-end; justify-self: safe left } #child { align-self: inherit; justify-self: inherit } #b { justify-self: first baseline }",
+        );
+        let doc = html::parse(
+            "<html><body><div id=a><span id=child></span></div><div id=b></div></body></html>",
+        );
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "a"));
+        let b = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "b"));
+        let child = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "child"));
+        assert_eq!(map[&a].get_property("align-self"), "safe self-end");
+        assert_eq!(map[&a].get_property("justify-self"), "safe left");
+        assert_eq!(map[&child].get_property("align-self"), "safe self-end");
+        assert_eq!(map[&child].get_property("justify-self"), "safe left");
+        assert_eq!(map[&b].get_property("justify-self"), "baseline");
+    }
+
+    #[test]
     fn get_property_untracked_returns_empty() {
         let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
             e.tag == "div"
