@@ -5507,6 +5507,44 @@ mod tests {
     }
 
     #[test]
+    fn click_dispatch_runs_one_activation_behavior() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var events = [];
+              var outer = document.createElement('input'); outer.type = 'checkbox';
+              var inner = document.createElement('input'); inner.type = 'checkbox';
+              outer.appendChild(inner); document.body.appendChild(outer);
+              outer.addEventListener('input', function (event) { if (event.target === outer) events.push('outer'); });
+              inner.addEventListener('input', function () { events.push('inner'); });
+              inner.click();
+
+              var canceled = document.createElement('input'); canceled.type = 'checkbox';
+              var canceledInputs = 0;
+              canceled.addEventListener('click', function (event) { event.preventDefault(); });
+              canceled.addEventListener('input', function () { canceledInputs++; });
+              document.body.appendChild(canceled); canceled.click();
+
+              var blockedOuter = document.createElement('input'); blockedOuter.type = 'checkbox';
+              var label = document.createElement('label');
+              var button = document.createElement('button'); button.type = 'button';
+              label.appendChild(button); blockedOuter.appendChild(label); document.body.appendChild(blockedOuter);
+              button.click();
+              [events.join(','), inner.checked, outer.checked,
+               canceled.checked, canceledInputs, blockedOuter.checked].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("inner|true|false|false|0|false")
+        );
+    }
+
+    #[test]
     fn srcless_iframe_has_window_and_location_throws_on_invalid() {
         // A srcless <iframe> still has an about:blank browsing context: contentWindow exposes the
         // frame realm's globals (e.g. DOMException), and assigning contentWindow.location an invalid

@@ -971,6 +971,149 @@
     if (path.indexOf(globalThis) < 0) { path.push(globalThis); }
     return path;
   });
+  function __activationTag(el) {
+    try { return String(el.localName || el.tagName || "").toLowerCase(); } catch (e) { return ""; }
+  }
+  function __activationType(el, fallback) {
+    try { return String(el.getAttribute("type") || fallback || "").toLowerCase(); } catch (e) { return fallback || ""; }
+  }
+  function __isInteractiveContent(el) {
+    var tag = __activationTag(el);
+    if (tag === "a" || tag === "area" || tag === "button" || tag === "details" || tag === "iframe" || tag === "select" || tag === "textarea") { return true; }
+    if (tag === "input") { return __activationType(el, "text") !== "hidden"; }
+    if (tag === "audio" || tag === "video") { try { return el.hasAttribute("controls"); } catch (e) {} }
+    return false;
+  }
+  function __labelContainsInteractiveTarget(label, target) {
+    for (var cur = target; cur && cur !== label; cur = cur.parentNode) {
+      if (__isInteractiveContent(cur)) { return true; }
+    }
+    return false;
+  }
+  function __activationKind(el, originalTarget) {
+    if (!el || typeof el.nodeType !== "number" || el.nodeType !== 1) { return null; }
+    var tag = __activationTag(el), type;
+    try { if (el.hasAttribute("disabled")) { return null; } } catch (e) {}
+    if (tag === "input") {
+      type = __activationType(el, "text");
+      if (type === "checkbox" || type === "radio") { return type; }
+      if (type === "submit" || type === "image") { return "submit"; }
+      if (type === "reset") { return "reset"; }
+    }
+    if (tag === "button") {
+      type = __activationType(el, "submit");
+      if (type === "submit" || type === "reset") { return type; }
+    }
+    if ((tag === "a" || tag === "area") && el.hasAttribute && el.hasAttribute("href")) { return "link"; }
+    if (tag === "summary") {
+      var details = el.parentNode;
+      if (__activationTag(details) === "details") {
+        var children = details.children || [];
+        for (var i = 0; i < children.length; i++) {
+          if (__activationTag(children[i]) === "summary") { return children[i] === el ? "summary" : null; }
+        }
+      }
+    }
+    if (tag === "label") {
+      // A click whose target is interactive content inside a label makes the label's activation
+      // behavior a no-op, but it still occupies the one activation-target slot. Ancestors must not
+      // become a fallback activation target.
+      return __labelContainsInteractiveTarget(el, originalTarget) ? "noop" : "label";
+    }
+    return null;
+  }
+  function __findActivationTarget(path, originalTarget) {
+    for (var i = 0; i < path.length; i++) {
+      var kind = __activationKind(path[i], originalTarget);
+      if (kind) { return { element: path[i], kind: kind }; }
+    }
+    return null;
+  }
+  function __findForm(control) {
+    for (var cur = control && control.parentNode; cur; cur = cur.parentNode) {
+      if (__activationTag(cur) === "form") { return cur; }
+    }
+    return null;
+  }
+  function __radioGroup(input) {
+    var form = __findForm(input), scope = form || document, name = "", radios = [];
+    try { name = String(input.getAttribute("name") || ""); radios = scope.querySelectorAll("input[type=radio]"); } catch (e) {}
+    var group = [];
+    for (var i = 0; i < radios.length; i++) {
+      var radio = radios[i], radioName = "";
+      try { radioName = String(radio.getAttribute("name") || ""); } catch (e2) {}
+      if (radioName === name && __findForm(radio) === form) { group.push(radio); }
+    }
+    return group;
+  }
+  function __legacyPreActivate(activation) {
+    if (!activation || (activation.kind !== "checkbox" && activation.kind !== "radio")) { return null; }
+    var el = activation.element;
+    if (activation.kind === "checkbox") {
+      var oldChecked = !!el.checked;
+      el.checked = !oldChecked;
+      return { elements: [el], checked: [oldChecked] };
+    }
+    var group = __radioGroup(el), old = [];
+    if (group.indexOf(el) < 0) { group.push(el); }
+    for (var i = 0; i < group.length; i++) { old.push(!!group[i].checked); group[i].checked = group[i] === el; }
+    return { elements: group, checked: old };
+  }
+  function __restorePreActivation(state) {
+    if (!state) { return; }
+    for (var i = 0; i < state.elements.length; i++) { state.elements[i].checked = state.checked[i]; }
+  }
+  function __dispatchActivationEvent(target, type, bubbles, cancelable) {
+    try { return target.dispatchEvent(new globalThis.Event(type, { bubbles: bubbles, cancelable: cancelable })); }
+    catch (e) { return true; }
+  }
+  function __activate(activation) {
+    if (!activation) { return; }
+    var el = activation.element, kind = activation.kind;
+    if (kind === "noop") { return; }
+    if (kind === "checkbox" || kind === "radio") {
+      __dispatchActivationEvent(el, "input", true, false);
+      __dispatchActivationEvent(el, "change", true, false);
+      return;
+    }
+    if (kind === "submit" || kind === "reset") {
+      var form = __findForm(el);
+      // This activation belongs to exactly one form. Keeping the synthetic submit/reset event at
+      // that form prevents invalid programmatic nested-form trees from invoking an ancestor form's
+      // activation handler as a second activation.
+      if (form) { __dispatchActivationEvent(form, kind, false, true); }
+      return;
+    }
+    if (kind === "summary") {
+      var details = el.parentNode;
+      try { if (details.hasAttribute("open")) { details.removeAttribute("open"); } else { details.setAttribute("open", ""); } } catch (e) {}
+      setTimeout(function () { __dispatchActivationEvent(details, "toggle", false, false); }, 0);
+      return;
+    }
+    if (kind === "label") {
+      var control = null, id = "";
+      try { id = el.getAttribute("for") || ""; } catch (e2) {}
+      if (id) { try { control = document.getElementById(id); } catch (e3) {} }
+      if (!control) { try { control = el.querySelector("button,input,select,textarea"); } catch (e4) {} }
+      if (control && typeof control.click === "function") { control.click(); }
+      return;
+    }
+    if (kind === "link") {
+      var oldURL = String(globalThis.location.href || ""), newURL = "";
+      try { newURL = String(el.href || el.getAttribute("href") || ""); } catch (e5) {}
+      if (!newURL) { return; }
+      globalThis.location.href = newURL;
+      newURL = String(globalThis.location.href || newURL);
+      if (oldURL !== newURL && oldURL.split("#")[0] === newURL.split("#")[0]) {
+        setTimeout(function () {
+          var hev;
+          try { hev = new globalThis.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: newURL }); }
+          catch (e6) { hev = new globalThis.Event("hashchange"); try { hev.oldURL = oldURL; hev.newURL = newURL; } catch (e7) {} }
+          globalThis.dispatchEvent(hev);
+        }, 0);
+      }
+    }
+  }
   // Shared dispatch for `target.dispatchEvent(ev)`. Drives constructed Event objects (which carry
   // internal __ev state + read-only getters) through the full DOM dispatch algorithm: builds the
   // propagation path, runs the capture phase (root -> target), the target phase, then the bubble
@@ -987,6 +1130,11 @@
     var bubbles = s.bubbles;
 
     var path = globalThis.__eventPath(target); // [target, ...ancestors, document, window]
+    // The DOM dispatch algorithm chooses at most one activation target: the first element with
+    // activation behavior in target-to-root order. Checkable controls run legacy pre-activation
+    // before listeners so click handlers observe the tentative checked state.
+    var activation = type === "click" ? __findActivationTarget(path, target) : null;
+    var preActivation = __legacyPreActivate(activation);
 
     s.dispatching = true; s.target = target; s.stopPropagation = false;
     s.stopImmediate = false; s.path = path.slice();
@@ -1019,6 +1167,8 @@
 
     s.eventPhase = 0; s.currentTarget = null; s.stopPropagation = false;
     s.stopImmediate = false; s.dispatching = false;
+    if (s.defaultPrevented) { __restorePreActivation(preActivation); }
+    else { __activate(activation); }
     return !s.defaultPrevented;
   });
   installEvents(globalThis);
@@ -5567,17 +5717,16 @@
           }
           // `checked` for checkbox/radio inputs, backed by presence of the `checked` attribute.
           if (__formTag === "input") {
-            var __ty = String(__getAttr(node, "type") || "").toLowerCase();
-            if (__ty === "checkbox" || __ty === "radio") {
-              var __hasChecked = false;
-              try { var __cd = Object.getOwnPropertyDescriptor(el, "checked"); __hasChecked = !!(__cd && (__cd.get || __cd.set)); } catch (e9) {}
-              if (!__hasChecked) {
-                Object.defineProperty(el, "checked", {
-                  get: function () { return __getAttr(node, "checked") != null; },
-                  set: function (v) { if (v) { __setAttr(node, "checked", ""); } else { __removeAttr(node, "checked"); } },
-                  configurable: true, enumerable: true
-                });
-              }
+            // Install regardless of the input's current type: scripts commonly create a text input
+            // and set `type = "checkbox"` afterwards, but the checked IDL member still exists.
+            var __hasChecked = false;
+            try { var __cd = Object.getOwnPropertyDescriptor(el, "checked"); __hasChecked = !!(__cd && (__cd.get || __cd.set)); } catch (e9) {}
+            if (!__hasChecked) {
+              Object.defineProperty(el, "checked", {
+                get: function () { return __getAttr(node, "checked") != null; },
+                set: function (v) { if (v) { __setAttr(node, "checked", ""); } else { __removeAttr(node, "checked"); } },
+                configurable: true, enumerable: true
+              });
             }
           }
         }
@@ -5886,7 +6035,13 @@
     if (typeof el.scrollIntoView !== "function") { def(el, "scrollIntoView", function () { try { __scrollIntoView(this.__node); } catch (e) {} }); }
     if (typeof el.focus !== "function") { def(el, "focus", fn); }
     if (typeof el.blur !== "function") { def(el, "blur", fn); }
-    if (typeof el.click !== "function") { def(el, "click", fn); }
+    if (typeof el.click !== "function") {
+      def(el, "click", function () {
+        if (this.hasAttribute && this.hasAttribute("disabled")) { return; }
+        var ev = new globalThis.MouseEvent("click", { bubbles: true, cancelable: true, composed: true });
+        this.dispatchEvent(ev);
+      });
+    }
     if (typeof el.cloneNode !== "function") { def(el, "cloneNode", function () { return this; }); }
     // Web Animations: minimal `Element.animate()` returning an Animation whose `finished`/`ready`
     // promises settle (after the effect's delay+duration). We don't composite animations, so styles
