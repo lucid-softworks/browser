@@ -2595,6 +2595,45 @@ mod tests {
     }
 
     #[test]
+    fn is_equal_node_compares_all_node_wrappers_structurally() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var left = document.createElement('section');
+                   var right = document.createElement('section');
+                   left.setAttribute('data-x', '1'); right.setAttribute('data-x', '1');
+                   left.appendChild(document.createTextNode('same'));
+                   right.appendChild(document.createTextNode('same'));
+                   var equalTrees = left.isEqualNode(right);
+                   var equalText = left.firstChild.isEqualNode(right.firstChild);
+                   right.firstChild.data = 'different';
+                   var differentTrees = left.isEqualNode(right);
+                   var leftAttr = document.createAttribute('data-x'); leftAttr.value = '1';
+                   var rightAttr = document.createAttribute('data-x'); rightAttr.value = '1';
+                   var equalAttrs = leftAttr.isEqualNode(rightAttr);
+                   rightAttr.value = '2';
+                   var differentAttrs = leftAttr.isEqualNode(rightAttr);
+                   var leftDoc = document.implementation.createHTMLDocument('');
+                   var rightDoc = document.implementation.createHTMLDocument('');
+                   var equalDocs = leftDoc.isEqualNode(rightDoc);
+                   rightDoc.body.appendChild(rightDoc.createElement('p'));
+                   var differentDocs = leftDoc.isEqualNode(rightDoc);
+                   var xml = document.implementation.createDocument(null, 'root');
+                   var cdata = xml.createCDATASection('same');
+                   var equalCdata = cdata.isEqualNode(xml.createCDATASection('same'));
+                   [equalTrees, equalText, differentTrees, equalAttrs, differentAttrs,
+                    equalDocs, differentDocs, equalCdata].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true|true|false|true|false|true|false|true")
+        );
+    }
+
+    #[test]
     fn range_insert_node_splits_text_and_updates_collapsed_end() {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(

@@ -786,6 +786,14 @@
       if (this === other) { return true; }
       return other != null && typeof other.__node === "number" && other.__node === id;
     });
+    // Install structural equality on the core wrapper rather than during element enrichment. That
+    // keeps Node.isEqualNode available on CharacterData, DocumentFragment, and DocumentType nodes.
+    def(el, "isEqualNode", function (other) {
+      if (this === other) { return true; }
+      return typeof globalThis.__nodesEqual === "function"
+        ? globalThis.__nodesEqual(this, other)
+        : false;
+    });
 
     Object.defineProperty(el, "textContent", {
       // Per spec: null for Document (9) and DocumentType (10); for everything else (Element,
@@ -1117,6 +1125,12 @@
       def(attr, "lookupPrefix", function (ns) { return nodeLookupPrefix(id, ns); });
       def(attr, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(id, ns); });
       def(attr, "isSameNode", function (other) { return this === other; });
+      def(attr, "isEqualNode", function (other) {
+        if (this === other) { return true; }
+        return typeof globalThis.__nodesEqual === "function"
+          ? globalThis.__nodesEqual(this, other)
+          : false;
+      });
       def(attr, "normalize", function () {});
       try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
       __attrNodeCache[attrName] = attr;
@@ -1691,6 +1705,12 @@
       var oe = this.ownerElement; return oe && oe.isDefaultNamespace ? oe.isDefaultNamespace(ns) : (ns == null || ns === "");
     });
     def(attr, "isSameNode", function (other) { return this === other; });
+    def(attr, "isEqualNode", function (other) {
+      if (this === other) { return true; }
+      return typeof globalThis.__nodesEqual === "function"
+        ? globalThis.__nodesEqual(this, other)
+        : false;
+    });
     def(attr, "normalize", function () {});
     try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
     return attr;
