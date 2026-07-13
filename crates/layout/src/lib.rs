@@ -2210,6 +2210,55 @@ mod tests {
     }
 
     #[test]
+    fn vertical_grid_with_orthogonal_items_terminates_with_finite_geometry() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let grid = doc.append_element(body, "div");
+        let horizontal = doc.append_element(grid, "div");
+        let vertical = doc.append_element(grid, "div");
+        doc.append_child(horizontal, dom::NodeData::Text("horizontal item".into()));
+        doc.append_child(vertical, dom::NodeData::Text("vertical item".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            grid,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                writing_mode: style::WritingMode::VerticalLr,
+                width: Some(240.0),
+                height: Some(180.0),
+                grid_template_columns: vec![style::TrackSize::Fr(1.0)],
+                grid_template_rows: vec![style::TrackSize::Fr(1.0), style::TrackSize::Fr(1.0)],
+                ..Default::default()
+            },
+        );
+        styles.insert(horizontal, block_style(true));
+        styles.insert(
+            vertical,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                writing_mode: style::WritingMode::VerticalRl,
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        for node in [grid, horizontal, vertical] {
+            let rect = rect_of(&root_box, node);
+            assert!(
+                [rect.x, rect.y, rect.width, rect.height]
+                    .into_iter()
+                    .all(f32::is_finite),
+                "vertical/orthogonal grid geometry must stay finite: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
     fn grid_align_self_end_positions_item_at_cell_bottom() {
         // An `align-self: end` grid item (height 20) in a 60px row sits at the cell bottom (offset
         // 40), content-sized rather than stretched to fill the cell.
