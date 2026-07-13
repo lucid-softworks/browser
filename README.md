@@ -81,7 +81,6 @@ GPU surface, can replace it later without touching the engine.)
 ### Rust workspace (`crates/`)
 - `net` — fetch a URL → bytes + content-type *(reuses `ureq`)*
 - `html` — hand-written HTML tokenizer + tree builder → DOM
-- `css` — CSS tokenizer + parser *(stub; Phase 3)*
 - `dom` — arena-based node tree
 - `js` — JS runtime + DOM/`window`/`self` bindings; runs page scripts. Compile-time backend
   switch: `backend-v8` (default, *reuses `v8`*) or `backend-lumen` (the from-scratch engine)

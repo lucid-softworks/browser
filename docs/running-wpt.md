@@ -46,6 +46,7 @@ product into the checkout's `wptrunner.browsers` package, builds `crates/webdriv
 
 ## Known limitations
 
-- **No worker support yet**, so `.worker` / `.sharedworker` / `.serviceworker` variants time out.
+- Worker variants are supported progressively; shared-worker and worker-specific platform APIs
+  still have conformance gaps, so use report data rather than assuming all variants behave alike.
 - Because `wpt run` launches a session per test, large areas can be slow; CI legs are time-bounded
   and report whatever completed (an area may show as `incomplete`).
