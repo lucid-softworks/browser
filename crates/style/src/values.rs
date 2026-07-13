@@ -504,6 +504,8 @@ pub struct ComputedStyle {
     pub opacity: f32,
     /// Uniform `border-radius` in px (0 = square corners). Not inherited.
     pub border_radius: f32,
+    /// Uniform percentage radius as a 0..1 fraction, resolved from the box dimensions at paint.
+    pub border_radius_pct: Option<f32>,
     /// A `background-image` gradient (linear/radial), if any. `None` = no gradient. Painted as the
     /// box's background fill (over any solid `background-color`). Not inherited.
     pub background_gradient: Option<Gradient>,
@@ -660,8 +662,10 @@ pub struct Rgba {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GradientStop {
     pub color: Rgba,
-    /// Position along the gradient line, 0.0..=1.0.
+    /// Percentage component along the gradient line, as a 0.0..=1.0 fraction.
     pub pos: f32,
+    /// Absolute component in CSS px, resolved against the actual gradient line during paint.
+    pub px: f32,
 }
 
 /// A `background-image` gradient. Simplifications: `radial-gradient` is always a centered circle
@@ -670,7 +674,7 @@ pub struct GradientStop {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gradient {
     /// A linear gradient. `angle_deg` follows the CSS convention: 0deg = to top, 90deg = to
-    /// right, 180deg = to bottom. Stops are sorted by `pos` ascending, each in 0..=1.
+    /// right, 180deg = to bottom.
     Linear {
         angle_deg: f32,
         stops: Vec<GradientStop>,

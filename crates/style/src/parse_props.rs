@@ -245,6 +245,17 @@ pub(crate) fn parse_border_radius(val: &str) -> Option<f32> {
     parse_length(first).map(|r| r.max(0.0))
 }
 
+/// Percentage component of the simplified uniform border radius, retained until box geometry is
+/// known. Elliptical/per-corner syntax still uses its first horizontal component.
+pub(crate) fn parse_border_radius_pct(val: &str) -> Option<f32> {
+    let main = val.split('/').next().unwrap_or(val);
+    let first = main.split_whitespace().next()?.trim();
+    first
+        .strip_suffix('%')
+        .and_then(|p| p.trim().parse::<f32>().ok())
+        .map(|p| (p / 100.0).max(0.0))
+}
+
 /// Split `s` on top-level commas (not inside parens). Returns trimmed non-empty parts.
 pub(crate) fn split_top_commas(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
@@ -539,8 +550,8 @@ pub(crate) fn parse_bg_position(val: &str) -> (BgLen, BgLen) {
 /// Parse a `linear-gradient(...)` / `radial-gradient(...)` (incl. `repeating-*`) value into a
 /// [`Gradient`], or `None` if the value isn't a recognized gradient. Color stops without an
 /// explicit position are distributed evenly between their neighbors (0..1). Stop positions
-/// expressed as `%` resolve directly; `px` lengths are resolved as a fraction of an assumed
-/// 200px gradient line (best-effort, since the real line length isn't known until paint).
+/// expressed as `%` remain fractional; absolute lengths are retained in CSS px and resolved from
+/// the actual gradient line during paint.
 pub(crate) fn parse_gradient(
     val: &str,
     current: (u8, u8, u8),
@@ -587,13 +598,17 @@ pub(crate) fn parse_gradient(
 
     let mut stops: Vec<GradientStop> = Vec::new();
     // Parse each "color [pos]" stop; remember which positions were explicit for distribution.
-    let mut explicit: Vec<Option<f32>> = Vec::new();
+    let mut explicit: Vec<Option<(f32, f32)>> = Vec::new();
     for part in &parts {
         // Split the color from a trailing position. The color may contain spaces (rgb( ... )),
         // so split off a trailing token only if it looks like a position (ends with % or a unit).
         let (color_str, pos) = split_stop(part);
         let color = parse_rgba_ctx(color_str, current, inherited)?;
-        stops.push(GradientStop { color, pos: 0.0 });
+        stops.push(GradientStop {
+            color,
+            pos: 0.0,
+            px: 0.0,
+        });
         explicit.push(pos);
     }
     if stops.len() < 2 {
@@ -603,10 +618,10 @@ pub(crate) fn parse_gradient(
     // Distribute positions: clamp to 0..1, default ends to 0 and 1, interpolate gaps.
     let n = stops.len();
     if explicit[0].is_none() {
-        explicit[0] = Some(0.0);
+        explicit[0] = Some((0.0, 0.0));
     }
     if explicit[n - 1].is_none() {
-        explicit[n - 1] = Some(1.0);
+        explicit[n - 1] = Some((1.0, 0.0));
     }
     let mut i = 0;
     while i < n {
@@ -624,18 +639,17 @@ pub(crate) fn parse_gradient(
         let gap = (j - (i - 1)) as f32;
         for k in i..j {
             let frac = (k - (i - 1)) as f32 / gap;
-            explicit[k] = Some(prev + (next - prev) * frac);
+            explicit[k] = Some((
+                prev.0 + (next.0 - prev.0) * frac,
+                prev.1 + (next.1 - prev.1) * frac,
+            ));
         }
         i = j;
     }
     for (s, p) in stops.iter_mut().zip(explicit.iter()) {
-        s.pos = p.unwrap().clamp(0.0, 1.0);
-    }
-    // Ensure non-decreasing positions.
-    for k in 1..n {
-        if stops[k].pos < stops[k - 1].pos {
-            stops[k].pos = stops[k - 1].pos;
-        }
+        let (pct, px) = p.unwrap();
+        s.pos = pct;
+        s.px = px;
     }
 
     if is_radial {
@@ -693,15 +707,15 @@ pub(crate) fn parse_linear_direction(s: &str) -> Option<f32> {
 /// Split a gradient color-stop into `(color_str, Option<position 0..1>)`. The position is the
 /// trailing token if it ends with `%` or a length unit; `%` resolves directly, `px` against an
 /// assumed 200px line.
-pub(crate) fn split_stop(part: &str) -> (&str, Option<f32>) {
+pub(crate) fn split_stop(part: &str) -> (&str, Option<(f32, f32)>) {
     let trimmed = part.trim();
     // Find the last whitespace-delimited token.
     if let Some(idx) = trimmed.rfind(char::is_whitespace) {
         let last = trimmed[idx + 1..].trim();
         let pos = if let Some(p) = last.strip_suffix('%') {
-            p.trim().parse::<f32>().ok().map(|x| x / 100.0)
+            p.trim().parse::<f32>().ok().map(|x| (x / 100.0, 0.0))
         } else if last.ends_with("px") || last.ends_with("rem") || last.ends_with("em") {
-            parse_length(last).map(|px| px / 200.0)
+            parse_length(last).map(|px| (0.0, px))
         } else {
             None
         };

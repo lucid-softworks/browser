@@ -257,7 +257,7 @@ pub(crate) fn paint_box_opacity(
     } else {
         line_x
     };
-    let radius = b.style.border_radius();
+    let radius = b.style.border_radius_for(border.width, border.height);
     let extras = b.style.extras.as_deref();
 
     // Fast-path: the common no-transform box keeps the incoming affine. A CSS `transform` composes
@@ -1528,7 +1528,11 @@ pub(crate) fn paint_gradient_fill(
                     }
                 }
             };
-            let col = sample_stops(stops, t.clamp(0.0, 1.0));
+            let line_len = match grad {
+                style::Gradient::Linear { .. } => half_len * 2.0,
+                style::Gradient::Radial { .. } => half_len,
+            };
+            let col = sample_stops(stops, t.clamp(0.0, 1.0), line_len);
             let a = scale_alpha(col.a, opacity);
             if a == 0 {
                 continue;
@@ -1573,8 +1577,9 @@ pub(crate) fn inside_round_rect(px: f32, py: f32, rect: Rect, r: f32) -> bool {
     }
 }
 
-/// Linearly interpolate the gradient stops at parameter `t` in 0..1 (stops sorted by `pos`).
-pub(crate) fn sample_stops(stops: &[style::GradientStop], t: f32) -> style::Rgba {
+/// Linearly interpolate gradient stops at `t`, resolving absolute stop lengths against the actual
+/// painted gradient line rather than a parser-time assumed box size.
+pub(crate) fn sample_stops(stops: &[style::GradientStop], t: f32, line_len: f32) -> style::Rgba {
     if stops.is_empty() {
         return style::Rgba {
             r: 0,
@@ -1583,19 +1588,28 @@ pub(crate) fn sample_stops(stops: &[style::GradientStop], t: f32) -> style::Rgba
             a: 0,
         };
     }
-    if t <= stops[0].pos {
+    let resolved = |s: &style::GradientStop| {
+        if line_len > 0.0 {
+            s.pos + s.px / line_len
+        } else {
+            s.pos
+        }
+    };
+    if t <= resolved(&stops[0]) {
         return stops[0].color;
     }
     let last = stops.len() - 1;
-    if t >= stops[last].pos {
+    if t >= resolved(&stops[last]) {
         return stops[last].color;
     }
     for i in 0..last {
         let a = stops[i];
         let b = stops[i + 1];
-        if t >= a.pos && t <= b.pos {
-            let span = (b.pos - a.pos).max(1e-6);
-            let f = (t - a.pos) / span;
+        let ap = resolved(&a);
+        let bp = resolved(&b).max(ap);
+        if t >= ap && t <= bp {
+            let span = (bp - ap).max(1e-6);
+            let f = (t - ap) / span;
             return style::Rgba {
                 r: lerp_u8(a.color.r, b.color.r, f),
                 g: lerp_u8(a.color.g, b.color.g, f),

@@ -1422,6 +1422,29 @@ mod tests {
         assert_eq!(parse_border_radius("4px 8px 12px 16px"), Some(4.0));
         // elliptical syntax: use horizontal radii before `/`
         assert_eq!(parse_border_radius("10px / 20px"), Some(10.0));
+        assert_eq!(parse_border_radius_pct("50%"), Some(0.5));
+
+        let sheet = css::parse("div { border-radius: 25% }");
+        let doc = html::parse("<html><body><div></div></body></html>");
+        let map = cascade(&doc, &[sheet]);
+        let div = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&div].border_radius_pct, Some(0.25));
+        assert_eq!(map[&div].get_property("border-radius"), "25%");
+    }
+
+    #[test]
+    fn gradient_pixel_stops_remain_absolute_until_paint() {
+        let g = parse_gradient(
+            "linear-gradient(to right, red 20px, blue 80px)",
+            (0, 0, 0),
+            (0, 0, 0),
+        )
+        .unwrap();
+        let Gradient::Linear { stops, .. } = g else {
+            panic!("expected linear gradient");
+        };
+        assert_eq!((stops[0].pos, stops[0].px), (0.0, 20.0));
+        assert_eq!((stops[1].pos, stops[1].px), (0.0, 80.0));
     }
 
     #[test]

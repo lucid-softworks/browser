@@ -1203,8 +1203,12 @@ pub(crate) fn apply_declaration(
 
         // --- border-radius ---
         "border-radius" => {
-            if let Some(r) = parse_border_radius(val) {
+            if let Some(p) = parse_border_radius_pct(val) {
+                style.border_radius = 0.0;
+                style.border_radius_pct = Some(p);
+            } else if let Some(r) = parse_border_radius(val) {
                 style.border_radius = r;
+                style.border_radius_pct = None;
             }
         }
 

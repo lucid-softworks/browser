@@ -2028,6 +2028,47 @@ mod tests {
     }
 
     #[test]
+    fn gradient_pixel_stops_use_actual_line_length() {
+        let stops = [
+            style::GradientStop {
+                color: style::Rgba {
+                    r: 255,
+                    g: 0,
+                    b: 0,
+                    a: 255,
+                },
+                pos: 0.0,
+                px: 20.0,
+            },
+            style::GradientStop {
+                color: style::Rgba {
+                    r: 0,
+                    g: 0,
+                    b: 255,
+                    a: 255,
+                },
+                pos: 0.0,
+                px: 80.0,
+            },
+        ];
+        let at_50_of_100 = sample_stops(&stops, 0.5, 100.0);
+        let at_50_of_200 = sample_stops(&stops, 0.25, 200.0);
+        assert_eq!(at_50_of_100, at_50_of_200);
+        assert!(at_50_of_100.r > 100 && at_50_of_100.b > 100);
+    }
+
+    #[test]
+    fn percentage_border_radius_resolves_from_box_size() {
+        let fb = render_html(
+            r#"<html><body style="margin:0"><div style="width:100px;height:40px;background:#ff0000;border-radius:50%"></div></body></html>"#,
+            120,
+            60,
+        );
+        assert_eq!(px_rgb(&fb, 1, 1), [0, 0, 0]);
+        assert_eq!(px_rgb(&fb, 50, 20), [255, 0, 0]);
+    }
+
+    #[test]
     fn box_shadow_paints_outside_the_box() {
         // A small box offset from the top-left with a box-shadow toward the bottom-right. Pixels
         // just outside the box's lower-right should be non-background (shadow), while the far

@@ -98,6 +98,7 @@ impl Default for ComputedStyle {
             vertical_align: VerticalAlign::Baseline,
             opacity: 1.0,
             border_radius: 0.0,
+            border_radius_pct: None,
             background_gradient: None,
             background_image_url: None,
             background_size: BgSize::Auto,
@@ -384,7 +385,10 @@ impl ComputedStyle {
                 if self.font_variant_emoji_emoji { "emoji" } else { "text" }.to_string()
             }
             "opacity" => num(self.opacity),
-            "border-radius" => px(self.border_radius),
+            "border-radius" => self
+                .border_radius_pct
+                .map(|p| format!("{}%", num(p * 100.0)))
+                .unwrap_or_else(|| px(self.border_radius)),
 
             // --- typography ---
             "font-family" => self.font_family.clone().unwrap_or_default(),

@@ -11,8 +11,9 @@ materially partial behavior.
   plus WebKit scrollbar pseudo-elements. Nested clipping, offsets, hit testing, and element scroll
   APIs are implemented.
 - [ ] **`position: sticky`** — sticky constraint rectangles inside the nearest scroll container.
-- [ ] **Percentage geometry** — resolve percentage border radii and percentage-bearing lengths
-  against the correct containing dimensions instead of dropping or approximating them.
+- [ ] **Remaining percentage geometry** — carry percentage-bearing box-model and math-function
+  lengths to layout with the correct containing dimensions. Percentage border radii are resolved
+  at paint time.
 - [ ] **Full Grid** — implicit tracks, auto-placement edge cases, `minmax()`, intrinsic sizing,
   named lines/areas, subgrid, and complete alignment.
 - [ ] **Fragmentation and multicolumn** — complete column balancing, breaks, and spanning.
@@ -34,7 +35,6 @@ materially partial behavior.
 - [ ] **Backgrounds and borders** — multiple backgrounds, conic gradients, `border-image`, and the
   remaining repeat/position/size edge cases.
 - [ ] **Shadows and outlines** — text shadows, complete inset/spread behavior, and outline geometry.
-- [ ] Resolve gradient length stops from the actual gradient line rather than an assumed size.
 
 ## P1 — typography
 

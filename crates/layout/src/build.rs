@@ -307,6 +307,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
             || !cs.box_shadows.is_empty()
             || cs.transform.is_some()
             || cs.border_radius != 0.0
+            || cs.border_radius_pct.is_some()
             || cs.mask_image.is_some()
             || cs.background_image_url.is_some()
         {
@@ -316,6 +317,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
                 transform: cs.transform,
                 transform_origin: cs.transform_origin,
                 border_radius: cs.border_radius,
+                border_radius_pct: cs.border_radius_pct,
                 mask_image: cs.mask_image.clone(),
                 background_image: cs.background_image_url.as_ref().map(|url| style::BgImage {
                     url: url.clone(),

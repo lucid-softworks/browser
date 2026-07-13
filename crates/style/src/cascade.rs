@@ -917,6 +917,7 @@ pub(crate) fn compute_element_style<'a>(
         // Paint extras: opacity & border-radius are not inherited.
         opacity: 1.0,
         border_radius: 0.0,
+        border_radius_pct: None,
         background_gradient: None,
         background_image_url: None,
         background_size: BgSize::Auto,
@@ -1306,6 +1307,7 @@ pub(crate) fn cascade_pseudo(
     ps.z_index = None;
     ps.opacity = 1.0;
     ps.border_radius = 0.0;
+    ps.border_radius_pct = None;
     ps.display = Display::Inline; // generated content is inline by default
     ps.display_block = false;
     ps.content = None;
@@ -1445,6 +1447,7 @@ pub fn compute_pseudo_style(
     ps.z_index = None;
     ps.opacity = 1.0;
     ps.border_radius = 0.0;
+    ps.border_radius_pct = None;
     ps.display = Display::Inline; // generated content is inline by default
     ps.display_block = false;
     ps.display_none = false;
