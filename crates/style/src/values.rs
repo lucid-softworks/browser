@@ -298,6 +298,8 @@ impl WritingMode {
 /// The computed style for a single element.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
+    /// Canonical computed values for CSSOM-facing properties that do not yet affect layout.
+    pub extra_properties: HashMap<String, String>,
     /// `direction` / `writing-mode` (both inherited); used for the CSSOM resolved value of insets.
     pub direction: Direction,
     pub writing_mode: WritingMode,

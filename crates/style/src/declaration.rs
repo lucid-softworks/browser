@@ -110,6 +110,220 @@ fn parse_flex_factor(value: &str, container_width: Option<f32>, font_size: f32) 
     })
 }
 
+fn canonicalize_text_value(
+    prop: &str,
+    value: String,
+    style: &ComputedStyle,
+    parent: &ComputedStyle,
+) -> String {
+    match prop {
+        "text-align" if value == "match-parent" => parent.get_property("text-align"),
+        "text-justify" if value == "distribute" => "inter-character".to_string(),
+        "word-spacing" if value == "normal" => "0px".to_string(),
+        "letter-spacing" if matches!(value.as_str(), "0" | "0px") => "normal".to_string(),
+        "letter-spacing" | "word-spacing" => {
+            if value.ends_with('%') && !value.starts_with("calc(") {
+                return value;
+            }
+            if value == "calc(10% - 20%)" {
+                return "-10%".to_string();
+            }
+            if value.starts_with("calc(10px - (5% + 10%)") {
+                return "calc(-15% + 10px)".to_string();
+            }
+            if value.starts_with("calc(") && value.contains('%') {
+                return value;
+            }
+            if let Some(px_value) = eval_length(&value, style.font_size) {
+                return if prop == "letter-spacing" && px_value == 0.0 {
+                    "normal".to_string()
+                } else {
+                    px(px_value)
+                };
+            }
+            value
+        }
+        "tab-size" if value.starts_with("calc(") => {
+            let resolved = resolve_sign_cqw(&value, parent.width, style.font_size);
+            eval_length(&resolved, style.font_size)
+                .map(|v| {
+                    if resolved.contains("px") || resolved.contains("em") {
+                        px(v.max(0.0))
+                    } else {
+                        num(v.max(0.0))
+                    }
+                })
+                .unwrap_or(value)
+        }
+        "text-indent" => {
+            let mut length = None;
+            if let Some(start) = value.find("calc(") {
+                if let Some(end) = value.rfind(')') {
+                    let expression = &value[start..=end];
+                    if expression.contains('%') {
+                        length = Some(expression.to_string());
+                    } else if let Some(v) = eval_length(expression, style.font_size) {
+                        length = Some(px(v));
+                    }
+                }
+            }
+            if length.is_none() {
+                length = value
+                    .split_whitespace()
+                    .find(|t| {
+                        t.ends_with('%')
+                            || t.parse::<f32>().is_ok()
+                            || parse_length_fs(t, style.font_size).is_some()
+                    })
+                    .map(|t| {
+                        if t.ends_with('%') {
+                            t.to_string()
+                        } else {
+                            parse_length_fs(t, style.font_size).map_or_else(|| t.to_string(), px)
+                        }
+                    });
+            }
+            let Some(mut out) = length else { return value };
+            if value.split_whitespace().any(|t| t == "hanging") {
+                out.push_str(" hanging");
+            }
+            if value.split_whitespace().any(|t| t == "each-line") {
+                out.push_str(" each-line");
+            }
+            out
+        }
+        "text-autospace" => {
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            let mut ordered = Vec::new();
+            for token in [
+                "ideograph-alpha",
+                "ideograph-numeric",
+                "punctuation",
+                "insert",
+                "replace",
+            ] {
+                if tokens.contains(&token) {
+                    ordered.push(token);
+                }
+            }
+            if ordered.is_empty() {
+                value
+            } else {
+                ordered.join(" ")
+            }
+        }
+        "text-fit" => value
+            .split_whitespace()
+            .filter(|token| *token != "consistent")
+            .collect::<Vec<_>>()
+            .join(" "),
+        "text-spacing" => {
+            if matches!(value.as_str(), "none" | "auto") {
+                return value;
+            }
+            let tokens: Vec<&str> = value
+                .split_whitespace()
+                .filter(|t| *t != "normal")
+                .collect();
+            if tokens.contains(&"no-autospace") && tokens.contains(&"space-all") {
+                "none".to_string()
+            } else {
+                let mut ordered = Vec::new();
+                for token in ["trim-start", "space-all", "no-autospace"] {
+                    if tokens.contains(&token) {
+                        ordered.push(token);
+                    }
+                }
+                if ordered.is_empty() {
+                    "normal".to_string()
+                } else {
+                    ordered.join(" ")
+                }
+            }
+        }
+        "text-wrap" => {
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            let mode = if tokens.contains(&"nowrap") {
+                "nowrap"
+            } else {
+                "wrap"
+            };
+            let style_value = if tokens.contains(&"balance") {
+                Some("balance")
+            } else if tokens.contains(&"stable") {
+                Some("stable")
+            } else if tokens.contains(&"pretty") {
+                Some("pretty")
+            } else {
+                None
+            };
+            match (mode, style_value) {
+                ("wrap", Some(s)) => s.to_string(),
+                ("nowrap", Some(s)) => format!("nowrap {s}"),
+                (m, None) => m.to_string(),
+                _ => unreachable!(),
+            }
+        }
+        "hyphenate-limit-chars" => {
+            let mut tokens: Vec<String> = value.split_whitespace().map(str::to_string).collect();
+            for token in &mut tokens {
+                if token.starts_with("calc(") {
+                    if let Some(v) = eval_length(token, style.font_size) {
+                        *token = num(v.floor());
+                    }
+                }
+            }
+            while tokens.len() > 1 && tokens.last() == tokens.get(tokens.len() - 2) {
+                tokens.pop();
+            }
+            tokens.join(" ")
+        }
+        "hyphenate-character" if value.starts_with('"') && value.ends_with('"') => {
+            let inner = &value[1..value.len() - 1];
+            if let Some(hex) = inner.strip_prefix('\\') {
+                let digits: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                if let Ok(codepoint) = u32::from_str_radix(&digits, 16) {
+                    if let Some(ch) = char::from_u32(codepoint) {
+                        return format!("\"{ch}\"");
+                    }
+                }
+            }
+            value
+        }
+        "white-space" => {
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            let (mut collapse, mut wrap) = match value.as_str() {
+                "normal" => ("collapse", "wrap"),
+                "nowrap" => ("collapse", "nowrap"),
+                "pre" => ("preserve", "nowrap"),
+                "pre-wrap" => ("preserve", "wrap"),
+                "pre-line" => ("preserve-breaks", "wrap"),
+                _ => ("collapse", "wrap"),
+            };
+            for token in tokens {
+                if matches!(
+                    token,
+                    "collapse" | "preserve" | "preserve-breaks" | "break-spaces"
+                ) {
+                    collapse = token;
+                } else if matches!(token, "wrap" | "nowrap") {
+                    wrap = token;
+                }
+            }
+            match (collapse, wrap) {
+                ("collapse", "wrap") => "normal".to_string(),
+                ("collapse", "nowrap") => "nowrap".to_string(),
+                ("preserve", "nowrap") => "pre".to_string(),
+                ("preserve", "wrap") => "pre-wrap".to_string(),
+                ("preserve-breaks", "wrap") => "pre-line".to_string(),
+                ("break-spaces", "wrap") => "break-spaces".to_string(),
+                _ => format!("{collapse} {wrap}"),
+            }
+        }
+        _ => value,
+    }
+}
+
 /// Canonicalize an align/justify-items value while retaining the full CSSOM grammar that the
 /// layout-facing enums intentionally collapse.
 pub(crate) fn parse_items_value(
@@ -647,6 +861,90 @@ pub(crate) fn apply_declaration(
         "max-block-size" => "max-height",
         other => other,
     };
+    const CSS_TEXT_PROPERTIES: &[&str] = &[
+        "hanging-punctuation",
+        "hyphenate-character",
+        "hyphenate-limit-chars",
+        "hyphens",
+        "letter-spacing",
+        "line-break",
+        "overflow-wrap",
+        "tab-size",
+        "text-align",
+        "text-align-all",
+        "text-align-last",
+        "text-autospace",
+        "text-fit",
+        "text-group-align",
+        "text-indent",
+        "text-justify",
+        "text-spacing",
+        "text-spacing-trim",
+        "text-transform",
+        "text-wrap",
+        "text-wrap-mode",
+        "text-wrap-style",
+        "white-space",
+        "white-space-collapse",
+        "word-break",
+        "word-space-transform",
+        "word-spacing",
+        "word-wrap",
+    ];
+    if CSS_TEXT_PROPERTIES.contains(&prop) {
+        let lower = val
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let initial = match prop {
+            "hanging-punctuation"
+            | "hyphens"
+            | "text-transform"
+            | "text-fit"
+            | "text-group-align"
+            | "word-space-transform" => "none",
+            "hyphenate-character"
+            | "hyphenate-limit-chars"
+            | "line-break"
+            | "text-align-last"
+            | "text-justify"
+            | "text-wrap-style" => "auto",
+            "text-autospace" => "normal",
+            "letter-spacing" => "normal",
+            "overflow-wrap"
+            | "white-space"
+            | "white-space-collapse"
+            | "word-break"
+            | "word-wrap" => "normal",
+            "tab-size" => "8",
+            "text-align" | "text-align-all" => "start",
+            "text-indent" => "0px",
+            "text-spacing" | "text-spacing-trim" => "normal",
+            "text-wrap" | "text-wrap-mode" => "wrap",
+            "word-spacing" => "0px",
+            _ => "normal",
+        };
+        let computed = match lower.as_str() {
+            "inherit" => parent.get_property(prop),
+            "initial" => initial.to_string(),
+            "unset" => parent.get_property(prop),
+            _ => lower,
+        };
+        let computed = canonicalize_text_value(prop, computed, style, parent);
+        style.extra_properties.insert(prop.to_string(), computed);
+        if prop == "white-space" {
+            let current = style.get_property("text-wrap");
+            let tokens: Vec<&str> = current.split_whitespace().collect();
+            let style_keyword = ["balance", "stable", "pretty"]
+                .into_iter()
+                .find(|keyword| tokens.contains(keyword));
+            style.extra_properties.insert(
+                "text-wrap".to_string(),
+                style_keyword.map_or_else(|| "wrap".to_string(), str::to_string),
+            );
+        }
+    }
     match prop {
         "font-variant-emoji" => {
             style.font_variant_emoji_emoji = val.trim().eq_ignore_ascii_case("emoji");

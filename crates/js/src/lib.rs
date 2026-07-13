@@ -2008,6 +2008,24 @@ mod tests {
     }
 
     #[test]
+    fn css_text_properties_reach_computed_style() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var e = document.querySelectorAll('div')[0];
+                e.style.hyphens = 'auto';
+                [e.getAttribute('style'), getComputedStyle(e).hyphens].join('|');
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("hyphens: auto;|auto"));
+    }
+
+    #[test]
     fn static_element_inset_resolves_to_auto() {
         // getComputedStyle of a `position: static` element: insets resolve to the computed value;
         // `auto` (the default) stays `auto`.

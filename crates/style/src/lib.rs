@@ -2533,6 +2533,18 @@ mod tests {
     }
 
     #[test]
+    fn css_text_values_are_retained_for_computed_style() {
+        let cs = cs_of(
+            "<html><body><div style='hyphens:auto;text-indent:20%;text-wrap:pretty'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.get_property("hyphens"), "auto");
+        assert_eq!(cs.get_property("text-indent"), "20%");
+        assert_eq!(cs.get_property("text-wrap"), "pretty");
+    }
+
+    #[test]
     fn get_property_untracked_returns_empty() {
         let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
             e.tag == "div"

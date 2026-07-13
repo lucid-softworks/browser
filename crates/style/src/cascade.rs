@@ -819,6 +819,7 @@ pub(crate) fn compute_element_style<'a>(
 ) -> (ComputedStyle, Arc<HashMap<String, String>>) {
     // Start from inherited values; non-inherited properties get reset below.
     let mut style = ComputedStyle {
+        extra_properties: parent.extra_properties.clone(),
         custom_props: empty_vars(),
         direction: parent.direction,       // inherited
         writing_mode: parent.writing_mode, // inherited

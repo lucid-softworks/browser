@@ -1648,7 +1648,7 @@
     "font-variant-east-asian", "font-variant-position", "font-variant-emoji",
     "font-stretch", "line-height",
     "text-align", "text-decoration-line", "text-decoration-style", "text-decoration-color",
-    "text-transform", "letter-spacing", "white-space", "vertical-align",
+    "text-transform", "letter-spacing", "white-space-collapse", "text-wrap-mode", "text-wrap-style", "vertical-align",
     "list-style-type", "list-style-position", "list-style-image",
     "overflow-x", "overflow-y", "z-index", "cursor", "box-sizing",
     "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
@@ -1808,6 +1808,7 @@
     if (name === "place-content") return ["align-content", "justify-content"];
     if (name === "place-items") return ["align-items", "justify-items"];
     if (name === "place-self") return ["align-self", "justify-self"];
+    if (name === "white-space") return ["white-space-collapse", "text-wrap-mode"];
     if (name === "columns") return ["column-width", "column-count"];
     // SVG `marker` shorthand sets all three marker longhands to the same value.
     if (name === "marker") return ["marker-start", "marker-mid", "marker-end"];
@@ -1959,6 +1960,16 @@
       var fvo = [];
       for (var fi = 0; fi < FONT_VARIANT_LONGHANDS.length; fi++) { var fl = FONT_VARIANT_LONGHANDS[fi]; fvo.push([fl, fv[fl]]); }
       return fvo;
+    }
+    if (name === "white-space") {
+      var wsv = value.toLowerCase().split(/\s+/), wc = "collapse", wm = "wrap";
+      if (value.toLowerCase() === "nowrap") wm = "nowrap";
+      else if (value.toLowerCase() === "pre") { wc = "preserve"; wm = "nowrap"; }
+      else if (value.toLowerCase() === "pre-wrap") wc = "preserve";
+      else if (value.toLowerCase() === "pre-line") wc = "preserve-breaks";
+      else if (value.toLowerCase() === "break-spaces") wc = "break-spaces";
+      else wsv.forEach(function (t) { if (/^(collapse|preserve|preserve-breaks|break-spaces)$/.test(t)) wc = t; else if (/^(wrap|nowrap)$/.test(t)) wm = t; });
+      return [["white-space-collapse", wc], ["text-wrap-mode", wm]];
     }
     if (name === "border-image") {
       if (value.toLowerCase() === "none") {
@@ -2130,6 +2141,16 @@
       if (fw === "nowrap") return fd;
       if (fd === "row") return fw;
       return fd + " " + fw;
+    }
+    if (name === "white-space") {
+      var wsc = g("white-space-collapse"), wsm = g("text-wrap-mode");
+      if (wsc === "collapse" && wsm === "wrap") return "normal";
+      if (wsc === "collapse" && wsm === "nowrap") return "nowrap";
+      if (wsc === "preserve" && wsm === "nowrap") return "pre";
+      if (wsc === "preserve" && wsm === "wrap") return "pre-wrap";
+      if (wsc === "preserve-breaks" && wsm === "wrap") return "pre-line";
+      if (wsc === "break-spaces" && wsm === "wrap") return "break-spaces";
+      return wsc + " " + wsm;
     }
     // `marker`: the common longhand value when all three markers agree, else "".
     if (name === "marker") {
@@ -2317,7 +2338,9 @@
       "break-after break-before break-inside text-indent text-justify text-orientation text-rendering " +
       "text-underline-position text-underline-offset text-decoration-thickness text-decoration-skip-ink " +
       "text-emphasis text-emphasis-color text-emphasis-style text-emphasis-position text-combine-upright " +
-      "hyphens hanging-punctuation line-break overflow-anchor overflow-clip-margin scrollbar-gutter " +
+      "hyphens hyphenate-character hyphenate-limit-chars hanging-punctuation line-break " +
+      "text-align-all text-align-last text-autospace text-fit text-group-align text-spacing " +
+      "text-spacing-trim word-space-transform overflow-anchor overflow-clip-margin scrollbar-gutter " +
       "scrollbar-width scrollbar-color scroll-snap-type scroll-snap-align scroll-snap-stop touch-action " +
       "flood-color flood-opacity stop-color stop-opacity lighting-color color-interpolation " +
       "color-interpolation-filters fill fill-opacity fill-rule stroke stroke-width stroke-opacity " +
@@ -2505,6 +2528,109 @@
         else return false;
       }
       return true;
+    }
+    function oneOfValue(pattern) { return pattern.test(vl); }
+    if (name === "hyphens") return oneOfValue(/^(none|manual|auto)$/);
+    if (name === "line-break") return oneOfValue(/^(auto|loose|normal|strict|anywhere)$/);
+    if (name === "overflow-wrap" || name === "word-wrap") return oneOfValue(/^(normal|break-word|anywhere)$/);
+    if (name === "text-align") return oneOfValue(/^(start|end|left|right|center|justify|justify-all|match-parent)$/);
+    if (name === "text-align-all") return oneOfValue(/^(start|end|left|right|center|justify|match-parent)$/);
+    if (name === "text-align-last") return oneOfValue(/^(auto|start|end|left|right|center|justify|match-parent)$/);
+    if (name === "text-group-align") return oneOfValue(/^(none|start|end|left|right|center)$/);
+    if (name === "text-justify") return oneOfValue(/^(auto|none|inter-word|inter-character|distribute)$/);
+    if (name === "word-break") return oneOfValue(/^(normal|break-all|keep-all|break-word|auto-phrase|manual)$/);
+    if (name === "text-wrap-mode") return oneOfValue(/^(wrap|nowrap)$/);
+    if (name === "text-wrap-style") return oneOfValue(/^(auto|balance|stable|pretty)$/);
+    if (name === "white-space-collapse") return oneOfValue(/^(collapse|preserve|preserve-breaks|preserve-spaces|break-spaces)$/);
+    if (name === "hyphenate-character") return vl === "auto" || /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/.test(v);
+    if (name === "hyphenate-limit-chars") {
+      var hl = splitCssTokens(v);
+      return hl.length >= 1 && hl.length <= 3 && hl.every(function (t) { return t === "auto" || /^\d+$/.test(t) || /^calc\(/i.test(t); });
+    }
+    if (name === "letter-spacing" || name === "word-spacing") {
+      if (vl === "normal") return true;
+      if (/^calc\(/i.test(v)) return true;
+      return isLenPct(v, true);
+    }
+    if (name === "tab-size") {
+      if (/^calc\(/i.test(v)) return !/%/.test(v);
+      var tm = /^(\+?(?:\d+\.?\d*|\.\d+))(?:([a-z]+))?$/i.exec(v);
+      return !!tm && parseFloat(tm[1]) >= 0 && (!tm[2] || STROKE_LEN_UNITS.test(tm[2].toLowerCase()));
+    }
+    if (name === "text-indent") {
+      var indent = splitCssTokens(v), lengthCount = 0, hanging = 0, eachLine = 0;
+      for (var ti = 0; ti < indent.length; ti++) {
+        if (indent[ti] === "hanging") hanging++;
+        else if (indent[ti] === "each-line") eachLine++;
+        else if (/^calc\(/i.test(indent[ti]) || isLenPct(indent[ti], true)) lengthCount++;
+        else return false;
+      }
+      return lengthCount === 1 && hanging <= 1 && eachLine <= 1;
+    }
+    if (name === "text-autospace") {
+      if (/^(normal|auto|no-autospace)$/.test(vl)) return true;
+      var at = vl.split(/\s+/), asSeen = {}, modeCount = 0;
+      for (var ai = 0; ai < at.length; ai++) {
+        if (!/^(ideograph-alpha|ideograph-numeric|punctuation|insert|replace)$/.test(at[ai]) || asSeen[at[ai]]) return false;
+        asSeen[at[ai]] = 1; if (at[ai] === "insert" || at[ai] === "replace") modeCount++;
+      }
+      return modeCount <= 1;
+    }
+    if (name === "text-transform") {
+      if (/^(none|math-auto)$/.test(vl)) return true;
+      var tt = vl.split(/\s+/), caseCount = 0, ttSeen = {};
+      for (var tti = 0; tti < tt.length; tti++) {
+        if (!/^(capitalize|uppercase|lowercase|full-width|full-size-kana)$/.test(tt[tti]) || ttSeen[tt[tti]]) return false;
+        ttSeen[tt[tti]] = 1; if (/^(capitalize|uppercase|lowercase)$/.test(tt[tti])) caseCount++;
+      }
+      return caseCount <= 1;
+    }
+    if (name === "text-wrap") {
+      var tw = vl.split(/\s+/), modes = 0, styles = 0;
+      for (var twi = 0; twi < tw.length; twi++) {
+        if (/^(wrap|nowrap)$/.test(tw[twi])) modes++;
+        else if (/^(auto|balance|stable|pretty)$/.test(tw[twi])) styles++;
+        else return false;
+      }
+      return modes <= 1 && styles <= 1;
+    }
+    if (name === "hanging-punctuation") {
+      if (vl === "none") return true;
+      var hp = vl.split(/\s+/), hpSeen = {}, endCount = 0;
+      for (var hi = 0; hi < hp.length; hi++) {
+        if (!/^(first|last|force-end|allow-end)$/.test(hp[hi]) || hpSeen[hp[hi]]) return false;
+        hpSeen[hp[hi]] = 1; if (hp[hi] === "force-end" || hp[hi] === "allow-end") endCount++;
+      }
+      return endCount <= 1;
+    }
+    if (name === "text-fit") {
+      if (/^(none|grow|shrink)$/.test(vl)) return true;
+      if (/^(grow|shrink) \d+(?:\.\d+)?%$/.test(vl)) return true;
+      return /^(grow|shrink) (consistent|per-line|per-line-all)(?: \d+(?:\.\d+)?%)?$/.test(vl) &&
+        !/^(?:grow|shrink) per-line-all /.test(vl);
+    }
+    if (name === "text-spacing-trim") return /^(normal|auto|space-all|trim-both|trim-all|trim-start|space-first)$/.test(vl);
+    if (name === "text-spacing") {
+      if (/^(normal|none|auto|no-autospace|trim-start|space-all)$/.test(vl)) return true;
+      var ts = vl.split(/\s+/);
+      if (ts.length !== 2) return false;
+      var aText = /^(normal|no-autospace)$/.test(ts[0]), bText = /^(normal|no-autospace)$/.test(ts[1]);
+      var aTrim = /^(normal|trim-start|space-all)$/.test(ts[0]), bTrim = /^(normal|trim-start|space-all)$/.test(ts[1]);
+      return (aText && bTrim) || (bText && aTrim);
+    }
+    if (name === "word-space-transform") {
+      if (vl === "none") return true;
+      return /^(?:space|ideographic-space)(?: auto-phrase)?$/.test(vl) || /^auto-phrase (?:space|ideographic-space)$/.test(vl);
+    }
+    if (name === "white-space") {
+      if (/^(normal|nowrap|pre|pre-wrap|pre-line|break-spaces)$/.test(vl)) return true;
+      var ws = vl.split(/\s+/), collapseCount = 0, wrapCount = 0;
+      for (var wi = 0; wi < ws.length; wi++) {
+        if (/^(collapse|preserve|preserve-breaks|break-spaces)$/.test(ws[wi])) collapseCount++;
+        else if (/^(wrap|nowrap)$/.test(ws[wi])) wrapCount++;
+        else return false;
+      }
+      return collapseCount <= 1 && wrapCount <= 1;
     }
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
@@ -2698,6 +2824,73 @@
     if ((name === "flex-grow" || name === "flex-shrink") && !/^calc\(/i.test(nv) &&
         !isCssWideKeyword(nv) && !/(?:var|env)\s*\(/i.test(nv)) {
       nv = String(Number(nv));
+    }
+    if (!isCssWideKeyword(nv) && name === "hyphenate-character" && /^"[\s\S]*"$/.test(nv)) {
+      nv = '"' + unescapeCssIdent(nv.slice(1, -1)) + '"';
+    }
+    if (!isCssWideKeyword(nv) && name === "hyphenate-limit-chars") {
+      var hlc = splitCssTokens(nv).map(function (t) {
+        var m = /^calc\(([-+]?\d+(?:\.\d+)?)\)$/i.exec(t); return m ? String(Math.floor(Number(m[1]))) : t;
+      });
+      while (hlc.length > 1 && hlc[hlc.length - 1] === hlc[hlc.length - 2]) hlc.pop();
+      nv = hlc.join(" ");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-transform" && !/^(none|math-auto)$/.test(nv)) {
+      var ttv = nv.split(/\s+/), tto = [];
+      ["capitalize", "uppercase", "lowercase", "full-width", "full-size-kana"].forEach(function (t) { if (ttv.indexOf(t) >= 0) tto.push(t); });
+      nv = tto.join(" ");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-autospace" && !/^(normal|auto|no-autospace)$/.test(nv)) {
+      var tav = nv.split(/\s+/), tao = [];
+      ["ideograph-alpha", "ideograph-numeric", "punctuation", "insert", "replace"].forEach(function (t) { if (tav.indexOf(t) >= 0) tao.push(t); });
+      nv = tao.join(" ");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-justify" && nv === "distribute") nv = "inter-character";
+    if (!isCssWideKeyword(nv) && name === "text-wrap") {
+      var twv = nv.split(/\s+/), twMode = twv.indexOf("nowrap") >= 0 ? "nowrap" : "wrap";
+      var twStyle = twv.indexOf("balance") >= 0 ? "balance" : (twv.indexOf("stable") >= 0 ? "stable" : (twv.indexOf("pretty") >= 0 ? "pretty" : null));
+      nv = twStyle ? (twMode === "wrap" ? twStyle : twMode + " " + twStyle) : twMode;
+    }
+    if (!isCssWideKeyword(nv) && (name === "letter-spacing" || name === "word-spacing")) {
+      var pctOnly = /^calc\(([-+]?\d+(?:\.\d+)?)%\s*([+-])\s*([-+]?\d+(?:\.\d+)?)%\)$/i.exec(nv);
+      if (pctOnly) nv = String(Number(pctOnly[1]) + (pctOnly[2] === "+" ? Number(pctOnly[3]) : -Number(pctOnly[3]))) + "%";
+      else nv = nv.replace(/^calc\(([^()]+) - ([-+]?\d+(?:\.\d+)?)%\)$/i, "calc(-$2% + $1)");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-indent") {
+      var tiv = splitCssTokens(nv), tiLength = [], tiHanging = false, tiEach = false;
+      for (var tii = 0; tii < tiv.length; tii++) {
+        if (tiv[tii] === "hanging") tiHanging = true;
+        else if (tiv[tii] === "each-line") tiEach = true;
+        else tiLength.push(tiv[tii]);
+      }
+      nv = tiLength.join(" ") + (tiHanging ? " hanging" : "") + (tiEach ? " each-line" : "");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-spacing") {
+      if (nv === "none" || nv === "auto") { /* already canonical */ }
+      else if (nv === "no-autospace space-all" || nv === "space-all no-autospace") nv = "none";
+      else {
+        var tsv = nv.split(/\s+/).filter(function (t) { return t !== "normal"; }), tso = [];
+        ["trim-start", "space-all", "no-autospace"].forEach(function (t) { if (tsv.indexOf(t) >= 0) tso.push(t); });
+        nv = tso.length ? tso.join(" ") : "normal";
+      }
+    }
+    if (!isCssWideKeyword(nv) && name === "white-space") {
+      var wsv = nv.split(/\s+/), wc = "collapse", wm = "wrap";
+      if (nv === "normal") { wc = "collapse"; wm = "wrap"; }
+      else if (nv === "nowrap") { wc = "collapse"; wm = "nowrap"; }
+      else if (nv === "pre") { wc = "preserve"; wm = "nowrap"; }
+      else if (nv === "pre-wrap") { wc = "preserve"; wm = "wrap"; }
+      else if (nv === "pre-line") { wc = "preserve-breaks"; wm = "wrap"; }
+      else {
+        wsv.forEach(function (t) { if (/^(collapse|preserve|preserve-breaks|break-spaces)$/.test(t)) wc = t; else if (/^(wrap|nowrap)$/.test(t)) wm = t; });
+      }
+      if (wc === "collapse" && wm === "wrap") nv = "normal";
+      else if (wc === "collapse" && wm === "nowrap") nv = "nowrap";
+      else if (wc === "preserve" && wm === "nowrap") nv = "pre";
+      else if (wc === "preserve" && wm === "wrap") nv = "pre-wrap";
+      else if (wc === "preserve-breaks" && wm === "wrap") nv = "pre-line";
+      else if (wc === "break-spaces" && wm === "wrap") nv = "break-spaces";
+      else nv = wc + " " + wm;
     }
     // The `font` shorthand serializes size/line-height with spaces around the slash: `10px / 1`.
     // It also resets every font-variant longhand to its initial (which serializes as absent inline).

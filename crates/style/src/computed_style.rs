@@ -3,6 +3,7 @@ use crate::*;
 impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle {
+            extra_properties: Default::default(),
             // Initial text color: black on a light canvas, or a light grey when the root opted into
             // a dark `color-scheme` (resolved before the cascade — see `root_used_scheme_dark`). The
             // root inherits this, so every box gets themed default text unless author CSS overrides.
@@ -298,6 +299,56 @@ impl ComputedStyle {
         }
         // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
         let name = trimmed.to_ascii_lowercase();
+        if name == "white-space" && !self.extra_properties.contains_key("white-space") {
+            let collapse = self
+                .extra_properties
+                .get("white-space-collapse")
+                .map_or("collapse", String::as_str);
+            let wrap = self
+                .extra_properties
+                .get("text-wrap-mode")
+                .map_or("wrap", String::as_str);
+            return match (collapse, wrap) {
+                ("collapse", "wrap") => "normal".to_string(),
+                ("collapse", "nowrap") => "nowrap".to_string(),
+                ("preserve", "nowrap") => "pre".to_string(),
+                ("preserve", "wrap") => "pre-wrap".to_string(),
+                ("preserve-breaks", "wrap") => "pre-line".to_string(),
+                ("break-spaces", "wrap") => "break-spaces".to_string(),
+                _ => format!("{collapse} {wrap}"),
+            };
+        }
+        if let Some(value) = self.extra_properties.get(&name) {
+            return value.clone();
+        }
+        let extra_initial = match name.as_str() {
+            "hanging-punctuation"
+            | "hyphens"
+            | "text-fit"
+            | "text-group-align"
+            | "word-space-transform" => Some("none"),
+            "hyphenate-character"
+            | "hyphenate-limit-chars"
+            | "line-break"
+            | "text-align-last"
+            | "text-justify"
+            | "text-wrap-style" => Some("auto"),
+            "text-autospace" => Some("normal"),
+            "overflow-wrap"
+            | "white-space-collapse"
+            | "word-break"
+            | "word-wrap"
+            | "text-spacing"
+            | "text-spacing-trim" => Some("normal"),
+            "tab-size" => Some("8"),
+            "text-align-all" => Some("start"),
+            "text-indent" | "word-spacing" => Some("0px"),
+            "text-wrap" | "text-wrap-mode" => Some("wrap"),
+            _ => None,
+        };
+        if let Some(value) = extra_initial {
+            return value.to_string();
+        }
         // Color-valued properties we only store opaquely (fill, stroke, …): serialize from the map.
         if let Some(extra) = &self.extra_colors {
             if let Some(&c) = extra.get(&name) {
@@ -734,6 +785,30 @@ impl ComputedStyle {
             "text-align",
             "text-transform",
             "letter-spacing",
+            "word-spacing",
+            "text-indent",
+            "tab-size",
+            "hyphens",
+            "hyphenate-character",
+            "hyphenate-limit-chars",
+            "line-break",
+            "overflow-wrap",
+            "word-wrap",
+            "word-break",
+            "hanging-punctuation",
+            "text-align-all",
+            "text-align-last",
+            "text-autospace",
+            "text-fit",
+            "text-group-align",
+            "text-justify",
+            "text-spacing",
+            "text-spacing-trim",
+            "text-wrap",
+            "text-wrap-mode",
+            "text-wrap-style",
+            "white-space-collapse",
+            "word-space-transform",
             "line-height",
             "white-space",
             "list-style-type",
