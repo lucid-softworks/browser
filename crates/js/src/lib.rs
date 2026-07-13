@@ -1045,6 +1045,12 @@ mod tests {
                     sel.extend(t, 8); r.push("e:" + sel.toString());
                     sel.selectAllChildren(p); r.push("a:" + sel.type + ":" + (sel.anchorNode === p));
                     sel.collapseToStart(); r.push("s:" + sel.type);
+                    sel.setBaseAndExtent(t, 8, t, 2);
+                    r.push("b:" + sel.anchorOffset + ":" + sel.focusOffset + ":" + sel.toString());
+                    var detached = document.createTextNode("away");
+                    sel.removeAllRanges(); sel.setBaseAndExtent(detached, 0, detached, 1);
+                    r.push("d:" + sel.rangeCount);
+                    try { sel.setBaseAndExtent(t, 0, t, 99); } catch (e) { r.push("x:" + e.name); }
                     r.join("|")"#
                 .to_string()],
             "https://example.com/",
@@ -1052,7 +1058,7 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(
             out[0].value.as_deref(),
-            Some("c:3:Caret|e:lo wo|a:Range:true|s:Caret")
+            Some("c:3:Caret|e:lo wo|a:Range:true|s:Caret|b:8:2:llo wo|d:0|x:IndexSizeError")
         );
     }
 

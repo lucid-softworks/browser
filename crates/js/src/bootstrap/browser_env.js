@@ -9298,9 +9298,20 @@
   function __makeSelection() {
     var sel = Object.create(__selectionProto);
     sel._ranges = [];
+    sel._direction = "directionless";
     return sel;
   }
   function __selStart(sel) { return sel._ranges.length ? sel._ranges[0] : null; }
+  function __selAnchor(sel) {
+    var r = __selStart(sel);
+    if (!r) { return null; }
+    return sel._direction === "backwards" ? { node: r._ec, offset: r._eo } : { node: r._sc, offset: r._so };
+  }
+  function __selFocus(sel) {
+    var r = __selStart(sel);
+    if (!r) { return null; }
+    return sel._direction === "backwards" ? { node: r._sc, offset: r._so } : { node: r._ec, offset: r._eo };
+  }
   // Push the current selection (its single range's boundaries, in document order) to the engine so it
   // can paint the ::selection highlight. The boundary node ids are passed as-is (the engine indexes
   // painted text runs by their node id, which is the text node); cleared when there is no range.
@@ -9320,10 +9331,10 @@
     get: function () { var r = __selStart(this); if (!r) { return "None"; } return (r._sc === r._ec && r._so === r._eo) ? "Caret" : "Range"; },
     enumerable: true, configurable: true
   });
-  Object.defineProperty(__selectionProto, "anchorNode", { get: function () { var r = __selStart(this); return r ? r._sc : null; }, enumerable: true, configurable: true });
-  Object.defineProperty(__selectionProto, "anchorOffset", { get: function () { var r = __selStart(this); return r ? r._so : 0; }, enumerable: true, configurable: true });
-  Object.defineProperty(__selectionProto, "focusNode", { get: function () { var r = __selStart(this); return r ? r._ec : null; }, enumerable: true, configurable: true });
-  Object.defineProperty(__selectionProto, "focusOffset", { get: function () { var r = __selStart(this); return r ? r._eo : 0; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "anchorNode", { get: function () { var p = __selAnchor(this); return p ? p.node : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "anchorOffset", { get: function () { var p = __selAnchor(this); return p ? p.offset : 0; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "focusNode", { get: function () { var p = __selFocus(this); return p ? p.node : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "focusOffset", { get: function () { var p = __selFocus(this); return p ? p.offset : 0; }, enumerable: true, configurable: true });
   def(__selectionProto, "getRangeAt", function (index) {
     index = index >>> 0;
     if (index >= this._ranges.length) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
@@ -9337,6 +9348,7 @@
     if (globalThis.__rootId(__idOf(range._sc)) !== __idOf(globalThis.document)) { return; }
     if (this._ranges.length) { return; }
     this._ranges = [range];
+    this._direction = "forwards";
     __syncSelection(this);
   });
   def(__selectionProto, "removeRange", function (range) {
@@ -9345,15 +9357,24 @@
     this._ranges.splice(i, 1);
     __syncSelection(this);
   });
-  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; __syncSelection(this); });
-  def(__selectionProto, "empty", function () { this._ranges = []; __syncSelection(this); });
-  // setBaseAndExtent: select from (anchorNode, anchorOffset) to (focusNode, focusOffset). We don't
-  // track selection direction, so a backward selection's anchor/focus getters may read swapped; the
-  // selected range itself is correct.
+  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; this._direction = "directionless"; __syncSelection(this); });
+  def(__selectionProto, "empty", function () { this._ranges = []; this._direction = "directionless"; __syncSelection(this); });
+  // setBaseAndExtent: validate both boundary points, preserve the requested anchor/focus direction,
+  // and ignore boundary points whose roots are not this Selection's document.
   def(__selectionProto, "setBaseAndExtent", function (anchorNode, anchorOffset, focusNode, focusOffset) {
+    if (arguments.length < 4) { throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': 4 arguments required."); }
+    var anchor = __validBP(anchorNode, anchorOffset, "setBaseAndExtent");
+    var focus = __validBP(focusNode, focusOffset, "setBaseAndExtent");
+    var documentRoot = __idOf(globalThis.document);
+    if (__rootOf(anchorNode) !== documentRoot || __rootOf(focusNode) !== documentRoot) { return; }
     var range = globalThis.document.createRange();
-    try { range.setStart(anchorNode, anchorOffset); range.setEnd(focusNode, focusOffset); }
-    catch (e) { try { range.setStart(focusNode, focusOffset); range.setEnd(anchorNode, anchorOffset); } catch (e2) { return; } }
+    if (__cmpBP(anchorNode, anchor, focusNode, focus) <= 0) {
+      range._sc = anchorNode; range._so = anchor; range._ec = focusNode; range._eo = focus;
+      this._direction = "forwards";
+    } else {
+      range._sc = focusNode; range._so = focus; range._ec = anchorNode; range._eo = anchor;
+      this._direction = "backwards";
+    }
     this._ranges = [range];
     __syncSelection(this);
   });
@@ -9364,25 +9385,26 @@
     var range = globalThis.document.createRange();
     range.setStart(node, offset || 0); range.collapse(true);
     this._ranges = [range];
+    this._direction = "forwards";
     __syncSelection(this);
   });
   def(__selectionProto, "setPosition", __selectionProto.collapse);
   def(__selectionProto, "collapseToStart", function () {
     var r = this._ranges[0];
     if (!r) { throw new globalThis.DOMException("There is no selection to collapse.", "InvalidStateError"); }
-    var nr = globalThis.document.createRange(); nr.setStart(r._sc, r._so); nr.collapse(true); this._ranges = [nr];
+    var nr = globalThis.document.createRange(); nr.setStart(r._sc, r._so); nr.collapse(true); this._ranges = [nr]; this._direction = "forwards"; __syncSelection(this);
   });
   def(__selectionProto, "collapseToEnd", function () {
     var r = this._ranges[0];
     if (!r) { throw new globalThis.DOMException("There is no selection to collapse.", "InvalidStateError"); }
-    var nr = globalThis.document.createRange(); nr.setStart(r._ec, r._eo); nr.collapse(true); this._ranges = [nr];
+    var nr = globalThis.document.createRange(); nr.setStart(r._ec, r._eo); nr.collapse(true); this._ranges = [nr]; this._direction = "forwards"; __syncSelection(this);
   });
   def(__selectionProto, "extend", function (node, offset) {
-    var r = this._ranges[0];
-    this.setBaseAndExtent(r ? r._sc : node, r ? r._so : 0, node, offset || 0);
+    var anchorNode = this.anchorNode;
+    this.setBaseAndExtent(anchorNode || node, anchorNode ? this.anchorOffset : 0, node, offset || 0);
   });
   def(__selectionProto, "selectAllChildren", function (node) {
-    var range = globalThis.document.createRange(); range.selectNodeContents(node); this._ranges = [range];
+    var range = globalThis.document.createRange(); range.selectNodeContents(node); this._ranges = [range]; this._direction = "forwards";
     __syncSelection(this);
   });
   def(__selectionProto, "containsNode", function (node) {
