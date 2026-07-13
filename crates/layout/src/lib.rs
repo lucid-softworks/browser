@@ -3615,6 +3615,34 @@ mod tests {
     }
 
     #[test]
+    fn table_caption_intrinsic_width_enlarges_table() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let table = doc.append_element(body, "table");
+        let caption = doc.append_element(table, "caption");
+        let wide = doc.append_element(caption, "span");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            table,
+            style::ComputedStyle {
+                display: style::Display::Table,
+                width: Some(50.0),
+                border: style::Edges::all(2.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(caption, disp(style::Display::TableCaption));
+        styles.insert(wide, inline_block(100.0, 10.0));
+        build_row(&mut doc, &mut styles, table, "td", &[""]);
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let table_box = find_box(&root_box, &|x| x.node == Some(table)).unwrap();
+        assert_eq!(table_box.dimensions.border_box().width, 100.0);
+    }
+
+    #[test]
     fn table_caption_side_bottom_sits_below_rows() {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -3842,6 +3870,8 @@ mod tests {
         styles.insert(col1, c1s);
 
         let cells = build_row(&mut doc, &mut styles, table, "td", &["a", "b"]);
+        // A larger cell width is also a column measure and wins over the narrower `<col>` width.
+        styles.get_mut(&cells[0]).unwrap().width = Some(200.0);
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let bx = |n: dom::NodeId| {
@@ -3854,10 +3884,7 @@ mod tests {
         };
         let w0 = bx(cells[0]).width;
         let w1 = bx(cells[1]).width;
-        assert!(
-            (w0 - 150.0).abs() < 1.5,
-            "col0 width should be 150, got {w0}"
-        );
+        assert!((w0 - 200.0).abs() < 1.5, "cell width should win, got {w0}");
         assert!((w1 - 50.0).abs() < 1.5, "col1 width should be 50, got {w1}");
     }
 
