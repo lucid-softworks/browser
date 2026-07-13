@@ -2577,6 +2577,22 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("1|DIV|bar|hi"));
     }
 
+    #[test]
+    fn document_element_inner_html_preserves_head_and_body() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"document.documentElement.innerHTML = '<head><title>x</title></head><body><p id="marker">inside</p></body>';
+                   [document.head.tagName,
+                    document.body.tagName,
+                    document.body.querySelector('#marker').textContent].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("HEAD|BODY|inside"));
+    }
+
     // --- Timer / event-loop APIs --------------------------------------------------------
 
     #[test]
@@ -6113,13 +6129,17 @@ mod tests {
                 f.onload = function () {
                   loads++;
                   var foreignClone = f.contentDocument.documentElement.cloneNode(true);
+                  document.body.setAttribute('data-foreign-has-body', foreignClone.innerHTML.indexOf('<body') >= 0 ? 'yes' : 'no');
                   referenceDoc.appendChild(foreignClone);
                   document.body.setAttribute('data-reference-root-before-restore', referenceDoc.documentElement ? referenceDoc.documentElement.tagName : 'null');
+                  document.body.setAttribute('data-reference-body-before-restore', referenceDoc.body ? referenceDoc.body.tagName : 'null');
                   while (f.contentDocument.firstChild) {
                     f.contentDocument.removeChild(f.contentDocument.firstChild);
                   }
                   f.contentDocument.appendChild(referenceDoc.documentElement.cloneNode(true));
                   document.body.setAttribute('data-frame-root-after-restore', f.contentDocument.documentElement ? f.contentDocument.documentElement.tagName : 'null');
+                  document.body.setAttribute('data-frame-body-after-restore', f.contentDocument.body ? f.contentDocument.body.tagName : 'null');
+                  f.contentDocument.body.insertBefore(f.contentDocument.createElement('div'), f.contentDocument.body.firstChild);
                   document.body.setAttribute('data-imported', f.contentWindow.readImported());
                   document.body.setAttribute('data-loads', String(loads));
                   document.body.setAttribute('data-reference-root', referenceDoc.documentElement ? referenceDoc.documentElement.tagName : 'null');
@@ -6161,9 +6181,18 @@ mod tests {
             attr("data-reference-root-before-restore").as_deref(),
             Some("HTML")
         );
+        assert_eq!(attr("data-foreign-has-body").as_deref(), Some("yes"));
+        assert_eq!(
+            attr("data-reference-body-before-restore").as_deref(),
+            Some("BODY")
+        );
         assert_eq!(
             attr("data-frame-root-after-restore").as_deref(),
             Some("HTML")
+        );
+        assert_eq!(
+            attr("data-frame-body-after-restore").as_deref(),
+            Some("BODY")
         );
         let imported = attr("data-imported");
         assert_eq!(imported.as_deref(), Some("copied:inside"));

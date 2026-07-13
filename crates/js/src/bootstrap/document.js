@@ -1787,7 +1787,8 @@
     }
     var type = node.nodeType, copy;
     if (type === 1) {
-      var qualifiedName = node.nodeName || node.tagName || "div";
+      var localName = node.localName || node.nodeName || node.tagName || "div";
+      var qualifiedName = node.prefix ? (node.prefix + ":" + localName) : localName;
       copy = document.createElementNS
         ? document.createElementNS(node.namespaceURI == null ? null : node.namespaceURI, qualifiedName)
         : document.createElement(qualifiedName);
