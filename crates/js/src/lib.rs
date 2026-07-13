@@ -2595,6 +2595,46 @@ mod tests {
     }
 
     #[test]
+    fn range_insert_node_splits_text_and_updates_collapsed_end() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var text = document.createTextNode('abcd');
+                   var mark = document.createElement('mark');
+                   p.appendChild(text);
+                   var r = document.createRange();
+                   r.setStart(text, 2); r.setEnd(text, 2);
+                   r.insertNode(mark);
+                   [p.childNodes.length, p.childNodes[0].data,
+                    p.childNodes[1] === mark, p.childNodes[2].data,
+                    r.startContainer === text, r.startOffset,
+                    r.endContainer === p, r.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("3|ab|true|cd|true|2|true|2"));
+    }
+
+    #[test]
+    fn range_insert_node_rejects_parentless_text_boundary() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var text = document.createTextNode('abcd');
+                   var r = document.createRange();
+                   r.setStart(text, 2); r.setEnd(text, 2);
+                   var name = ''; try { r.insertNode(document.createElement('i')); } catch (e) { name = e.name; }
+                   [name, text.data].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("HierarchyRequestError|abcd"));
+    }
+
+    #[test]
     fn document_element_inner_html_preserves_head_and_body() {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(

@@ -9690,6 +9690,43 @@
   Range.prototype.cloneContents = function () {
     return __cloneRangeContents(this);
   };
+  Range.prototype.insertNode = function (node) {
+    __reqNode(node, "insertNode");
+    var startId = __idOf(this._sc), startType = __nodeType(startId);
+    var nodeId = __idOf(node);
+    if (startType === 7 || startType === 8 ||
+        ((startType === 3 || startType === 4) && __parent(startId) < 0) ||
+        __sameNode(this._sc, node)) {
+      throw new globalThis.DOMException("The node cannot be inserted at the Range boundary.", "HierarchyRequestError");
+    }
+
+    var reference = null;
+    if (startType === 3 || startType === 4) {
+      reference = this._sc;
+    } else {
+      var startKids = __children(startId);
+      reference = this._so < startKids.length ? __nodeFor(startKids[this._so]) : null;
+    }
+    var parent = reference === null ? this._sc : reference.parentNode;
+    var parentId = __idOf(parent);
+    var referenceId = reference === null ? -1 : __idOf(reference);
+    globalThis.__ensurePreInsertValid(parentId, nodeId, referenceId, -1);
+
+    if (startType === 3 || startType === 4) {
+      reference = this._sc.splitText(this._so);
+    }
+    if (__sameNode(node, reference)) { reference = reference.nextSibling; }
+
+    var newOffset = reference === null
+      ? __rangeLength(parent)
+      : __children(parentId).indexOf(__idOf(reference));
+    newOffset += __nodeType(nodeId) === 11 ? __children(nodeId).length : 1;
+    parent.insertBefore(node, reference);
+
+    if (__sameNode(this._sc, this._ec) && this._so === this._eo) {
+      __setRangeEnd(this, parent, newOffset);
+    }
+  };
   Range.prototype.cloneRange = function () { var r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; };
   Range.prototype.detach = function () {};
   Range.prototype.createContextualFragment = function (html) {
