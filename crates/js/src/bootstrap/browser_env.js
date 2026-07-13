@@ -6371,6 +6371,7 @@
       Object.defineProperty(doc, "previousSibling", { get: function () { return null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "nextSibling", { get: function () { return null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "ownerDocument", { get: function () { return null; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "isConnected", { get: function () { return true; }, configurable: true, enumerable: true });
       def(doc, "contains", function (other) { return nodeContains(doc, other); });
       def(doc, "isSameNode", function (other) { return other === doc; });
       def(doc, "compareDocumentPosition", function (other) {
@@ -6692,6 +6693,7 @@
   }
   // The document is itself the root of its tree; getRootNode returns it, isSameNode is identity.
   if (typeof document.getRootNode !== "function") { def(document, "getRootNode", function () { return document; }); }
+  if (typeof document.isConnected === "undefined") { Object.defineProperty(document, "isConnected", { get: function () { return true; }, configurable: true, enumerable: true }); }
   if (typeof document.isSameNode !== "function") { def(document, "isSameNode", function (other) { return other === document; }); }
   if (typeof document.compareDocumentPosition !== "function") {
     def(document, "compareDocumentPosition", function (other) {
@@ -9641,7 +9643,7 @@
           // A loaded frame (real nested realm) exposes its own parsed document. Wrap it so
           // `contentDocument.defaultView` is the contentWindow proxy: the raw frame window can't be
           // read across realms (V8 access check → "no access"), but the proxy reads via __frameGet.
-          if (this.__frameLoadedKey && typeof __frameGet === "function") {
+          if (this.__frameLoadedKey && this.__frameLoadedKey !== "about:blank" && typeof __frameGet === "function") {
             try {
               var rdoc = __frameGet(this.__node, "document");
               if (rdoc) {
@@ -9919,6 +9921,7 @@
                     // (and assign/replace/reload) actually navigate the frame.
                     if (prop === "location") { return el.__frameLocProxy || (el.__frameLocProxy = __frameLocationProxy(el)); }
                     if (prop === "history") { return el.__frameHistProxy || (el.__frameHistProxy = __frameHistoryProxy(el)); }
+                    if (prop === "document" && el.__frameLoadedKey === "about:blank") { return el.contentDocument; }
                     // A same-origin frame (about:blank inherits the parent's origin) shares the cookie
                     // jar + origin, so expose the parent's cookieStore — the frame realm's own would key
                     // cookies on "about:blank" and see nothing.

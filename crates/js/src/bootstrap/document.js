@@ -687,6 +687,24 @@
       return __nodeType(id) === 1 ? __tag(id) : null;
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "nodeType", { get: function () { return __nodeType(id); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "isConnected", {
+      get: function () {
+        var current = id;
+        while (current >= 0) {
+          if (__nodeType(current) === 9) { return true; }
+          // Lightweight iframe documents use a detached arena subtree whose root wrapper carries
+          // its owning Document facade. Nodes in that subtree are connected to that document even
+          // when the host iframe itself is detached from the outer document.
+          try {
+            var wrapped = globalThis.__nodeFor(current);
+            if (wrapped && wrapped.__frameDoc && wrapped.__frameDoc.nodeType === 9) { return true; }
+          } catch (e) {}
+          current = __parent(current);
+        }
+        return false;
+      },
+      enumerable: true, configurable: true
+    });
     // Legacy identity alias from Node. A node can be surfaced through more than one wrapper, so
     // arena-backed nodes compare by their stable node id rather than wrapper object identity alone.
     def(el, "isSameNode", function (other) {
@@ -972,6 +990,7 @@
                prefix: meta ? meta.prefix : null,
                localName: meta ? meta.localName : attrName,
                specified: true };
+      Object.defineProperty(attr, "isConnected", { get: function () { return false; }, enumerable: true, configurable: true });
       Object.defineProperty(attr, "ownerElement", {
         get: function () { return __getAttr(id, attrName) == null ? null : el; },
         enumerable: true, configurable: true
@@ -1502,6 +1521,7 @@
       specified: true,
       ownerElement: null
     };
+    Object.defineProperty(attr, "isConnected", { get: function () { return false; }, enumerable: true, configurable: true });
     Object.defineProperty(attr, "value", {
       get: function () { return value; },
       set: function (v) { value = v == null ? "" : String(v); },

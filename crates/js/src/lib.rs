@@ -3093,6 +3093,28 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("false|true|false"));
     }
 
+    #[test]
+    fn node_is_connected_tracks_document_membership() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var parent = document.createElement('div');
+              var child = document.createTextNode('value'); parent.appendChild(child);
+              var values = [parent.isConnected, child.isConnected];
+              document.body.appendChild(parent); values.push(parent.isConnected, child.isConnected);
+              parent.remove(); values.push(parent.isConnected, child.isConnected);
+              var detachedDocument = document.implementation.createHTMLDocument('');
+              values.push(detachedDocument.isConnected, detachedDocument.body.isConnected);
+              values.join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("false|false|true|true|false|false|true|true"));
+    }
+
     // --- Browser environment (`install_browser_env`) ------------------------------------
 
     /// Convenience: run one expression source against a fresh doc+body at the given URL and
