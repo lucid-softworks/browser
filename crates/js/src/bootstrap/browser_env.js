@@ -1169,7 +1169,17 @@
   document.referrer = "";
   document.URL = parts.href;
   document.documentURI = parts.href;
-  document.baseURI = parts.href;
+  Object.defineProperty(document, "baseURI", {
+    get: function () {
+      var base = null;
+      try { base = document.querySelector("base[href]"); } catch (e) {}
+      if (base && typeof base.getAttribute === "function") {
+        try { return new globalThis.URL(base.getAttribute("href"), parts.href).href; } catch (e2) {}
+      }
+      return parts.href;
+    },
+    enumerable: true, configurable: true
+  });
   document.domain = parts.hostname;
   document.title = document.title; // leave as-is; real getter/setter already present
 
@@ -6458,6 +6468,7 @@
       ro("compatMode", "CSS1Compat");
       ro("URL", "about:blank");
       ro("documentURI", "about:blank");
+      ro("baseURI", "about:blank");
       ro("location", null);
     }
     // The first HTML-namespace <title> element in tree order (the "title element" the HTML spec's

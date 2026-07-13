@@ -3115,6 +3115,29 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("false|false|true|true|false|false|true|true"));
     }
 
+    #[test]
+    fn node_base_uri_tracks_the_document_base_url() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              var attr = document.createAttribute('data-value');
+              var before = [el.baseURI, attr.baseURI];
+              var base = document.createElement('base'); base.setAttribute('href', '/assets/');
+              document.head.appendChild(base);
+              before.concat([el.baseURI, document.createTextNode('').baseURI]).join('|')
+            "#
+            .to_string()],
+            "https://example.com/path/page.html",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("https://example.com/path/page.html|https://example.com/path/page.html|https://example.com/assets/|https://example.com/assets/")
+        );
+    }
+
     // --- Browser environment (`install_browser_env`) ------------------------------------
 
     /// Convenience: run one expression source against a fresh doc+body at the given URL and

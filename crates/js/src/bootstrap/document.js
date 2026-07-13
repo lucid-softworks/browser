@@ -687,6 +687,13 @@
       return __nodeType(id) === 1 ? __tag(id) : null;
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "nodeType", { get: function () { return __nodeType(id); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "baseURI", {
+      get: function () {
+        var owner = el.ownerDocument || document;
+        return owner && owner.baseURI != null ? String(owner.baseURI) : "about:blank";
+      },
+      enumerable: true, configurable: true
+    });
     Object.defineProperty(el, "isConnected", {
       get: function () {
         var current = id;
@@ -991,6 +998,7 @@
                localName: meta ? meta.localName : attrName,
                specified: true };
       Object.defineProperty(attr, "isConnected", { get: function () { return false; }, enumerable: true, configurable: true });
+      Object.defineProperty(attr, "baseURI", { get: function () { return document.baseURI; }, enumerable: true, configurable: true });
       Object.defineProperty(attr, "ownerElement", {
         get: function () { return __getAttr(id, attrName) == null ? null : el; },
         enumerable: true, configurable: true
@@ -1522,6 +1530,7 @@
       ownerElement: null
     };
     Object.defineProperty(attr, "isConnected", { get: function () { return false; }, enumerable: true, configurable: true });
+    Object.defineProperty(attr, "baseURI", { get: function () { return document.baseURI; }, enumerable: true, configurable: true });
     Object.defineProperty(attr, "value", {
       get: function () { return value; },
       set: function (v) { value = v == null ? "" : String(v); },
