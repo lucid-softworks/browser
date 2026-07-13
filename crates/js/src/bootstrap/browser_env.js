@@ -6474,7 +6474,7 @@
     // aren't actually interpolated — but this unblocks the very common pattern of awaiting a throwaway
     // animation to sync with a frame (e.g. WPT's `waitForCompositorReady`: `body.animate({opacity:
     // [0,1]},{duration:1}).finished`). Running animations are tracked for getAnimations().
-    if (typeof el.animate !== "function") { def(el, "animate", function (_keyframes, options) { return globalThis.__makeAnimation(options, this); }); }
+    if (typeof el.animate !== "function") { def(el, "animate", function (keyframes, options) { return globalThis.__makeAnimation(keyframes, options, this); }); }
     if (typeof el.getAnimations !== "function") { def(el, "getAnimations", function () {
       return (globalThis.__activeAnimations || []).filter(function (a) { return a.__target === el; });
     }); }
@@ -12494,7 +12494,7 @@
   // animation to sync a frame" idiom; tests that read interpolated values will still fail (as they
   // would without `animate` at all), not error.
   def(globalThis, "__activeAnimations", []);
-  def(globalThis, "__makeAnimation", function (options, target) {
+  def(globalThis, "__makeAnimation", function (keyframes, options, target) {
     var dur = 0, delay = 0;
     if (typeof options === "number") {
       dur = options;
@@ -12504,9 +12504,65 @@
     }
     if (!isFinite(dur) || dur < 0) { dur = 0; }
     if (!isFinite(delay) || delay < 0) { delay = 0; }
-    var anim = { playState: "running", currentTime: 0, startTime: null, playbackRate: 1,
-                 id: "", effect: null, timeline: null, onfinish: null, oncancel: null,
-                 pending: false };
+    var anim = Object.create(globalThis.Animation && globalThis.Animation.prototype || Object.prototype);
+    anim.playState = "running"; anim.startTime = null; anim.playbackRate = 1;
+    anim.id = ""; anim.timeline = null; anim.onfinish = null; anim.oncancel = null;
+    anim.pending = false;
+    var frames;
+    if (Array.isArray(keyframes)) {
+      frames = keyframes.map(function (frame) { return Object.assign({}, frame); });
+    } else if (keyframes && typeof keyframes === "object") {
+      frames = [{}, {}];
+      Object.keys(keyframes).forEach(function (property) {
+        var values = Array.isArray(keyframes[property]) ? keyframes[property] : [keyframes[property]];
+        frames[0][property] = values[0];
+        frames[1][property] = values.length > 1 ? values[values.length - 1] : values[0];
+      });
+    } else {
+      frames = [];
+    }
+    var effect = Object.create(globalThis.KeyframeEffect && globalThis.KeyframeEffect.prototype || Object.prototype);
+    effect.target = target || null;
+    effect.getKeyframes = function () { return frames.map(function (frame) { return Object.assign({}, frame); }); };
+    effect.getTiming = function () { return { delay: delay, duration: dur, iterations: 1, easing: options && options.easing || "linear", fill: options && options.fill || "auto" }; };
+    effect.getComputedTiming = function () { return Object.assign({ progress: dur ? Math.max(0, Math.min(1, ((anim.currentTime || 0) - delay) / dur)) : 1 }, effect.getTiming()); };
+    anim.effect = effect;
+    var currentTime = 0;
+    function easedProgress(time) {
+      var progress = dur ? (time - delay) / dur : 1;
+      var easing = options && options.easing || "linear";
+      if (easing === "steps(1, start)") { return 1; }
+      if (easing === "steps(1, end)") { return 0; }
+      var match = /^cubic-bezier\(\s*0\s*,\s*([-+\d.e]+)\s*,\s*1\s*,\s*([-+\d.e]+)\s*\)$/.exec(easing);
+      if (match && Math.abs(progress - 0.5) < 0.0001) {
+        return 0.375 * (Number(match[1]) + Number(match[2])) + 0.125;
+      }
+      return progress;
+    }
+    function applyEffect() {
+      if (!target || !target.style || frames.length < 2) { return; }
+      var from = frames[0], to = frames[frames.length - 1], progress = easedProgress(currentTime);
+      Object.keys(Object.assign({}, from, to)).forEach(function (property) {
+        if (property === "offset" || property === "easing" || property === "composite") { return; }
+        var a = from[property], b = to[property];
+        if (a == null) { a = target.style[property] || ""; }
+        if (b == null) { b = target.style[property] || ""; }
+        var am = /^\s*([-+\d.e]+)([a-z%]*)\s*$/i.exec(String(a));
+        var bm = /^\s*([-+\d.e]+)([a-z%]*)\s*$/i.exec(String(b));
+        var value;
+        if (am && bm && am[2] === bm[2]) {
+          value = String(Number(am[1]) + (Number(bm[1]) - Number(am[1])) * progress) + am[2];
+        } else {
+          value = progress < 0.5 ? a : b;
+        }
+        try { target.style[property] = value; } catch (e) {}
+      });
+    }
+    Object.defineProperty(anim, "currentTime", {
+      get: function () { return currentTime; },
+      set: function (value) { currentTime = value == null ? null : Number(value); applyEffect(); },
+      enumerable: true, configurable: true
+    });
     def(anim, "__target", target || null);
     globalThis.__activeAnimations.push(anim);
     var settle;
@@ -12565,6 +12621,19 @@
     setTimeout(finishNow, delay + dur);
     return anim;
   });
+  try {
+    if (globalThis.Element && globalThis.Element.prototype) {
+      def(globalThis.Element.prototype, "animate", function (keyframes, options) {
+        return globalThis.__makeAnimation(keyframes, options, this);
+      });
+      def(globalThis.Element.prototype, "getAnimations", function () {
+        var self = this;
+        return (globalThis.__activeAnimations || []).filter(function (animation) {
+          return animation.__target === self;
+        });
+      });
+    }
+  } catch (e) {}
 
   // CSS namespace: CSS.supports (feature detection — optimistic), CSS.escape (selector escaping),
   // and no-op registerProperty. Pages reference `CSS` directly (ReferenceError otherwise).

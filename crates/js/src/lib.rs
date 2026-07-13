@@ -2665,6 +2665,25 @@ mod tests {
     }
 
     #[test]
+    fn web_animation_exposes_prototypes_effect_and_interpolated_style() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "var a=document.body.animate([{width:'10px'},{width:'30px'}],{duration:1000}); \
+                 a.pause(); a.currentTime=500; \
+                 [typeof Element.prototype.animate, a instanceof Animation, \
+                  a.effect instanceof KeyframeEffect, a.effect.getKeyframes().length, \
+                  getComputedStyle(document.body).width].join(',')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("function,true,true,2,20px"));
+    }
+
+    #[test]
     fn window_post_message_dispatches_message_event() {
         // `window.postMessage` delivers a `message` MessageEvent to the window asynchronously, with
         // data structured-cloned, the window's own origin, and source === window. WPT's
