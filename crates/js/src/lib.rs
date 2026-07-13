@@ -6141,6 +6141,11 @@ mod tests {
                   document.body.setAttribute('data-frame-body-after-restore', f.contentDocument.body ? f.contentDocument.body.tagName : 'null');
                   f.contentDocument.body.insertBefore(f.contentDocument.createElement('div'), f.contentDocument.body.firstChild);
                   document.body.setAttribute('data-imported', f.contentWindow.readImported());
+                  document.body.setAttribute('data-exported-range', typeof f.contentWindow.exportedRange);
+                  f.contentWindow.rangeStart = 1;
+                  f.contentWindow.makeRange();
+                  document.body.setAttribute('data-late-range', typeof f.contentWindow.testRange);
+                  document.body.setAttribute('data-frame-global-write', String(f.contentWindow.testRange.startOffset));
                   document.body.setAttribute('data-loads', String(loads));
                   document.body.setAttribute('data-reference-root', referenceDoc.documentElement ? referenceDoc.documentElement.tagName : 'null');
                 };
@@ -6151,7 +6156,7 @@ mod tests {
         let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
             Arc::new(|_m, u, _b, _h| {
                 if u.ends_with("frame.html") {
-                    let frame = r#"<!doctype html><title>Range test iframe</title><body><p id='marker' data-value='copied'>inside</p><script>window.readImported = function () { var n = document.querySelector('#marker'); return n && n.getAttribute('data-value') + ':' + n.textContent; };</script></body>"#;
+                    let frame = r#"<!doctype html><title>Range test iframe</title><body><p id='marker' data-value='copied'>inside</p><script>window.readImported = function () { var n = document.querySelector('#marker'); return n && n.getAttribute('data-value') + ':' + n.textContent; }; window.exportedRange = document.createRange(); window.makeRange = function () { var n = document.querySelector('#marker').firstChild; var r = document.createRange(); r.setStart(n, window.rangeStart); r.setEnd(n, window.rangeStart + 1); window.testRange = r; };</script></body>"#;
                     Some(format!(
                         r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{frame}"}}"#
                     ))
@@ -6196,6 +6201,9 @@ mod tests {
         );
         let imported = attr("data-imported");
         assert_eq!(imported.as_deref(), Some("copied:inside"));
+        assert_eq!(attr("data-exported-range").as_deref(), Some("object"));
+        assert_eq!(attr("data-late-range").as_deref(), Some("object"));
+        assert_eq!(attr("data-frame-global-write").as_deref(), Some("1"));
         assert_eq!(attr("data-loads").as_deref(), Some("1"));
         assert_eq!(attr("data-reference-root").as_deref(), Some("HTML"));
     }

@@ -63,6 +63,7 @@ pub(crate) fn register_iframe_natives(scope: &mut v8::PinScope, global: v8::Loca
     );
     set_fn(scope, global, "__frameUnload", prim_frame_unload);
     set_fn(scope, global, "__frameGet", prim_frame_get);
+    set_fn(scope, global, "__frameSet", prim_frame_set);
 }
 
 /// `__frameGet(nodeId, prop)` -> the value of `globalThis[prop]` in the frame's context (or
@@ -92,6 +93,34 @@ fn prim_frame_get(
             }
         }
     }
+}
+
+/// `__frameSet(nodeId, prop, value)` writes a same-origin WindowProxy property into the frame's
+/// actual global object. Origin policy is enforced by the page-side proxy before calling this.
+fn prim_frame_set(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node_id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
+    let prop = arg_str(scope, &args, 1);
+    let value = args.get(2);
+    let ctx_g = FRAME_REG.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|f| f.node_id == node_id && f.alive)
+            .map(|f| f.context.clone())
+    });
+    let mut written = false;
+    if let Some(ctx_g) = ctx_g {
+        let ctx = v8::Local::new(scope, &ctx_g);
+        let cscope = &mut v8::ContextScope::new(scope, ctx);
+        let global = cscope.get_current_context().global(cscope);
+        if let Some(key) = v8::String::new(cscope, &prop) {
+            written = global.set(cscope, key.into(), value).unwrap_or(false);
+        }
+    }
+    rv.set(v8::Boolean::new(scope, written).into());
 }
 
 /// Walk a parsed document for runnable classic `<script>`s in document order: `(is_external, value)`
@@ -280,9 +309,17 @@ fn build_browsing_context(
 
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
     let (ws_tx, ws_evt_rx) = std::sync::mpsc::channel();
+    let page_url = page_state.page_url.borrow().clone();
+    let shares_security_token = !opaque_origin
+        && (srcdoc.is_some() || frame_url == "about:blank" || same_origin(&page_url, &frame_url));
 
     let ctx_global = {
+        let security_token =
+            shares_security_token.then(|| scope.get_current_context().get_security_token(scope));
         let ctx = v8::Context::new(scope, Default::default());
+        if let Some(token) = security_token {
+            ctx.set_security_token(token);
+        }
         let cscope = &mut v8::ContextScope::new(scope, ctx);
         let shared: SharedDoc = Rc::new(RefCell::new(doc));
         let cookie_getter = std::sync::Arc::clone(&page_state.cookie_getter);

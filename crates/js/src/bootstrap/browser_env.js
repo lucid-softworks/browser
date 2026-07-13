@@ -10670,6 +10670,11 @@
                       try { el.setAttribute("src", String(v)); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el); } catch (e) {}
                       return true;
                     }
+                    var sameOrigin = el.__frameLoadedKey === "about:blank";
+                    if (!sameOrigin) { try { sameOrigin = __frameGet(el.__node, "origin") === globalThis.origin; } catch (e) {} }
+                    if (sameOrigin && typeof prop === "string" && typeof __frameSet === "function") {
+                      try { if (__frameSet(el.__node, prop, v)) { return true; } } catch (e) {}
+                    }
                     t[prop] = v;
                     return true;
                   }
