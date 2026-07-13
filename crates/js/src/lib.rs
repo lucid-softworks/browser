@@ -3462,6 +3462,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replace_child_with_itself_runs_live_range_mutation_steps() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var parent = document.createElement('div');
+                   var child = parent.appendChild(document.createElement('p'));
+                   parent.appendChild(document.createElement('span'));
+                   var inside = document.createRange(); inside.setStart(child, 0); inside.setEnd(child, 0);
+                   var between = document.createRange(); between.setStart(parent, 1); between.setEnd(parent, 2);
+                   var returned = parent.replaceChild(child, child);
+                   [returned === child, parent.firstChild === child,
+                    inside.startContainer === parent, inside.startOffset, inside.endOffset,
+                    between.startOffset, between.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|true|true|0|0|0|2"));
+    }
+
     // --- Browser environment (`install_browser_env`) ------------------------------------
 
     /// Convenience: run one expression source against a fresh doc+body at the given URL and

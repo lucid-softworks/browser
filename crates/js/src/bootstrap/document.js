@@ -1369,7 +1369,6 @@
         ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1;
       }
       ensurePreInsertValid(id, nid, ref, oid);
-      if (nid === oid) { return oldNode; }
       __removeChild(id, oid);
       if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       insertNode(id, nid, ref);

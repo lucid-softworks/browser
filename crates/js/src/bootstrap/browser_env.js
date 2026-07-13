@@ -6960,7 +6960,6 @@
         var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
         if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
         globalThis.__ensurePreInsertValid(docId, n, ref, o);
-        if (n === o) { return oldNode; }
         globalThis.__removeChild(docId, o); globalThis.__insertDomNode(docId, n, ref); return oldNode;
       });
       function kids() { return globalThis.__children(docId); }
@@ -7378,7 +7377,6 @@
       var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
       if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
       globalThis.__ensurePreInsertValid(id, n, ref, o);
-      if (n === o) { return oldNode; }
       __removeChild(id, o); globalThis.__insertDomNode(id, n, ref); return oldNode;
     });
   })();
