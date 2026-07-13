@@ -15,7 +15,7 @@ webpki-roots = "0.26"
 # Pure-Rust WebSocket client (handles ws:// and wss://). rustls TLS to match ureq's backend
 # (rustls 0.23) so we don't pull a second TLS stack. `webpki-roots` ships Mozilla's root store so
 # wss:// works without depending on the OS trust store.
-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 base64 = "0.22"
 wurl = { path = "../wurl" }
 
