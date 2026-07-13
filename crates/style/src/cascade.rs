@@ -882,6 +882,14 @@ pub(crate) fn compute_element_style<'a>(
         flex_wrap: FlexWrap::NoWrap,
         justify_content: JustifyContent::FlexStart,
         align_items: AlignItems::Stretch,
+        align_items_css: "normal".to_string(),
+        // `justify-items: legacy <position>` is the one form that passes to descendants; all other
+        // parent values leave an undeclared child at the initial `normal`.
+        justify_items: if parent.justify_items.starts_with("legacy ") {
+            parent.justify_items.clone()
+        } else {
+            "normal".to_string()
+        },
         align_content: None,
         flex_grow: 0.0,
         flex_shrink: 1.0,

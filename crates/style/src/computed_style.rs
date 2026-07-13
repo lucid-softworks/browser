@@ -66,6 +66,8 @@ impl Default for ComputedStyle {
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,
             align_items: AlignItems::Stretch,
+            align_items_css: "normal".to_string(),
+            justify_items: "normal".to_string(),
             align_content: None,
             flex_grow: 0.0,
             flex_shrink: 1.0,
@@ -548,15 +550,8 @@ impl ComputedStyle {
             }
             .to_string(),
             "justify-content" => justify_content_str(self.justify_content).to_string(),
-            "align-items" => match self.align_items {
-                AlignItems::Stretch => "stretch",
-                AlignItems::FlexStart => "flex-start",
-                AlignItems::FlexEnd => "flex-end",
-                AlignItems::Center => "center",
-                AlignItems::Baseline => "baseline",
-                AlignItems::LastBaseline => "last baseline",
-            }
-            .to_string(),
+            "align-items" => self.align_items_css.clone(),
+            "justify-items" => self.justify_items.clone(),
             "align-content" => match self.align_content {
                 Some(jc) => justify_content_str(jc).to_string(),
                 None => "normal".to_string(),
@@ -771,6 +766,7 @@ impl ComputedStyle {
             "flex-wrap",
             "justify-content",
             "align-items",
+            "justify-items",
             "align-content",
             "flex-grow",
             "flex-shrink",

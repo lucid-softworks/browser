@@ -13,6 +13,55 @@ pub(crate) fn parse_justify(val: &str) -> Option<JustifyContent> {
     }
 }
 
+/// Canonicalize an align/justify-items value while retaining the full CSSOM grammar that the
+/// layout-facing enums intentionally collapse.
+pub(crate) fn parse_items_value(val: &str, justify: bool) -> Option<String> {
+    let value = val
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let canonical = if value == "first baseline" {
+        "baseline"
+    } else {
+        value.as_str()
+    };
+    let single = [
+        "normal",
+        "stretch",
+        "baseline",
+        "last baseline",
+        "start",
+        "end",
+        "self-start",
+        "self-end",
+        "center",
+        "flex-start",
+        "flex-end",
+    ];
+    if single.contains(&canonical) || (justify && matches!(canonical, "left" | "right")) {
+        return Some(canonical.to_string());
+    }
+    let tokens: Vec<&str> = canonical.split_whitespace().collect();
+    if tokens.len() == 2
+        && matches!(tokens[0], "safe" | "unsafe")
+        && matches!(
+            tokens[1],
+            "start" | "end" | "self-start" | "self-end" | "center" | "flex-start" | "flex-end"
+        )
+    {
+        return Some(canonical.to_string());
+    }
+    if justify
+        && tokens.len() == 2
+        && tokens[0] == "legacy"
+        && matches!(tokens[1], "left" | "right" | "center")
+    {
+        return Some(canonical.to_string());
+    }
+    None
+}
+
 /// Parse the `flex` shorthand. Supported forms:
 /// - `none` → grow 0, shrink 0, basis auto
 /// - `auto` → grow 1, shrink 1, basis auto
@@ -829,15 +878,40 @@ pub(crate) fn apply_declaration(
                 style.justify_content = j;
             }
         }
-        "align-items" => match val.trim().to_ascii_lowercase().as_str() {
-            "stretch" => style.align_items = AlignItems::Stretch,
-            "flex-start" | "start" => style.align_items = AlignItems::FlexStart,
-            "flex-end" | "end" => style.align_items = AlignItems::FlexEnd,
-            "center" => style.align_items = AlignItems::Center,
-            "baseline" | "first baseline" => style.align_items = AlignItems::Baseline,
-            "last baseline" => style.align_items = AlignItems::LastBaseline,
-            _ => {}
-        },
+        "align-items" => {
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.align_items_css.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_items_value(val, false),
+            };
+            if let Some(computed) = computed {
+                let position = computed.split_whitespace().last().unwrap_or("normal");
+                style.align_items = if computed == "last baseline" {
+                    AlignItems::LastBaseline
+                } else {
+                    match position {
+                        "stretch" | "normal" => AlignItems::Stretch,
+                        "flex-start" | "start" | "self-start" => AlignItems::FlexStart,
+                        "flex-end" | "end" | "self-end" => AlignItems::FlexEnd,
+                        "center" => AlignItems::Center,
+                        "baseline" => AlignItems::Baseline,
+                        _ => style.align_items,
+                    }
+                };
+                style.align_items_css = computed;
+            }
+        }
+        "justify-items" => {
+            let lower = val.trim().to_ascii_lowercase();
+            if let Some(computed) = match lower.as_str() {
+                "inherit" => Some(parent.justify_items.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_items_value(val, true),
+            } {
+                style.justify_items = computed;
+            }
+        }
         "align-content" => {
             if let Some(j) = parse_justify(val) {
                 style.align_content = Some(j);

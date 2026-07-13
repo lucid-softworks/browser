@@ -435,6 +435,11 @@ pub struct ComputedStyle {
     pub flex_wrap: FlexWrap,
     pub justify_content: JustifyContent,
     pub align_items: AlignItems,
+    /// Canonical computed `align-items` value. Kept separately because layout folds values such as
+    /// `safe end` / `self-start` into its smaller alignment enum.
+    pub align_items_css: String,
+    /// Canonical computed `justify-items` value (including `legacy left|center|right`).
+    pub justify_items: String,
     /// Cross-axis distribution of flex lines (multi-line). `None` = default (stretch-ish).
     pub align_content: Option<JustifyContent>,
 
