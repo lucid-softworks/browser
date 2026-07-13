@@ -224,6 +224,8 @@ pub enum TrackSize {
     Fr(f32),
     Pct(f32),
     Auto,
+    AutoRepeatFill(f32),
+    AutoRepeatFit(f32),
 }
 
 /// A grid line placement: `(start_line, GridSpan)`. Lines are 1-based as in CSS.

@@ -552,6 +552,18 @@ pub(crate) fn parse_track_list(val: &str) -> Vec<TrackSize> {
                         }
                         out.extend(inner_tracks.iter().copied());
                     }
+                } else if let Some(size) = parse_track_size(rest.trim()).and_then(|track| {
+                    if let TrackSize::Px(size) = track {
+                        Some(size)
+                    } else {
+                        None
+                    }
+                }) {
+                    match count_s.trim() {
+                        "auto-fill" => out.push(TrackSize::AutoRepeatFill(size)),
+                        "auto-fit" => out.push(TrackSize::AutoRepeatFit(size)),
+                        _ => {}
+                    }
                 }
             }
         } else if let Some(t) = parse_track_size(&tok) {

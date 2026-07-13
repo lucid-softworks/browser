@@ -856,6 +856,13 @@ mod tests {
             parse_track_list("repeat(3, 1fr)"),
             vec![TrackSize::Fr(1.0), TrackSize::Fr(1.0), TrackSize::Fr(1.0)]
         );
+        assert_eq!(
+            parse_track_list("repeat(auto-fill, 10px) repeat(auto-fit, 20px)"),
+            vec![
+                TrackSize::AutoRepeatFill(10.0),
+                TrackSize::AutoRepeatFit(20.0)
+            ]
+        );
         // Pathological input (grid-template-columns-crash.html builds 100k chained repeats) must not
         // expand without bound: the total track count is capped instead of exhausting memory.
         let mut huge = String::new();

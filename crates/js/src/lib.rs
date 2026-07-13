@@ -1896,6 +1896,29 @@ mod tests {
     }
 
     #[test]
+    fn computed_grid_tracks_serialize_as_expanded_used_pixels() {
+        let (mut doc, body) = doc_with_body("");
+        let grid = doc.append_element(body, "div");
+        if let dom::NodeData::Element(element) = &mut doc.get_mut(grid).data {
+            element.attrs.insert(
+                "style".to_string(),
+                "display:grid;width:300px;height:120px;grid-template-columns:repeat(3,1fr);grid-template-rows:1fr 2fr"
+                    .to_string(),
+            );
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "var s=getComputedStyle(document.querySelector('div')); [s.gridTemplateColumns,s.gridTemplateRows].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("100px 100px 100px|40px 80px"));
+    }
+
+    #[test]
     fn computed_style_inline_color_serializes_rgb() {
         let (mut doc, body) = doc_with_body("");
         let p = doc.append_element(body, "p");

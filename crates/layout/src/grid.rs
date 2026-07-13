@@ -31,12 +31,22 @@ pub(crate) fn layout_grid(
     let col_tracks = if cs.grid_template_columns.is_empty() {
         vec![style::TrackSize::Auto]
     } else {
-        cs.grid_template_columns.clone()
+        expand_auto_repeat_tracks(
+            &cs.grid_template_columns,
+            content.width,
+            cs.column_gap,
+            items.len(),
+        )
     };
     let num_cols = col_tracks.len().max(1);
 
     // Determine number of rows: explicit rows, else enough to fit all items row-major.
-    let explicit_rows = cs.grid_template_rows.clone();
+    let explicit_rows = expand_auto_repeat_tracks(
+        &cs.grid_template_rows,
+        content.height,
+        cs.row_gap,
+        items.len(),
+    );
     let num_rows = if !explicit_rows.is_empty() {
         explicit_rows.len()
     } else {
@@ -317,6 +327,35 @@ pub(crate) fn layout_grid(
     container_h.unwrap_or(total_h)
 }
 
+fn expand_auto_repeat_tracks(
+    tracks: &[style::TrackSize],
+    available: f32,
+    gap: f32,
+    item_count: usize,
+) -> Vec<style::TrackSize> {
+    let mut expanded = Vec::new();
+    for track in tracks {
+        match *track {
+            style::TrackSize::AutoRepeatFill(size) | style::TrackSize::AutoRepeatFit(size) => {
+                let step = (size + gap).max(f32::EPSILON);
+                let count = (((available + gap).max(0.0) / step).ceil() as usize).max(1);
+                for index in 0..count {
+                    let used = if matches!(track, style::TrackSize::AutoRepeatFit(_))
+                        && index >= item_count
+                    {
+                        0.0
+                    } else {
+                        size
+                    };
+                    expanded.push(style::TrackSize::Px(used));
+                }
+            }
+            other => expanded.push(other),
+        }
+    }
+    expanded
+}
+
 /// Resolve a track list into pixel widths within `avail`, accounting for `gap` between tracks.
 pub(crate) fn resolve_tracks(
     tracks: &[style::TrackSize],
@@ -337,6 +376,7 @@ pub(crate) fn resolve_tracks(
             style::TrackSize::Pct(p) => fixed += space * (p / 100.0),
             style::TrackSize::Fr(f) => fr_total += f,
             style::TrackSize::Auto => auto_count += 1,
+            style::TrackSize::AutoRepeatFill(_) | style::TrackSize::AutoRepeatFit(_) => {}
         }
     }
     let remaining = (space - fixed).max(0.0);
@@ -360,6 +400,7 @@ pub(crate) fn resolve_tracks(
             style::TrackSize::Pct(p) => space * (p / 100.0),
             style::TrackSize::Fr(f) => fr_unit * f,
             style::TrackSize::Auto => auto_each,
+            style::TrackSize::AutoRepeatFill(_) | style::TrackSize::AutoRepeatFit(_) => 0.0,
         })
         .collect()
 }
@@ -409,6 +450,7 @@ pub(crate) fn resolve_row_heights(
                 style::TrackSize::Pct(p) => fixed += space * (p / 100.0),
                 style::TrackSize::Fr(f) => fr_total += f,
                 style::TrackSize::Auto => fixed += content_rows[i],
+                style::TrackSize::AutoRepeatFill(_) | style::TrackSize::AutoRepeatFit(_) => {}
             }
         }
         let remaining = (space - fixed).max(0.0);
@@ -425,6 +467,7 @@ pub(crate) fn resolve_row_heights(
                 style::TrackSize::Pct(p) => space * (p / 100.0),
                 style::TrackSize::Fr(f) => fr_unit * f,
                 style::TrackSize::Auto => content_rows[i],
+                style::TrackSize::AutoRepeatFill(_) | style::TrackSize::AutoRepeatFit(_) => 0.0,
             })
             .collect()
     } else {
@@ -437,6 +480,7 @@ pub(crate) fn resolve_row_heights(
                 style::TrackSize::Pct(_) => content_rows[i],
                 style::TrackSize::Fr(_) => content_rows[i],
                 style::TrackSize::Auto => content_rows[i],
+                style::TrackSize::AutoRepeatFill(_) | style::TrackSize::AutoRepeatFit(_) => 0.0,
             })
             .collect()
     }

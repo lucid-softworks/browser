@@ -244,6 +244,8 @@ pub(crate) fn track_str(t: TrackSize) -> String {
         TrackSize::Fr(v) => format!("{}fr", num(v)),
         TrackSize::Pct(p) => format!("{}%", num(p)),
         TrackSize::Auto => "auto".to_string(),
+        TrackSize::AutoRepeatFill(v) => format!("repeat(auto-fill, {})", px(v)),
+        TrackSize::AutoRepeatFit(v) => format!("repeat(auto-fit, {})", px(v)),
     }
 }
 
