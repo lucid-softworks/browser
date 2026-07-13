@@ -41,8 +41,10 @@ product into the checkout's `wptrunner.browsers` package, builds `crates/webdriv
 
 ## CI
 
-[`.github/workflows/wpt-run.yml`](../.github/workflows/wpt-run.yml) runs each WPT area through
-`wpt run` in parallel and writes a pass-rate summary to the job summary.
+[`.github/workflows/wpt-run.yml`](../.github/workflows/wpt-run.yml) runs the complete upstream WPT
+suite nightly. It generates weighted shards from the current WPT tree, sparse-checks out each
+shard, and runs them in parallel through `wpt run`; every shard uploads its raw report and writes a
+pass-rate summary to the job summary.
 
 ## Known limitations
 

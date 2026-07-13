@@ -3,10 +3,10 @@ name: WPT
 # Runs the Web Platform Tests the way other browsers are tested: the real `wpt run` harness driving
 # our engine over WebDriver (crates/webdriver) via the `lucid` wptrunner product.
 #
-# `wpt run` launches a session per test, so a whole area (dom ≈ 600 files, fetch ≈ 540) is far too
-# slow to run as a single leg. Instead each area is split into balanced CHUNKS (`wpt run
-# --total-chunks/--this-chunk`) that run as parallel matrix legs, so wall-clock is roughly the
-# slowest single chunk + per-leg setup. Same areas we've always tracked — just parallelized.
+# `wpt run` launches a session per test, so the complete suite is divided into a generated matrix.
+# Large areas are split into hash chunks; small areas are packed together. Every leg sparse-checks
+# out only its assigned paths, keeping full-WPT coverage practical without cloning the entire WPT
+# working tree hundreds of times.
 #
 # Runs NIGHTLY only (not on PRs): the full suite is slow and PR feedback comes from `ci.yml`
 # (cargo fmt/clippy/test). Each leg uploads its raw `wptreport` JSON as an artifact; there is no
@@ -27,35 +27,19 @@ permissions:
   contents: read
 
 jobs:
-  # Build the chunked run matrix. Each `area:chunks` becomes `chunks` legs; chunk counts are sized so
-  # every leg is ~150 test files (≈ the slowest tolerable leg). Edit AREAS to change coverage.
+  # Build a bounded, weighted matrix from the current upstream WPT tree. This covers every test area
+  # while remaining below GitHub's 256-leg matrix limit.
   scope:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
-    # `dir:chunks` per area; chunk counts are sized so each leg is ~150 test files (the slowest
-    # tolerable leg). CSS2 flow/positioning subdirs and the modern CSS modules are tracked
-    # individually rather than via the whole `css/` tree (tens of thousands of files) to keep the
-    # matrix bounded. Edit AREAS to change coverage.
-    env:
-      AREAS: >-
-        css/cssom:2 dom:4 domparsing:1 html/dom:3 url:1 fetch:4 service-workers:3
-        css/CSS2/abspos:1 css/CSS2/box-display:1 css/CSS2/floats:1 css/CSS2/floats-clear:1
-        css/CSS2/linebox:1 css/CSS2/margin-padding-clear:1 css/CSS2/normal-flow:2
-        css/CSS2/positioning:2 css/CSS2/tables:2
-        css/css-align:2 css/css-break:1 css/css-flexbox:4 css/css-grid:6 css/css-position:3
-        css/css-sizing:2 css/css-text:8 css/css-tables:2
     steps:
+      - uses: actions/checkout@v4
+      - name: Fetch WPT tree metadata
+        run: git clone --depth 1 --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git wpt
       - id: gen
         run: |
-          entries=""
-          for ac in $AREAS; do
-            dir="${ac%:*}"; chunks="${ac#*:}"; slug="${dir//\//-}"
-            for c in $(seq 1 "$chunks"); do
-              entries="${entries}{\"dir\":\"$dir\",\"slug\":\"$slug\",\"chunks\":$chunks,\"chunk\":$c}\n"
-            done
-          done
-          matrix=$(printf "$entries" | jq -s -c '{include: .}')
+          matrix=$(python3 scripts/wpt-matrix.py wpt)
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   # Build the WebDriver server ONCE and share the binary with every matrix leg via an artifact.
@@ -101,7 +85,7 @@ jobs:
 
   wpt:
     needs: [scope, webdriver]
-    name: wpt (${{ matrix.dir }} ${{ matrix.chunk }}/${{ matrix.chunks }})
+    name: wpt (${{ matrix.slug }} ${{ matrix.chunk }}/${{ matrix.chunks }})
     runs-on: ubuntu-latest
     timeout-minutes: 35
     strategy:
@@ -124,45 +108,50 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
 
       - name: Checkout web-platform-tests
+        env:
+          CHECKOUT_JSON: ${{ toJSON(matrix.checkout) }}
         run: |
-          git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git wpt
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git wpt
           cd wpt
           # `css/support` holds shared CSS test helpers (e.g. interpolation-testcommon.js) that
           # testharness tests under css/ load via /css/support/*; `fonts` holds the Ahem test font
           # (and ahem.css) that layout tests load to get exact glyph metrics. Without them those
           # resources 404 — the helper test throws before registering subtests (area reports 0/0),
           # and Ahem-based geometry assertions measure with the fallback font. Add both for css/ areas.
-          extra=""
-          case "${{ matrix.dir }}" in css/*) extra="css/support fonts" ;; esac
-          git sparse-checkout set tools third_party docs resources common $extra "${{ matrix.dir }}"
+          mapfile -t checkout_paths < <(jq -r '.[]' <<< "$CHECKOUT_JSON")
+          git sparse-checkout set tools third_party docs resources common css/support fonts quirks interfaces images "${checkout_paths[@]}"
 
       - name: Map WPT hosts
         run: |
           cd wpt
           python3 ./wpt make-hosts-file | sudo tee -a /etc/hosts >/dev/null
 
-      # Drive this chunk via `wpt run`. `--test-types testharness` avoids the aamtest accessibility
-      # requirements (PyGObject/cairo, absent on the runner). `--chunk-type hash` balances tests
-      # evenly across chunks. A short timeout multiplier keeps worker-variant timeouts cheap. The run
+      # Drive this chunk via `wpt run`, including every test type supported by the Lucid product
+      # (testharness, reftest, wdspec, and crashtest). `--chunk-type hash` balances tests evenly
+      # across chunks. A short timeout multiplier keeps unsupported-feature timeouts cheap. The run
       # is wall-bounded; `|| true` so failures / a cut-off never fail the build. `WEBDRIVER_BIN`
       # points `run-wpt.sh` at the prebuilt binary so it skips its own `cargo build`.
       - name: Run WPT via wpt run
         env:
           WEBDRIVER_BIN: ${{ github.workspace }}/bin/webdriver
+          TESTS_JSON: ${{ toJSON(matrix.tests) }}
         run: |
           mkdir -p reports
-          timeout 1500 scripts/run-wpt.sh "${{ matrix.dir }}" -- \
-            --test-types testharness \
+          mapfile -t test_paths < <(jq -r '.[]' <<< "$TESTS_JSON")
+          timeout 1500 scripts/run-wpt.sh "${test_paths[@]}" -- \
             --timeout-multiplier=0.25 \
             --total-chunks ${{ matrix.chunks }} \
             --this-chunk ${{ matrix.chunk }} \
             --chunk-type hash \
-            --log-wptreport="$PWD/reports/${{ matrix.slug }}-${{ matrix.chunk }}.json" \
+            --log-wptreport="$PWD/reports/${{ matrix.slug }}.json" \
           || true
 
       - name: Summarize chunk
+        env:
+          TESTS_JSON: ${{ toJSON(matrix.tests) }}
         run: |
-          python3 - "${{ matrix.dir }}" "reports/${{ matrix.slug }}-${{ matrix.chunk }}.json" "reports/${{ matrix.slug }}-${{ matrix.chunk }}.tsv" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          label=$(jq -r 'join(" ")' <<< "$TESTS_JSON")
+          python3 - "$label" "reports/${{ matrix.slug }}.json" "reports/${{ matrix.slug }}.tsv" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import json, os, sys
           area, report, tsv = sys.argv[1], sys.argv[2], sys.argv[3]
           if not os.path.exists(report) or os.path.getsize(report) == 0:
