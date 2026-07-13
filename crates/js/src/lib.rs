@@ -6098,6 +6098,80 @@ mod tests {
     }
 
     #[test]
+    fn iframe_document_imports_parent_realm_subtree_on_append() {
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.createElement('iframe');
+                document.body.appendChild(f);
+                var loads = 0;
+                var referenceDoc = document.implementation.createHTMLDocument('');
+                referenceDoc.removeChild(referenceDoc.documentElement);
+                f.onload = function () {
+                  loads++;
+                  var foreignClone = f.contentDocument.documentElement.cloneNode(true);
+                  referenceDoc.appendChild(foreignClone);
+                  document.body.setAttribute('data-reference-root-before-restore', referenceDoc.documentElement ? referenceDoc.documentElement.tagName : 'null');
+                  while (f.contentDocument.firstChild) {
+                    f.contentDocument.removeChild(f.contentDocument.firstChild);
+                  }
+                  f.contentDocument.appendChild(referenceDoc.documentElement.cloneNode(true));
+                  document.body.setAttribute('data-frame-root-after-restore', f.contentDocument.documentElement ? f.contentDocument.documentElement.tagName : 'null');
+                  document.body.setAttribute('data-imported', f.contentWindow.readImported());
+                  document.body.setAttribute('data-loads', String(loads));
+                  document.body.setAttribute('data-reference-root', referenceDoc.documentElement ? referenceDoc.documentElement.tagName : 'null');
+                };
+                f.src = 'frame.html';
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("frame.html") {
+                    let frame = r#"<!doctype html><title>Range test iframe</title><body><p id='marker' data-value='copied'>inside</p><script>window.readImported = function () { var n = document.querySelector('#marker'); return n && n.getAttribute('data-value') + ':' + n.textContent; };</script></body>"#;
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{frame}"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-reference-root-before-restore").as_deref(),
+            Some("HTML")
+        );
+        assert_eq!(
+            attr("data-frame-root-after-restore").as_deref(),
+            Some("HTML")
+        );
+        let imported = attr("data-imported");
+        assert_eq!(imported.as_deref(), Some("copied:inside"));
+        assert_eq!(attr("data-loads").as_deref(), Some("1"));
+        assert_eq!(attr("data-reference-root").as_deref(), Some("HTML"));
+    }
+
+    #[test]
     fn dedicated_worker_async_fetch_resolves() {
         // A worker's async fetch() resolves: its completion is routed back into the worker context by
         // pump_workers (its own fetch channel), so the promise settles and the worker posts the body.

@@ -6928,6 +6928,7 @@
         if (typeof cid === "number" && cid >= 0) { globalThis.__insertNode(docId, cid, -1); }
       }
       function reqNode(x, m) {
+        if (typeof globalThis.__coerceNodeForRealm === "function") { x = globalThis.__coerceNodeForRealm(x); }
         var n = (x && typeof x.__node === "number") ? x.__node : -1;
         if (n < 0) { throw new TypeError("Failed to execute '" + m + "' on 'Node': parameter is not of type 'Node'."); }
         return n;
@@ -7328,12 +7329,15 @@
   // document node id is the parent of <html>.
   (function () {
     function reqNode(x, m) {
+      if (typeof globalThis.__coerceNodeForRealm === "function") { x = globalThis.__coerceNodeForRealm(x); }
       var n = (x && typeof x.__node === "number") ? x.__node : -1;
       if (n < 0) { throw new TypeError("Failed to execute '" + m + "' on 'Node': parameter is not of type 'Node'."); }
       return n;
     }
     function notFound(msg) { throw new (globalThis.DOMException)(msg, "NotFoundError"); }
-    function docNode() { var de = __documentElementId(); return de >= 0 ? __parent(de) : -1; }
+    // The live document arena root is always node 0. Deriving it from documentElement breaks as
+    // soon as script temporarily removes the root element (a common document-reset algorithm).
+    function docNode() { return (typeof document.__node === "number") ? document.__node : 0; }
     var childNodesList = globalThis.__makeNodeList(function () {
       var ids = __children(docNode()), out = [];
       for (var i = 0; i < ids.length; i++) { out.push(globalThis.__nodeFor(ids[i])); }
@@ -10483,6 +10487,11 @@
         if (key === "") { return; }
         if (el.__frameLoadedKey === key && navType !== "reload") { return; }
         el.__frameLoadedKey = key;
+        // Timer cancellation alone is insufficient once an earlier callback has entered the due
+        // queue. Associate every navigation with a generation so a superseded about:blank load
+        // cannot dispatch after src/srcdoc starts a real navigation.
+        var loadGeneration = (el.__frameLoadGeneration || 0) + 1;
+        el.__frameLoadGeneration = loadGeneration;
         // Maintain the frame's session history (for contentWindow.history.back/forward/go). A normal
         // navigation pushes (truncating any forward entries); reload/back_forward don't add an entry.
         if (!el.__history) { el.__history = []; el.__histIndex = -1; }
@@ -10496,6 +10505,7 @@
         try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null), navType || "navigate"); }
         catch (e) { ok = false; }
         var fireLoad = function () {
+          if (el.__frameLoadGeneration !== loadGeneration) { return; }
           el.__pendingLoadTimer = null;
           var ev;
           try { ev = new globalThis.Event(ok ? "load" : "error"); } catch (e) { ev = { type: ok ? "load" : "error", target: el, currentTarget: el }; }

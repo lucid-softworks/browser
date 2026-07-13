@@ -157,6 +157,10 @@
   globalThis.location = { href: "" };
 
   var NODE = "__node";
+  // Numeric node ids are local to one browsing-context realm. A unique object tags wrappers so
+  // mutation methods can distinguish a foreign wrapper from a local node with the same id.
+  var __nodeRealmToken = {};
+  def(globalThis, "__nodeRealmToken", __nodeRealmToken);
 
   // --- DOM namespace / case metadata ----------------------------------------------------------
   // The Rust arena stores only a lowercased `tag` string per element, which loses the namespace,
@@ -400,7 +404,20 @@
     throw new globalThis.DOMException(msg || "The object can not be found here.", "NotFoundError");
   }
   // The node id of an argument: real DOM-arena nodes carry `__node`; strings/anything else => -1.
-  function nodeIdOf(x) { return (x && typeof x.__node === "number") ? x.__node : -1; }
+  // A node from another iframe realm is first rebuilt in this realm because its numeric id belongs
+  // to a different Rust arena.
+  function coerceNodeForRealm(x) {
+    if (x && x.__nodeRealmToken && x.__nodeRealmToken !== __nodeRealmToken &&
+        typeof globalThis.__importForeignNode === "function") {
+      return globalThis.__importForeignNode(x, true);
+    }
+    return x;
+  }
+  def(globalThis, "__coerceNodeForRealm", coerceNodeForRealm);
+  function nodeIdOf(x) {
+    x = coerceNodeForRealm(x);
+    return (x && typeof x.__node === "number") ? x.__node : -1;
+  }
   // WebIDL: a non-nullable `Node` parameter throws a TypeError (not a DOMException) when the value
   // isn't a Node. Returns the node id on success.
   function requireNodeArg(x, methodName) {
@@ -688,6 +705,7 @@
     if (typeof id !== "number" || id < 0) { return null; }
     var el = {};
     def(el, NODE, id);
+    def(el, "__nodeRealmToken", __nodeRealmToken);
 
     function uc(s) { return String(s == null ? "" : s).toUpperCase(); }
 
@@ -1529,6 +1547,8 @@
 
   // --- document --------------------------------------------------------------------------------
   var document = {};
+  def(document, NODE, 0);
+  def(document, "__nodeRealmToken", __nodeRealmToken);
   def(document, "getElementById", function (idStr) { var n = __getElementById(String(idStr)); return n >= 0 ? wrap(n) : null; });
   def(document, "getElementsByTagName", function (tag) {
     var qn = String(tag);
@@ -1759,9 +1779,68 @@
     if (nid >= 0) { var p = __parent(nid); if (p >= 0) { __removeChild(p, nid); } }
     return node;
   });
-  // importNode(node, deep): return a clone of `node` belonging to this document. Cross-document
-  // ownership isn't tracked, so this is a plain clone (the original stays put).
+  // Rebuild a node from another V8 browsing-context realm in this realm's DOM arena. Attribute and
+  // child access happens through the foreign wrapper, while every factory call creates a local node.
+  function importForeignNode(node, deep) {
+    if (!node || typeof node.nodeType !== "number") {
+      throw new TypeError("Failed to execute 'importNode' on 'Document': parameter 1 is not of type 'Node'.");
+    }
+    var type = node.nodeType, copy;
+    if (type === 1) {
+      var qualifiedName = node.nodeName || node.tagName || "div";
+      copy = document.createElementNS
+        ? document.createElementNS(node.namespaceURI == null ? null : node.namespaceURI, qualifiedName)
+        : document.createElement(qualifiedName);
+      var attrs = node.attributes;
+      if (attrs) {
+        for (var ai = 0; ai < attrs.length; ai++) {
+          var attr = attrs.item ? attrs.item(ai) : attrs[ai];
+          if (!attr) { continue; }
+          if (attr.namespaceURI != null && copy.setAttributeNS) {
+            copy.setAttributeNS(attr.namespaceURI, attr.name, attr.value);
+          } else if (copy.setAttribute) {
+            copy.setAttribute(attr.name, attr.value);
+          }
+        }
+      }
+    } else if (type === 3) {
+      copy = document.createTextNode(node.data == null ? "" : node.data);
+    } else if (type === 8) {
+      copy = document.createComment(node.data == null ? "" : node.data);
+    } else if (type === 11) {
+      copy = document.createDocumentFragment();
+    } else if (type === 10) {
+      copy = document.implementation.createDocumentType(
+        node.name || "html", node.publicId || "", node.systemId || ""
+      );
+    } else if (type === 7 && document.createProcessingInstruction) {
+      copy = document.createProcessingInstruction(node.target || node.nodeName, node.data || "");
+    } else {
+      throw new globalThis.DOMException("The node type is not supported.", "NotSupportedError");
+    }
+    if (deep && type === 1 && typeof node.innerHTML === "string" && "innerHTML" in copy) {
+      // String-valued accessors cross V8 contexts reliably even when object-valued navigation
+      // accessors do not. Parsing the foreign element's contents preserves its complete subtree.
+      copy.innerHTML = node.innerHTML;
+    } else if (deep) {
+      // Cross-context NodeList proxies can report an empty length even when navigation accessors
+      // expose the subtree. Walk the sibling chain, snapshotting `nextSibling` before insertion.
+      var child = node.firstChild;
+      while (child) {
+        var next = child.nextSibling;
+        copy.appendChild(importForeignNode(child, true));
+        child = next;
+      }
+    }
+    return copy;
+  }
+  def(globalThis, "__importForeignNode", importForeignNode);
+  // importNode(node, deep): return a clone belonging to this document. Same-realm nodes use the
+  // native arena clone; foreign iframe nodes are serialized into this realm first.
   def(document, "importNode", function (node, deep) {
+    if (node && node.__nodeRealmToken && node.__nodeRealmToken !== __nodeRealmToken) {
+      return importForeignNode(node, !!deep);
+    }
     if (node == null || typeof node.cloneNode !== "function") { return node; }
     return node.cloneNode(!!deep);
   });
