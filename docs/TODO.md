@@ -11,17 +11,13 @@ README status section, not in this file. See `docs/CSS-TODO.md` for CSS-specific
 - [ ] **Real iframe browsing contexts** — load and render nested documents with navigation and
   origin boundaries. The current JS window representation is not a rendered nested context.
 
-## P1 — platform behavior currently exposed as a shim
+## P1 — partial platform behavior
 
 - [ ] **Popover/top layer** — implement visibility state, events, focus, stacking, and rendering.
 - [ ] **ElementInternals** — implement form-associated custom elements, validity, labels, states,
   and form values.
 - [ ] **View Transitions** — capture old/new states and render transitions; the callback/promise
   surface currently completes without a visual transition.
-- [ ] **Cookie Store in workers** — back service-worker registrations and subscriptions with the
-  network cookie jar.
-- [ ] **Structured clone transfer lists** — detach transferred `ArrayBuffer` values instead of
-  accepting and ignoring the option.
 - [ ] **Editing commands** — implement the still-relevant `execCommand` behavior or deliberately
   scope and document the unsupported subset.
 

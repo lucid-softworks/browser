@@ -1170,6 +1170,20 @@ pub(crate) fn prim_natural_size(
     rv.set(obj.into());
 }
 
+/// `__detachArrayBuffer(value) -> bool` — detach a V8 ArrayBuffer after structured-clone copied it.
+pub(crate) fn prim_detach_array_buffer(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(args.get(0)) else {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
+    };
+    let detached = buffer.detach(None).unwrap_or(false);
+    rv.set(v8::Boolean::new(scope, detached).into());
+}
+
 /// `__elemMetrics(id) -> { ow, oh, ot, ol, sw, sh } | null`
 ///
 /// Box metrics for `offsetWidth/Height/Top/Left`, `clientWidth/Height`, `scrollWidth/Height`:
@@ -2258,6 +2272,12 @@ pub(crate) fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local
     set_fn(scope, global, "__nodeType", prim_node_type);
     set_fn(scope, global, "__rect", prim_rect);
     set_fn(scope, global, "__naturalSize", prim_natural_size);
+    set_fn(
+        scope,
+        global,
+        "__detachArrayBuffer",
+        prim_detach_array_buffer,
+    );
     set_fn(scope, global, "__canvasPixels", prim_canvas_pixels);
     set_fn(scope, global, "__rasterizeCanvas", prim_rasterize_canvas);
     set_fn(scope, global, "__elemMetrics", prim_elem_metrics);

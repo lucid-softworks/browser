@@ -535,6 +535,56 @@ mod tests {
     }
 
     #[test]
+    fn structured_clone_transfers_and_detaches_array_buffer() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var b = new ArrayBuffer(4); new Uint8Array(b)[0] = 7;
+                    var c = structuredClone(b, { transfer: [b] });
+                    var duplicate = false;
+                    try { structuredClone(c, { transfer: [c, c] }); }
+                    catch (e) { duplicate = e.name === "DataCloneError"; }
+                    b.byteLength + ":" + c.byteLength + ":" + new Uint8Array(c)[0] + ":" + duplicate"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("0:4:7:true"));
+    }
+
+    #[test]
+    fn popover_internals_animations_and_view_transitions_have_state() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var log=[]; var p=document.createElement('div'); p.setAttribute('popover','auto');
+                   document.body.appendChild(p); p.addEventListener('beforetoggle',e=>log.push(e.oldState+'>'+e.newState));
+                   p.addEventListener('toggle',e=>log.push(e.type)); p.showPopover();
+                   var shown=p.togglePopover(true); p.hidePopover();
+                   class FormThing { static formAssociated=true; }
+                   customElements.define('form-thing',FormThing); var f=document.createElement('form'); f.id='f';
+                   var c=document.createElement('form-thing'); f.appendChild(c); document.body.appendChild(f);
+                   var internals=c.attachInternals(); internals.setFormValue('answer');
+                   internals.setValidity({customError:true},'bad');
+                   var invalid=!internals.checkValidity() && internals.form===f && c.__formValue==='answer';
+                   var a=p.animate([{opacity:0},{opacity:1}],100000); var tracked=p.getAnimations()[0]===a && document.getAnimations()[0]===a; a.cancel();
+                   var vt=document.startViewTransition(function(){document.body.setAttribute('data-vt','ran')});
+                   [shown,p.style.display,log.join(','),invalid,tracked,vt.types instanceof Set].join('|')"#
+                    .to_string(),
+                "document.body.getAttribute('data-vt')".to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true|none|closed>open,toggle,open>closed,toggle|true|true|true")
+        );
+        assert_eq!(out[1].value.as_deref(), Some("ran"));
+    }
+
+    #[test]
     fn custom_element_lifecycle_callbacks_fire_in_order() {
         // connectedCallback already worked; this also exercises the new attributeChangedCallback
         // (only for observedAttributes) and disconnectedCallback (via the removeChild wrapper).
@@ -894,7 +944,7 @@ mod tests {
                     r.push("move:" + (div.firstChild === a));
                     div.scrollTo(0, 0); div.scroll(); div.scrollBy(1, 1);
                     r.push("vis:" + div.checkVisibility());
-                    div.showPopover(); div.hidePopover();
+                    div.setAttribute("popover", "auto"); div.showPopover(); div.hidePopover();
                     r.push("toggle:" + div.togglePopover());
                     r.push("exec:" + document.execCommand("bold"));
                     r.push("anims:" + document.getAnimations().length);
@@ -912,7 +962,7 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(
             out[0].value.as_deref(),
-            Some("root:true|same:true:false|move:true|vis:true|toggle:false|exec:false|anims:0|svt:function|sup256:true|supMd5:false|supAes:true|sel:hel")
+            Some("root:true|same:true:false|move:true|vis:true|toggle:true|exec:false|anims:0|svt:function|sup256:true|supMd5:false|supAes:true|sel:hel")
         );
     }
 
@@ -1016,6 +1066,7 @@ mod tests {
             vec![r#"var r = [];
                     var te = new TextEvent("t"); te.initTextEvent("textInput", true, false, window, "hi");
                     r.push("te:" + te.type + ":" + te.data);
+                    class XY { static formAssociated = true; } customElements.define("x-y", XY);
                     var ai = document.createElement("x-y").attachInternals();
                     ai.setFormValue("v"); r.push("ai:" + ai.checkValidity() + ":" + (typeof ai.states.add));
                     var an = document.body.animate({ opacity: [0, 1] }, 1); an.commitStyles(); an.persist();
@@ -2529,7 +2580,7 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("function,true,0"));
+        assert_eq!(out[0].value.as_deref(), Some("function,true,1"));
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
         assert!(
             all.iter().any(|l| l == "finished:finished"),

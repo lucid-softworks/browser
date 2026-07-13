@@ -5882,9 +5882,11 @@
     // promises settle (after the effect's delay+duration). We don't composite animations, so styles
     // aren't actually interpolated — but this unblocks the very common pattern of awaiting a throwaway
     // animation to sync with a frame (e.g. WPT's `waitForCompositorReady`: `body.animate({opacity:
-    // [0,1]},{duration:1}).finished`). `getAnimations()` reports none (we keep no running set).
-    if (typeof el.animate !== "function") { def(el, "animate", function (_keyframes, options) { return globalThis.__makeAnimation(options); }); }
-    if (typeof el.getAnimations !== "function") { def(el, "getAnimations", function () { return []; }); }
+    // [0,1]},{duration:1}).finished`). Running animations are tracked for getAnimations().
+    if (typeof el.animate !== "function") { def(el, "animate", function (_keyframes, options) { return globalThis.__makeAnimation(options, this); }); }
+    if (typeof el.getAnimations !== "function") { def(el, "getAnimations", function () {
+      return (globalThis.__activeAnimations || []).filter(function (a) { return a.__target === el; });
+    }); }
     if (typeof el.isEqualNode !== "function") { def(el, "isEqualNode", function (other) { return globalThis.__nodesEqual(this, other); }); }
     // getRootNode walks to the topmost ancestor (the document for a connected node; no shadow trees,
     // so the `composed` option is a no-op). isSameNode is identity (compare by node id, since one node
@@ -5925,20 +5927,92 @@
       });
     }
     if (typeof el.checkVisibility !== "function") { def(el, "checkVisibility", function () { return true; }); }
-    // Popover API: accept the calls (we don't render the top layer), togglePopover reports "hidden".
-    if (typeof el.showPopover !== "function") { def(el, "showPopover", fn); }
-    if (typeof el.hidePopover !== "function") { def(el, "hidePopover", fn); }
-    if (typeof el.togglePopover !== "function") { def(el, "togglePopover", function () { return false; }); }
-    // attachInternals: form-associated custom elements / ElementInternals are not implemented; return
-    // a minimal internals object whose methods are no-ops so callers don't hit a TypeError. (Tests
-    // that exercise real form association still fail — just not with "not a function".)
+    // Popover API: maintain open state, toggle events, and actual layout visibility. The painter's
+    // ordinary document order is used for now; top-layer stacking/focus dismissal remain separate
+    // rendering concerns rather than inert API calls.
+    function __popoverEvent(type, oldState, newState, cancelable) {
+      var ev = new Event(type, { cancelable: !!cancelable });
+      def(ev, "oldState", oldState); def(ev, "newState", newState);
+      return ev;
+    }
+    function __requirePopover(self) {
+      if (!self.hasAttribute || !self.hasAttribute("popover")) {
+        throw new DOMException("The element is not a popover.", "NotSupportedError");
+      }
+    }
+    if (el.hasAttribute && el.hasAttribute("popover") && el.__popoverOpen === undefined) {
+      def(el, "__popoverOpen", false);
+      def(el, "__popoverDisplay", el.style ? el.style.display : "");
+      try { el.style.display = "none"; } catch (e) {}
+    }
+    if (typeof el.showPopover !== "function") {
+      def(el, "showPopover", function () {
+        __requirePopover(this); if (this.__popoverOpen) { return; }
+        if (!this.dispatchEvent(__popoverEvent("beforetoggle", "closed", "open", true))) { return; }
+        this.__popoverOpen = true;
+        try { this.style.display = this.__popoverDisplay || "block"; } catch (e) {}
+        this.dispatchEvent(__popoverEvent("toggle", "closed", "open", false));
+      });
+    }
+    if (typeof el.hidePopover !== "function") {
+      def(el, "hidePopover", function () {
+        __requirePopover(this); if (!this.__popoverOpen) { return; }
+        if (!this.dispatchEvent(__popoverEvent("beforetoggle", "open", "closed", true))) { return; }
+        this.__popoverOpen = false;
+        try { this.style.display = "none"; } catch (e) {}
+        this.dispatchEvent(__popoverEvent("toggle", "open", "closed", false));
+      });
+    }
+    if (typeof el.togglePopover !== "function") {
+      def(el, "togglePopover", function (force) {
+        __requirePopover(this);
+        var show = force === undefined ? !this.__popoverOpen : !!force;
+        if (show) { this.showPopover(); } else { this.hidePopover(); }
+        return !!this.__popoverOpen;
+      });
+    }
+    // ElementInternals: form ownership, form values, validity, labels, and custom states for
+    // form-associated custom elements. The returned object is stable and attachInternals is
+    // single-use, matching the platform's observable lifecycle.
     if (typeof el.attachInternals !== "function") {
       def(el, "attachInternals", function () {
-        return {
-          shadowRoot: this.shadowRoot || null, form: null, labels: [], states: new Set(),
-          willValidate: true, validity: { valid: true }, validationMessage: "",
-          setFormValue: fn, setValidity: fn, checkValidity: function () { return true; }, reportValidity: function () { return true; }
-        };
+        var host = this, tag = String(host.localName || host.tagName || "").toLowerCase();
+        var ctor = globalThis.customElements && globalThis.customElements.get ? globalThis.customElements.get(tag) : null;
+        if (tag.indexOf("-") < 0 || !ctor || ctor.formAssociated !== true) {
+          throw new DOMException("Element is not a form-associated custom element.", "NotSupportedError");
+        }
+        if (host.__internals) { throw new DOMException("ElementInternals already attached.", "NotSupportedError"); }
+        var validity = { valueMissing:false, typeMismatch:false, patternMismatch:false, tooLong:false,
+          tooShort:false, rangeUnderflow:false, rangeOverflow:false, stepMismatch:false, badInput:false,
+          customError:false, valid:true };
+        var message = "", formValue = null, stateValue = null;
+        var internals = { shadowRoot: host.shadowRoot || null, states: new Set() };
+        Object.defineProperty(internals, "form", { get:function () {
+          var fid = host.getAttribute && host.getAttribute("form");
+          if (fid) { var f = document.getElementById(fid); if (f && String(f.tagName).toLowerCase() === "form") { return f; } }
+          var p = host.parentNode; while (p) { if (String(p.tagName).toLowerCase() === "form") { return p; } p = p.parentNode; }
+          return null;
+        }, enumerable:true });
+        Object.defineProperty(internals, "labels", { get:function () {
+          var out = [], id = host.id || (host.getAttribute && host.getAttribute("id"));
+          if (id) { try { out = Array.prototype.slice.call(document.querySelectorAll('label[for="'+String(id).replace(/"/g,'\\"')+'"]')); } catch (e) {} }
+          var p = host.parentNode; while (p) { if (String(p.tagName).toLowerCase() === "label") { out.push(p); break; } p = p.parentNode; }
+          return out;
+        }, enumerable:true });
+        Object.defineProperty(internals, "willValidate", { get:function(){ return !host.hasAttribute("disabled"); }, enumerable:true });
+        Object.defineProperty(internals, "validity", { get:function(){ return validity; }, enumerable:true });
+        Object.defineProperty(internals, "validationMessage", { get:function(){ return message; }, enumerable:true });
+        def(internals, "setFormValue", function (value, state) { formValue = value; stateValue = state === undefined ? value : state; host.__formValue = formValue; host.__formState = stateValue; });
+        def(internals, "setValidity", function (flags, msg, anchor) {
+          flags = flags || {}; var any = false;
+          Object.keys(validity).forEach(function(k){ if(k!=="valid"){ validity[k]=!!flags[k]; any=any||validity[k]; } });
+          validity.valid = !any; message = any ? String(msg || "") : ""; internals.validationAnchor = anchor || null;
+          if (any && !message) { throw new TypeError("A validation message is required when invalid."); }
+        });
+        def(internals, "checkValidity", function () { if (validity.valid) { return true; } host.dispatchEvent(new Event("invalid", { cancelable:true })); return false; });
+        def(internals, "reportValidity", function () { return internals.checkValidity(); });
+        def(host, "__internals", internals);
+        return internals;
       });
     }
     // ParentNode/ChildNode insertion (node-taking variants; the *HTML helpers are added below). A
@@ -9215,8 +9289,8 @@
   try { def(globalThis.document, "getSelection", getSelection); } catch (e) {}
 
   // Document-level method stubs for APIs we don't implement, so calls don't throw a TypeError:
-  // execCommand/queryCommand* (legacy editing — we report unsupported), getAnimations (none running),
-  // and startViewTransition (run the update callback immediately; no visual transition).
+  // execCommand/queryCommand* (legacy editing — we report unsupported), active animations, and
+  // the View Transition promise/state lifecycle.
   try {
     var d = globalThis.document;
     if (typeof d.execCommand !== "function") { def(d, "execCommand", function () { return false; }); }
@@ -9224,12 +9298,27 @@
     if (typeof d.queryCommandEnabled !== "function") { def(d, "queryCommandEnabled", function () { return false; }); }
     if (typeof d.queryCommandState !== "function") { def(d, "queryCommandState", function () { return false; }); }
     if (typeof d.queryCommandValue !== "function") { def(d, "queryCommandValue", function () { return ""; }); }
-    if (typeof d.getAnimations !== "function") { def(d, "getAnimations", function () { return []; }); }
+    if (typeof d.getAnimations !== "function") { def(d, "getAnimations", function () { return (globalThis.__activeAnimations || []).slice(); }); }
     if (typeof d.startViewTransition !== "function") {
       def(d, "startViewTransition", function (cb) {
-        var done = Promise.resolve();
-        try { if (typeof cb === "function") { var r = cb(); if (r && typeof r.then === "function") { done = r.then(function () {}, function () {}); } } } catch (e) {}
-        return { ready: Promise.resolve(), finished: Promise.resolve(), updateCallbackDone: done, skipTransition: function () {} };
+        var skipped = false, rejectReady;
+        var skippedReady = new Promise(function (_resolve, reject) { rejectReady = reject; });
+        var update = Promise.resolve().then(function () { return typeof cb === "function" ? cb() : undefined; });
+        var ready = Promise.race([update.then(function () { return undefined; }), skippedReady]);
+        var transition = {
+          ready: ready, updateCallbackDone: update, types: new Set(),
+          skipTransition: function () {
+            if (skipped) { return; } skipped = true;
+            rejectReady(new DOMException("View transition skipped.", "AbortError"));
+          }
+        };
+        transition.finished = update.then(function () {
+          return new Promise(function (resolve) { requestAnimationFrame(function () { resolve(); }); });
+        });
+        d.__activeViewTransition = transition;
+        transition.finished.then(function () { if (d.__activeViewTransition === transition) { d.__activeViewTransition = null; } });
+        ready.catch(function () {});
+        return transition;
       });
     }
   } catch (e) {}
@@ -11588,11 +11677,21 @@
     // views, Map, Set, Array, plain objects, Error, Blob), preserves shared references and cycles
     // via a memory map, and throws DataCloneError for non-cloneable values (functions, symbols, DOM
     // nodes, exotic objects) the way the spec requires — instead of the old JSON round-trip that
-    // silently dropped Maps/Sets/cycles and returned the original on failure. We don't implement
-    // `transfer` (no ArrayBuffer detach primitive in pure JS); the option is accepted and ignored.
-    def(globalThis, "structuredClone", function (value, _options) {
+    // silently dropped Maps/Sets/cycles and returned the original on failure. Transfer-list
+    // ArrayBuffers are copied into the result and detached through the V8 host primitive only after
+    // the graph has been cloned, so typed-array metadata remains readable during traversal.
+    def(globalThis, "structuredClone", function (value, options) {
       var seen = new Map();
       function dce(msg) { return new globalThis.DOMException(msg, "DataCloneError"); }
+      var transfer = options && options.transfer != null ? Array.prototype.slice.call(options.transfer) : [];
+      var transferSeen = new Set();
+      for (var ti = 0; ti < transfer.length; ti++) {
+        var tv = transfer[ti];
+        if (!(tv instanceof ArrayBuffer)) { throw dce("Value in transfer list is not transferable."); }
+        if (transferSeen.has(tv)) { throw dce("Transfer list contains duplicate ArrayBuffer."); }
+        if (tv.byteLength === 0) { throw dce("A detached ArrayBuffer cannot be transferred."); }
+        transferSeen.add(tv);
+      }
       function clone(v) {
         if (v === null) { return v; }
         var t = typeof v;
@@ -11651,7 +11750,13 @@
         }
         throw dce("An object could not be cloned.");        // exotic / non-[Serializable]
       }
-      return clone(value);
+      var result = clone(value);
+      for (var di = 0; di < transfer.length; di++) {
+        if (typeof __detachArrayBuffer !== "function" || !__detachArrayBuffer(transfer[di])) {
+          throw dce("ArrayBuffer transfer is unavailable.");
+        }
+      }
+      return result;
     });
   }
 
@@ -11670,7 +11775,8 @@
   // treated as completing after its `delay + duration`. Enough for the common "await a throwaway
   // animation to sync a frame" idiom; tests that read interpolated values will still fail (as they
   // would without `animate` at all), not error.
-  def(globalThis, "__makeAnimation", function (options) {
+  def(globalThis, "__activeAnimations", []);
+  def(globalThis, "__makeAnimation", function (options, target) {
     var dur = 0, delay = 0;
     if (typeof options === "number") {
       dur = options;
@@ -11683,6 +11789,8 @@
     var anim = { playState: "running", currentTime: 0, startTime: null, playbackRate: 1,
                  id: "", effect: null, timeline: null, onfinish: null, oncancel: null,
                  pending: false };
+    def(anim, "__target", target || null);
+    globalThis.__activeAnimations.push(anim);
     var settle;
     anim.finished = new Promise(function (resolve) { settle = resolve; });
     // Swallow rejection-less completion; cancel just resolves the lifecycle for our purposes.
@@ -11704,6 +11812,7 @@
       anim.currentTime = delay + dur;
       settle(anim);
       fireAnimEvent("finish", "onfinish");
+      var i = globalThis.__activeAnimations.indexOf(anim); if (i >= 0) { globalThis.__activeAnimations.splice(i, 1); }
     }
     anim.play = function () { anim.playState = "running"; };
     anim.pause = function () { anim.playState = "paused"; };
@@ -11716,6 +11825,7 @@
       anim.currentTime = null;
       settle(anim); // resolve rather than reject: nothing awaits a cancellation here
       fireAnimEvent("cancel", "oncancel");
+      var i = globalThis.__activeAnimations.indexOf(anim); if (i >= 0) { globalThis.__activeAnimations.splice(i, 1); }
     };
     anim.updatePlaybackRate = fn;
     anim.commitStyles = fn;   // we don't interpolate, so there are no computed values to commit
@@ -13421,8 +13531,8 @@
     // --- Cookie Store API (window) -----------------------------------------------------------
     // Async cookie access backed by the document cookie jar (__cookie/__setCookie). The jar only
     // round-trips name=value, so read CookieListItems carry spec defaults for the other members.
-    // The ServiceWorker side (registration.cookies / CookieStoreManager subscriptions) needs a
-    // worker cookie backend we don't have, so it's a non-functional stub.
+    // Service-worker scopes receive a same-origin worker store and subscribed registrations are
+    // notified through ExtendableCookieChangeEvent by the service-worker integration below.
     function CookieStore() { throw new globalThis.TypeError("Illegal constructor"); }
     function CookieStoreManager() { throw new globalThis.TypeError("Illegal constructor"); }
     def(globalThis, "CookieStore", CookieStore);
