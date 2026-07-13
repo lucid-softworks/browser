@@ -6,8 +6,6 @@ README status section, not in this file. See `docs/CSS-TODO.md` for CSS-specific
 
 ## P0 — conformance and core browser behavior
 
-- [ ] **Nested scroll containers** — make `overflow: auto/scroll` establish a clipped scrollport;
-  implement element `scrollTop`/`scrollLeft`, `scroll()`, `scrollTo()`, and `scrollBy()`.
 - [ ] **Form submit navigation** — perform GET/POST navigation after an uncancelled submit.
 - [ ] **File upload** — multipart/form-data plus complete `File`/`Blob` integration.
 - [ ] **Real iframe browsing contexts** — load and render nested documents with navigation and

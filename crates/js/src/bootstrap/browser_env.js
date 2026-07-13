@@ -5892,10 +5892,38 @@
     if (typeof el.getRootNode !== "function") { def(el, "getRootNode", function () { var n = this; while (n && n.parentNode) { n = n.parentNode; } return n; }); }
     if (typeof el.isSameNode !== "function") { def(el, "isSameNode", function (other) { if (this === other) { return true; } try { return other != null && this.__node != null && this.__node === other.__node; } catch (e) { return false; } }); }
     if (typeof el.moveBefore !== "function") { def(el, "moveBefore", function (node, ref) { return this.insertBefore(node, ref); }); }
-    // Scrolling an element does nothing here (no scroll containers in layout); accept and ignore.
-    if (typeof el.scroll !== "function") { def(el, "scroll", fn); }
-    if (typeof el.scrollTo !== "function") { def(el, "scrollTo", fn); }
-    if (typeof el.scrollBy !== "function") { def(el, "scrollBy", fn); }
+    // CSSOM View element scrolling. The accessors below clamp against the laid-out scrolling area;
+    // the engine reads the private values before paint and translates the clipped subtree.
+    if (typeof el.scroll !== "function") {
+      def(el, "scroll", function (x, y) {
+        var left, top;
+        if (x && typeof x === "object") {
+          left = x.left == null ? this.scrollLeft : Number(x.left);
+          top = x.top == null ? this.scrollTop : Number(x.top);
+        } else {
+          left = Number(x) || 0;
+          top = Number(y) || 0;
+        }
+        var oldLeft = this.scrollLeft, oldTop = this.scrollTop;
+        this.scrollLeft = left; this.scrollTop = top;
+        if (this.scrollLeft !== oldLeft || this.scrollTop !== oldTop) {
+          try { this.dispatchEvent(new Event("scroll")); } catch (e) {}
+        }
+      });
+    }
+    if (typeof el.scrollTo !== "function") { def(el, "scrollTo", el.scroll); }
+    if (typeof el.scrollBy !== "function") {
+      def(el, "scrollBy", function (x, y) {
+        if (x && typeof x === "object") {
+          return this.scroll({
+            left: this.scrollLeft + (Number(x.left) || 0),
+            top: this.scrollTop + (Number(x.top) || 0),
+            behavior: x.behavior
+          });
+        }
+        return this.scroll(this.scrollLeft + (Number(x) || 0), this.scrollTop + (Number(y) || 0));
+      });
+    }
     if (typeof el.checkVisibility !== "function") { def(el, "checkVisibility", function () { return true; }); }
     // Popover API: accept the calls (we don't render the top layer), togglePopover reports "hidden".
     if (typeof el.showPopover !== "function") { def(el, "showPopover", fn); }
@@ -5976,8 +6004,16 @@
           if (__sd && (__sd.get || __sd.set)) { return; } // page already defined an accessor
           var clamp = function (self, v) {
             v = Number(v); if (!isFinite(v)) { v = 0; }
+            try {
+              var axisProp = prop === "scrollTop" ? "overflowY" : "overflowX";
+              var ov = getComputedStyle(self)[axisProp] || (self.style && (self.style[axisProp] || self.style.overflow));
+              if (!ov || ov === "visible" || ov === "clip") { return 0; }
+            } catch (e) {}
             var m = __elemMetrics(self.__node);
-            var max = m ? Math.max(0, (m[sizeF] || 0) - (m[clientF] || 0)) : 0;
+            // The engine pushes visually translated descendant rects after a scroll. Add the
+            // already-applied offset back when deriving the invariant scroll range.
+            var current = Number(self[backing]) || 0;
+            var max = m ? Math.max(0, (m[sizeF] || 0) - (m[clientF] || 0) + current) : 0;
             if (v < 0) { v = 0; } else if (v > max) { v = max; }
             return v;
           };
@@ -5993,6 +6029,22 @@
     } else {
       if (!("scrollTop" in el)) { el.scrollTop = 0; }
       if (!("scrollLeft" in el)) { el.scrollLeft = 0; }
+    }
+    // Called by the engine between layout and paint. Include zero-valued entries once an element
+    // has been scrolled so resetting scrollTop/Left translates its subtree back to the origin.
+    if (typeof globalThis.__elementScrollOffsets !== "function") {
+      globalThis.__elementScrollOffsets = function () {
+        var out = [], all = [];
+        try { all = document.querySelectorAll("*"); } catch (e) {}
+        for (var i = 0; i < all.length; i++) {
+          var n = all[i];
+          if (Object.prototype.hasOwnProperty.call(n, "__scrollLeftVal") ||
+              Object.prototype.hasOwnProperty.call(n, "__scrollTopVal")) {
+            out.push(String(n.__node) + ":" + String(Number(n.scrollLeft) || 0) + ":" + String(Number(n.scrollTop) || 0));
+          }
+        }
+        return out.join(";");
+      };
     }
     if (!("offsetWidth" in el)) { el.offsetWidth = 0; }
     if (!("offsetHeight" in el)) { el.offsetHeight = 0; }

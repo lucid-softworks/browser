@@ -7,8 +7,9 @@ materially partial behavior.
 
 ## P0 — layout and geometry
 
-- [ ] **Nested overflow and scroll containers** — clipping, scrollbars, scroll offsets, hit testing,
-  and element scrolling APIs.
+- [ ] **Scrollbar UI and styling** — paint nested scrollbars and implement scrollbar-width/color
+  plus WebKit scrollbar pseudo-elements. Nested clipping, offsets, hit testing, and element scroll
+  APIs are implemented.
 - [ ] **`position: sticky`** — sticky constraint rectangles inside the nearest scroll container.
 - [ ] **Percentage geometry** — resolve percentage border radii and percentage-bearing lengths
   against the correct containing dimensions instead of dropping or approximating them.

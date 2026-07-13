@@ -314,6 +314,15 @@ impl Session {
         out.value.unwrap_or_else(|| "[]".to_string())
     }
 
+    /// Return element scroll offsets as `node:left:top;...`. Only elements whose scrolling
+    /// accessors have been written are included; zero entries remain present so the engine can
+    /// undo a previously-applied translation.
+    pub fn element_scroll_offsets(&self) -> String {
+        let (out, _doc, _console) = self
+            .eval_full("(globalThis.__elementScrollOffsets||function(){return ''})()".to_string());
+        out.value.unwrap_or_default()
+    }
+
     /// Deliver computed IntersectionObserver/ResizeObserver geometry to the page: invokes the JS
     /// observer callbacks (which may mutate the DOM), drains the loop, and returns a fresh snapshot
     /// + console. `arr_json` is the JSON array described in `__deliverObservations`.

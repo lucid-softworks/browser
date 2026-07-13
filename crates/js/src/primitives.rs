@@ -1177,9 +1177,8 @@ pub(crate) fn prim_natural_size(
 ///   not subtract borders/scrollbars).
 /// - `ot`/`ol` = document-absolute top/left (offsetTop/Left — a simplification; real offsetTop is
 ///   relative to `offsetParent`, but we report absolute coordinates).
-/// - `sw`/`sh` = scrollWidth/Height ≈ the border-box size (no overflow tracking), EXCEPT for the
-///   document root / `<html>` / `<body>`, where `sh` is the full document height and `sw` the
-///   viewport width — so `document.documentElement.scrollHeight` reports the whole page.
+/// - `sw`/`sh` = the union of the element's client box and laid-out descendant border boxes.
+///   The document root / `<html>` / `<body>` use the full document height.
 /// Returns `null` when the node has no laid-out box.
 pub(crate) fn prim_elem_metrics(
     scope: &mut v8::PinScope,
@@ -1250,7 +1249,35 @@ pub(crate) fn prim_elem_metrics(
         // Viewport width ≈ the root border-box width here; full document height for scrollHeight.
         (w, state.doc_height.get().max(h))
     } else {
-        (w, h)
+        // CSSOM View's scrolling area includes positive overflow from descendants. Walk the DOM
+        // ancestry for every laid-out rect so nested boxes contribute even though the layout table
+        // is flat by node id here. Negative overflow does not extend the start edge.
+        let rects = state.layout_rects.borrow();
+        let doc = state.doc.borrow();
+        let mut right = ax + client_box.map(|v| v.0).unwrap_or(w);
+        let mut bottom = ay + client_box.map(|v| v.1).unwrap_or(h);
+        if let Some(owner) = node {
+            for (&id, &(rx, ry, rw, rh)) in rects.iter() {
+                let mut cur = if id < doc.len() {
+                    doc.get(dom::NodeId(id)).parent
+                } else {
+                    None
+                };
+                let mut descendant = false;
+                while let Some(parent) = cur {
+                    if parent == owner {
+                        descendant = true;
+                        break;
+                    }
+                    cur = doc.get(parent).parent;
+                }
+                if descendant {
+                    right = right.max(rx + rw);
+                    bottom = bottom.max(ry + rh);
+                }
+            }
+        }
+        ((right - ax).max(w), (bottom - ay).max(h))
     };
     // `offsetTop`/`offsetLeft` are relative to the offsetParent — the nearest positioned ancestor
     // (per CSSOM-View): subtract its border-box origin and its top/left border widths

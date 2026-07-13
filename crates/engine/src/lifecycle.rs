@@ -12,6 +12,7 @@ impl Engine {
             scroll_y: 0.0,
             is_dark: false,
             layout_cache: None,
+            element_scroll_offsets: HashMap::new(),
             framebuffer: None,
             session: None,
             focused_node: None,
@@ -123,6 +124,7 @@ impl Engine {
 
     pub fn load_url(&mut self, url: &str) -> i32 {
         self.scroll_y = 0.0; // new navigation starts at the top
+        self.element_scroll_offsets.clear();
         self.layout_cache = None; // invalidate cached layout for the previous page
         self.focused_node = None; // a new page has no focused field
         self.focus_value = None;
@@ -864,6 +866,57 @@ impl Engine {
         );
     }
 
+    /// Pull CSSOM element scroll offsets from the live JS context and apply their delta to the
+    /// cached layout tree. Layout remains the source of sizes; this only changes visual geometry,
+    /// so scrolling avoids cascade/reflow while paint, hit testing, and pushed client rects agree.
+    fn sync_element_scroll_offsets(&mut self) -> bool {
+        let raw = match &self.session {
+            Some(session) => session.element_scroll_offsets(),
+            None => return false,
+        };
+        let mut next: HashMap<dom::NodeId, (f32, f32)> = HashMap::new();
+        for entry in raw.split(';').filter(|s| !s.is_empty()) {
+            let mut fields = entry.split(':');
+            let (Some(id), Some(x), Some(y), None) = (
+                fields.next().and_then(|v| v.parse::<usize>().ok()),
+                fields.next().and_then(|v| v.parse::<f32>().ok()),
+                fields.next().and_then(|v| v.parse::<f32>().ok()),
+                fields.next(),
+            ) else {
+                continue;
+            };
+            next.insert(dom::NodeId(id), (x * self.scale, y * self.scale));
+        }
+
+        let mut keys: Vec<dom::NodeId> = self.element_scroll_offsets.keys().copied().collect();
+        for key in next.keys().copied() {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        let Some(cache) = self.layout_cache.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        for node in keys {
+            let old = self
+                .element_scroll_offsets
+                .get(&node)
+                .copied()
+                .unwrap_or((0.0, 0.0));
+            let new = next.get(&node).copied().unwrap_or((0.0, 0.0));
+            let dx = old.0 - new.0;
+            let dy = old.1 - new.1;
+            if (dx.abs() > f32::EPSILON || dy.abs() > f32::EPSILON)
+                && translate_scroll_descendants(&mut cache.root, node, dx, dy)
+            {
+                changed = true;
+            }
+        }
+        self.element_scroll_offsets = next;
+        changed
+    }
+
     /// Paint the current state into a fresh framebuffer and return a reference to it.
     pub fn render(&mut self) -> &Framebuffer {
         let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
@@ -877,6 +930,12 @@ impl Engine {
         // stay current. Gated on the rebuild so scroll-only repaints don't re-ship the rect table.
         let layout_changed = self.ensure_layout(dw, dh, header_h);
         if layout_changed {
+            // A rebuilt tree is in unscrolled document geometry; reapply every live CSSOM offset.
+            self.element_scroll_offsets.clear();
+            self.push_layout_rects();
+        }
+        let element_scroll_changed = self.sync_element_scroll_offsets();
+        if element_scroll_changed {
             self.push_layout_rects();
         }
 

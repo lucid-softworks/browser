@@ -144,6 +144,10 @@ pub struct Engine {
     is_dark: bool,
     /// Cached layout tree so scrolling only re-paints (no re-cascade / re-layout).
     layout_cache: Option<LayoutCache>,
+    /// Element scroll offsets already applied to the cached layout tree, in device pixels.
+    /// The JS session owns the CSSOM values; before paint we translate each scroll container's
+    /// descendants by the delta from this map.
+    element_scroll_offsets: HashMap<dom::NodeId, (f32, f32)>,
     /// Retained so the FFI layer can hand out a pointer that stays valid until the next
     /// render or until the engine is dropped.
     framebuffer: Option<Framebuffer>,
@@ -555,6 +559,52 @@ mod tests {
         // The body's scrollHeight reports the full document content height (> 0).
         let sh = e.console_eval("document.body.scrollHeight > 0");
         assert_eq!(sh, "true", "document.body.scrollHeight should be positive");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn nested_scroll_container_clamps_and_translates_content() {
+        let html = r#"<html><body style="margin:0">
+          <div id="box" style="width:100px;height:50px;overflow:auto">
+            <div id="child" style="width:100px;height:150px;background:#ff0000"></div>
+          </div>
+          <div id="visible" style="width:100px;height:20px;overflow:visible">
+            <div style="height:100px"></div>
+          </div>
+          <script>box.addEventListener('scroll',function(){document.body.dataset.scrolled='yes'})</script>
+        </body></html>"#;
+        let path = std::env::temp_dir().join("browser_nested_scroll_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(300, 200, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+
+        assert_eq!(
+            e.console_eval("box.scrollWidth+','+box.scrollHeight+','+box.clientHeight"),
+            "100,150,50"
+        );
+        let before = e
+            .console_eval("child.getBoundingClientRect().top")
+            .parse::<f32>()
+            .unwrap();
+        assert_eq!(e.console_eval("box.scrollTo(0,80); box.scrollTop"), "80");
+        assert_eq!(e.body_attr("data-scrolled").as_deref(), Some("yes"));
+        let _ = e.render();
+        let after = e
+            .console_eval("child.getBoundingClientRect().top")
+            .parse::<f32>()
+            .unwrap();
+        assert!((after - (before - 80.0)).abs() < 0.1, "{before} -> {after}");
+
+        // Overscroll clamps, while overflow:visible never establishes a scroll container.
+        assert_eq!(e.console_eval("box.scrollTop=999; box.scrollTop"), "100");
+        assert_eq!(
+            e.console_eval("visible.scrollTop=20; visible.scrollTop"),
+            "0"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

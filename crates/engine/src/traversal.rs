@@ -42,6 +42,16 @@ impl layout::TextMeasurer for FontMeasurer<'_> {
 /// searched first (and in order) so the deepest / topmost box wins; a box's own border box is
 /// its hit area.
 pub(crate) fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<dom::NodeId> {
+    // A clipping box prevents descendants outside its padding box from receiving pointer input.
+    if b.style.clips_overflow {
+        let r = b.dimensions.padding_box();
+        if x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height {
+            let own = b.dimensions.border_box();
+            return (x >= own.x && x < own.x + own.width && y >= own.y && y < own.y + own.height)
+                .then_some(b.node)
+                .flatten();
+        }
+    }
     // Recurse into children first so a deeper hit takes precedence over this box.
     for c in &b.children {
         if let Some(n) = deepest_node_at(c, x, y) {
@@ -54,6 +64,44 @@ pub(crate) fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<d
         b.node
     } else {
         None
+    }
+}
+
+/// Translate every descendant of the first layout box for `node`, leaving the scroll container's
+/// own border/padding/background fixed. Returns whether the container was found.
+pub(crate) fn translate_scroll_descendants(
+    b: &mut layout::LayoutBox,
+    node: dom::NodeId,
+    dx: f32,
+    dy: f32,
+) -> bool {
+    if b.node == Some(node) {
+        for child in &mut b.children {
+            translate_layout_subtree(child, dx, dy);
+        }
+        return true;
+    }
+    for child in &mut b.children {
+        if translate_scroll_descendants(child, node, dx, dy) {
+            return true;
+        }
+    }
+    false
+}
+
+fn translate_layout_subtree(b: &mut layout::LayoutBox, dx: f32, dy: f32) {
+    b.dimensions.content.x += dx;
+    b.dimensions.content.y += dy;
+    if let Some(grid) = &mut b.grid_geometry {
+        for x in &mut grid.column_lines {
+            *x += dx;
+        }
+        for y in &mut grid.row_lines {
+            *y += dy;
+        }
+    }
+    for child in &mut b.children {
+        translate_layout_subtree(child, dx, dy);
     }
 }
 
