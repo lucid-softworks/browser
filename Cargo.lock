@@ -1404,8 +1404,8 @@ dependencies = [
 
 [[package]]
 name = "lumen"
-version = "0.1.0"
-source = "git+https://github.com/lucid-softworks/lumen#27a2d73658712a80aa45d87b2be0985266cae07c"
+version = "0.1.2"
+source = "git+https://github.com/lucid-softworks/lumen#72ac3f19a61b740e06bca2ab1a96e53eaf5f45e3"
 
 [[package]]
 name = "maybe-rayon"
