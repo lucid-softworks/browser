@@ -928,11 +928,38 @@
       var ns = __namespaceUri(id);
       return ns == null || ns === HTML_NS;
     }
+    // The arena keys attributes by one string, while DOM permits attributes in different namespaces
+    // to share a qualified name. Namespace metadata therefore also records the public qualified name;
+    // colliding entries receive a private storage key that never leaks through the DOM API.
+    var __attrNs = {};
+    var __attrStorageSerial = 0;
+    function attrQualifiedName(key) {
+      var meta = __attrNs[key];
+      return meta && meta.qualifiedName != null ? meta.qualifiedName : key;
+    }
+    function lowercaseNamedPropertiesOnly() {
+      var owner = el.ownerDocument || document;
+      return elIsHtml() && !el.__nonHtmlDocument && (!owner || owner === document || owner.contentType === "text/html");
+    }
+    function attrKeyByQualifiedName(name) {
+      var names = __attrNames(id);
+      for (var i = 0; i < names.length; i++) {
+        if (attrQualifiedName(names[i]) === name) { return names[i]; }
+      }
+      return null;
+    }
+    function newAttrStorageKey(qualifiedName) {
+      if (__getAttr(id, qualifiedName) == null) { return qualifiedName; }
+      var key;
+      do { key = qualifiedName + "\uE000" + (++__attrStorageSerial); } while (__getAttr(id, key) != null);
+      return key;
+    }
     def(el, "getAttribute", function (name) {
       // HTML elements ASCII-lowercase the qualified name before matching (stored lowercased).
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      return __getAttr(id, nm);
+      var key = attrKeyByQualifiedName(nm);
+      return key == null ? null : __getAttr(id, key);
     });
     def(el, "setAttribute", function (name, value) {
       var nm = String(name);
@@ -946,10 +973,13 @@
       // HTML elements ASCII-lowercase the attribute's qualified name.
       if (elIsHtml()) { nm = asciiLower(nm); }
       // Capture the old value before mutating, for a custom element's attributeChangedCallback.
-      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function") ? __getAttr(id, nm) : null;
+      var priorKey = attrKeyByQualifiedName(nm);
+      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function" && priorKey != null) ? __getAttr(id, priorKey) : null;
       // `value` is a non-nullable DOMString in WebIDL: undefined -> "undefined", null -> "null".
       var newVal = String(value);
-      __setAttr(id, nm, newVal);
+      var storageKey = attrKeyByQualifiedName(nm);
+      if (storageKey == null) { storageKey = nm; }
+      __setAttr(id, storageKey, newVal);
       if ((nm === "id" || nm === "name") && globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       // Mutating an aria element-reflection content attribute directly clears any explicitly set
       // attr-element slot, so the IDL getter falls back to ID lookup (see __aomNoteAttrChange).
@@ -959,9 +989,9 @@
     def(el, "removeAttribute", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function") ? __getAttr(id, nm) : null;
-      __detachCachedAttr(nm);
-      __removeAttr(id, nm); delete __attrNs[nm]; delete __attrNodeCache[nm];
+      var key = attrKeyByQualifiedName(nm);
+      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function" && key != null) ? __getAttr(id, key) : null;
+      if (key != null) { __detachCachedAttr(key); __removeAttr(id, key); delete __attrNs[key]; delete __attrNodeCache[key]; }
       if ((nm === "id" || nm === "name") && globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
       // Only a real removal is a mutation; removing an absent attribute is a no-op (oldValue null).
@@ -970,19 +1000,24 @@
     def(el, "hasAttribute", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      return __getAttr(id, nm) != null;
+      return attrKeyByQualifiedName(nm) != null;
     });
     def(el, "hasAttributes", function () { return __attrNames(id).length !== 0; });
-    def(el, "getAttributeNames", function () { return __attrNames(id); });
+    def(el, "getAttributeNames", function () { return __attrNames(id).map(attrQualifiedName); });
 
     // Namespaced attribute accessors. The arena keys attrs by their qualified name; we keep the
     // namespace/prefix/localName split in __attrNs so getAttributeNS and Attr reflection work.
-    var __attrNs = {};
     def(el, "setAttributeNS", function (ns, qualifiedName, value) {
       var ex = validateAndExtract(ns, qualifiedName);
-      var key = String(qualifiedName);
+      var existing = attrKeyByNs(ex.namespace, ex.localName);
+      if (existing != null) {
+        __setAttr(id, existing, value == null ? "" : String(value));
+        return;
+      }
+      var publicName = String(qualifiedName);
+      var key = newAttrStorageKey(publicName);
       __setAttr(id, key, value == null ? "" : String(value));
-      __attrNs[key] = { namespaceURI: ex.namespace, prefix: ex.prefix, localName: ex.localName };
+      __attrNs[key] = { namespaceURI: ex.namespace, prefix: ex.prefix, localName: ex.localName, qualifiedName: publicName };
     });
     def(el, "getAttributeNS", function (ns, localName) {
       var want = (ns === undefined || ns === null || ns === "") ? null : String(ns);
@@ -1023,11 +1058,13 @@
     var makeAttr = function (attrName) {
       if (__attrNodeCache[attrName]) { return __attrNodeCache[attrName]; }
       var meta = __attrNs[attrName];
-      var attr = { nodeName: attrName, name: attrName, nodeType: 2,
+      var publicName = attrQualifiedName(attrName);
+      var attr = { nodeName: publicName, name: publicName, nodeType: 2,
                namespaceURI: meta ? meta.namespaceURI : null,
                prefix: meta ? meta.prefix : null,
-               localName: meta ? meta.localName : attrName,
+               localName: meta ? meta.localName : publicName,
                specified: true };
+      def(attr, "__attrKey", attrName);
       Object.defineProperty(attr, "isConnected", { get: function () { return false; }, enumerable: true, configurable: true });
       Object.defineProperty(attr, "baseURI", { get: function () { return document.baseURI; }, enumerable: true, configurable: true });
       Object.defineProperty(attr, "ownerElement", {
@@ -1095,7 +1132,7 @@
         if (prop === Symbol.iterator) { return function () { return __attrNames(id).map(makeAttr)[Symbol.iterator](); }; }
         if (typeof prop === "string" && /^\d+$/.test(prop)) { var n = __attrNames(id)[+prop]; return n == null ? undefined : makeAttr(n); }
         // Named property access: getNamedItem(prop).
-        if (typeof prop === "string" && __getAttr(id, prop) != null) { return makeAttr(prop); }
+        if (typeof prop === "string") { var namedKey = attrKeyByQualifiedName(prop); if (namedKey != null) { return makeAttr(namedKey); } }
         return t[prop];
       },
       has: function (t, prop) {
@@ -1110,7 +1147,11 @@
         var names = __attrNames(id), keys = [];
         for (var i = 0; i < names.length; i++) { keys.push(String(i)); }
         var seen = Object.create(null);
-        for (var j = 0; j < names.length; j++) { if (!seen[names[j]]) { seen[names[j]] = 1; keys.push(names[j]); } }
+        for (var j = 0; j < names.length; j++) {
+          var publicName = attrQualifiedName(names[j]);
+          if (lowercaseNamedPropertiesOnly() && asciiLower(publicName) !== publicName) { continue; }
+          if (!seen[publicName]) { seen[publicName] = 1; keys.push(publicName); }
+        }
         return keys;
       },
       getOwnPropertyDescriptor: function (t, prop) {
@@ -1120,9 +1161,11 @@
           return undefined;
         }
         if (prop === "length") { return { value: __attrNames(id).length, writable: false, enumerable: false, configurable: true }; }
-        if (typeof prop === "string" && __getAttr(id, prop) != null) {
+        if (typeof prop === "string") {
+          var namedKey = attrKeyByQualifiedName(prop);
+          if (namedKey == null || (lowercaseNamedPropertiesOnly() && asciiLower(prop) !== prop)) { return Object.getOwnPropertyDescriptor(t, prop); }
           // A named (qualified-name) own property: non-enumerable, holds the Attr.
-          return { value: makeAttr(prop), writable: false, enumerable: false, configurable: true };
+          return { value: makeAttr(namedKey), writable: false, enumerable: false, configurable: true };
         }
         return Object.getOwnPropertyDescriptor(t, prop);
       }
@@ -1151,7 +1194,8 @@
     def(el, "getAttributeNode", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      return __getAttr(id, nm) == null ? null : makeAttr(nm);
+      var key = attrKeyByQualifiedName(nm);
+      return key == null ? null : makeAttr(key);
     });
     def(el, "getAttributeNodeNS", function (ns, localName) {
       var want = (ns === undefined || ns === null || ns === "") ? null : String(ns);
@@ -1169,17 +1213,22 @@
       }
       var ns = attr.namespaceURI || null;
       var ln = attr.localName != null ? String(attr.localName) : String(attr.name);
-      var key = String(attr.name);
+      var publicName = String(attr.name);
       // Existing attribute with the same namespace + localName?
       var oldKey = attrKeyByNs(ns, ln);
       var oldAttr = null;
+      var key;
       if (oldKey != null) {
         oldAttr = makeAttr(oldKey);
-        if (oldKey !== key) { __removeAttr(id, oldKey); delete __attrNs[oldKey]; delete __attrNodeCache[oldKey]; }
+        __detachCachedAttr(oldKey);
+        delete __attrNodeCache[oldKey];
+        key = oldKey;
+      } else {
+        key = newAttrStorageKey(publicName);
       }
       var newVal = attr.value == null ? "" : String(attr.value);
       __setAttr(id, key, newVal);
-      __attrNs[key] = { namespaceURI: ns, prefix: attr.prefix || null, localName: ln };
+      __attrNs[key] = { namespaceURI: ns, prefix: attr.prefix || null, localName: ln, qualifiedName: publicName };
       // Adopt the SAME Attr object: re-bind its value / ownerElement getters to this element's live
       // arena attribute, and register it as the canonical cached node so getAttributeNode /
       // el.attributes[i] return the identical object (per spec the node is moved, not copied).
@@ -1207,12 +1256,15 @@
         if (vc === 0x3E || vc === 0x20 || vc === 0x09 || vc === 0x0A || vc === 0x0C || vc === 0x0D) { invalidCharacterError(); }
       }
       if (elIsHtml()) { qn = asciiLower(qn); }
-      var present = __getAttr(id, qn) != null;
+      var key = attrKeyByQualifiedName(qn);
+      var present = key != null;
       if (!present) {
         if (force === undefined || force === true) { __setAttr(id, qn, ""); return true; }
         return false;
       }
-      if (force === undefined || force === false) { __removeAttr(id, qn); delete __attrNs[qn]; return false; }
+      if (force === undefined || force === false) {
+        __detachCachedAttr(key); __removeAttr(id, key); delete __attrNs[key]; delete __attrNodeCache[key]; return false;
+      }
       return true;
     });
 

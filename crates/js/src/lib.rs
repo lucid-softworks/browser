@@ -3094,6 +3094,26 @@ mod tests {
     }
 
     #[test]
+    fn toggle_attribute_removes_first_same_named_attribute() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              el.setAttributeNS('first', 'attr', 'one');
+              el.setAttributeNS('second', 'attr', 'two');
+              var result = el.toggleAttribute('attr');
+              [result, el.attributes.length, el.attributes[0].name,
+               el.attributes[0].namespaceURI, el.attributes[0].value].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("false|1|attr|second|two"));
+    }
+
+    #[test]
     fn node_is_connected_tracks_document_membership() {
         let (doc, _body) = doc_with_body("");
         let (_doc, out) = run_with_dom(

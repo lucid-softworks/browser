@@ -6533,9 +6533,9 @@
         lookupPrefix: function () { var de = this.documentElement; return de && de.lookupPrefix ? de.lookupPrefix.apply(de, arguments) : null; },
         isDefaultNamespace: function (ns) { var de = this.documentElement; return de && de.isDefaultNamespace ? de.isDefaultNamespace.apply(de, arguments) : (ns == null || ns === ""); },
         createElement: isXML
-          ? function (name) { return globalThis.__createElementCasePreserving(elNs, name); }
+          ? function (name) { var e = globalThis.__createElementCasePreserving(elNs, name); def(e, "__nonHtmlDocument", true); return e; }
           : function (tag) { return document.createElement(tag); },
-        createElementNS: function (ns, qn) { return document.createElementNS(ns, qn); },
+        createElementNS: function (ns, qn) { var e = document.createElementNS(ns, qn); if (isXML) { def(e, "__nonHtmlDocument", true); } return e; },
         createAttribute: isXML
           ? function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm, nm); }
           : function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm.toLowerCase(), nm.toLowerCase()); },
