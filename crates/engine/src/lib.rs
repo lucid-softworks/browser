@@ -1663,6 +1663,39 @@ mod tests {
     }
 
     #[test]
+    fn xml_parsed_cdata_style_body_is_collected() {
+        // The sibling test below covers a `.xht` served as `text/html`, where the lenient parser
+        // leaves the CDATA markers in the text and they get stripped as a string. Served as
+        // `application/xhtml+xml` the XML parser instead resolves the section into a `Cdata` node,
+        // so there is no wrapper to strip and the body is not a `Text` child — collecting only
+        // `Text` dropped the whole stylesheet on the floor. WPT's most-used shared reference
+        // (`/css/reference/ref-filled-green-100px-square.xht`, cited by ~2.5k tests) is exactly
+        // this shape, so it rendered blank and took every test citing it down with it.
+        let doc = html::xml::parse_xml(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head>
+               <style type="text/css"><![CDATA[
+               div { background-color: green; height: 3px; width: 96px; }
+               ]]></style></head><body><div></div></body></html>"#,
+        );
+        let sources = collect_style_sources(&doc, "https://example.com/page.xht");
+        let inline = sources
+            .iter()
+            .find_map(|s| match s {
+                StyleSource::Inline(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("an inline <style> source");
+        assert!(
+            inline.contains("background-color: green"),
+            "CDATA style body was dropped: {inline:?}"
+        );
+        assert!(
+            !inline.contains("CDATA") && !inline.contains("]]>"),
+            "CDATA markers leaked into the CSS: {inline:?}"
+        );
+    }
+
+    #[test]
     fn cdata_wrapped_inline_style_import_is_followed() {
         // XHTML reftests (WPT `.xht`) wrap inline CSS in `<![CDATA[ … ]]>` so the XML parser leaves
         // `@import`/`url(...)` alone. Our lenient HTML parser captures `<style>` as raw text, so the

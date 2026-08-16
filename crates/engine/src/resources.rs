@@ -365,18 +365,26 @@ pub fn base_url(doc: &dom::Document, final_url: &str) -> String {
 /// Walk the DOM in document order, classifying each author style contribution as an inline
 /// `<style>` body or an external `<link rel=stylesheet href>` (resolved against `base`).
 /// Pure: no fetching, so the ordering/classification is unit-testable without network.
-/// Concatenate a `<style>`/`<script>` element's text children, stripping an XHTML `<![CDATA[ … ]]>`
-/// wrapper (and the legacy `<!-- … -->` comment guard). XHTML files (e.g. WPT's `.xht` reftests)
-/// wrap inline CSS/JS in CDATA so the XML parser doesn't treat `&`/`<` as markup; our lenient HTML
-/// parser captures `<style>` as raw text, so those markers land literally in the CSS — where they
-/// break `@import` extraction (the leading `<![CDATA[` makes the scanner read `@import …;` as a
-/// normal rule's prelude and skip it, so the imported sheet is never fetched). Only the surrounding
-/// wrapper is removed (markers never appear mid-CSS in practice), leaving the CSS otherwise intact.
+/// Concatenate a `<style>`/`<script>` element's character-data children, stripping an XHTML
+/// `<![CDATA[ … ]]>` wrapper (and the legacy `<!-- … -->` comment guard). XHTML files (e.g. WPT's
+/// `.xht` reftests) wrap inline CSS/JS in CDATA so the XML parser doesn't treat `&`/`<` as markup,
+/// and the wrapper reaches us in one of two shapes depending on which parser ran.
+///
+/// Served as `text/html`, the lenient HTML parser captures `<style>` as raw text and the markers
+/// land literally in the CSS — where they break `@import` extraction (the leading `<![CDATA[` makes
+/// the scanner read `@import …;` as a normal rule's prelude and skip it, so the imported sheet is
+/// never fetched). Stripping the surrounding wrapper handles that; markers never appear mid-CSS in
+/// practice, so the CSS is otherwise intact.
+///
+/// Served as `application/xhtml+xml`, the XML parser resolves the section properly into a
+/// [`dom::NodeData::Cdata`] child, so there is no wrapper to strip but the body is no longer a
+/// `Text` node. Both kinds must be concatenated or the entire stylesheet silently vanishes.
 pub(crate) fn raw_text_content(doc: &dom::Document, id: dom::NodeId) -> String {
     let mut src = String::new();
     for &child in &doc.get(id).children {
-        if let dom::NodeData::Text(t) = &doc.get(child).data {
-            src.push_str(t);
+        match &doc.get(child).data {
+            dom::NodeData::Text(t) | dom::NodeData::Cdata(t) => src.push_str(t),
+            _ => {}
         }
     }
     let trimmed = src.trim();
