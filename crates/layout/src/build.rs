@@ -293,6 +293,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         overline: cs.overline,
         vertical_align: cs.vertical_align,
         white_space: cs.white_space,
+        word_break: cs.word_break,
         opacity: cs.opacity,
         visible: cs.visibility == style::Visibility::Visible,
         visited_link: cs.visited_link,

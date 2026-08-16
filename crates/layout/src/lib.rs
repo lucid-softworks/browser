@@ -14,6 +14,7 @@ mod float;
 mod grid;
 mod inline;
 mod intrinsic;
+mod linebreak;
 mod sizing;
 mod table;
 mod types;
@@ -857,6 +858,105 @@ mod tests {
         // Total height = lines * line_height(16) = lines * 20.8.
         let expected_h = lines as f32 * 16.0 * 1.3;
         assert!((pbox.dimensions.content.height - expected_h).abs() < 0.01);
+    }
+
+    #[test]
+    fn ideographic_segments_are_placed_without_gaps() {
+        // Breaking a CJK run into per-character segments must not insert an inter-word space
+        // between them: an ideographic break is a break *opportunity*, not a separator, so on a
+        // single line the run has to paint exactly as if it were never split.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("日本語".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(p, block_style(true));
+
+        fn texts(b: &LayoutBox, out: &mut Vec<(String, f32)>) {
+            if let BoxContent::Text(t) = &b.content {
+                out.push((t.clone(), b.dimensions.content.width));
+            }
+            for c in &b.children {
+                texts(c, out);
+            }
+        }
+
+        // Wide enough that everything fits on one line, so only the spacing is under test. The
+        // segments share a DOM node and are contiguous, so they are rejoined into a single painted
+        // run — and that rejoin must not introduce separators.
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let mut boxes = Vec::new();
+        texts(pbox, &mut boxes);
+        assert_eq!(boxes.len(), 1, "one line, so one painted run: {boxes:?}");
+        assert_eq!(
+            boxes[0].0, "日本語",
+            "no space may be inserted at a break opportunity"
+        );
+        // 3 chars * 16 * 0.6 = 28.8px. Two inserted spaces would measure 48.0.
+        assert!(
+            (boxes[0].1 - 28.8).abs() < 0.01,
+            "run measured {}, expected 28.8 — inserted spaces widen it",
+            boxes[0].1,
+        );
+
+        // Narrow enough to force wrapping: the run now breaks between ideographs, and no line may
+        // pick up a space from the split either.
+        let root_box = layout_document(&doc, &styles, 20.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let mut boxes = Vec::new();
+        texts(pbox, &mut boxes);
+        assert!(boxes.len() > 1, "expected wrapping at 20px, got {boxes:?}");
+        for (t, _) in &boxes {
+            assert!(!t.contains(' '), "wrapped line {t:?} gained a space");
+        }
+        let joined: String = boxes.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, "日本語", "wrapping must not drop or add characters");
+    }
+
+    #[test]
+    fn a_run_that_exactly_fills_the_line_does_not_wrap() {
+        // Only a segmentable run can expose this: an atomic word is placed on the line whatever its
+        // width, so the fits-exactly comparison is never consulted. Once `break-all` gives every
+        // character its own break opportunity, an off-by-a-hair `>=` test wraps text that measures
+        // exactly the content width, and the block lays out taller than the single line it needs.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("XXXXX".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            p,
+            style::ComputedStyle {
+                display_block: true,
+                word_break: style::WordBreak::BreakAll,
+                ..Default::default()
+            },
+        );
+
+        // 5 chars * 16 * 0.6 = 48.0px, so 48.0 is exactly the width the run needs.
+        let root_box = layout_document(&doc, &styles, 48.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let lines = count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)));
+        assert_eq!(lines, 1, "a run that exactly fits must stay on one line");
+        assert!(
+            (pbox.dimensions.content.height - 16.0 * 1.3).abs() < 0.01,
+            "height {} should be one line",
+            pbox.dimensions.content.height,
+        );
+
+        // One pixel narrower genuinely does not fit, so it must wrap — otherwise a fix for the above
+        // would just be "never wrap".
+        let root_box = layout_document(&doc, &styles, 47.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let lines = count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)));
+        assert_eq!(lines, 2, "a run one pixel too wide must wrap");
     }
 
     #[test]

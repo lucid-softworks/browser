@@ -176,15 +176,12 @@ pub(crate) fn layout_inline_children(
                 InlineItem::Word { node, .. } => *node,
                 _ => None,
             });
-            let text: String = line
-                .items
-                .iter()
-                .filter_map(|(it, _)| match it {
-                    InlineItem::Word { text, .. } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            let text: String = joined_text(line.items.iter().filter_map(|(it, _)| match it {
+                InlineItem::Word {
+                    text, leads_space, ..
+                } => Some((text.as_str(), *leads_space)),
+                _ => None,
+            }));
             let mut tb = LayoutBox::new(BoxContent::Text(text), style, node);
             tb.dimensions.content = Rect {
                 x: line_x,
@@ -238,7 +235,8 @@ pub(crate) fn layout_inline_children(
         // A "run" accumulates the words' joined text, the run's start x offset (line-relative),
         // its node, the paint style of its first word, and the font size to measure at.
         struct Run {
-            texts: Vec<String>,
+            /// Each word plus whether a space precedes it, so the run can be rejoined exactly.
+            words: Vec<(String, bool)>,
             start_off: f32,
             node: Option<dom::NodeId>,
             style: PaintStyle,
@@ -246,7 +244,7 @@ pub(crate) fn layout_inline_children(
         let mut run: Option<Run> = None;
         let flush = |run: &mut Option<Run>, out: &mut Vec<LayoutBox>| {
             if let Some(r) = run.take() {
-                let text = r.texts.join(" ");
+                let text = joined_text(r.words.iter().map(|(t, s)| (t.as_str(), *s)));
                 let ls = r.style.letter_spacing;
                 // `vertical-align: sub|super` shifts the run off the line's baseline by ~0.3em
                 // (of the run's own, already-reduced, font size). Super raises (smaller y), sub
@@ -281,15 +279,20 @@ pub(crate) fn layout_inline_children(
         for (item, off) in &line.items {
             match item {
                 InlineItem::Word {
-                    text, style, node, ..
+                    text,
+                    style,
+                    node,
+                    leads_space,
                 } => {
                     match &mut run {
                         // Continue the current run only if the node matches.
-                        Some(r) if r.node == *node => r.texts.push(text.clone()),
+                        Some(r) if r.node == *node => r.words.push((text.clone(), *leads_space)),
                         _ => {
                             flush(&mut run, &mut new_children);
                             run = Some(Run {
-                                texts: vec![text.clone()],
+                                // A run's first word never carries a leading space: `start_off`
+                                // already positions it past any preceding one.
+                                words: vec![(text.clone(), false)],
                                 start_off: *off,
                                 node: *node,
                                 style: style.clone(),
@@ -322,6 +325,24 @@ pub(crate) fn layout_inline_children(
     boxx.children = new_children;
     let _ = ctx;
     total_h
+}
+
+/// Join a line run's words back into the string that gets painted and measured.
+///
+/// A space goes in only where the word actually follows one in the source. Words come from splitting
+/// at breaking spaces, so that is usually every word after the first — but a break *opportunity*
+/// inside a word (between two ideographs, or anywhere under `word-break: break-all`) emits several
+/// words with nothing between them, and joining those with a space would paint separators the source
+/// never had and measure the run too wide.
+fn joined_text<'a>(words: impl Iterator<Item = (&'a str, bool)>) -> String {
+    let mut out = String::new();
+    for (i, (text, leads_space)) in words.enumerate() {
+        if i > 0 && leads_space {
+            out.push(' ');
+        }
+        out.push_str(text);
+    }
+    out
 }
 
 /// Advance width of a text run including `letter-spacing` (added once per character).
@@ -507,12 +528,22 @@ pub(crate) fn collect_inline_items(
                     // splits (leading/trailing/consecutive separators) are dropped, like
                     // `split_whitespace`.
                     for word in text.split(is_breaking_space).filter(|w| !w.is_empty()) {
-                        out.push(InlineItem::Word {
-                            text: word.to_string(),
-                            style: child.style.clone(),
-                            node,
-                            leads_space: true,
-                        });
+                        // A word is the atomic unit the line-filling loop wraps between, so any
+                        // break opportunity *inside* it has to be expressed by emitting several
+                        // words. Ideographic text has no spaces and would otherwise be one
+                        // unbreakable run. Only the first piece inherits the preceding space;
+                        // an ideographic break inserts nothing between the pieces.
+                        for (i, seg) in crate::linebreak::segments(word, child.style.word_break)
+                            .into_iter()
+                            .enumerate()
+                        {
+                            out.push(InlineItem::Word {
+                                text: seg.to_string(),
+                                style: child.style.clone(),
+                                node,
+                                leads_space: i == 0,
+                            });
+                        }
                     }
                 }
             }
@@ -577,12 +608,18 @@ pub(crate) fn collect_inline_words(children: &[LayoutBox], out: &mut Vec<InlineW
     for child in children {
         match &child.content {
             BoxContent::Text(text) => {
+                // Segment as the line-filling path does, so min-content width agrees with what
+                // can actually be put on a line: for ideographic text that is one character, not
+                // the whole run. Sizing that consults min-content (grid, flex, tables) depends on
+                // this matching.
                 for word in text.split_whitespace() {
-                    out.push(InlineWord {
-                        text: word.to_string(),
-                        style: child.style.clone(),
-                        node: child.node,
-                    });
+                    for seg in crate::linebreak::segments(word, child.style.word_break) {
+                        out.push(InlineWord {
+                            text: seg.to_string(),
+                            style: child.style.clone(),
+                            node: child.node,
+                        });
+                    }
                 }
             }
             BoxContent::Inline => {

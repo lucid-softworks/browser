@@ -929,6 +929,7 @@ pub(crate) fn compute_element_style<'a>(
         letter_spacing: parent.letter_spacing,
         text_indent: parent.text_indent,
         white_space: parent.white_space,
+        word_break: parent.word_break,
         visibility: parent.visibility,
         list_style_type: parent.list_style_type,
         underline: parent.underline,

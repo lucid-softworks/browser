@@ -541,6 +541,28 @@ mod tests {
     }
 
     #[test]
+    fn word_break_parses_and_inherits() {
+        let doc = html::parse(
+            r#"<html><body style="word-break: keep-all"><span>x</span>
+               <p style="word-break: break-all">y</p></body></html>"#,
+        );
+        let map = cascade(&doc, &[]);
+        // The span sets nothing, so it must pick `keep-all` up from body — inheritance is the whole
+        // reason the property is usable, since it is nearly always set on a container.
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&span].word_break, WordBreak::KeepAll);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].word_break, WordBreak::BreakAll);
+        // An unknown or unsupported value (`auto-phrase` needs phrase analysis we don't do) must
+        // leave the initial value in place rather than being treated as a break-anywhere mode.
+        let doc2 =
+            html::parse(r#"<html><body><i style="word-break: auto-phrase">z</i></body></html>"#);
+        let map2 = cascade(&doc2, &[]);
+        let i = elem(&doc2, |e| e.tag == "i");
+        assert_eq!(map2[&i].word_break, WordBreak::Normal);
+    }
+
+    #[test]
     fn id_beats_class_beats_type() {
         let sheet = css::parse("p { color: red } .c { color: green } #x { color: blue }");
         let doc = html::parse(r#"<html><body><p id="x" class="c">t</p></body></html>"#);

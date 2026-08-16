@@ -89,6 +89,9 @@ pub struct PaintStyle {
     /// `white-space` mode (collapse vs preserve spaces/newlines). Read by inline layout to decide
     /// whether a text run's spaces are preserved and `\n`s are forced breaks.
     pub white_space: style::WhiteSpace,
+    /// `word-break` mode. Read by inline layout to decide which soft-wrap opportunities exist inside
+    /// a text run — notably whether an ideographic run may break at all.
+    pub word_break: style::WordBreak,
     /// Per-box opacity (0.0..=1.0); the painter multiplies painted alpha by this (and threads it
     /// to the subtree). 1.0 = fully opaque.
     pub opacity: f32,
@@ -159,6 +162,7 @@ impl Default for PaintStyle {
             overline: false,
             vertical_align: style::VerticalAlign::Baseline,
             white_space: style::WhiteSpace::Normal,
+            word_break: style::WordBreak::Normal,
             opacity: 1.0,
             visible: true,
             visited_link: false,
