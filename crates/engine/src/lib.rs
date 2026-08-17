@@ -770,6 +770,58 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn resize_relayouts_before_handlers_observe_geometry() {
+        // A `resize` handler exists to measure, so the pushed geometry must already describe the new
+        // viewport when it runs. The percentage-width div is the load-bearing part: the root's own
+        // `clientWidth` falls back to `innerWidth`, so asserting on that would pass even if layout
+        // had never re-run. `#half` resolves against the viewport, so its rect only reads 320 if it
+        // was laid out at the new 640px width before dispatch — it reads 500, the pre-resize value,
+        // if the stale rect table is still in place.
+        let html = "<html><body><div id=half style='width:50%;height:10px'></div><script>\
+                    window.__seen = [];\
+                    addEventListener('resize', function () {\
+                      window.__seen.push(innerWidth + 'x' + innerHeight\
+                        + '@' + devicePixelRatio\
+                        + '/' + document.getElementById('half').getBoundingClientRect().width);\
+                    });\
+                    </script></body></html>";
+        let path = std::env::temp_dir().join(format!("browser_resize_{}.html", rand_suffix()));
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(1000, 800, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+        assert_eq!(
+            e.console_eval("document.getElementById('half').getBoundingClientRect().width"),
+            "500",
+            "sanity: the div is half of the initial 1000px viewport",
+        );
+
+        e.set_viewport(640, 480, 1.0);
+        assert_eq!(
+            e.console_eval("window.__seen.length"),
+            "1",
+            "resize should fire exactly once per viewport change",
+        );
+        assert_eq!(
+            e.console_eval("window.__seen[0]"),
+            "640x480@1/320",
+            "handler should see the new metrics AND the re-laid-out geometry",
+        );
+
+        // An unchanged viewport must not re-enter JS at all.
+        e.set_viewport(640, 480, 1.0);
+        assert_eq!(
+            e.console_eval("window.__seen.length"),
+            "1",
+            "a no-op set_viewport should not fire resize",
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Render `html` at `os_dark` appearance and return the top-left canvas pixel (r, g, b).
     /// Holds the color-scheme test lock for the whole set+render so the OS flag can't be flipped
     /// by a parallel test mid-render.

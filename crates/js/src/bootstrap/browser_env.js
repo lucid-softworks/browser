@@ -743,6 +743,19 @@
   def(globalThis, "__mediaChanged", function () {
     for (var i = 0; i < __mqlRegistry.length; i++) { try { __mqlRegistry[i].__reeval(); } catch (e) {} }
   });
+  // Adopt a new viewport into the live context. `innerWidth`/`innerHeight`/`devicePixelRatio` are
+  // seeded once when the context is built, so without this a page keeps whatever size it loaded
+  // at: every responsive script (and anything reading `devicePixelRatio` to pick an asset) stays
+  // frozen at the wrong window and lays itself out for a viewport we don't have. Called by the
+  // engine from `set_viewport`. Re-evaluates media query lists too, since a resize can flip a
+  // `(max-width: …)`, then fires `resize` so page code re-runs its own measurements.
+  def(globalThis, "__viewportChanged", function (w, h, dpr) {
+    if (typeof w === "number" && w > 0) { globalThis.innerWidth = w; }
+    if (typeof h === "number" && h > 0) { globalThis.innerHeight = h; }
+    if (typeof dpr === "number" && dpr > 0) { globalThis.devicePixelRatio = dpr; }
+    try { globalThis.__mediaChanged(); } catch (e) {}
+    try { globalThis.dispatchEvent(new globalThis.Event("resize")); } catch (e) {}
+  });
 
   // --- getComputedStyle --------------------------------------------------------------------
   // Returns a read-only CSSStyleDeclaration-like object backed by the in-Session cascade

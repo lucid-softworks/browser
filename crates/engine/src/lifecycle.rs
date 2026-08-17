@@ -49,12 +49,54 @@ impl Engine {
     }
 
     pub fn set_viewport(&mut self, w: u32, h: u32, scale: f32) {
-        self.vp_w = w.max(1);
-        self.vp_h = h.max(1);
-        self.scale = if scale > 0.0 { scale } else { 1.0 };
+        let (w, h) = (w.max(1), h.max(1));
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        let unchanged = (self.vp_w, self.vp_h, self.scale) == (w, h, scale);
+        self.vp_w = w;
+        self.vp_h = h;
+        self.scale = scale;
         // Surface the real viewport + scale to page JS (window.innerWidth/innerHeight,
-        // devicePixelRatio) so responsive/HiDPI code sees true values.
+        // devicePixelRatio) so responsive/HiDPI code sees true values. This seeds the globals a
+        // *future* context is built with.
+        //
+        // Published even when nothing changed, because the globals are process-wide and start at
+        // their own built-in default rather than at ours: an embedder whose first call happens to
+        // name the size we already hold (as a fresh 800×600 engine does) would otherwise never sync
+        // them, and every page it loaded would report the default size instead.
         js::set_device_metrics(self.vp_w, self.vp_h, self.scale);
+        if unchanged || self.session.is_none() {
+            // No change → don't re-enter JS or churn the layout cache.
+            return;
+        }
+        // Re-lay out at the new size and push the geometry BEFORE dispatching `resize`. A resize
+        // handler exists to measure, and `clientWidth`/`getBoundingClientRect` read the pushed rect
+        // table rather than the globals set above — so dispatching first lets handlers observe the
+        // pre-resize layout and cache the wrong values. Dropping the cache forces the pass, since
+        // `ensure_layout` short-circuits on an unchanged device size.
+        self.layout_cache = None;
+        let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
+        let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
+        if self.ensure_layout(dw, dh, 0.0) {
+            self.push_layout_rects();
+        }
+        // A context that already exists was seeded at load and would otherwise keep the size it
+        // loaded at forever, so push the new metrics into it and fire `resize`. Mirrors
+        // `set_color_scheme`: adopt whatever the handlers mutated so the next render sees it.
+        if let Some(session) = &self.session {
+            let (mut snapshot, console) =
+                session.notify_viewport_changed(self.vp_w, self.vp_h, self.scale);
+            snapshot.prune_invalid();
+            if let LoadState::Loaded {
+                doc, console: c, ..
+            } = &mut self.state
+            {
+                *doc = Some(snapshot);
+                c.extend(console);
+            }
+            // Handlers commonly restyle or rebuild a component on resize, so re-cascade on the
+            // next render rather than painting the layout computed before they ran.
+            self.layout_cache = None;
+        }
     }
 
     /// Set the effective OS appearance (Dark/Light). Pushed by the host on launch and on every

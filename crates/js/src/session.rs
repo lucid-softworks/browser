@@ -288,6 +288,19 @@ impl Session {
         self.eval_interact("(globalThis.__mediaChanged && globalThis.__mediaChanged())".to_string())
     }
 
+    /// Push a resized viewport into the live context: refreshes `innerWidth`, `innerHeight` and
+    /// `devicePixelRatio`, re-evaluates media query lists, and fires `resize`.
+    pub fn notify_viewport_changed(
+        &self,
+        w: u32,
+        h: u32,
+        dpr: f32,
+    ) -> (dom::Document, Vec<String>) {
+        self.eval_interact(format!(
+            "(globalThis.__viewportChanged && globalThis.__viewportChanged({w},{h},{dpr:?}))"
+        ))
+    }
+
     /// Evaluate an arbitrary JS source string against the live context, drain the event loop, and
     /// return a fresh DOM snapshot + console. Backs the higher-level interaction helpers below.
     fn eval_interact(&self, source: String) -> (dom::Document, Vec<String>) {
