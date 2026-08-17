@@ -563,8 +563,25 @@ pub(crate) fn parse_font_weight(val: &str) -> Option<bool> {
     }
 }
 
-/// Parse a `font-size`: `Npx`, `Npt` (×4/3), or `Nem` (relative to `parent_px`). Bare numbers
-/// are treated as px.
+/// The `<absolute-size>` keywords, on the scale browsers converged on with `medium` = 16px.
+///
+/// Lowercase input is assumed; callers have already normalised.
+pub(crate) fn absolute_font_size(v: &str) -> Option<f32> {
+    Some(match v {
+        "xx-small" => 9.0,
+        "x-small" => 10.0,
+        "small" => 13.0,
+        "medium" => 16.0,
+        "large" => 18.0,
+        "x-large" => 24.0,
+        "xx-large" => 32.0,
+        "xxx-large" => 48.0,
+        _ => return None,
+    })
+}
+
+/// Parse a `font-size`: an `<absolute-size>` keyword, `Npx`, `Npt` (×4/3), or `Nem` (relative to
+/// `parent_px`). Bare numbers are treated as px.
 pub(crate) fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
     let v = val.trim().to_ascii_lowercase();
     // Relative keywords resolve against the parent font size (CSS uses ~1.2× steps).
@@ -572,6 +589,9 @@ pub(crate) fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
         "smaller" => return Some(parent_px / 1.2).filter(|n| *n > 0.0),
         "larger" => return Some(parent_px * 1.2).filter(|n| *n > 0.0),
         _ => {}
+    }
+    if let Some(px) = absolute_font_size(&v) {
+        return Some(px);
     }
     if has_math_func(&v) {
         // `em` in a font-size resolves against the parent font size.
