@@ -838,10 +838,16 @@ pub(crate) fn intrinsic_cross_height(
     // One line of text at the box's font size (0 if it has none) …
     let fs = boxx.style.font_size;
     let line_h = if has_any_text(boxx) {
-        measurer.line_height(
-            if fs > 0.0 { fs } else { 16.0 },
-            boxx.style.font_family.as_deref(),
-        )
+        // A specified `line-height` *is* the line box's height, so it has to win over the font's
+        // natural metric here as it does everywhere else the two are combined. Grid takes the greater
+        // of this estimate and the item's laid-out height, so a too-tall estimate is not a harmless
+        // over-guess — it becomes the row's height.
+        boxx.style.line_height.unwrap_or_else(|| {
+            measurer.line_height(
+                if fs > 0.0 { fs } else { 16.0 },
+                boxx.style.font_family.as_deref(),
+            )
+        })
     } else {
         0.0
     };
