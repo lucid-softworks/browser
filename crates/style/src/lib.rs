@@ -954,6 +954,113 @@ mod tests {
     }
 
     #[test]
+    fn grid_area_assigns_the_four_lines_to_the_right_axes() {
+        // The lines interleave: row-start / column-start / row-end / column-end. Values chosen so
+        // every one is distinct, which is what catches an axis or start/end transposition — a
+        // symmetric `2 / 2 / 3 / 3` passes even if the two axes are swapped.
+        let sheet = css::parse("#a { grid-area: 2 / 3 / 4 / 5 }");
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(
+            map[&a].grid_row,
+            Some(GridPlacement {
+                start: Some(2),
+                start_span: None,
+                end: GridEnd::Line(4),
+            })
+        );
+        assert_eq!(
+            map[&a].grid_column,
+            Some(GridPlacement {
+                start: Some(3),
+                start_span: None,
+                end: GridEnd::Line(5),
+            })
+        );
+    }
+
+    #[test]
+    fn grid_area_omitted_sides_are_auto() {
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let placement = |decl: &str| {
+            let map = cascade(&doc, &[css::parse(&format!("#a {{ {decl} }}"))]);
+            let a = elem(&doc, |e| e.id() == Some("a"));
+            (map[&a].grid_row, map[&a].grid_column)
+        };
+
+        // One value places the row start only; the other three sides stay auto, which leaves the
+        // column entirely unplaced rather than pinned to line 1.
+        let (row, col) = placement("grid-area: 2");
+        assert_eq!(
+            row,
+            Some(GridPlacement {
+                start: Some(2),
+                start_span: None,
+                end: GridEnd::Auto,
+            })
+        );
+        assert_eq!(col, None, "an omitted column must stay auto-placed");
+
+        // Two values give both starts, no ends.
+        let (row, col) = placement("grid-area: 2 / 3");
+        assert_eq!(row.unwrap().start, Some(2));
+        assert_eq!(col.unwrap().start, Some(3));
+        assert!(matches!(row.unwrap().end, GridEnd::Auto));
+        assert!(matches!(col.unwrap().end, GridEnd::Auto));
+
+        // Three values leave only the column end auto — the asymmetric case a naive
+        // "split into two halves" implementation gets wrong.
+        let (row, col) = placement("grid-area: 2 / 3 / 4");
+        assert_eq!(row.unwrap().end, GridEnd::Line(4));
+        assert!(matches!(col.unwrap().end, GridEnd::Auto));
+
+        // `span` is a valid line on either side.
+        let (row, _) = placement("grid-area: span 2 / 1 / 4");
+        assert_eq!(row.unwrap().start_span, Some(2));
+        assert_eq!(row.unwrap().end, GridEnd::Line(4));
+
+        // All-auto resolves to no placement at all, not a placement full of defaults.
+        assert_eq!(placement("grid-area: auto / auto / auto / auto"), (None, None));
+    }
+
+    #[test]
+    fn unresolvable_grid_area_leaves_the_longhands_alone() {
+        // Named areas aren't implemented, so `grid-area: hdr` can't be honoured. It must not clobber
+        // the placement the longhands already established — silently dropping the ident and applying
+        // the rest would put the item in the wrong cell, which is worse than ignoring the line.
+        let sheet = css::parse("#a { grid-row: 2 / 4; grid-column: 3 / 5; grid-area: hdr }");
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(map[&a].grid_row.unwrap().start, Some(2));
+        assert_eq!(map[&a].grid_column.unwrap().start, Some(3));
+
+        // Too many values is also invalid.
+        let sheet = css::parse("#a { grid-row: 2 / 4; grid-area: 1 / 1 / 1 / 1 / 1 }");
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(map[&a].grid_row.unwrap().start, Some(2));
+    }
+
+    #[test]
+    fn legacy_grid_gap_spellings_alias_the_modern_ones() {
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let gaps = |decl: &str| {
+            let map = cascade(&doc, &[css::parse(&format!("#a {{ {decl} }}"))]);
+            let a = elem(&doc, |e| e.id() == Some("a"));
+            (map[&a].row_gap, map[&a].column_gap)
+        };
+
+        assert_eq!(gaps("grid-gap: 7px"), (7.0, 7.0));
+        assert_eq!(gaps("grid-gap: 7px 9px"), (7.0, 9.0));
+        assert_eq!(gaps("grid-row-gap: 4px"), (4.0, 0.0));
+        assert_eq!(gaps("grid-column-gap: 5px"), (0.0, 5.0));
+        // Aliases participate in the cascade as the same property, so a later modern spelling wins.
+        assert_eq!(gaps("grid-gap: 7px; column-gap: 2px"), (7.0, 2.0));
+    }
+
+    #[test]
     fn rgb_function_parses() {
         assert_eq!(parse_color("rgb(255 0 0)"), Some((255, 0, 0)));
         assert_eq!(parse_color("rgb(255, 0, 0)"), Some((255, 0, 0)));
