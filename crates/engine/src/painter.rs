@@ -407,7 +407,7 @@ pub(crate) fn paint_box_opacity(
                         fb.blit_rgba(dst, &img.rgba, img.w, img.h);
                     } else {
                         let mut scaled = img.rgba.clone();
-                        for px in scaled.chunks_exact_mut(4) {
+                        for px in scaled.as_chunks_mut::<4>().0 {
                             px[3] = scale_alpha(px[3], opacity);
                         }
                         fb.blit_rgba(dst, &scaled, img.w, img.h);
@@ -796,7 +796,7 @@ pub(crate) fn paint_box_opacity(
                     Some(img) if opacity >= 0.999 => fb.blit_rgba(dst, &img.rgba, img.w, img.h),
                     Some(img) => {
                         let mut scaled = img.rgba.clone();
-                        for px in scaled.chunks_exact_mut(4) {
+                        for px in scaled.as_chunks_mut::<4>().0 {
                             px[3] = scale_alpha(px[3], opacity);
                         }
                         fb.blit_rgba(dst, &scaled, img.w, img.h);

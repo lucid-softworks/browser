@@ -943,7 +943,7 @@ fn decode_svg_object(bytes: &[u8], base: &str) -> Option<DecodedImage> {
     let css = collect_svg_style_text(&doc, svg_id);
     let mut backdrop = vec![0u8; (w as usize) * (h as usize) * 4];
     if let Some((r, g, b, a)) = css_background_color(&css) {
-        for px in backdrop.chunks_exact_mut(4) {
+        for px in backdrop.as_chunks_mut::<4>().0 {
             px[0] = r;
             px[1] = g;
             px[2] = b;
