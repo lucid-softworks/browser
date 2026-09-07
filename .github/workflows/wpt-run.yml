@@ -119,7 +119,9 @@ jobs:
           # resources 404 — the helper test throws before registering subtests (area reports 0/0),
           # and Ahem-based geometry assertions measure with the fallback font. Add both for css/ areas.
           mapfile -t checkout_paths < <(jq -r '.[]' <<< "$CHECKOUT_JSON")
-          git sparse-checkout set tools third_party docs resources common css/support fonts quirks interfaces images "${checkout_paths[@]}"
+          # Some matrix entries are individual test files. Cone-mode sparse checkout rejects those
+          # paths unless checks are skipped, even though Git materializes the files correctly.
+          git sparse-checkout set --skip-checks tools third_party docs resources common css/support fonts quirks interfaces images "${checkout_paths[@]}"
 
       - name: Map WPT hosts
         run: |
