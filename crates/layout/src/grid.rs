@@ -94,6 +94,17 @@ pub(crate) fn layout_grid(
             // explicit column; row explicit or current cursor row
             let r = row_opt.unwrap_or(cursor_r);
             (r, c)
+        } else if let Some(r) = row_opt {
+            // A definite row with an auto column: the row is fixed, so only the column is searched.
+            // The fully-auto path below moves down a row when it runs out of columns, which would
+            // discard the very position this item asked for.
+            let mut c = 0;
+            while c + col_span <= num_cols && occupied.contains(&(r, c)) {
+                c += 1;
+            }
+            // A row with no free slot grows the grid with implicit columns, which aren't sized here;
+            // clamping to the last usable start keeps the item inside the explicit tracks.
+            (r, c.min(num_cols.saturating_sub(col_span)))
         } else {
             // auto-place: find next free cell row-major
             let mut r = cursor_r;

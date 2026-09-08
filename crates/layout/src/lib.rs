@@ -2305,6 +2305,79 @@ mod tests {
     }
 
     #[test]
+    fn definite_grid_row_is_honoured_when_the_column_is_auto() {
+        // `grid-row: 3` with no `grid-column` pins the row and leaves the column to auto-placement.
+        // The auto path moves down a row whenever it runs out of columns, so routing this item
+        // through it threw the requested row away and left it in row 1.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let g = doc.append_element(body, "div");
+        let a = doc.append_element(g, "div");
+        let b = doc.append_element(g, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            g,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                width: Some(150.0),
+                grid_template_columns: vec![style::TrackSize::Px(50.0); 3],
+                grid_template_rows: vec![style::TrackSize::Px(20.0); 3],
+                ..Default::default()
+            },
+        );
+        // `a` is pinned to row 3; `b` is fully auto and lands in the first free cell.
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                grid_row: Some(style::GridPlacement {
+                    start: Some(3),
+                    start_span: None,
+                    end: style::GridEnd::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display_block: true,
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let gbox = find_box(&root_box, &|x| x.node == Some(g)).unwrap();
+        let (gx, gy) = (gbox.dimensions.content.x, gbox.dimensions.content.y);
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+
+        // Third row starts 40px down; the column is the first free one, so no x offset.
+        assert!(
+            (abox.dimensions.content.y - (gy + 40.0)).abs() < 0.01,
+            "pinned item should sit in row 3 at y+40, got {}",
+            abox.dimensions.content.y - gy,
+        );
+        assert!(
+            (abox.dimensions.content.x - gx).abs() < 0.01,
+            "auto column should resolve to the first track, got x+{}",
+            abox.dimensions.content.x - gx,
+        );
+
+        // The pinned item must still occupy its cell, so a later auto item cannot be placed on top
+        // of it — a fix that merely positioned `a` without marking the cell would collide here.
+        let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
+        assert!(
+            (bbox.dimensions.content.y - (gy + 40.0)).abs() > 0.01
+                || (bbox.dimensions.content.x - gx).abs() > 0.01,
+            "auto item overlaps the pinned cell",
+        );
+    }
+
+    #[test]
     fn vertical_grid_with_orthogonal_items_terminates_with_finite_geometry() {
         let mut doc = dom::Document::new();
         let root = doc.root();
