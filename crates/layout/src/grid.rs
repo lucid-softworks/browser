@@ -19,7 +19,7 @@ pub(crate) fn layout_grid(
     let content = boxx.dimensions.content;
 
     // In-flow item indices.
-    let items: Vec<usize> = boxx
+    let mut items: Vec<usize> = boxx
         .children
         .iter()
         .enumerate()
@@ -28,7 +28,7 @@ pub(crate) fn layout_grid(
         .collect();
 
     // Column tracks: default to a single auto track if unspecified.
-    let col_tracks = if cs.grid_template_columns.is_empty() {
+    let mut col_tracks = if cs.grid_template_columns.is_empty() {
         vec![style::TrackSize::Auto]
     } else {
         expand_auto_repeat_tracks(
@@ -38,7 +38,8 @@ pub(crate) fn layout_grid(
             items.len(),
         )
     };
-    let num_cols = col_tracks.len().max(1);
+    let explicit_cols = col_tracks.len().max(1);
+    let mut num_cols = explicit_cols;
 
     // Determine number of rows: explicit rows, else enough to fit all items row-major.
     let explicit_rows = expand_auto_repeat_tracks(
@@ -52,9 +53,6 @@ pub(crate) fn layout_grid(
     } else {
         items.len().div_ceil(num_cols).max(1)
     };
-
-    // Resolve column widths in px.
-    let col_widths = resolve_tracks(&col_tracks, content.width, cs.column_gap, num_cols);
 
     // Row heights: resolve explicit row tracks; for auto/implicit rows use a content estimate.
     let row_template = if explicit_rows.is_empty() {
@@ -80,47 +78,68 @@ pub(crate) fn layout_grid(
     let mut cursor_r = 0usize;
     let mut cursor_c = 0usize;
     let mut occupied: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    // CSS placement phases: definite positions, row-locked, then remaining items.
+    // Stable sorting preserves source order within each phase.
+    items.sort_by_key(|&i| {
+        let cs = style_of(&boxx.children[i], styles)
+            .cloned()
+            .unwrap_or_default();
+        let row = placement_to_cell(cs.grid_row, num_rows).0.is_some();
+        let col = placement_to_cell(cs.grid_column, explicit_cols).0.is_some();
+        if row && col {
+            0
+        } else if row {
+            1
+        } else {
+            2
+        }
+    });
     for &i in &items {
         let child = &boxx.children[i];
         let ccs = style_of(child, styles).cloned().unwrap_or_default();
         // Explicit placement?
-        let (col, col_span) = placement_to_cell(ccs.grid_column, num_cols);
+        let (col, col_span) = placement_to_cell(ccs.grid_column, explicit_cols);
         let (row_opt, row_span) = match ccs.grid_row {
             Some(p) => placement_to_cell(Some(p), num_rows.max(1)),
             None => (None, 1),
         };
 
-        let (final_r, final_c) = if let Some(c) = col {
-            // explicit column; row explicit or current cursor row
-            let r = row_opt.unwrap_or(cursor_r);
-            (r, c)
-        } else if let Some(r) = row_opt {
-            // A definite row with an auto column: the row is fixed, so only the column is searched.
-            // The fully-auto path below moves down a row when it runs out of columns, which would
-            // discard the very position this item asked for.
-            let mut c = 0;
-            while c + col_span <= num_cols && occupied.contains(&(r, c)) {
-                c += 1;
-            }
-            // A row with no free slot grows the grid with implicit columns, which aren't sized here;
-            // clamping to the last usable start keeps the item inside the explicit tracks.
-            (r, c.min(num_cols.saturating_sub(col_span)))
-        } else {
-            // auto-place: find next free cell row-major
-            let mut r = cursor_r;
-            let mut c = cursor_c;
-            loop {
-                if c + col_span > num_cols {
-                    r += 1;
-                    c = 0;
-                }
-                if !occupied.contains(&(r, c)) {
-                    break;
-                }
-                c += 1;
-            }
-            (r, c)
+        let fits = |r: usize, c: usize| {
+            (0..row_span).all(|dr| (0..col_span).all(|dc| !occupied.contains(&(r + dr, c + dc))))
         };
+        let (final_r, final_c) = match (row_opt, col) {
+            (Some(r), Some(c)) => (r, c),
+            (Some(r), None) => {
+                let mut c = 0;
+                while !fits(r, c) {
+                    c += 1;
+                }
+                (r, c)
+            }
+            (None, Some(c)) => {
+                let mut r = cursor_r + usize::from(c < cursor_c);
+                while !fits(r, c) {
+                    r += 1;
+                }
+                (r, c)
+            }
+            (None, None) => {
+                let mut r = cursor_r;
+                let mut c = cursor_c;
+                loop {
+                    if c + col_span > num_cols {
+                        r += 1;
+                        c = 0;
+                    }
+                    if fits(r, c) {
+                        break;
+                    }
+                    c += 1;
+                }
+                (r, c)
+            }
+        };
+        num_cols = num_cols.max(final_c + col_span);
 
         for dr in 0..row_span {
             for dc in 0..col_span {
@@ -128,13 +147,14 @@ pub(crate) fn layout_grid(
             }
         }
         // Advance auto cursor past this item.
-        cursor_r = final_r;
-        cursor_c = final_c + col_span;
-        if cursor_c >= num_cols {
-            cursor_c = 0;
-            cursor_r += 1;
+        if row_opt.is_none() {
+            cursor_r = final_r;
+            cursor_c = final_c + col_span;
+            if cursor_c >= num_cols {
+                cursor_c = 0;
+                cursor_r += 1;
+            }
         }
-
         placed.push(Placed {
             idx: i,
             row: final_r,
@@ -155,6 +175,12 @@ pub(crate) fn layout_grid(
     while row_tmpl.len() < used_rows {
         row_tmpl.push(style::TrackSize::Auto);
     }
+
+    // Size newly created implicit columns using the existing Auto track policy.
+    col_tracks.resize(num_cols, style::TrackSize::Auto);
+    let col_widths = resolve_tracks(&col_tracks, content.width, cs.column_gap, num_cols);
+    // Placement phase order must not change painting/source order.
+    placed.sort_by_key(|p| p.idx);
 
     // Column x offsets (cumulative + gaps).
     let mut col_x = vec![0.0f32; num_cols + 1];

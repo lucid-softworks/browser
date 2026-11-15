@@ -193,6 +193,84 @@ mod tests {
     }
 
     #[test]
+    fn row_locked_placement_reserves_spans_before_auto_in_both_orders() {
+        for reverse in [false, true] {
+            for (row, span, explicit_col, fixed_row_offset, expected_x, expected_auto_y) in [
+                (3, 1, 2, 0, 0.0, 0.0),
+                (1, 2, 2, 0, 200.0, 0.0),
+                (1, 2, 2, 1, 200.0, 0.0),
+                (1, 1, 1, 0, 100.0, 20.0),
+            ] {
+                let mut doc = dom::Document::new();
+                let root = doc.root();
+                let g = doc.append_element(root, "div");
+                let first = doc.append_element(g, "div");
+                let second = doc.append_element(g, "div");
+                let fixed = doc.append_element(g, "div");
+                let (locked, auto) = if reverse {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
+                let mut styles = HashMap::new();
+                let cols = if explicit_col == 1 { 1 } else { 3 };
+                styles.insert(
+                    g,
+                    style::ComputedStyle {
+                        display: style::Display::Grid,
+                        display_block: true,
+                        width: Some(500.0),
+                        grid_template_columns: vec![style::TrackSize::Px(100.0); cols],
+                        grid_template_rows: vec![style::TrackSize::Px(20.0); 4],
+                        ..Default::default()
+                    },
+                );
+                let line = |n| {
+                    Some(style::GridPlacement {
+                        start: Some(n),
+                        start_span: None,
+                        end: style::GridEnd::Auto,
+                    })
+                };
+                styles.insert(
+                    fixed,
+                    style::ComputedStyle {
+                        grid_row: line(row + fixed_row_offset),
+                        grid_column: line(explicit_col),
+                        ..block_style(true)
+                    },
+                );
+                styles.insert(
+                    locked,
+                    style::ComputedStyle {
+                        grid_row: Some(style::GridPlacement {
+                            start: Some(row),
+                            start_span: None,
+                            end: style::GridEnd::Span(2),
+                        }),
+                        grid_column: Some(style::GridPlacement {
+                            start: None,
+                            start_span: None,
+                            end: style::GridEnd::Span(span),
+                        }),
+                        ..block_style(true)
+                    },
+                );
+                styles.insert(auto, block_style(true));
+                let tree =
+                    layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+                let gr = rect_of(&tree, g);
+                let lr = rect_of(&tree, locked);
+                let ar = rect_of(&tree, auto);
+                assert_eq!(lr.x - gr.x, expected_x, "row={row} span={span}");
+                assert_eq!(lr.y - gr.y, (row - 1) as f32 * 20.0);
+                assert_eq!(ar.x - gr.x, 0.0);
+                assert_eq!(ar.y - gr.y, expected_auto_y);
+                assert!(lr.width > 0.0);
+            }
+        }
+    }
+    #[test]
     fn br_splits_text_onto_two_lines() {
         // body > p > "first" <br> "second"
         let mut doc = dom::Document::new();
