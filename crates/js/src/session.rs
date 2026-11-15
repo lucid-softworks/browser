@@ -55,16 +55,16 @@ pub(crate) enum SessionCmd {
     SetCanvasPixels {
         pixels: Vec<(usize, u32, u32, Vec<u8>)>,
     },
-    /// Stop the loop; the isolate is torn down on the thread it lives on.
+    /// Stop the loop; the engine is torn down on the thread it lives on.
     Stop,
 }
 
-/// A persistent JS runtime bound to one page. The V8 isolate + context live for the whole session
+/// A persistent JS runtime bound to one page. The Lumen engine + realm live for the whole session
 /// on a dedicated thread; [`dispatch_event`](Session::dispatch_event) and [`tick`](Session::tick)
 /// post commands to that thread and block on the reply, returning a fresh DOM snapshot each time.
 /// The session keeps mutating the live document; callers render the returned clone.
 /// Per-tab runtime stats, sampled on the session thread and read lock-free by the engine/UI (for the
-/// tab tooltip). `heap_bytes` is the V8 heap used size; `cpu_ns` is cumulative time spent actively
+/// tab tooltip). `heap_bytes` is the allocated JS bytes when available; `cpu_ns` is cumulative time spent actively
 /// running JS on this tab's thread — a CPU proxy, since the thread is otherwise blocked on `recv`.
 #[derive(Default)]
 pub struct TabStats {
@@ -73,13 +73,52 @@ pub struct TabStats {
 }
 
 pub struct Session {
+    execution: ExecutionControl,
+    last_snapshot: std::sync::Mutex<dom::Document>,
     tx: std::sync::mpsc::Sender<SessionCmd>,
     handle: Option<std::thread::JoinHandle<()>>,
     stats: Arc<TabStats>,
 }
 
 impl Session {
-    /// V8 heap used by this tab (bytes).
+    pub fn execution_stopped(&self) -> bool {
+        self.execution.is_cancelled()
+    }
+    fn snapshot(&self) -> dom::Document {
+        self.last_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    fn remember(&self, doc: &dom::Document) {
+        *self.last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = doc.clone();
+    }
+    fn receive_snapshot(
+        &self,
+        receiver: std::sync::mpsc::Receiver<(dom::Document, Vec<String>)>,
+    ) -> (dom::Document, Vec<String>) {
+        match receiver.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+            Ok((doc, console)) => {
+                self.remember(&doc);
+                (doc, console)
+            }
+            Err(_) => {
+                self.execution.cancel();
+                (self.snapshot(), vec![EXECUTION_STOPPED.to_string()])
+            }
+        }
+    }
+    fn stopped_output(&self) -> (EvalOutput, dom::Document, Vec<String>) {
+        (
+            EvalOutput {
+                error: Some(EXECUTION_STOPPED.to_string()),
+                ..EvalOutput::default()
+            },
+            self.snapshot(),
+            Vec::new(),
+        )
+    }
+    /// Allocated JS bytes; currently zero because Lumen does not expose this measurement.
     pub fn heap_bytes(&self) -> u64 {
         self.stats.heap_bytes.load(Ordering::Relaxed)
     }
@@ -90,7 +129,7 @@ impl Session {
 }
 
 impl Session {
-    /// Spawn the runtime thread, create the isolate + context, install the browser environment, run
+    /// Spawn the runtime thread, create the engine + context, install the browser environment, run
     /// the initial classic `scripts` in order then the module graph (`entries` + `modules`, via
     /// `fetcher`), drain once, and return the session plus the initial DOM snapshot + per-source
     /// [`EvalOutput`]s (one per classic script, then one per module entry — matching the order
@@ -128,10 +167,14 @@ impl Session {
         let stats = Arc::new(TabStats::default());
         let stats_thread = stats.clone();
 
+        let host_context = HostContext::current();
+        let execution = host_context.new_execution();
+        let thread_execution = execution.clone();
         let spawn = std::thread::Builder::new()
             .name("js-session".to_string())
             .stack_size(256 * 1024 * 1024)
             .spawn(move || {
+                let _host = host_context.enter();
                 // Catch any panic so it never crosses the thread boundary; on panic the init
                 // channel is dropped and the caller falls back to an empty snapshot.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -150,6 +193,7 @@ impl Session {
                         cmd_rx,
                         initial_rects,
                         stats_thread,
+                        thread_execution,
                     );
                 }));
             });
@@ -159,6 +203,8 @@ impl Session {
             Err(e) => {
                 return (
                     Session {
+                        execution,
+                        last_snapshot: std::sync::Mutex::new(fallback.clone()),
                         tx: cmd_tx,
                         handle: None,
                         stats,
@@ -175,21 +221,26 @@ impl Session {
 
         // Block (bounded) for the initial load to finish. On timeout/panic, render the pre-script
         // DOM — matching the existing channel-timeout fallback in run_with_dom/run_modules.
-        let budget = std::time::Duration::from_secs(20);
+        let budget = EXECUTION_BUDGET + std::time::Duration::from_secs(2);
         let (snapshot, outputs) = match init_rx.recv_timeout(budget) {
             Ok(result) => result,
-            Err(_) => (
-                fallback,
-                vec![EvalOutput {
-                    value: None,
-                    console: Vec::new(),
-                    error: Some("session load timed out or aborted".to_string()),
-                }],
-            ),
+            Err(_) => {
+                execution.cancel();
+                (
+                    fallback,
+                    vec![EvalOutput {
+                        value: None,
+                        console: Vec::new(),
+                        error: Some(EXECUTION_STOPPED.to_string()),
+                    }],
+                )
+            }
         };
 
         (
             Session {
+                execution,
+                last_snapshot: std::sync::Mutex::new(snapshot.clone()),
                 tx: cmd_tx,
                 handle: Some(handle),
                 stats,
@@ -219,11 +270,9 @@ impl Session {
             reply: reply_tx,
         };
         if self.tx.send(cmd).is_err() {
-            return (dom::Document::new(), Vec::new());
+            return (self.snapshot(), vec![EXECUTION_STOPPED.to_string()]);
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        self.receive_snapshot(reply_rx)
     }
 
     /// Deliver a key press to `node_id`: fires `keydown`, mutates the focused text field's value
@@ -243,11 +292,9 @@ impl Session {
             reply: reply_tx,
         };
         if self.tx.send(cmd).is_err() {
-            return (dom::Document::new(), Vec::new());
+            return (self.snapshot(), vec![EXECUTION_STOPPED.to_string()]);
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        self.receive_snapshot(reply_rx)
     }
 
     /// Push the engine's laid-out element rects (CSS px, document-absolute, top-origin) to the
@@ -281,7 +328,7 @@ impl Session {
     }
 
     /// Notify the page that the OS appearance (prefers-color-scheme) changed: re-evaluates every
-    /// live `MediaQueryList` and fires `change` on those whose `.matches` flipped. The process-global
+    /// live `MediaQueryList` and fires `change` on those whose `.matches` flipped. The session host
     /// flag is already updated via [`set_color_scheme_dark`]; this just dispatches the JS events and
     /// drains the loop so any DOM mutations the handlers make are reflected.
     pub fn notify_color_scheme_changed(&self) -> (dom::Document, Vec<String>) {
@@ -314,6 +361,15 @@ impl Session {
         out.value.unwrap_or_else(|| "[]".to_string())
     }
 
+    /// Return element scroll offsets as `node:left:top;...`. Only elements whose scrolling
+    /// accessors have been written are included; zero entries remain present so the engine can
+    /// undo a previously-applied translation.
+    pub fn element_scroll_offsets(&self) -> String {
+        let (out, _doc, _console) = self
+            .eval_full("(globalThis.__elementScrollOffsets||function(){return ''})()".to_string());
+        out.value.unwrap_or_default()
+    }
+
     /// Deliver computed IntersectionObserver/ResizeObserver geometry to the page: invokes the JS
     /// observer callbacks (which may mutate the DOM), drains the loop, and returns a fresh snapshot
     /// + console. `arr_json` is the JSON array described in `__deliverObservations`.
@@ -333,11 +389,18 @@ impl Session {
             })
             .is_err()
         {
-            return (EvalOutput::default(), dom::Document::new(), Vec::new());
+            return self.stopped_output();
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| (EvalOutput::default(), dom::Document::new(), Vec::new()))
+        match reply_rx.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+            Ok((out, doc, console)) => {
+                self.remember(&doc);
+                (out, doc, console)
+            }
+            Err(_) => {
+                self.execution.cancel();
+                self.stopped_output()
+            }
+        }
     }
 
     /// Devtools console REPL: evaluate `source` in the live page context and return a display
@@ -415,13 +478,25 @@ impl Session {
         if self.tx.send(SessionCmd::Tick { reply: reply_tx }).is_err() {
             return None;
         }
-        reply_rx.recv().unwrap_or(None)
+        match reply_rx.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+            Ok(result) => {
+                if let Some((doc, _)) = &result {
+                    self.remember(doc);
+                }
+                result
+            }
+            Err(_) => {
+                self.execution.cancel();
+                None
+            }
+        }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Ask the runtime thread to stop, then join so the isolate is dropped on its own thread.
+        self.execution.cancel();
+        // Interrupt execution before asking the runtime thread to stop and joining it.
         let _ = self.tx.send(SessionCmd::Stop);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -429,37 +504,7 @@ impl Drop for Session {
     }
 }
 
-/// Body of the session runtime thread: owns the isolate + persistent context for the whole session.
-#[allow(clippy::too_many_arguments)]
-/// Per-isolate V8 heap ceiling. A runaway page (infinite DOM growth, a script that allocates without
-/// bound) is terminated at this point rather than being allowed to grow until V8 calls
-/// `FatalProcessOutOfMemory`, which aborts the WHOLE process (the crash this guards against).
-pub(crate) const SESSION_HEAP_MAX: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
-
-/// V8 near-heap-limit callback. Fired on the isolate's own thread when the heap approaches
-/// [`SESSION_HEAP_MAX`]. We terminate the running script (so one tab's runaway allocation can't take
-/// the browser down) and return a slightly raised limit so V8 has headroom to unwind the stack and
-/// deliver the termination, instead of OOM-aborting before it can.
-unsafe extern "C" fn near_heap_limit_cb(
-    data: *mut std::ffi::c_void,
-    current: usize,
-    _initial: usize,
-) -> usize {
-    let handle = &*(data as *const v8::IsolateHandle);
-    handle.terminate_execution();
-    current + 256 * 1024 * 1024
-}
-
-/// Create a V8 isolate with a bounded heap + the graceful-OOM guard, so a single page can't crash
-/// the process. The leaked `IsolateHandle` lives as long as the isolate (one per session).
-pub(crate) fn new_guarded_isolate() -> v8::OwnedIsolate {
-    let mut isolate =
-        v8::Isolate::new(v8::CreateParams::default().heap_limits(0, SESSION_HEAP_MAX));
-    let handle = Box::into_raw(Box::new(isolate.thread_safe_handle()));
-    isolate.add_near_heap_limit_callback(near_heap_limit_cb, handle as *mut std::ffi::c_void);
-    isolate
-}
-
+/// Own the Lumen engine and its persistent page realm on the session thread.
 pub(crate) fn session_thread_main(
     doc: dom::Document,
     scripts: Vec<String>,
@@ -482,8 +527,20 @@ pub(crate) fn session_thread_main(
         f32,
     )>,
     stats: Arc<TabStats>,
+    execution: ExecutionControl,
 ) {
-    ensure_v8_initialized();
+    // A tab can close while navigation is fetching, before this thread is created.
+    // Return its parsed document without attempting to bootstrap a cancelled realm.
+    if execution.is_cancelled() {
+        let _ = init_tx.send((
+            doc,
+            vec![EvalOutput {
+                error: Some(EXECUTION_STOPPED.to_string()),
+                ..EvalOutput::default()
+            }],
+        ));
+        return;
+    }
     let shared: SharedDoc = Rc::new(RefCell::new(doc));
     // Background fetch threads deliver completions here; the receiver lives for the whole session
     // (used by every drain — init load and each subsequent command).
@@ -491,22 +548,13 @@ pub(crate) fn session_thread_main(
     // Background socket threads deliver WebSocket events here; the receiver lives for the whole
     // session and is drained (non-blocking) on every drain pass alongside the fetch channel.
     let (ws_evt_tx, ws_evt_rx) = std::sync::mpsc::channel::<WsEvent>();
-    // Keep the isolate owned by this thread for the whole session.
-    let mut isolate = new_guarded_isolate();
-    // Register the same isolate-level callbacks run_modules uses so modules + dynamic import work.
-    isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
-    isolate.set_promise_reject_callback(promise_reject_callback);
-    isolate.set_host_initialize_import_meta_object_callback(initialize_import_meta_callback);
-
-    // Create the context once and persist it as a Global across all operations.
-    let context: v8::Global<v8::Context> = {
-        v8::scope!(let handle_scope, &mut isolate);
-        let context = v8::Context::new(handle_scope, Default::default());
-        let scope = &mut v8::ContextScope::new(handle_scope, context);
-
+    let initial_operation = execution.enter(EXECUTION_BUDGET);
+    let mut engine = controlled_engine(&execution);
+    let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> = Rc::new(move |u: &str| fetcher(u));
+    let registry = install_module_loader(&mut engine, modules, fetcher.clone(), &url);
+    {
+        let scope = engine.ctx();
         // Share one fetcher between the module loader and the JS `fetch()` primitive (as run_modules).
-        let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> =
-            Rc::new(move |u: &str| fetcher(u));
         let state = HostState::with_fetcher(
             Rc::clone(&shared),
             Rc::clone(&fetcher),
@@ -517,20 +565,15 @@ pub(crate) fn session_thread_main(
             cookie_getter,
             cookie_setter,
         );
-        scope.get_current_context().set_slot(state);
-        let registry = Rc::new(ModuleRegistry {
-            sources: RefCell::new(modules),
-            compiled: RefCell::new(HashMap::new()),
-            identity_to_url: RefCell::new(HashMap::new()),
-            fetcher,
-            base_url: url.clone(),
-        });
-        scope.get_current_context().set_slot(registry);
+        install_host_state(scope, state);
         install_browser_environment(scope, &url);
 
         // Register the page context NOW (before the initial scripts run), so a worker created during
         // page load can immediately deliver `postMessage` back into the page.
-        crate::set_page_context(v8::Global::new(scope, context));
+        crate::set_page_context(
+            crate::realms::Realm::current(scope)
+                .unwrap_or_else(|_| panic!("page realm must be available")),
+        );
 
         // Seed the engine-computed layout rects BEFORE scripts run, so synchronous
         // getBoundingClientRect / elementFromPoint / caret*FromPoint reads during page load see real
@@ -580,9 +623,10 @@ pub(crate) fn session_thread_main(
             results.push(eval_source(scope, source, "<script>"));
         }
         for entry in &entries {
-            results.push(run_one_entry(scope, entry));
+            results.push(run_one_entry(&mut engine, &registry, entry));
         }
-        drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
+        drain_runtime(&mut engine, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
+        let scope = engine.ctx();
         // Load drain done; switch the timer clock to real time so subsequent ticks/events run
         // setInterval/setTimeout/rAF over actual elapsed time.
         eval_internal(
@@ -593,11 +637,20 @@ pub(crate) fn session_thread_main(
 
         // Send the initial snapshot back to Session::new's caller.
         let _ = init_tx.send((shared.borrow().clone(), results));
-        v8::Global::new(scope, context)
-    };
+    }
 
-    // Command loop: each op re-enters the persistent context via Local::new(global).
+    drop(initial_operation);
+    if execution.is_cancelled() {
+        crate::clear_workers();
+        crate::clear_frames();
+        return;
+    }
+    // Commands reuse the persistent Lumen page realm.
     for cmd in cmd_rx {
+        if execution.is_cancelled() {
+            break;
+        }
+        let _operation = execution.enter(EXECUTION_BUDGET);
         let __cmd_t0 = std::time::Instant::now();
         match cmd {
             SessionCmd::Dispatch {
@@ -607,10 +660,7 @@ pub(crate) fn session_thread_main(
                 y,
                 reply,
             } => {
-                let ctx = context.clone();
-                v8::scope!(let handle_scope, &mut isolate);
-                let local_ctx = v8::Local::new(handle_scope, &ctx);
-                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let scope = engine.ctx();
                 let source = format!(
                     "__dispatchSyntheticEvent({}, {}, {{clientX:{}, clientY:{}, button:0}})",
                     node_id,
@@ -620,7 +670,7 @@ pub(crate) fn session_thread_main(
                 );
                 // Run the dispatch as one op, then drain the loop, folding console into a result.
                 let mut results = vec![eval_source(scope, &source, "<dispatch>")];
-                drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
+                drain_runtime(&mut engine, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
@@ -630,10 +680,7 @@ pub(crate) fn session_thread_main(
                 code,
                 reply,
             } => {
-                let ctx = context.clone();
-                v8::scope!(let handle_scope, &mut isolate);
-                let local_ctx = v8::Local::new(handle_scope, &ctx);
-                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let scope = engine.ctx();
                 let source = format!(
                     "__handleKeyInput({}, {}, {})",
                     node_id,
@@ -641,33 +688,30 @@ pub(crate) fn session_thread_main(
                     js_string_literal(&code),
                 );
                 let mut results = vec![eval_source(scope, &source, "<key>")];
-                drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
+                drain_runtime(&mut engine, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
             }
             SessionCmd::Eval { source, reply } => {
-                let ctx = context.clone();
-                v8::scope!(let handle_scope, &mut isolate);
-                let local_ctx = v8::Local::new(handle_scope, &ctx);
-                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let scope = engine.ctx();
                 let mut results = vec![eval_source(scope, &source, "<interact>")];
-                let first = EvalOutput {
+                let mut first = EvalOutput {
                     value: results[0].value.clone(),
                     error: results[0].error.clone(),
                     console: Vec::new(),
                 };
-                drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
+                drain_runtime(&mut engine, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
+                if execution.is_cancelled() {
+                    first.value = None;
+                    first.error = Some(EXECUTION_STOPPED.to_string());
+                }
                 let _ = reply.send((first, shared.borrow().clone(), console));
             }
             SessionCmd::Tick { reply } => {
-                let ctx = context.clone();
-                v8::scope!(let handle_scope, &mut isolate);
-                let local_ctx = v8::Local::new(handle_scope, &ctx);
-                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![EvalOutput::default()];
                 let did_work =
-                    drain_event_loop(scope, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
+                    drain_runtime(&mut engine, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 // Only snapshot+report when something actually ran, so idle ticks are cheap.
                 if did_work {
                     let console = results.into_iter().flat_map(|r| r.console).collect();
@@ -686,10 +730,7 @@ pub(crate) fn session_thread_main(
             } => {
                 // Store on HostState (no JS run needed — just update the geometry tables). Re-enter
                 // the persistent context to reach the slot. Fire-and-forget: no reply.
-                let ctx = context.clone();
-                v8::scope!(let handle_scope, &mut isolate);
-                let local_ctx = v8::Local::new(handle_scope, &ctx);
-                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let scope = engine.ctx();
                 let state = host_state(scope);
                 let mut map = state.layout_rects.borrow_mut();
                 map.clear();
@@ -723,10 +764,7 @@ pub(crate) fn session_thread_main(
             SessionCmd::SetCanvasPixels { pixels } => {
                 // Store the engine's rasterized RGBA on HostState for getImageData. Re-enter the
                 // persistent context to reach the slot. Fire-and-forget: no reply.
-                let ctx = context.clone();
-                v8::scope!(let handle_scope, &mut isolate);
-                let local_ctx = v8::Local::new(handle_scope, &ctx);
-                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let scope = engine.ctx();
                 let state = host_state(scope);
                 let mut map = state.canvas_pixels.borrow_mut();
                 map.clear();
@@ -737,19 +775,77 @@ pub(crate) fn session_thread_main(
             SessionCmd::Stop => break,
         }
         // Per-tab stats for the tab tooltip: active JS time this command (CPU proxy — the thread is
-        // otherwise blocked on recv) + the V8 heap used size. Cheap, sampled once per command.
+        // otherwise blocked on recv) + the allocated JS bytes when available. Cheap, sampled once per command.
         stats
             .cpu_ns
             .fetch_add(__cmd_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        stats.heap_bytes.store(
-            isolate.get_heap_statistics().used_heap_size() as u64,
-            Ordering::Relaxed,
-        );
+        // Lumen does not expose an allocated-byte measurement. Zero means unavailable.
+        stats.heap_bytes.store(0, Ordering::Relaxed);
+        if execution.is_cancelled() {
+            break;
+        }
     }
     // Loop ended (Stop or sender dropped). Drop worker realms + the page-context handle BEFORE the
-    // isolate so the thread-local doesn't outlive the isolate it holds handles into.
+    // engine so the thread-local doesn't outlive the engine it holds handles into.
     crate::clear_workers();
     crate::clear_frames();
-    drop(context);
-    drop(isolate);
+    drop(engine);
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    fn session() -> Session {
+        Session::new(
+            html::parse("<p>keep this document</p>"),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            "about:blank",
+            Box::new(|_| None),
+            Arc::new(|_, _, _, _| None),
+            Arc::new(|_, _, _| Err("no sockets".into())),
+            Arc::new(|_| String::new()),
+            Arc::new(|_, _| false),
+            None,
+        )
+        .0
+    }
+    #[test]
+    fn timer_and_promise_deadlines_stop_threads_and_preserve_the_document() {
+        for source in [
+            "setTimeout(function(){while(true){}},0)",
+            "Promise.resolve().then(function(){while(true){}})",
+        ] {
+            let session = session();
+            let original_count = session.snapshot().len();
+            let _short = session
+                .execution
+                .enter(std::time::Duration::from_millis(100));
+            let start = std::time::Instant::now();
+            let (out, snapshot, _) = session.eval_full(source.to_string());
+            assert_eq!(out.error.as_deref(), Some(EXECUTION_STOPPED), "{out:?}");
+            assert_eq!(snapshot.len(), original_count);
+            let (stopped, retained, _) = session.eval_full("1+1".into());
+            assert_eq!(stopped.error.as_deref(), Some(EXECUTION_STOPPED));
+            assert_eq!(retained.len(), original_count);
+            drop(session);
+            assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        }
+    }
+    #[test]
+    fn external_cancellation_stops_a_running_session() {
+        let session = session();
+        let execution = session.execution.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            execution.cancel();
+        });
+        let start = std::time::Instant::now();
+        let (out, _, _) = session.eval_full("for (;;) {}".into());
+        assert_eq!(out.error.as_deref(), Some(EXECUTION_STOPPED));
+        drop(session);
+        cancel.join().unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
 }

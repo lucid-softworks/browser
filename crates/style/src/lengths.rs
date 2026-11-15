@@ -291,6 +291,14 @@ pub(crate) fn parse_length_fs(val: &str, font_size: f32) -> Option<f32> {
     } else if let Some(em) = num("em") {
         // em resolves against the element's own font size.
         Some(em * font_size)
+    } else if let Some(vw) = num("vw") {
+        Some(vw * assumed_viewport_width() / 100.0)
+    } else if let Some(vh) = num("vh") {
+        Some(vh * assumed_viewport_height() / 100.0)
+    } else if let Some(vmin) = num("vmin") {
+        Some(vmin * assumed_viewport_width().min(assumed_viewport_height()) / 100.0)
+    } else if let Some(vmax) = num("vmax") {
+        Some(vmax * assumed_viewport_width().max(assumed_viewport_height()) / 100.0)
     } else {
         v.parse::<f32>().ok()
     }
@@ -375,10 +383,8 @@ pub(crate) fn parse_calc_percent(val: &str, font_size: f32) -> Option<InsetValue
                 if let Some(p) = tok.strip_suffix('%').and_then(|n| n.parse::<f32>().ok()) {
                     pct += sign * p;
                     found_pct = true;
-                } else if let Some(l) = parse_length_fs(tok, font_size) {
-                    px += sign * l;
                 } else {
-                    return None;
+                    px += sign * parse_length_fs(tok, font_size)?;
                 }
                 sign = 1.0;
             }

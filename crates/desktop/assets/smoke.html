@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lumen browser test</title>
+<style>
+body { background: #f4f5f7; color: #17202e; font-family: sans-serif; margin: 40px; }
+h1 { font-size: 36px; margin-bottom: 12px; }
+p { font-size: 18px; line-height: 1.5; }
+button { background: #304ffe; color: white; border: none; padding: 14px 24px; font-size: 18px; }
+input { padding: 12px; font-size: 18px; border: 1px solid #a6adbb; }
+section { background: white; padding: 28px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<h1>Lumen is running.</h1>
+<p>This page is rendered by the Rust browser engine inside a Rune window.</p>
+<section>
+<h2>Try JavaScript and text input</h2>
+<button id="counter">Clicked 0 times</button>
+<p><label>Your message: <input id="message" placeholder="Type here"></label></p>
+<p id="echo">Your message will appear here.</p>
+</section>
+<p><a href="https://example.com">Open example.com</a> to test navigation, then use Back.</p>
+<script>
+let count = 0;
+document.getElementById('counter').onclick = function () {
+  count += 1;
+  this.textContent = 'Clicked ' + count + (count === 1 ? ' time' : ' times');
+};
+document.getElementById('message').oninput = function () {
+  document.getElementById('echo').textContent = this.value || 'Your message will appear here.';
+};
+</script>
+</body>
+</html>

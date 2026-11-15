@@ -155,7 +155,32 @@ pub(crate) fn set_inner_html(doc: &mut dom::Document, target: dom::NodeId, html:
     }
     let frag = html::parse(html);
     let frag_root = frag.root();
+    let target_is_html = matches!(
+        &doc.get(target).data,
+        dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("html")
+    );
+    if target_is_html {
+        if let Some(src_html) = find_by_tag(&frag, frag_root, "html") {
+            for &child in &frag.get(src_html).children {
+                copy_subtree_into(doc, target, &frag, child);
+            }
+            return;
+        }
+    }
     copy_children_into(doc, target, &frag, frag_root);
+}
+
+/// Copy `src_node` and all descendants without flattening structural HTML elements.
+fn copy_subtree_into(
+    doc: &mut dom::Document,
+    dst_parent: dom::NodeId,
+    frag: &dom::Document,
+    src_node: dom::NodeId,
+) {
+    let new_id = doc.append_child(dst_parent, frag.get(src_node).data.clone());
+    for &child in &frag.get(src_node).children {
+        copy_subtree_into(doc, new_id, frag, child);
+    }
 }
 
 /// Recursively copy the children of `src_node` (in `frag`) as children of `dst_parent` in `doc`.

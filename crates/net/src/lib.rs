@@ -1615,7 +1615,7 @@ pub fn ws_run(
         loop {
             match out_rx.try_recv() {
                 Ok((0, text)) => {
-                    if socket.send(Message::Text(text)).is_err() {
+                    if socket.send(Message::Text(text.into())).is_err() {
                         let _ = evt_tx.send((id, 4, "send failed".to_string()));
                         closing = true;
                         break;
@@ -1625,7 +1625,7 @@ pub fn ws_run(
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(b64.as_bytes())
                         .unwrap_or_default();
-                    if socket.send(Message::Binary(bytes)).is_err() {
+                    if socket.send(Message::Binary(bytes.into())).is_err() {
                         let _ = evt_tx.send((id, 4, "send failed".to_string()));
                         closing = true;
                         break;
@@ -1651,7 +1651,7 @@ pub fn ws_run(
         // (b) Attempt one non-blocking read.
         match socket.read() {
             Ok(Message::Text(t)) => {
-                let _ = evt_tx.send((id, 1, t));
+                let _ = evt_tx.send((id, 1, t.to_string()));
             }
             Ok(Message::Binary(b)) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&b);
@@ -2211,6 +2211,53 @@ mod tests {
             !events.iter().any(|(_, k, _)| *k == 0),
             "must not open on an unreachable host, got {events:?}"
         );
+    }
+
+    #[test]
+    fn ws_local_text_and_binary_round_trip() {
+        use std::net::TcpListener;
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let text = socket.read().unwrap();
+            assert_eq!(text, tungstenite::Message::Text("hello 🦀".into()));
+            socket.send(text).unwrap();
+            let binary = socket.read().unwrap();
+            assert_eq!(
+                binary,
+                tungstenite::Message::Binary(vec![0, 255, 128, 1].into())
+            );
+            socket.send(binary).unwrap();
+            assert!(matches!(
+                socket.read().unwrap(),
+                tungstenite::Message::Close(_)
+            ));
+        });
+        let (events, incoming) = channel();
+        let (outgoing, commands) = channel();
+        let client =
+            std::thread::spawn(move || ws_run(format!("ws://{addr}"), 42, events, commands));
+        let receive = || incoming.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(receive(), (42, 0, String::new()));
+        outgoing.send((0, "hello 🦀".into())).unwrap();
+        assert_eq!(receive(), (42, 1, "hello 🦀".into()));
+        let payload = base64::engine::general_purpose::STANDARD.encode([0, 255, 128, 1]);
+        outgoing.send((1, payload.clone())).unwrap();
+        assert_eq!(receive(), (42, 2, payload));
+        outgoing.send((2, String::new())).unwrap();
+        assert_eq!(receive().1, 3);
+        client.join().unwrap();
+        server.join().unwrap();
     }
 
     #[test]

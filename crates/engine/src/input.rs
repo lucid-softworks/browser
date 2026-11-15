@@ -83,6 +83,7 @@ impl Engine {
     }
 
     pub fn dispatch_click(&mut self, x: f32, y: f32) -> bool {
+        let _host = self.js_context.enter();
         // Hit-test in layout (document) coordinates: header_h = 0, left = 0, so add scroll_y.
         let node = match self.layout_cache.as_ref() {
             Some(cache) => match deepest_node_at(&cache.root, x, y + self.scroll_y) {
@@ -105,6 +106,7 @@ impl Engine {
         // field (text-like <input> / <textarea>), else clear focus. Computed against the new
         // snapshot so the node ids are valid in the doc we're about to store.
         let new_focus = editable_text_ancestor(&snapshot, node);
+        js::set_interaction_state(self.hovered_node.map(|n| n.0), new_focus.map(|n| n.0));
         let session = self.session.as_ref().unwrap();
 
         // Focus transition: if focus moved, fire blur (+ change if the old field's value changed)
@@ -137,32 +139,7 @@ impl Engine {
             self.focus_value = new_focus.and_then(|n| node_value(&snapshot, n));
         }
         self.focused_node = new_focus;
-
-        // Checkbox / radio toggle: if the click landed on (or inside, e.g. a <label for>) a
-        // checkable input that isn't disabled, toggle it (fires input + change).
-        if let Some(target) = checkable_target(&snapshot, node) {
-            let (s, c) = session.toggle_checkbox(target.0);
-            snapshot = s;
-            snapshot.prune_invalid();
-            console.extend(c);
-        }
-
-        // <details>/<summary>: a click on a summary toggles the parent <details> open/closed.
-        if let Some(details) = details_toggle_target(&snapshot, node) {
-            let (s, c) = session.toggle_details(details.0);
-            snapshot = s;
-            snapshot.prune_invalid();
-            console.extend(c);
-        }
-
-        // Submit: a click on a submit button (<input type=submit>, <button type=submit>, or a
-        // <button> with no type) inside a form fires `submit` on the nearest ancestor <form>.
-        if let Some(form) = submit_target_form(&snapshot, node) {
-            let (s, c) = session.fire_event(form.0, "submit");
-            snapshot = s;
-            snapshot.prune_invalid();
-            console.extend(c);
-        }
+        js::set_interaction_state(self.hovered_node.map(|n| n.0), new_focus.map(|n| n.0));
 
         if let LoadState::Loaded {
             doc, console: c, ..
@@ -389,6 +366,7 @@ impl Engine {
     /// one, adopts the updated snapshot, and invalidates the layout cache. Returns `true` if the
     /// hovered node changed (a re-render may be warranted); `false` (cheap no-op) if unchanged.
     pub fn dispatch_move(&mut self, x: f32, y: f32) -> bool {
+        let _host = self.js_context.enter();
         let node = match self.layout_cache.as_ref() {
             Some(cache) => deepest_node_at(&cache.root, x, y + self.scroll_y),
             None => None,
@@ -397,6 +375,7 @@ impl Engine {
         if node == self.hovered_node {
             return false;
         }
+        js::set_interaction_state(node.map(|n| n.0), self.focused_node.map(|n| n.0));
         let session = match &self.session {
             Some(s) => s,
             None => {
@@ -557,6 +536,7 @@ impl Engine {
     /// stored a document-CSS-px target; convert to device px and move the scroll offset. Returns
     /// whether the offset changed (so the caller re-renders). The render clamps to the page height.
     pub(crate) fn apply_pending_scroll(&mut self) -> bool {
+        let _host = self.js_context.enter();
         if let Some(y_css) = js::take_pending_scroll() {
             let y = (y_css * self.scale).max(0.0);
             if (y - self.scroll_y).abs() > 0.5 {
