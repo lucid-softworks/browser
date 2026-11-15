@@ -1,0 +1,66 @@
+name: Desktop
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            binary: browser
+          - os: windows-latest
+            platform: windows
+            binary: browser.exe
+          - os: macos-latest
+            platform: macos
+            binary: browser
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-${{ matrix.platform }}
+      - name: Install Linux libraries and fonts
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxkbcommon-x11-0 mesa-vulkan-drivers fonts-dejavu-core
+      - name: Check desktop targets
+        run: cargo check --locked -p browser-desktop --all-targets
+      - name: Test engine and desktop integration
+        run: cargo test --locked --workspace
+      - name: Build desktop executable
+        run: cargo build --locked --release -p browser-desktop
+      - name: Stage executable and licenses
+        shell: bash
+        run: |
+          mkdir -p "dist/browser-${{ matrix.platform }}"
+          cp "target/release/${{ matrix.binary }}" LICENSE crates/desktop/assets/Inter-LICENSE.txt "dist/browser-${{ matrix.platform }}/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-${{ matrix.platform }}
+          path: dist/browser-${{ matrix.platform }}/
+          if-no-files-found: error

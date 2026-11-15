@@ -26,7 +26,7 @@ pub(crate) const MAX_EXTERNAL_STYLESHEETS: usize = 100;
 pub(crate) const MAX_EXTERNAL_SCRIPTS: usize = 24;
 /// Skip fetched script bodies larger than this (mirrors the inline-script cap). Large SPA
 /// frameworks ship multi-MB bundles (e.g. youtube's main app bundle is ~10.5 MB), so the cap is
-/// generous; V8 parses lazily and the per-run execution budget bounds the time.
+/// generous; script execution runs on a dedicated session thread.
 pub(crate) const MAX_SCRIPT_BYTES: usize = 32 * 1024 * 1024;
 
 /// One author stylesheet source in document order: either an inline `<style>` body or an

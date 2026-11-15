@@ -32,7 +32,7 @@ curl -s -X POST localhost:4444/session/browser-wd-00000001/execute/sync \
 
 - **HTTP server**: a tiny blocking HTTP/1.1 server built on `std::net` (one request per
   connection, `Connection: close`), modeled on `crates/wpt-runner`'s static server. Each session's
-  `Engine` owns a V8 isolate that is **not `Send`**, so the server is **single-threaded**: it
+  `Engine` drives a Lumen runtime on its own JavaScript thread. The server is **single-threaded**: it
   handles one connection at a time and serializes all engine work behind one `Mutex`. WebDriver
   clients issue commands sequentially, so this is sufficient (and `wptrunner` drives one session at
   a time).
