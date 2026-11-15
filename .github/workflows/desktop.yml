@@ -31,8 +31,13 @@ jobs:
           - os: windows-latest
             platform: windows
             binary: browser.exe
-          - os: macos-latest
-            platform: macos
+          - os: macos-15
+            platform: macos-arm64
+            arch: arm64
+            binary: browser
+          - os: macos-15-intel
+            platform: macos-x86_64
+            arch: x86_64
             binary: browser
     runs-on: ${{ matrix.os }}
     steps:
@@ -53,14 +58,38 @@ jobs:
       - name: Test engine and desktop integration
         run: cargo test --locked --workspace
       - name: Build desktop executable
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
         run: cargo build --locked --release -p browser-desktop
       - name: Stage executable and licenses
+        if: runner.os != 'macOS'
         shell: bash
         run: |
           mkdir -p "dist/browser-${{ matrix.platform }}"
           cp "target/release/${{ matrix.binary }}" LICENSE crates/desktop/assets/Inter-LICENSE.txt "dist/browser-${{ matrix.platform }}/"
+      - name: Package macOS app and disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "browser-desktop"))')"
+          scripts/package-macos.sh target/release/browser "dist/browser-${{ matrix.platform }}" "$version" "$PACKAGE_ARCH" "$GITHUB_SHA"
       - uses: actions/upload-artifact@v4
+        id: package
         with:
           name: browser-${{ matrix.platform }}
           path: dist/browser-${{ matrix.platform }}/
           if-no-files-found: error
+          retention-days: 30
+      - name: Link downloadable build
+        shell: bash
+        env:
+          ARTIFACT_URL: ${{ steps.package.outputs.artifact-url }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "### Browser for $PLATFORM" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Download this build]($ARTIFACT_URL) — commit $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            echo 'Extract the downloaded ZIP, open the DMG, and drag Browser into Applications. These test builds are ad-hoc signed, not Apple-notarized.' >> "$GITHUB_STEP_SUMMARY"
+          fi
