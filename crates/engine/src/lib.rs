@@ -124,6 +124,19 @@ pub struct SelectHit {
     pub selected: usize,
 }
 
+/// Thread-safe cancellation of the currently loaded page. A later navigation installs a new token.
+#[derive(Clone)]
+pub struct InterruptHandle(js::HostContext);
+impl InterruptHandle {
+    pub fn interrupt(&self) {
+        self.0.cancel_execution();
+    }
+    /// Permanently stop this browser owner, including a navigation still loading its response.
+    pub fn shutdown(&self) {
+        self.0.shutdown_execution();
+    }
+}
+
 pub struct Engine {
     /// Browser-owned settings and outputs shared with this tab's JS worker.
     js_context: js::HostContext,

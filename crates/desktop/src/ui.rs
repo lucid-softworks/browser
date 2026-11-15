@@ -16,6 +16,28 @@ struct Tab {
     snapshot: Snapshot,
     pixels: Pixels,
     last_frame: u64,
+    console: Vec<String>,
+    console_input: TextEdit,
+    console_document_id: u64,
+}
+
+impl Tab {
+    fn begin_console_document(&mut self, document_id: u64) {
+        if document_id > self.console_document_id {
+            self.console.clear();
+            self.console_document_id = document_id;
+        }
+    }
+
+    fn record_console(&mut self, document_id: u64, line: String) {
+        self.begin_console_document(document_id);
+        if document_id == self.console_document_id {
+            self.console.push(line);
+            if self.console.len() > 200 {
+                self.console.remove(0);
+            }
+        }
+    }
 }
 
 pub struct Browser {
@@ -23,8 +45,6 @@ pub struct Browser {
     active: usize,
     next_id: u64,
     address: TextEdit,
-    console_input: TextEdit,
-    console: Vec<String>,
     console_open: bool,
     select: Option<engine::SelectHit>,
     waker: Option<Waker>,
@@ -43,8 +63,6 @@ impl Browser {
             active: 0,
             next_id: 1,
             address: TextEdit::new(&url),
-            console_input: TextEdit::default(),
-            console: Vec::new(),
             console_open: false,
             select: None,
             waker: None,
@@ -86,6 +104,9 @@ impl Browser {
             snapshot: Snapshot::default(),
             pixels: Pixels::default(),
             last_frame: 0,
+            console: Vec::new(),
+            console_input: TextEdit::default(),
+            console_document_id: 0,
         });
         self.activate(self.tabs.len() - 1);
         self.configure_active();
@@ -182,7 +203,10 @@ fn poll(state: &mut Browser, _time: f64, tx: &mut Tx) -> bool {
     }
     for (index, tab) in state.tabs.iter_mut().enumerate() {
         let Some(worker) = &tab.worker else { continue };
-        if let Some(snapshot) = worker.take_snapshot() {
+        let snapshot = worker.take_snapshot();
+        let events = worker.drain_events();
+        if let Some(snapshot) = snapshot {
+            tab.begin_console_document(snapshot.document_id);
             if let Some(frame) = &snapshot.frame {
                 if frame.sequence != tab.last_frame {
                     tab.pixels
@@ -203,16 +227,11 @@ fn poll(state: &mut Browser, _time: f64, tx: &mut Tx) -> bool {
             tab.snapshot = snapshot;
             changed = true;
         }
-        for event in worker.drain_events() {
+        for event in events {
             match event {
                 Event::Clipboard(value) => tx.copy(value),
                 Event::Select(hit) if index == state.active => state.select = Some(hit),
-                Event::Console(line) => {
-                    state.console.push(line);
-                    if state.console.len() > 200 {
-                        state.console.remove(0);
-                    }
-                }
+                Event::Console { document_id, line } => tab.record_console(document_id, line),
                 _ => {}
             }
             changed = true;
@@ -329,6 +348,7 @@ fn view(state: &Browser, cx: &mut Cx<Browser>) -> El {
         .fill(theme.bg)
         .color(theme.text)
         .on_edit(|s: &mut Browser| &mut s.address)
+        .on_input_key(shortcuts)
         .on_submit(|s: &mut Browser, tx| s.navigate(tx));
     let toolbar = row()
         .key("navigation")
@@ -494,8 +514,8 @@ fn view(state: &Browser, cx: &mut Cx<Browser>) -> El {
         }
         root = root.child(options);
     }
-    if state.console_open {
-        let output = state
+    if let Some(tab) = state.tab().filter(|_| state.console_open) {
+        let output = tab
             .console
             .iter()
             .rev()
@@ -512,9 +532,15 @@ fn view(state: &Browser, cx: &mut Cx<Browser>) -> El {
                 .padding(8.0)
                 .gap(6.0)
                 .fill(theme.card)
-                .child(text(output).font(type_::LABEL).color(theme.text).grow(1.0))
                 .child(
-                    text_input(&state.console_input, type_::BODY)
+                    text(output)
+                        .key("console-output")
+                        .font(type_::LABEL)
+                        .color(theme.text)
+                        .grow(1.0),
+                )
+                .child(
+                    text_input(&tab.console_input, type_::BODY)
                         .key("console-input")
                         .single_line()
                         .label("JavaScript console")
@@ -522,11 +548,12 @@ fn view(state: &Browser, cx: &mut Cx<Browser>) -> El {
                         .w_full()
                         .fill(theme.bg)
                         .color(theme.text)
-                        .on_edit(|s: &mut Browser| &mut s.console_input)
+                        .on_edit(|s: &mut Browser| &mut s.tabs[s.active].console_input)
+                        .on_input_key(shortcuts)
                         .on_submit(|s: &mut Browser, _| {
-                            let code = s.console_input.text.clone();
+                            let code = s.tabs[s.active].console_input.text.clone();
                             s.send(Command::Eval(code));
-                            s.console_input.replace_text("");
+                            s.tabs[s.active].console_input.replace_text("");
                         }),
                 ),
         );
@@ -575,12 +602,45 @@ fn shortcuts(state: &mut Browser, event: &KeyEvent, tx: &mut Tx) -> bool {
         state.activate((state.active + step) % state.tabs.len());
         return true;
     }
-    if event.mods.alt && matches!(event.key, Key::Left | Key::Right) {
-        state.send(if matches!(event.key, Key::Left) {
-            Command::Back
+    // macOS Option+Arrow belongs to word editing. Browser history uses Command+brackets
+    // there; Windows/Linux use bare Alt+Arrow, even while a text field is focused.
+    let history_back = if cfg!(target_os = "macos") {
+        if event.is_command('[') {
+            Some(true)
+        } else if event.is_command(']') {
+            Some(false)
         } else {
-            Command::Forward
-        });
+            None
+        }
+    } else if event.mods.alt
+        && !event.mods.ctrl
+        && !event.mods.cmd
+        && !event.mods.logo
+        && !event.mods.shift
+        && matches!(event.key, Key::Left | Key::Right)
+    {
+        Some(matches!(event.key, Key::Left))
+    } else {
+        None
+    };
+    if let Some(back) = history_back {
+        if state.tab().is_some_and(|tab| {
+            if back {
+                tab.snapshot.can_back
+            } else {
+                tab.snapshot.can_forward
+            }
+        }) {
+            state.select = None;
+            state.status = None;
+            state.send(if back {
+                Command::Back
+            } else {
+                Command::Forward
+            });
+            // Navigation ends address editing so the arriving URL can replace its old value.
+            tx.focus("page", false);
+        }
         return true;
     }
     false

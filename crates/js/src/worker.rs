@@ -23,6 +23,7 @@ const WORKER_ENV_BOOTSTRAP: &str = include_str!("bootstrap/worker_env.js");
 struct WorkerRealm {
     id: u32,
     context: Realm,
+    parent: Realm,
     fetch_rx: Receiver<FetchCompletion>,
     ws_evt_rx: Receiver<WsEvent>,
     alive: bool,
@@ -53,6 +54,22 @@ pub fn clear_workers() {
         reg.realms.clear();
         reg.page_context = None;
     });
+}
+
+/// Stop workers owned by a discarded document/worker, recursively.
+pub(crate) fn retire_children(scope: &mut Ctx, parent: &Value) {
+    let parent_addr = scope.object_addr(parent);
+    let retired = WORKER_REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        let (retired, live): (Vec<_>, Vec<_>) = std::mem::take(&mut reg.realms)
+            .into_iter()
+            .partition(|w| scope.object_addr(&w.parent.global) == parent_addr);
+        reg.realms = live;
+        retired
+    });
+    for worker in retired {
+        worker.context.retire(scope);
+    }
 }
 
 /// Install the worker bridge natives onto a context's global (page and worker contexts alike, so a
@@ -93,6 +110,10 @@ fn prim_worker_create(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) 
     // Inherit the page's network capabilities (synchronous `__request` powers importScripts; the
     // async fetch/WebSocket channels are the worker's own, drained by pump_workers in its context).
     let page_state = host_state(scope);
+    let Ok(parent) = Realm::current(scope) else {
+        rv.set_bool(false);
+        return;
+    };
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
     let cookie_getter = std::sync::Arc::clone(&page_state.cookie_getter);
@@ -130,6 +151,8 @@ fn prim_worker_create(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) 
     })
     .unwrap_or(false);
     if !initialized {
+        ctx_global.retire(scope);
+        scope.collect_garbage_for_host();
         rv.set_bool(false);
         return;
     }
@@ -138,6 +161,7 @@ fn prim_worker_create(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) 
         r.borrow_mut().realms.push(WorkerRealm {
             id,
             context: ctx_global,
+            parent,
             fetch_rx,
             ws_evt_rx,
             alive: true,
@@ -199,7 +223,19 @@ fn prim_worker_post_to_parent(scope: &mut Ctx, args: NativeArgs, _rv: &mut Nativ
 /// `__workerTerminate(id)`. Mark a worker dead and drop its context.
 fn prim_worker_terminate(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
-    WORKER_REG.with(|r| r.borrow_mut().realms.retain(|w| w.id != id));
+    let parent_addr = scope.object_addr(&scope.global_this());
+    let retired = WORKER_REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        let (retired, live): (Vec<_>, Vec<_>) = std::mem::take(&mut reg.realms)
+            .into_iter()
+            .partition(|w| w.id == id && scope.object_addr(&w.parent.global) == parent_addr);
+        reg.realms = live;
+        retired
+    });
+    for worker in retired {
+        worker.context.retire(scope);
+    }
+    scope.collect_garbage_for_host();
 }
 
 /// The page (top-level) context, if registered. Shared with the iframe realm bridge.
@@ -224,6 +260,16 @@ pub(crate) fn call_global_fn(scope: &mut Ctx, name: &str, args: &[Value]) {
 /// tasks (queued message deliveries, timers, settled fetches), and `in_flight` is the total
 /// outstanding async fetches across all workers so the drain keeps waiting (on the longer network
 /// budget) until they settle. Called from [`crate::drain_event_loop`].
+fn realm_is_active(scope: &Ctx, realm: &Realm) -> bool {
+    let address = scope.object_addr(&realm.global);
+    WORKER_REG.with(|r| {
+        r.borrow()
+            .realms
+            .iter()
+            .any(|entry| scope.object_addr(&entry.context.global) == address)
+    })
+}
+
 pub fn pump_workers(scope: &mut Ctx) -> (bool, usize) {
     // Phase 1: collect completed fetches / ws events per realm under a short borrow (try_recv runs
     // no JS). Running worker JS may re-enter WORKER_REG (spawn a sub-worker, terminate), so we must
@@ -245,6 +291,9 @@ pub fn pump_workers(scope: &mut Ctx) -> (bool, usize) {
 
     let mut did_work = false;
     for (realm, completion) in fetches {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
         let _ = with_realm(scope, &realm, move |ctx| {
             deliver_fetch_completion(ctx, completion);
             ctx.drain_microtasks_for_host();
@@ -252,6 +301,9 @@ pub fn pump_workers(scope: &mut Ctx) -> (bool, usize) {
         did_work = true;
     }
     for (realm, (id, kind, payload)) in ws_events {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
         let _ = with_realm(scope, &realm, move |ctx| {
             deliver_ws_event(ctx, id, kind, &payload);
             ctx.drain_microtasks_for_host();
@@ -260,6 +312,9 @@ pub fn pump_workers(scope: &mut Ctx) -> (bool, usize) {
     }
     let mut in_flight = 0;
     for realm in ctxs {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
         if let Ok((ran, pending)) = with_realm(scope, &realm, |ctx| {
             let ran = run_due_timers(ctx);
             ctx.drain_microtasks_for_host();
@@ -270,4 +325,90 @@ pub fn pump_workers(scope: &mut Ctx) -> (bool, usize) {
         }
     }
     (did_work, in_flight)
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::*;
+
+    #[test]
+    fn terminating_workers_releases_their_host_state() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        install_host_state(
+            ctx,
+            HostState::new(Rc::new(RefCell::new(html::parse("<body></body>")))),
+        );
+        install_browser_environment(ctx, "https://example.test/");
+        set_page_context(Realm::current(ctx).unwrap_or_else(|_| panic!("page realm")));
+        for _ in 0..6 {
+            let output = eval_source(ctx, "__workerCreate(1, 'https://example.test/worker.js', 'var held = new Array(1000).fill(42);')", "create");
+            assert_eq!(output.value.as_deref(), Some("true"), "{output:?}");
+            let weak = WORKER_REG.with(|r| {
+                let worker = r.borrow().realms.last().unwrap().context.clone();
+                let state = ctx
+                    .realm_resource_for_host::<HostState>(&worker.global)
+                    .unwrap();
+                Rc::downgrade(&state)
+            });
+            assert!(eval_source(ctx, "__workerTerminate(1)", "terminate")
+                .error
+                .is_none());
+            ctx.collect_garbage_for_host();
+            assert!(
+                weak.upgrade().is_none(),
+                "terminated worker must release host data"
+            );
+        }
+        clear_workers();
+        crate::clear_frames();
+    }
+    #[test]
+    fn discarding_frame_retires_workers_and_their_nested_workers() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        install_host_state(
+            ctx,
+            HostState::new(Rc::new(RefCell::new(html::parse("<body></body>")))),
+        );
+        install_browser_environment(ctx, "https://example.test/");
+        set_page_context(Realm::current(ctx).unwrap_or_else(|_| panic!("page realm")));
+        let setup = eval_source(
+            ctx,
+            r#"
+            var f = document.createElement('iframe');
+            document.body.appendChild(f);
+            __iframeLoad(f.__node, 'about:blank', '<body>frame</body>');
+            __frameGet(f.__node, '__workerCreate')(1, 'https://example.test/outer.js',
+                '__workerCreate(1, "https://example.test/inner.js", "var held = new Array(1000).fill(42)")');
+        "#,
+            "nested workers",
+        );
+        assert!(setup.error.is_none(), "{setup:?}");
+        let states = WORKER_REG.with(|r| {
+            r.borrow()
+                .realms
+                .iter()
+                .map(|worker| {
+                    let state = ctx
+                        .realm_resource_for_host::<HostState>(&worker.context.global)
+                        .unwrap();
+                    Rc::downgrade(&state)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(states.len(), 2);
+        assert!(eval_source(ctx, "__frameUnload(f.__node)", "discard owner")
+            .error
+            .is_none());
+        ctx.collect_garbage_for_host();
+        assert!(WORKER_REG.with(|r| r.borrow().realms.is_empty()));
+        assert!(
+            states.iter().all(|state| state.upgrade().is_none()),
+            "nested workers release host data with their owner"
+        );
+        clear_workers();
+        crate::clear_frames();
+    }
 }

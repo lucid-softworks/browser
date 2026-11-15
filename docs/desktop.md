@@ -102,9 +102,11 @@ License (`Inter-LICENSE.txt`). Retain those license files when redistributing th
 Font provenance is recorded in `crates/desktop/assets/README.md`.
 
 The shared shell uses the same engine and its existing web-platform limitations as the
-Swift app. In particular, Lumen currently exposes no execution-interruption hook: the UI
-runs independently of the page worker, but it cannot forcibly stop a JavaScript callback
-that never returns. Closing a tab must not block the desktop UI waiting for such a worker.
+Swift app. JavaScript execution has a 20-second deadline, including timer and promise
+callbacks. Closing a tab interrupts its running JavaScript without blocking the desktop UI.
+After a deadline, reload the page to resume scripting; the last rendered document remains
+visible. Native host operations use their own timeouts, and JavaScript heap-byte limits
+are not yet available. See the [Lumen patch notes](../vendor/lumen/README.browser.md).
 
 Engine-only builds can omit the desktop toolkit and its system libraries:
 

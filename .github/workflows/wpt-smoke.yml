@@ -1,0 +1,140 @@
+name: WPT smoke
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tools/wpt/**'
+      - 'scripts/*wpt*'
+      - '.github/workflows/wpt-smoke.yml'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Baseline revision to compare against this branch
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wpt-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Explicitly update this pin and the smoke selection together. Both engines use identical tests.
+  WPT_REVISION: c0f2b11f490d5849bf4d48c276b68681e894b1fb
+  CARGO_INCREMENTAL: 0
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  run:
+    name: WPT smoke (${{ matrix.engine }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [base, head]
+    steps:
+      # The harness and selection come from the PR for BOTH binaries, so runner changes cannot
+      # accidentally compare different suites. Pull-request jobs have no secrets/write token.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.engine == 'base' && (github.event.pull_request.base.sha || inputs.base_ref) || (github.event.pull_request.head.sha || github.sha) }}
+          path: engine-source
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-source -> target
+          shared-key: wpt-smoke-${{ matrix.engine }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
+      - name: Build engine under test
+        working-directory: engine-source
+        run: |
+          # A baseline before the Lumen migration still needs the pinned V8 archive.
+          if ver="$(cargo pkgid --locked v8 2>/dev/null)"; then
+            ver="${ver##*@}"
+            curl -fL --retry 3 "https://github.com/denoland/rusty_v8/releases/download/v${ver}/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz" -o "$RUNNER_TEMP/v8.a.gz"
+            gunzip -f "$RUNNER_TEMP/v8.a.gz"
+            export RUSTY_V8_ARCHIVE="$RUNNER_TEMP/v8.a"
+          fi
+          cargo build --locked --release -p webdriver
+          echo "ENGINE_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "WEBDRIVER_BIN=$PWD/target/release/webdriver" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: web-platform-tests/wpt
+          ref: ${{ env.WPT_REVISION }}
+          path: wpt
+          sparse-checkout: |
+            tools
+            third_party
+            docs
+            resources
+            common
+            fonts
+            quirks
+            interfaces
+            images
+            css/support
+            dom/nodes
+            html/semantics/scripting-1/the-script-element
+            html/semantics/embedded-content/the-iframe-element
+            workers
+      - name: Map WPT hosts
+        run: python3 wpt/wpt make-hosts-file | sudo tee -a /etc/hosts >/dev/null
+      - name: Test report comparator
+        run: python3 scripts/test-compare-wpt.py
+      - name: Run real WPT harness
+        run: scripts/run-wpt-smoke.sh "reports/${{ matrix.engine }}"
+      - name: Upload reports and harness logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-smoke-${{ matrix.engine }}
+          path: reports/${{ matrix.engine }}/
+          if-no-files-found: error
+
+  compare:
+    name: WPT regression gate
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wpt-smoke-base
+          path: reports/base
+      - uses: actions/download-artifact@v4
+        with:
+          name: wpt-smoke-head
+          path: reports/head
+      - name: Compare base and head
+        run: python3 scripts/compare-wpt.py reports/base reports/head --output comparison.md
+      - name: Publish comparison summary
+        if: always()
+        run: |
+          if [[ -f comparison.md ]]; then cat comparison.md >> "$GITHUB_STEP_SUMMARY"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wpt-smoke-comparison
+          path: comparison.md
+          if-no-files-found: error

@@ -36,6 +36,37 @@ pub fn clear_frames() {
     FRAME_REG.with(|r| r.borrow_mut().clear());
 }
 
+/// Retire every child of a discarded browsing context, including nested frames.
+pub(crate) fn retire_children(scope: &mut Ctx, parent: &Value) {
+    let parent_addr = scope.object_addr(parent);
+    let retired = FRAME_REG.with(|r| {
+        let mut frames = r.borrow_mut();
+        let (retired, live): (Vec<_>, Vec<_>) = std::mem::take(&mut *frames)
+            .into_iter()
+            .partition(|f| scope.object_addr(&f.parent.global) == parent_addr);
+        *frames = live;
+        retired
+    });
+    for frame in retired {
+        frame.context.retire(scope);
+    }
+}
+
+fn remove_frame(scope: &mut Ctx, node_id: u32, parent_addr: Option<usize>) {
+    let retired = FRAME_REG.with(|r| {
+        let mut frames = r.borrow_mut();
+        let (retired, live): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *frames).into_iter().partition(|f| {
+                f.node_id == node_id && scope.object_addr(&f.parent.global) == parent_addr
+            });
+        *frames = live;
+        retired
+    });
+    for frame in retired {
+        frame.context.retire(scope);
+    }
+}
+
 /// Install the iframe bridge natives onto a context's global (page + frame contexts, so nested
 /// iframes work).
 pub(crate) fn register_iframe_natives(scope: &mut Ctx, global: &Value) {
@@ -370,13 +401,14 @@ fn build_browsing_context(
     })
     .unwrap_or(false);
     if !initialized {
+        ctx_global.retire(scope);
+        scope.collect_garbage_for_host();
         return false;
     }
 
+    // Replace the old document and all of its descendant browsing contexts.
+    remove_frame(scope, node_id, parent_addr);
     FRAME_REG.with(|r| {
-        // Replace any prior realm for this node (re-navigation).
-        r.borrow_mut()
-            .retain(|f| f.node_id != node_id || scope.object_addr(&f.parent.global) != parent_addr);
         r.borrow_mut().push(FrameRealm {
             node_id,
             context: ctx_global,
@@ -387,6 +419,7 @@ fn build_browsing_context(
             alive: true,
         })
     });
+    scope.collect_garbage_for_host();
     true
 }
 
@@ -442,14 +475,21 @@ fn prim_frame_post_to_parent(scope: &mut Ctx, args: NativeArgs, _rv: &mut Native
 fn prim_frame_unload(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node_id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
     let parent_addr = scope.object_addr(&scope.global_this());
-    FRAME_REG.with(|r| {
-        r.borrow_mut()
-            .retain(|f| f.node_id != node_id || scope.object_addr(&f.parent.global) != parent_addr)
-    });
+    remove_frame(scope, node_id, parent_addr);
+    scope.collect_garbage_for_host();
 }
 
 /// Advance every live frame's loop one pass (fetches + ws + timers + microtasks), each in its own
 /// context. Returns `(did_work, in_flight)` like [`crate::worker::pump_workers`].
+fn realm_is_active(scope: &Ctx, realm: &Realm) -> bool {
+    let address = scope.object_addr(&realm.global);
+    FRAME_REG.with(|r| {
+        r.borrow()
+            .iter()
+            .any(|entry| scope.object_addr(&entry.context.global) == address)
+    })
+}
+
 pub fn pump_frames(scope: &mut Ctx) -> (bool, usize) {
     let mut ctxs: Vec<Realm> = Vec::new();
     let mut fetches: Vec<(Realm, FetchCompletion)> = Vec::new();
@@ -468,6 +508,9 @@ pub fn pump_frames(scope: &mut Ctx) -> (bool, usize) {
 
     let mut did_work = false;
     for (realm, completion) in fetches {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
         let _ = with_realm(scope, &realm, move |ctx| {
             deliver_fetch_completion(ctx, completion);
             ctx.drain_microtasks_for_host();
@@ -475,6 +518,9 @@ pub fn pump_frames(scope: &mut Ctx) -> (bool, usize) {
         did_work = true;
     }
     for (realm, (id, kind, payload)) in ws_events {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
         let _ = with_realm(scope, &realm, move |ctx| {
             deliver_ws_event(ctx, id, kind, &payload);
             ctx.drain_microtasks_for_host();
@@ -483,6 +529,9 @@ pub fn pump_frames(scope: &mut Ctx) -> (bool, usize) {
     }
     let mut in_flight = 0;
     for realm in ctxs {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
         if let Ok((ran, pending)) = with_realm(scope, &realm, |ctx| {
             let ran = run_due_timers(ctx);
             ctx.drain_microtasks_for_host();
@@ -706,5 +755,76 @@ mod tests {
         assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
         let console: Vec<_> = results.into_iter().flat_map(|r| r.console).collect();
         assert_eq!(console, ["object", "undefined", "false", "true"]);
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::*;
+
+    #[test]
+    fn replacing_and_unloading_frames_releases_old_documents() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        install_host_state(
+            ctx,
+            HostState::new(Rc::new(RefCell::new(html::parse("<body></body>")))),
+        );
+        install_browser_environment(ctx, "https://example.test/");
+        crate::set_page_context(Realm::current(ctx).unwrap_or_else(|_| panic!("page realm")));
+        assert!(eval_source(
+            ctx,
+            "var f = document.createElement('iframe'); document.body.appendChild(f);",
+            "fixture"
+        )
+        .error
+        .is_none());
+        for _ in 0..6 {
+            assert!(eval_source(
+                ctx,
+                "__iframeLoad(f.__node, 'about:blank', '<body>first</body>');",
+                "load"
+            )
+            .error
+            .is_none());
+            let old = FRAME_REG.with(|r| {
+                let frame = r.borrow().last().unwrap().context.clone();
+                let state = ctx
+                    .realm_resource_for_host::<HostState>(&frame.global)
+                    .unwrap();
+                Rc::downgrade(&state)
+            });
+            assert!(eval_source(
+                ctx,
+                "__iframeLoad(f.__node, 'about:blank', '<body>second</body>');",
+                "replace"
+            )
+            .error
+            .is_none());
+            ctx.collect_garbage_for_host();
+            assert!(
+                old.upgrade().is_none(),
+                "renavigation must retire the old document"
+            );
+            let last = FRAME_REG.with(|r| {
+                let frame = r.borrow().last().unwrap().context.clone();
+                let state = ctx
+                    .realm_resource_for_host::<HostState>(&frame.global)
+                    .unwrap();
+                Rc::downgrade(&state)
+            });
+            assert!(eval_source(ctx, "__frameUnload(f.__node);", "unload")
+                .error
+                .is_none());
+            ctx.collect_garbage_for_host();
+            assert!(
+                last.upgrade().is_none(),
+                "unloaded document must be reclaimed"
+            );
+            assert!(FRAME_REG.with(|r| r.borrow().is_empty()));
+        }
+        clear_frames();
+        crate::clear_workers();
     }
 }

@@ -118,9 +118,14 @@ the platform-agnostic engine.
 ## Memory model
 
 Each tab owns a Lumen engine on its JavaScript thread within the browser process.
-The current Lumen embedding API does not expose heap-byte accounting, heap limits, or
-an execution-interruption hook. Heap telemetry reports 0 (unavailable). Event-loop budgets
-bound work between callbacks, but cannot interrupt a script stuck inside one callback.
+The browser's vendored Lumen patches enforce a 20-second execution deadline, including
+timer and promise callbacks, and allow tab closure to cancel running JavaScript. Cancellation
+is sticky until reload; the last rendered document is retained. Controlled engines use the
+bytecode interpreter because the native JIT has no cancellation safe points. Synchronous
+host I/O still relies on its own timeouts. Retired iframe and worker realms are collected
+when no live JavaScript references retain them.
+Heap-byte accounting and heap limits remain unavailable; heap telemetry reports 0.
+See [the patch provenance](vendor/lumen/README.browser.md).
 The DOM arena uses `usize`; the network body backstop is 16 GiB.
 
 ## Contributing

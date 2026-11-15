@@ -113,10 +113,10 @@ fn navigate(runtime: &mut Runtime<Browser>, page: &Page) {
 
 fn evaluate(runtime: &mut Runtime<Browser>, expression: &str) -> String {
     // Inspection only: page interaction itself uses Rune's input callbacks.
-    runtime.state.console.clear();
+    runtime.state.tabs[runtime.state.active].console.clear();
     runtime.state.send(Command::Eval(expression.into()));
     settle(runtime);
-    runtime.state.console.last().unwrap().clone()
+    runtime.state.tab().unwrap().console.last().unwrap().clone()
 }
 
 #[test]
@@ -203,4 +203,130 @@ fn page_pointer_and_keyboard_callbacks_use_hidpi_coordinates() {
             .unwrap()
             .focused
     );
+}
+
+fn console_output(runtime: &Runtime<Browser>) -> String {
+    runtime
+        .elements()
+        .into_iter()
+        .find(|element| element.key.as_deref() == Some("console-output"))
+        .unwrap()
+        .text
+        .unwrap_or_default()
+}
+
+#[test]
+fn console_logs_and_drafts_follow_their_tab_and_reload_discards_old_results() {
+    let mut runtime = runtime(1.0);
+    let first = runtime.state.tabs[0].id;
+    assert_eq!(evaluate(&mut runtime, "'first tab'"), "first tab");
+    click(&mut runtime, "console-toggle");
+    click(&mut runtime, "console-input");
+    runtime.paste("unfinished first draft");
+    settle(&mut runtime);
+
+    click(&mut runtime, "new-tab");
+    assert!(console_output(&runtime).is_empty());
+    assert!(runtime.state.tab().unwrap().console_input.text.is_empty());
+    let background = runtime.state.tabs[0].worker.as_ref().unwrap();
+    assert!(background.send(Command::Eval("'background first tab'".into())));
+    assert!(background.synchronize(std::time::Duration::from_secs(15)));
+    assert_eq!(evaluate(&mut runtime, "'second tab'"), "second tab");
+    assert_eq!(console_output(&runtime), "second tab");
+
+    click(&mut runtime, &format!("activate-{first}"));
+    assert_eq!(console_output(&runtime), "first tab\nbackground first tab");
+    assert_eq!(
+        runtime.state.tab().unwrap().console_input.text,
+        "unfinished first draft"
+    );
+    let document_id = runtime.state.tab().unwrap().snapshot.document_id;
+    // Both commands complete before the next UI poll. The old evaluation result is
+    // still in the mailbox, while the latest snapshot belongs to the reloaded page.
+    runtime.state.send(Command::Eval("'stale result'".into()));
+    runtime.state.send(Command::Reload);
+    settle(&mut runtime);
+    assert_eq!(
+        runtime.state.tab().unwrap().snapshot.document_id,
+        document_id + 1
+    );
+    assert!(console_output(&runtime).is_empty());
+    assert_eq!(evaluate(&mut runtime, "'after reload'"), "after reload");
+    assert_eq!(console_output(&runtime), "after reload");
+}
+
+fn history_key(back: bool) -> KeyEvent {
+    if cfg!(target_os = "macos") {
+        KeyEvent {
+            key: Key::Command(if back { '[' } else { ']' }),
+            mods: Mods {
+                cmd: true,
+                ..Mods::default()
+            },
+        }
+    } else {
+        KeyEvent {
+            key: if back { Key::Left } else { Key::Right },
+            mods: Mods {
+                alt: true,
+                ..Mods::default()
+            },
+        }
+    }
+}
+
+#[test]
+fn browser_history_shortcuts_work_before_focused_editor_handling() {
+    let page = Page::new();
+    let mut runtime = runtime(1.0);
+    navigate(&mut runtime, &page);
+    click(&mut runtime, "address");
+    assert!(runtime.state.address.focused);
+    runtime.key(history_key(true));
+    settle(&mut runtime);
+    assert_eq!(runtime.state.tab().unwrap().snapshot.url, "about:blank");
+    assert_eq!(runtime.state.address.text, "about:blank");
+    runtime.key(history_key(false));
+    settle(&mut runtime);
+    assert_eq!(runtime.state.tab().unwrap().snapshot.url, page.url);
+
+    // The console's editor has the same pre-editor shortcut routing.
+    click(&mut runtime, "console-toggle");
+    click(&mut runtime, "console-input");
+    runtime.paste("draft");
+    settle(&mut runtime);
+    runtime.key(history_key(true));
+    settle(&mut runtime);
+    assert_eq!(runtime.state.tab().unwrap().snapshot.url, "about:blank");
+    assert_eq!(runtime.state.tab().unwrap().console_input.text, "draft");
+}
+
+#[test]
+fn browser_shortcuts_preserve_platform_word_editing() {
+    let page = Page::new();
+    let mut runtime = runtime(1.0);
+    navigate(&mut runtime, &page);
+    runtime.key(KeyEvent {
+        key: Key::Command('l'),
+        mods: Mods {
+            cmd: true,
+            ..Mods::default()
+        },
+    });
+    settle(&mut runtime);
+    runtime.paste("one two");
+    settle(&mut runtime);
+    runtime.key(KeyEvent {
+        key: Key::Left,
+        mods: Mods {
+            alt: cfg!(target_os = "macos"),
+            ctrl: !cfg!(target_os = "macos"),
+            cmd: !cfg!(target_os = "macos"),
+            ..Mods::default()
+        },
+    });
+    settle(&mut runtime);
+    assert_eq!(runtime.state.address.text, "one two");
+    assert_eq!(runtime.state.address.focus, 4);
+    assert_eq!(runtime.state.tab().unwrap().snapshot.url, page.url);
 }

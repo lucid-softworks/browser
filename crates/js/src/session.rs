@@ -73,12 +73,51 @@ pub struct TabStats {
 }
 
 pub struct Session {
+    execution: ExecutionControl,
+    last_snapshot: std::sync::Mutex<dom::Document>,
     tx: std::sync::mpsc::Sender<SessionCmd>,
     handle: Option<std::thread::JoinHandle<()>>,
     stats: Arc<TabStats>,
 }
 
 impl Session {
+    pub fn execution_stopped(&self) -> bool {
+        self.execution.is_cancelled()
+    }
+    fn snapshot(&self) -> dom::Document {
+        self.last_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    fn remember(&self, doc: &dom::Document) {
+        *self.last_snapshot.lock().unwrap_or_else(|e| e.into_inner()) = doc.clone();
+    }
+    fn receive_snapshot(
+        &self,
+        receiver: std::sync::mpsc::Receiver<(dom::Document, Vec<String>)>,
+    ) -> (dom::Document, Vec<String>) {
+        match receiver.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+            Ok((doc, console)) => {
+                self.remember(&doc);
+                (doc, console)
+            }
+            Err(_) => {
+                self.execution.cancel();
+                (self.snapshot(), vec![EXECUTION_STOPPED.to_string()])
+            }
+        }
+    }
+    fn stopped_output(&self) -> (EvalOutput, dom::Document, Vec<String>) {
+        (
+            EvalOutput {
+                error: Some(EXECUTION_STOPPED.to_string()),
+                ..EvalOutput::default()
+            },
+            self.snapshot(),
+            Vec::new(),
+        )
+    }
     /// Allocated JS bytes; currently zero because Lumen does not expose this measurement.
     pub fn heap_bytes(&self) -> u64 {
         self.stats.heap_bytes.load(Ordering::Relaxed)
@@ -129,6 +168,8 @@ impl Session {
         let stats_thread = stats.clone();
 
         let host_context = HostContext::current();
+        let execution = host_context.new_execution();
+        let thread_execution = execution.clone();
         let spawn = std::thread::Builder::new()
             .name("js-session".to_string())
             .stack_size(256 * 1024 * 1024)
@@ -152,6 +193,7 @@ impl Session {
                         cmd_rx,
                         initial_rects,
                         stats_thread,
+                        thread_execution,
                     );
                 }));
             });
@@ -161,6 +203,8 @@ impl Session {
             Err(e) => {
                 return (
                     Session {
+                        execution,
+                        last_snapshot: std::sync::Mutex::new(fallback.clone()),
                         tx: cmd_tx,
                         handle: None,
                         stats,
@@ -177,21 +221,26 @@ impl Session {
 
         // Block (bounded) for the initial load to finish. On timeout/panic, render the pre-script
         // DOM — matching the existing channel-timeout fallback in run_with_dom/run_modules.
-        let budget = std::time::Duration::from_secs(20);
+        let budget = EXECUTION_BUDGET + std::time::Duration::from_secs(2);
         let (snapshot, outputs) = match init_rx.recv_timeout(budget) {
             Ok(result) => result,
-            Err(_) => (
-                fallback,
-                vec![EvalOutput {
-                    value: None,
-                    console: Vec::new(),
-                    error: Some("session load timed out or aborted".to_string()),
-                }],
-            ),
+            Err(_) => {
+                execution.cancel();
+                (
+                    fallback,
+                    vec![EvalOutput {
+                        value: None,
+                        console: Vec::new(),
+                        error: Some(EXECUTION_STOPPED.to_string()),
+                    }],
+                )
+            }
         };
 
         (
             Session {
+                execution,
+                last_snapshot: std::sync::Mutex::new(snapshot.clone()),
                 tx: cmd_tx,
                 handle: Some(handle),
                 stats,
@@ -221,11 +270,9 @@ impl Session {
             reply: reply_tx,
         };
         if self.tx.send(cmd).is_err() {
-            return (dom::Document::new(), Vec::new());
+            return (self.snapshot(), vec![EXECUTION_STOPPED.to_string()]);
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        self.receive_snapshot(reply_rx)
     }
 
     /// Deliver a key press to `node_id`: fires `keydown`, mutates the focused text field's value
@@ -245,11 +292,9 @@ impl Session {
             reply: reply_tx,
         };
         if self.tx.send(cmd).is_err() {
-            return (dom::Document::new(), Vec::new());
+            return (self.snapshot(), vec![EXECUTION_STOPPED.to_string()]);
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        self.receive_snapshot(reply_rx)
     }
 
     /// Push the engine's laid-out element rects (CSS px, document-absolute, top-origin) to the
@@ -344,11 +389,18 @@ impl Session {
             })
             .is_err()
         {
-            return (EvalOutput::default(), dom::Document::new(), Vec::new());
+            return self.stopped_output();
         }
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| (EvalOutput::default(), dom::Document::new(), Vec::new()))
+        match reply_rx.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+            Ok((out, doc, console)) => {
+                self.remember(&doc);
+                (out, doc, console)
+            }
+            Err(_) => {
+                self.execution.cancel();
+                self.stopped_output()
+            }
+        }
     }
 
     /// Devtools console REPL: evaluate `source` in the live page context and return a display
@@ -426,13 +478,25 @@ impl Session {
         if self.tx.send(SessionCmd::Tick { reply: reply_tx }).is_err() {
             return None;
         }
-        reply_rx.recv().unwrap_or(None)
+        match reply_rx.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+            Ok(result) => {
+                if let Some((doc, _)) = &result {
+                    self.remember(doc);
+                }
+                result
+            }
+            Err(_) => {
+                self.execution.cancel();
+                None
+            }
+        }
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Ask the runtime thread to stop, then join so the engine is dropped on its own thread.
+        self.execution.cancel();
+        // Interrupt execution before asking the runtime thread to stop and joining it.
         let _ = self.tx.send(SessionCmd::Stop);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -463,7 +527,20 @@ pub(crate) fn session_thread_main(
         f32,
     )>,
     stats: Arc<TabStats>,
+    execution: ExecutionControl,
 ) {
+    // A tab can close while navigation is fetching, before this thread is created.
+    // Return its parsed document without attempting to bootstrap a cancelled realm.
+    if execution.is_cancelled() {
+        let _ = init_tx.send((
+            doc,
+            vec![EvalOutput {
+                error: Some(EXECUTION_STOPPED.to_string()),
+                ..EvalOutput::default()
+            }],
+        ));
+        return;
+    }
     let shared: SharedDoc = Rc::new(RefCell::new(doc));
     // Background fetch threads deliver completions here; the receiver lives for the whole session
     // (used by every drain — init load and each subsequent command).
@@ -471,7 +548,8 @@ pub(crate) fn session_thread_main(
     // Background socket threads deliver WebSocket events here; the receiver lives for the whole
     // session and is drained (non-blocking) on every drain pass alongside the fetch channel.
     let (ws_evt_tx, ws_evt_rx) = std::sync::mpsc::channel::<WsEvent>();
-    let mut engine = Engine::new();
+    let initial_operation = execution.enter(EXECUTION_BUDGET);
+    let mut engine = controlled_engine(&execution);
     let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> = Rc::new(move |u: &str| fetcher(u));
     let registry = install_module_loader(&mut engine, modules, fetcher.clone(), &url);
     {
@@ -561,8 +639,18 @@ pub(crate) fn session_thread_main(
         let _ = init_tx.send((shared.borrow().clone(), results));
     }
 
+    drop(initial_operation);
+    if execution.is_cancelled() {
+        crate::clear_workers();
+        crate::clear_frames();
+        return;
+    }
     // Commands reuse the persistent Lumen page realm.
     for cmd in cmd_rx {
+        if execution.is_cancelled() {
+            break;
+        }
+        let _operation = execution.enter(EXECUTION_BUDGET);
         let __cmd_t0 = std::time::Instant::now();
         match cmd {
             SessionCmd::Dispatch {
@@ -607,13 +695,17 @@ pub(crate) fn session_thread_main(
             SessionCmd::Eval { source, reply } => {
                 let scope = engine.ctx();
                 let mut results = vec![eval_source(scope, &source, "<interact>")];
-                let first = EvalOutput {
+                let mut first = EvalOutput {
                     value: results[0].value.clone(),
                     error: results[0].error.clone(),
                     console: Vec::new(),
                 };
                 drain_runtime(&mut engine, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
+                if execution.is_cancelled() {
+                    first.value = None;
+                    first.error = Some(EXECUTION_STOPPED.to_string());
+                }
                 let _ = reply.send((first, shared.borrow().clone(), console));
             }
             SessionCmd::Tick { reply } => {
@@ -689,10 +781,71 @@ pub(crate) fn session_thread_main(
             .fetch_add(__cmd_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // Lumen does not expose an allocated-byte measurement. Zero means unavailable.
         stats.heap_bytes.store(0, Ordering::Relaxed);
+        if execution.is_cancelled() {
+            break;
+        }
     }
     // Loop ended (Stop or sender dropped). Drop worker realms + the page-context handle BEFORE the
     // engine so the thread-local doesn't outlive the engine it holds handles into.
     crate::clear_workers();
     crate::clear_frames();
     drop(engine);
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    fn session() -> Session {
+        Session::new(
+            html::parse("<p>keep this document</p>"),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            "about:blank",
+            Box::new(|_| None),
+            Arc::new(|_, _, _, _| None),
+            Arc::new(|_, _, _| Err("no sockets".into())),
+            Arc::new(|_| String::new()),
+            Arc::new(|_, _| false),
+            None,
+        )
+        .0
+    }
+    #[test]
+    fn timer_and_promise_deadlines_stop_threads_and_preserve_the_document() {
+        for source in [
+            "setTimeout(function(){while(true){}},0)",
+            "Promise.resolve().then(function(){while(true){}})",
+        ] {
+            let session = session();
+            let original_count = session.snapshot().len();
+            let _short = session
+                .execution
+                .enter(std::time::Duration::from_millis(100));
+            let start = std::time::Instant::now();
+            let (out, snapshot, _) = session.eval_full(source.to_string());
+            assert_eq!(out.error.as_deref(), Some(EXECUTION_STOPPED), "{out:?}");
+            assert_eq!(snapshot.len(), original_count);
+            let (stopped, retained, _) = session.eval_full("1+1".into());
+            assert_eq!(stopped.error.as_deref(), Some(EXECUTION_STOPPED));
+            assert_eq!(retained.len(), original_count);
+            drop(session);
+            assert!(start.elapsed() < std::time::Duration::from_secs(3));
+        }
+    }
+    #[test]
+    fn external_cancellation_stops_a_running_session() {
+        let session = session();
+        let execution = session.execution.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            execution.cancel();
+        });
+        let start = std::time::Instant::now();
+        let (out, _, _) = session.eval_full("for (;;) {}".into());
+        assert_eq!(out.error.as_deref(), Some(EXECUTION_STOPPED));
+        drop(session);
+        cancel.join().unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    }
 }

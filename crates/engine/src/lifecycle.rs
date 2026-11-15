@@ -1,6 +1,9 @@
 use crate::*;
 
 impl Engine {
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle(self.js_context.clone())
+    }
     pub fn new() -> Self {
         let js_context = js::HostContext::default();
         {

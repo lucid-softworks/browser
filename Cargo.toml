@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/lumen"]
 members = [
     "crates/net",
     "crates/html",
@@ -60,3 +61,7 @@ winit = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f19045534
 parley_engine = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
 accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
 accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+
+# Local host cancellation / realm-lifetime patch to the pinned upstream engine.
+[patch."https://github.com/lucid-softworks/lumen"]
+lumen = { path = "vendor/lumen" }

@@ -5,7 +5,9 @@ use lumen::{
     Engine,
 };
 mod embedding;
+mod execution;
 pub(crate) use embedding::*;
+use execution::{controlled_engine, ExecutionControl, EXECUTION_BUDGET, EXECUTION_STOPPED};
 mod realms;
 pub(crate) use realms::*;
 

@@ -1,18 +1,6 @@
 //! The small Lumen embedding boundary used by native browser callbacks.
 use crate::*;
 
-struct RealmHost {
-    global: Value,
-    state: Rc<HostState>,
-    eval: Value,
-    strict_eval: Value,
-    sloppy_eval: Value,
-    apply: Value,
-    boolean: Value,
-}
-#[derive(Default)]
-struct HostRegistry(Vec<RealmHost>);
-
 pub(crate) fn register_host_state(ctx: &mut Ctx, global: &Value, state: Rc<HostState>) {
     // The host's evalScript performs GlobalDeclarationInstantiation, unlike indirect eval,
     // which would lose top-level lexical declarations between successive script elements.
@@ -75,22 +63,16 @@ pub(crate) fn register_host_state(ctx: &mut Ctx, global: &Value, state: Rc<HostS
         .member_get(global, "Boolean")
         .ok()
         .expect("Boolean intrinsic");
-    if !ctx.op_state().has::<HostRegistry>() {
-        ctx.op_state().put(HostRegistry::default());
+    ctx.set_realm_resource_for_host(global, state);
+    for (key, value) in [
+        ("browser.eval", eval),
+        ("browser.strictEval", strict_eval),
+        ("browser.sloppyEval", sloppy_eval),
+        ("browser.apply", apply),
+        ("browser.boolean", boolean),
+    ] {
+        ctx.set_realm_value_for_host(global, key, value);
     }
-    ctx.op_state()
-        .get_mut::<HostRegistry>()
-        .unwrap()
-        .0
-        .push(RealmHost {
-            global: global.clone(),
-            state,
-            eval,
-            strict_eval,
-            sloppy_eval,
-            apply,
-            boolean,
-        });
 }
 pub(crate) fn install_host_state(ctx: &mut Ctx, state: Rc<HostState>) {
     let global = ctx.global_this();
@@ -98,44 +80,28 @@ pub(crate) fn install_host_state(ctx: &mut Ctx, state: Rc<HostState>) {
     Realm::current(ctx).unwrap_or_else(|_| panic!("capture realm intrinsics"));
 }
 pub(crate) fn host_state_opt(ctx: &mut Ctx) -> Option<Rc<HostState>> {
-    let addr = ctx.object_addr(&ctx.global_this());
-    let hosts = ctx.op_state().get::<HostRegistry>()?;
-    hosts
-        .0
-        .iter()
-        .find(|h| match &h.global {
-            Value::Obj(o) => Some(Rc::as_ptr(o) as usize) == addr,
-            _ => false,
-        })
-        .map(|h| h.state.clone())
+    ctx.realm_resource_for_host(&ctx.global_this())
 }
 pub(crate) fn host_state(ctx: &mut Ctx) -> Rc<HostState> {
     host_state_opt(ctx).expect("browser host state installed for realm")
 }
 /// Execute a script using private host intrinsics captured before author scripts run.
 pub(crate) fn eval_value(ctx: &mut Ctx, source: &str) -> Result<Value, Value> {
-    let addr = ctx.object_addr(&ctx.global_this());
-    let eval = ctx.op_state().get::<HostRegistry>().and_then(|hosts| {
-        hosts
-            .0
-            .iter()
-            .find(|h| match &h.global {
-                Value::Obj(o) => Some(Rc::as_ptr(o) as usize) == addr,
-                _ => false,
-            })
-            .map(|h| {
-                (
-                    h.eval.clone(),
-                    if has_use_strict_directive(source) {
-                        h.strict_eval.clone()
-                    } else {
-                        h.sloppy_eval.clone()
-                    },
-                    h.apply.clone(),
-                )
-            })
-    });
-    let (eval, trampoline, apply) = eval.expect("registered script evaluator");
+    let global = ctx.global_this();
+    let eval = ctx
+        .realm_value_for_host(&global, "browser.eval")
+        .expect("registered script evaluator");
+    let mode = if has_use_strict_directive(source) {
+        "browser.strictEval"
+    } else {
+        "browser.sloppyEval"
+    };
+    let trampoline = ctx
+        .realm_value_for_host(&global, mode)
+        .expect("script trampoline");
+    let apply = ctx
+        .realm_value_for_host(&global, "browser.apply")
+        .expect("Reflect.apply intrinsic");
     // A null-prototype receiver avoids the host's indirect-eval path for child realms.
     let receiver = ctx.new_object_with_proto(&Value::Null);
     let source = js_str(ctx, source);
@@ -199,20 +165,8 @@ impl ValueExt for Value {
         ctx.coerce_number(self).ok()
     }
     fn boolean_value(&self, ctx: &mut Ctx) -> bool {
-        let addr = ctx.object_addr(&ctx.global_this());
         let f = ctx
-            .op_state()
-            .get::<HostRegistry>()
-            .and_then(|hosts| {
-                hosts
-                    .0
-                    .iter()
-                    .find(|h| match &h.global {
-                        Value::Obj(o) => Some(Rc::as_ptr(o) as usize) == addr,
-                        _ => false,
-                    })
-                    .map(|h| h.boolean.clone())
-            })
+            .realm_value_for_host(&ctx.global_this(), "browser.boolean")
             .expect("Boolean intrinsic");
         matches!(
             ctx.invoke(f, Value::Undefined, std::slice::from_ref(self)),

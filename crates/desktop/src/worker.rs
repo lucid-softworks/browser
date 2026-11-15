@@ -39,6 +39,8 @@ pub struct Frame {
 
 #[derive(Clone, Default)]
 pub struct Snapshot {
+    /// Monotonic navigation identity, including reloads of the same URL.
+    pub document_id: u64,
     pub frame: Option<Arc<Frame>>,
     pub url: String,
     pub title: String,
@@ -53,7 +55,7 @@ pub struct Snapshot {
 pub enum Event {
     Clipboard(String),
     Select(engine::SelectHit),
-    Console(String),
+    Console { document_id: u64, line: String },
 }
 
 #[derive(Default)]
@@ -63,6 +65,7 @@ struct Mailbox {
 }
 
 pub struct Worker {
+    interrupt: Arc<Mutex<Option<engine::InterruptHandle>>>,
     commands: mpsc::SyncSender<Message>,
     mailbox: Arc<Mutex<Mailbox>>,
     shutdown: Arc<AtomicBool>,
@@ -75,6 +78,8 @@ enum Message {
 
 impl Worker {
     pub fn spawn(repaint: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Self> {
+        let interrupt = Arc::new(Mutex::new(None));
+        let thread_interrupt = interrupt.clone();
         let (commands, receiver) = mpsc::sync_channel(256);
         let mailbox = Arc::new(Mutex::new(Mailbox::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -85,7 +90,9 @@ impl Worker {
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    Tab::new(worker_mailbox.clone(), repaint.clone()).run(receiver, &worker_shutdown);
+                    let tab = Tab::new(worker_mailbox.clone(), repaint.clone());
+                    *thread_interrupt.lock().unwrap_or_else(|e| e.into_inner()) = Some(tab.engine.interrupt_handle());
+                    tab.run(receiver, &worker_shutdown);
                 }));
                 if result.is_err() {
                     let mut mailbox = worker_mailbox.lock().unwrap_or_else(|e| e.into_inner());
@@ -98,6 +105,7 @@ impl Worker {
                 }
             })?;
         Ok(Self {
+            interrupt,
             commands,
             mailbox,
             shutdown,
@@ -141,9 +149,17 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self
+            .interrupt
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            handle.shutdown();
+        }
         let _ = self.commands.try_send(Message::Command(Command::Close));
-        // Lumen currently exposes no interruption handle. Never freeze the UI by joining a tab
-        // stuck in author JavaScript; the worker exits after the current engine call returns.
+        // The sticky interpreter interrupt stops author loops. Never block the window waiting
+        // for a host network operation to return; the tab thread owns its final teardown.
     }
 }
 
@@ -250,7 +266,10 @@ impl Tab {
         }
         let logs = self.engine.console_lines();
         for line in logs.iter().skip(self.console_count).rev().take(128).rev() {
-            self.event(Event::Console(line.clone()));
+            self.event(Event::Console {
+                document_id: self.snapshot.document_id,
+                line: line.clone(),
+            });
         }
         self.console_count = logs.len();
         self.mailbox
@@ -271,6 +290,9 @@ impl Tab {
     }
 
     fn navigate(&mut self, url: String, new_entry: bool) {
+        self.snapshot.document_id += 1;
+        // Ignore any not-yet-published old-document logs when publishing the loading snapshot.
+        self.console_count = self.engine.console_lines().len();
         self.snapshot.url = url.clone();
         self.snapshot.loading = true;
         self.snapshot.error = None;
@@ -447,7 +469,10 @@ impl Tab {
             Command::Select { node_id, index } => self.engine.set_select_index(node_id, index),
             Command::Eval(code) => {
                 let result = self.engine.console_eval(&code);
-                self.event(Event::Console(result));
+                self.event(Event::Console {
+                    document_id: self.snapshot.document_id,
+                    line: result,
+                });
                 true
             }
             Command::Close => false,
@@ -477,6 +502,28 @@ mod tests {
         assert!(history.forward().is_none());
         assert_eq!(history.back().as_deref(), Some("b-redirect"));
         assert_eq!(history.back().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn closing_a_tab_stops_its_running_javascript_thread() {
+        let worker = Worker::spawn(Arc::new(|| {})).unwrap();
+        assert!(worker.send(Command::Navigate("about:blank".into())));
+        assert!(worker.synchronize(Duration::from_secs(15)));
+        let mailbox = Arc::downgrade(&worker.mailbox);
+        assert!(worker.send(Command::Eval("for (;;) {}".into())));
+        // Let the worker enter the callback before closing it. The weak mailbox checks
+        // actual thread teardown, rather than merely a nonblocking Worker::drop.
+        std::thread::sleep(Duration::from_millis(100));
+        drop(worker);
+        let started = Instant::now();
+        while mailbox.strong_count() != 0 && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            mailbox.strong_count(),
+            0,
+            "closed tab thread is still alive"
+        );
     }
 
     fn wait_for(worker: &Worker, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
@@ -517,7 +564,7 @@ mod tests {
         assert!(worker
             .drain_events()
             .iter()
-            .any(|e| matches!(e, Event::Console(s) if s == "executed")));
+            .any(|e| matches!(e, Event::Console { line, .. } if line == "executed")));
         let start = Instant::now();
         drop(worker);
         assert!(start.elapsed() < Duration::from_secs(1));
@@ -552,7 +599,7 @@ mod tests {
         assert!(worker
             .drain_events()
             .iter()
-            .any(|event| matches!(event, Event::Console(value) if value == "before barrier")));
+            .any(|event| matches!(event, Event::Console { line, .. } if line == "before barrier")));
     }
 
     #[test]
@@ -595,7 +642,7 @@ mod tests {
             if worker
                 .drain_events()
                 .iter()
-                .any(|event| matches!(event, Event::Console(value) if value == expected))
+                .any(|event| matches!(event, Event::Console { line, .. } if line == expected))
             {
                 return;
             }

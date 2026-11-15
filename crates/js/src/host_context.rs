@@ -13,6 +13,8 @@ use std::{
 pub struct HostContext(Arc<Mutex<HostData>>);
 
 struct HostData {
+    execution: crate::ExecutionControl,
+    shutdown: bool,
     metrics: (u32, u32, f32),
     dark: bool,
     isolated: bool,
@@ -28,6 +30,8 @@ struct HostData {
 impl Default for HostContext {
     fn default() -> Self {
         Self(Arc::new(Mutex::new(HostData {
+            execution: crate::ExecutionControl::default(),
+            shutdown: false,
             metrics: (1200, 780, 2.0),
             dark: false,
             isolated: false,
@@ -54,6 +58,29 @@ pub struct HostContextGuard {
 }
 
 impl HostContext {
+    /// Cancel the current page execution from any thread. A new Session installs a fresh control.
+    pub fn cancel_execution(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .execution
+            .cancel();
+    }
+    /// Permanently stop this browser owner, including sessions created by an in-flight navigation.
+    pub fn shutdown_execution(&self) {
+        let mut data = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        data.shutdown = true;
+        data.execution.cancel();
+    }
+    pub(crate) fn new_execution(&self) -> crate::ExecutionControl {
+        let control = crate::ExecutionControl::default();
+        let mut data = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if data.shutdown {
+            control.cancel();
+        }
+        data.execution = control.clone();
+        control
+    }
     pub(crate) fn current() -> Self {
         CURRENT.with(|c| c.borrow().clone())
     }
@@ -172,5 +199,35 @@ pub(crate) fn sync_style_context(state: &crate::HostState) {
     if state.style_context_revision.replace(revision) != revision {
         *state.computed_cache.borrow_mut() = None;
         state.rects_dom_version.set(u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_cancels_sessions_created_after_an_in_flight_navigation() {
+        let host = HostContext::default();
+        let initial = host.new_execution();
+        host.cancel_execution();
+        assert!(initial.is_cancelled());
+        let next = host.new_execution();
+        assert!(!next.is_cancelled(), "normal cancellation permits reload");
+
+        let navigation_host = host.clone();
+        let (resume, delayed) = std::sync::mpsc::channel();
+        let navigation = std::thread::spawn(move || {
+            delayed.recv().unwrap();
+            navigation_host.new_execution()
+        });
+        host.shutdown_execution();
+        assert!(next.is_cancelled());
+        resume.send(()).unwrap();
+        assert!(navigation.join().unwrap().is_cancelled());
+        assert!(
+            host.new_execution().is_cancelled(),
+            "shutdown stays permanent"
+        );
     }
 }

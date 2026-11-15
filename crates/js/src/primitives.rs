@@ -74,13 +74,9 @@ pub(crate) fn js_str(_scope: &mut Ctx, s: &str) -> Value {
 /// Construct arrays through the realm's captured intrinsic constructor, never page replacements.
 fn js_array(scope: &mut Ctx, elements: Vec<Value>) -> Value {
     let global = scope.global_this();
-    let key = scope.object_addr(&global).expect("realm global");
     let ctor = scope
-        .op_state()
-        .get::<HashMap<usize, PrimitiveIntrinsics>>()
-        .expect("primitive intrinsics")[&key]
-        .array
-        .clone();
+        .realm_value_for_host(&global, "browser.array")
+        .expect("Array intrinsic");
     let array = scope
         .construct_value(ctor, &[Value::Num(elements.len() as f64)])
         .unwrap_or_else(|_| panic!("Array construction"));
@@ -105,12 +101,6 @@ pub(crate) fn js_str_array(scope: &mut Ctx, items: &[String]) -> Value {
             .map(|s| Value::from_string(encode_lumen_string(s)))
             .collect(),
     )
-}
-
-struct PrimitiveIntrinsics {
-    array: Value,
-    detach: Value,
-    array_buffer_byte_length: Value,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1054,23 +1044,16 @@ pub(crate) fn prim_natural_size(scope: &mut Ctx, args: NativeArgs, rv: &mut Nati
 /// `__detachArrayBuffer(value) -> bool` — detach a Lumen ArrayBuffer after structured-clone copied it.
 pub(crate) fn prim_detach_array_buffer(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let global = scope.global_this();
-    let key = scope.object_addr(&global).expect("realm global");
     let byte_length = scope
-        .op_state()
-        .get::<HashMap<usize, PrimitiveIntrinsics>>()
-        .expect("primitive intrinsics")[&key]
-        .array_buffer_byte_length
-        .clone();
+        .realm_value_for_host(&global, "browser.arrayBufferByteLength")
+        .expect("ArrayBuffer getter");
     if scope.invoke(byte_length, args.get(0), &[]).is_err() {
         rv.set_bool(false);
         return;
     }
     let detach = scope
-        .op_state()
-        .get::<HashMap<usize, PrimitiveIntrinsics>>()
-        .expect("primitive intrinsics")[&key]
-        .detach
-        .clone();
+        .realm_value_for_host(&global, "browser.detach")
+        .expect("detach intrinsic");
     let detached = scope
         .invoke(detach, Value::Undefined, &[args.get(0)])
         .is_ok();
@@ -2094,20 +2077,9 @@ fn prim_normalize_css_numbers(scope: &mut Ctx, args: NativeArgs, rv: &mut Native
 
 /// Install the node-id DOM primitives onto `globalThis`.
 pub(crate) fn install_dom_primitives(scope: &mut Ctx, global: &Value) {
-    let realm = scope.object_addr(global).expect("realm global");
-    if !scope
-        .op_state()
-        .has::<HashMap<usize, PrimitiveIntrinsics>>()
-    {
-        scope
-            .op_state()
-            .put(HashMap::<usize, PrimitiveIntrinsics>::new());
-    }
-    if !scope
-        .op_state()
-        .get::<HashMap<usize, PrimitiveIntrinsics>>()
-        .unwrap()
-        .contains_key(&realm)
+    if scope
+        .realm_value_for_host(global, "browser.array")
+        .is_none()
     {
         let array = scope
             .member_get(global, "Array")
@@ -2136,18 +2108,13 @@ pub(crate) fn install_dom_primitives(scope: &mut Ctx, global: &Value) {
         let array_buffer_byte_length = scope
             .member_get(&desc, "get")
             .unwrap_or_else(|_| panic!("ArrayBuffer getter"));
-        scope
-            .op_state()
-            .get_mut::<HashMap<usize, PrimitiveIntrinsics>>()
-            .unwrap()
-            .insert(
-                realm,
-                PrimitiveIntrinsics {
-                    array,
-                    detach,
-                    array_buffer_byte_length,
-                },
-            );
+        scope.set_realm_value_for_host(global, "browser.array", array);
+        scope.set_realm_value_for_host(global, "browser.detach", detach);
+        scope.set_realm_value_for_host(
+            global,
+            "browser.arrayBufferByteLength",
+            array_buffer_byte_length,
+        );
     }
     set_fn(
         scope,

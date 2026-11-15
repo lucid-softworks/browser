@@ -172,3 +172,84 @@ pub(crate) fn js_string_literal(s: &str) -> String {
     out.push('"');
     out
 }
+
+#[cfg(test)]
+mod tests {
+    fn module_source(name: &str) -> Option<(String, String)> {
+        let source = match name {
+            // b completes registration through the cycle before a's other branch fails.
+            "a" => "import 'b'; import 'tail'; globalThis.executed = true;",
+            "b" => "import 'a'; export const b = 1;",
+            "tail" => "import 'missing';",
+            "second" => "import 'b';",
+            _ => return None,
+        };
+        Some((name.into(), source.into()))
+    }
+
+    fn assert_missing_module(completion: lumen::Completion) {
+        match completion {
+            lumen::Completion::Throw { name, message } => {
+                assert_eq!(name, "TypeError");
+                assert!(message.contains("missing"), "{message}");
+            }
+            lumen::Completion::Value(value) => panic!("expected failed import, got value {value}"),
+        }
+    }
+
+    #[test]
+    fn failed_module_graph_cannot_poison_later_static_or_dynamic_imports() {
+        let mut engine = lumen::Engine::new();
+        for name in ["a", "second", "b", "a", "second"] {
+            let source = module_source(name).unwrap().1;
+            assert_missing_module(
+                engine
+                    .eval_module(&source, name, |name, _| module_source(name))
+                    .unwrap(),
+            );
+        }
+        engine.eval("var result = 'pending'; import('b').then(() => result = 'resolved', error => result = error.name);", false).unwrap();
+        assert!(
+            matches!(engine.eval("result", false).unwrap(), lumen::Completion::Value(value) if value == "TypeError")
+        );
+        assert!(
+            matches!(engine.eval("typeof executed", false).unwrap(), lumen::Completion::Value(value) if value == "undefined")
+        );
+        assert!(matches!(
+            engine
+                .eval_module("globalThis.recovered = 42;", "valid", |_, _| None)
+                .unwrap(),
+            lumen::Completion::Value(_)
+        ));
+        assert!(
+            matches!(engine.eval("recovered", false).unwrap(), lumen::Completion::Value(value) if value == "42")
+        );
+    }
+
+    #[test]
+    fn failed_link_in_cycle_stays_failed_when_imported_through_another_member() {
+        fn source(name: &str) -> Option<(String, String)> {
+            Some((
+                name.into(),
+                match name {
+                    "a" => "import 'b'; export { absent } from 'b'; globalThis.executed = true;",
+                    "b" => "import 'a'; export const present = 1;",
+                    _ => return None,
+                }
+                .into(),
+            ))
+        }
+        let mut engine = lumen::Engine::new();
+        for name in ["a", "b", "a", "b"] {
+            let result = engine
+                .eval_module(&source(name).unwrap().1, name, |name, _| source(name))
+                .unwrap();
+            assert!(
+                matches!(result, lumen::Completion::Throw { name, .. } if name == "SyntaxError")
+            );
+        }
+        assert!(
+            matches!(engine.eval("typeof executed", false).unwrap(), lumen::Completion::Value(value) if value == "undefined")
+        );
+    }
+}

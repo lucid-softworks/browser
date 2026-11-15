@@ -6,6 +6,7 @@ use crate::*;
 pub struct Runtime {
     engine: Engine,
     host_context: HostContext,
+    execution: ExecutionControl,
 }
 
 impl Default for Runtime {
@@ -18,7 +19,9 @@ impl Runtime {
     /// Build a fresh runtime with `console` + timers installed (no DOM). State persists across
     /// `eval` calls via the owned global context.
     pub fn new() -> Self {
-        let mut engine = Engine::new();
+        let execution = ExecutionControl::default();
+        let _operation = execution.enter(EXECUTION_BUDGET);
+        let mut engine = controlled_engine(&execution);
         let scope = engine.ctx();
         let state = HostState::new(Rc::new(RefCell::new(dom::Document::new())));
         install_host_state(scope, state);
@@ -28,6 +31,7 @@ impl Runtime {
         Runtime {
             engine,
             host_context: HostContext::current(),
+            execution,
         }
     }
 
@@ -35,6 +39,7 @@ impl Runtime {
     /// error — it is captured into `EvalOutput.error`.
     pub fn eval(&mut self, source: &str) -> EvalOutput {
         let _host = self.host_context.enter();
+        let _operation = self.execution.enter(EXECUTION_BUDGET);
         eval_source(self.engine.ctx(), source, "<eval>")
     }
 }
@@ -56,6 +61,7 @@ pub fn eval_batch(sources: Vec<String>) -> Vec<EvalOutput> {
             let mut rt = Runtime::new();
             let mut results: Vec<EvalOutput> = sources.iter().map(|s| rt.eval(s)).collect();
             // Drive the event loop so timers/microtasks the scripts registered actually run.
+            let _operation = rt.execution.enter(EXECUTION_BUDGET);
             drain_runtime(&mut rt.engine, &mut results, None, None);
             results
         });
@@ -106,7 +112,9 @@ pub fn run_with_dom(
             let _host = host_context.enter();
             let result: (dom::Document, Vec<EvalOutput>) = {
                 let shared: SharedDoc = Rc::new(RefCell::new(doc));
-                let mut engine = Engine::new();
+                let execution = ExecutionControl::default();
+                let _operation = execution.enter(std::time::Duration::from_secs(8));
+                let mut engine = controlled_engine(&execution);
                 let scope = engine.ctx();
                 install_host_state(scope, HostState::new(Rc::clone(&shared)));
                 install_browser_environment(scope, &url);
@@ -232,5 +240,54 @@ mod tests {
             "{:?}",
             outputs[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn deadline_stops_tree_walk_bytecode_calls_and_catch_loops() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(|| {
+                for source in [
+                    "while (true) {}",
+                    "(function spin(){for (;;) {}})()",
+                    "try { while(true) {} } catch(e) { while(true) {} } finally { while(true) {} }",
+                    "(function spin(){while(true){ (()=>1)(); }})()",
+                    "Array.prototype.indexOf.call({length: 9007199254740991}, 1)",
+                    "Array.prototype.includes.call({length: 9007199254740991}, 1)",
+                    "Array.prototype.lastIndexOf.call({length: 9007199254740991}, 1)",
+                    "Array.prototype.copyWithin.call({length: 9007199254740991}, 0, 1)",
+                ] {
+                    let mut runtime = Runtime::new();
+                    let earlier = runtime.execution.enter(std::time::Duration::from_secs(20));
+                    let _short = runtime
+                        .execution
+                        .enter(std::time::Duration::from_millis(100));
+                    // A previous host operation may finish after a new caller arms a deadline.
+                    // Dropping it must not clear the newer operation's shorter deadline.
+                    drop(earlier);
+                    let start = std::time::Instant::now();
+                    let out = runtime.eval(source);
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(3),
+                        "{source}"
+                    );
+                    assert_eq!(
+                        out.error.as_deref(),
+                        Some(EXECUTION_STOPPED),
+                        "{out:?}: {source}"
+                    );
+                    assert!(
+                        runtime.eval("1+1").error.is_some(),
+                        "a stopped engine stays stopped"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

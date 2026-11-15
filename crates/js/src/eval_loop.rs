@@ -118,16 +118,20 @@ pub(crate) fn eval_source(scope: &mut Ctx, source: &str, _name: &str) -> EvalOut
     host_state(scope).console.borrow_mut().clear();
     let result = eval_value(scope, source);
     scope.drain_microtasks_for_host();
-    let (value, error) = match result {
-        Ok(v) => (
-            if v.is_undefined() {
-                None
-            } else {
-                Some(v.to_rust_string_lossy(scope))
-            },
-            None,
-        ),
-        Err(e) => (None, Some(e.to_rust_string_lossy(scope))),
+    let (value, error) = if scope.execution_cancelled() {
+        (None, Some(EXECUTION_STOPPED.to_string()))
+    } else {
+        match result {
+            Ok(v) => (
+                if v.is_undefined() {
+                    None
+                } else {
+                    Some(v.to_rust_string_lossy(scope))
+                },
+                None,
+            ),
+            Err(e) => (None, Some(e.to_rust_string_lossy(scope))),
+        }
     };
     let console = std::mem::take(&mut *host_state(scope).console.borrow_mut());
     EvalOutput {
@@ -170,7 +174,8 @@ pub(crate) fn drain_event_loop(
         "<lifecycle>",
     );
 
-    // Lumen currently has no interrupt handle. This budget bounds work between callbacks.
+    // Interpreter safe points enforce the host deadline even inside a single callback.
+    // These shorter budgets additionally bound cooperative event-loop work.
     let start = std::time::Instant::now();
     // Idle budget keeps ticks snappy; the network budget is raised because a page legitimately
     // waiting on a slow request (the slowest imlunahey _serverFn is ~6.8s) needs longer than 3s.
@@ -182,6 +187,12 @@ pub(crate) fn drain_event_loop(
     // loop stays alive on the network budget while either the page or a worker has requests pending.
     let mut worker_in_flight = 0usize;
     loop {
+        if scope.execution_cancelled() {
+            if let Some(last) = results.last_mut() {
+                last.error = Some(EXECUTION_STOPPED.to_string());
+            }
+            break;
+        }
         // Pull any completed background fetches and settle their JS promises, then run a microtask
         // checkpoint so the `.then` chains progress within this same drain.
         if resolve_completed_fetches(scope, fetch_rx) {
@@ -326,6 +337,13 @@ pub(crate) fn drain_event_loop(
         }
     }
 
+    if scope.execution_cancelled() {
+        if let Some(last) = results.last_mut() {
+            last.error = Some(EXECUTION_STOPPED.to_string());
+            last.console.push(EXECUTION_STOPPED.to_string());
+        }
+        return true;
+    }
     // Collect timer/microtask errors recorded JS-side.
     let mut extra: Vec<String> = Vec::new();
     if let Some(joined) = eval_to_string(scope, "(globalThis.__timerErrors || []).join('\\u0000')")
