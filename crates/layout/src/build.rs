@@ -284,6 +284,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         bold: cs.bold,
         italic: cs.italic,
         background_color: cs.background_color,
+        background_alpha: cs.background_alpha,
         border_color: cs.border_color,
         border_collapse: cs.border_collapse,
         is_table_cell: cs.display == style::Display::TableCell,

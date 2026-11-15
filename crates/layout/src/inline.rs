@@ -451,15 +451,22 @@ pub(crate) fn collect_inline_items(
     out: &mut Vec<InlineItem>,
 ) {
     for mut child in children {
-        // An element whose display is inline-block (or inline-flex/grid) is atomic.
-        let is_atomic = child.node.and_then(|n| styles.get(&n)).map(|cs| {
-            matches!(
-                cs.display,
-                style::Display::InlineBlock
-                    | style::Display::InlineFlex
-                    | style::Display::InlineGrid
-            )
-        }) == Some(true);
+        // Only element/replaced boxes can establish an atomic inline formatting context.
+        // A control's generated value text and caret carry its node ID for hit testing, but
+        // must not inherit its width/height a second time (a caret stays a thin bar).
+        let is_element_box = matches!(
+            child.content,
+            BoxContent::Block | BoxContent::Inline | BoxContent::Image(_) | BoxContent::Widget(_)
+        );
+        let is_atomic = is_element_box
+            && child.node.and_then(|n| styles.get(&n)).is_some_and(|cs| {
+                matches!(
+                    cs.display,
+                    style::Display::InlineBlock
+                        | style::Display::InlineFlex
+                        | style::Display::InlineGrid
+                )
+            });
 
         if is_atomic {
             // Lay the atomic box out as a block at a tentative origin (0,0); it'll be repositioned on

@@ -210,7 +210,9 @@ pub(crate) fn layout_grid(
                 w += cs.column_gap;
             }
         }
-        let child = &mut boxx.children[p.idx];
+        // Keep the structural children intact for final placement, notably nested table rows.
+        let mut probe = boxx.children[p.idx].clone();
+        let child = &mut probe;
         let m = child.dimensions.margin;
         let b = child.dimensions.border;
         let pad = child.dimensions.padding;

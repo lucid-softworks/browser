@@ -1,6 +1,40 @@
 use crate::*;
 
 impl Engine {
+    /// Whether two URL spellings identify different fragments of the same document.
+    /// Normalize first: Windows file paths and JS URL serialization use different separators.
+    pub fn is_fragment_navigation(from: &str, to: &str) -> bool {
+        let (Ok(from), Ok(to)) = (wurl::Url::parse(from), wurl::Url::parse(to)) else {
+            return false;
+        };
+        let (from, to) = (from.href(), to.href());
+        from != to && from.split('#').next() == to.split('#').next()
+    }
+
+    /// Take a navigation requested by page script or an uncancelled link/form activation.
+    /// The host owns its history and loads the destination after the event has completed.
+    pub fn take_navigation_request(&mut self) -> Option<(String, bool)> {
+        let _host = self.js_context.enter();
+        js::take_pending_navigation()
+    }
+
+    /// Traverse a fragment history entry in the existing JS realm. Return false when the host
+    /// must load another document instead. Preserves application state and notifies hash routers.
+    pub fn traverse_same_document_history(&mut self, url: &str) -> bool {
+        // The live realm owns the current fragment; the last fetched URL may predate it.
+        // __traverseFragmentHistory normalizes the target and rejects other documents.
+        if self.session.is_none() {
+            return false;
+        }
+        if self.console_eval(&format!("__traverseFragmentHistory({})", json_str(url))) != "true" {
+            return false;
+        }
+        if let LoadState::Loaded { url: current, .. } = &mut self.state {
+            *current = url.to_owned();
+        }
+        true
+    }
+
     /// Hit-test the painted page at framebuffer device-pixel `(x, y)` and, if the deepest box
     /// hit belongs to (or descends from) an `<a href>`, return the absolute link URL.
     ///
@@ -128,10 +162,18 @@ impl Engine {
                     snapshot = s;
                     snapshot.prune_invalid();
                     console.extend(c);
+                    let (s, c) = session.fire_event(old.0, "focusout");
+                    snapshot = s;
+                    snapshot.prune_invalid();
+                    console.extend(c);
                 }
             }
             if let Some(newf) = new_focus {
                 let (s, c) = session.fire_event_nonbubbling(newf.0, "focus");
+                snapshot = s;
+                snapshot.prune_invalid();
+                console.extend(c);
+                let (s, c) = session.fire_event(newf.0, "focusin");
                 snapshot = s;
                 snapshot.prune_invalid();
                 console.extend(c);
@@ -193,7 +235,7 @@ impl Engine {
 
         // The select's principal box rect (device px), viewport-relative.
         let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
-        collect_node_rects(&cache.root, &mut rects);
+        collect_node_rects(&cache.root, &self.state, &cache.styles, &mut rects);
         let r = rects.get(&select_id.0)?;
         Some(SelectHit {
             node_id: select_id.0,
@@ -428,6 +470,57 @@ impl Engine {
         true
     }
 
+    /// Focus an editable text field without generating a pointer click. Used by keyboard
+    /// automation; subsequent keys follow the same path as the native desktop shell.
+    pub fn focus_text_field(&mut self, node_id: usize) -> bool {
+        let _host = self.js_context.enter();
+        let node = dom::NodeId(node_id);
+        let valid = matches!(&self.state, LoadState::Loaded { doc: Some(d), .. }
+            if node_id < d.len() && is_editable_text_field(d, node));
+        if !valid || self.session.is_none() {
+            return false;
+        }
+        if self.focused_node == Some(node) {
+            return true;
+        }
+        let session = self.session.as_ref().unwrap();
+        let mut snapshot = match &self.state {
+            LoadState::Loaded { doc: Some(doc), .. } => doc.clone(),
+            _ => return false,
+        };
+        let mut console = Vec::new();
+        if let Some(old) = self.focused_node.filter(|old| old.0 < snapshot.len()) {
+            if self.focus_value.is_some() && self.focus_value != node_value(&snapshot, old) {
+                let (_, lines) = session.fire_event(old.0, "change");
+                console.extend(lines);
+            }
+            let (_, lines) = session.fire_event_nonbubbling(old.0, "blur");
+            console.extend(lines);
+            let (doc, lines) = session.fire_event(old.0, "focusout");
+            snapshot = doc;
+            console.extend(lines);
+        }
+        self.focused_node = Some(node);
+        self.focus_value = node_value(&snapshot, node);
+        js::set_interaction_state(self.hovered_node.map(|n| n.0), Some(node_id));
+        let (_, lines) = session.fire_event_nonbubbling(node_id, "focus");
+        console.extend(lines);
+        let (mut snapshot, lines) = session.fire_event(node_id, "focusin");
+        snapshot.prune_invalid();
+        console.extend(lines);
+        if let LoadState::Loaded {
+            doc,
+            console: lines,
+            ..
+        } = &mut self.state
+        {
+            *doc = Some(snapshot);
+            lines.extend(console);
+        }
+        self.layout_cache = None;
+        true
+    }
+
     /// Deliver a physical key press to the focused text field, if any. Routes through the live JS
     /// session (fires keydown → value mutation + input → keyup), adopts the updated DOM snapshot,
     /// and invalidates the layout cache. Returns `true` if a focused field consumed the key (a
@@ -441,20 +534,8 @@ impl Engine {
             Some(s) => s,
             None => return false,
         };
-        let (mut snapshot, mut console) = session.dispatch_key(node.0, key, code);
+        let (mut snapshot, console) = session.dispatch_key(node.0, key, code);
         snapshot.prune_invalid();
-
-        // Enter in a single-line <input> (not <textarea>) inside a <form> fires `submit` on the
-        // nearest ancestor form (no navigation — handlers can preventDefault as usual).
-        if key == "Enter" && node.0 < snapshot.len() && is_single_line_input(&snapshot, node) {
-            if let Some(form) = ancestor_form(&snapshot, node) {
-                let session = self.session.as_ref().unwrap();
-                let (s, c) = session.fire_event(form.0, "submit");
-                snapshot = s;
-                snapshot.prune_invalid();
-                console.extend(c);
-            }
-        }
 
         if let LoadState::Loaded {
             doc, console: c, ..
@@ -580,7 +661,7 @@ impl Engine {
             None => return false,
         };
         let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
-        collect_node_rects(&cache.root, &mut rects);
+        collect_node_rects(&cache.root, &self.state, &cache.styles, &mut rects);
 
         // Viewport visible region in layout (device-px) coords.
         let root_w = dw as f32;

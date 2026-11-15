@@ -39,7 +39,7 @@ impl layout::TextMeasurer for FontMeasurer<'_> {
 
 /// Hit-test a layout subtree at layout coordinates `(x, y)`, returning the DOM node of the
 /// deepest box whose border box contains the point and that carries a `node`. Children are
-/// searched first (and in order) so the deepest / topmost box wins; a box's own border box is
+/// searched first in reverse paint order so the deepest / topmost box wins; a box's own border box is
 /// its hit area.
 pub(crate) fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<dom::NodeId> {
     // A clipping box prevents descendants outside its padding box from receiving pointer input.
@@ -52,8 +52,9 @@ pub(crate) fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<d
                 .flatten();
         }
     }
-    // Recurse into children first so a deeper hit takes precedence over this box.
-    for c in &b.children {
+    // The painter draws later siblings on top. Hit-test that same stack from front to back,
+    // matching DOM elementFromPoint and allowing an overlapping button to receive its click.
+    for c in b.children.iter().rev() {
         if let Some(n) = deepest_node_at(c, x, y) {
             return Some(n);
         }
@@ -490,13 +491,14 @@ pub(crate) fn scale_layout_tree(b: &mut layout::LayoutBox, s: f32) {
     }
 }
 
-pub(crate) fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Rect>) {
-    if let Some(node) = b.node {
-        out.entry(node.0)
-            .or_insert_with(|| b.dimensions.border_box());
-    }
-    for c in &b.children {
-        collect_node_rects(c, out);
+pub(crate) fn collect_node_rects(
+    b: &layout::LayoutBox,
+    state: &LoadState,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    out: &mut HashMap<usize, layout::Rect>,
+) {
+    if let LoadState::Loaded { doc: Some(doc), .. } = state {
+        out.extend(layout::node_rects(b, doc, styles));
     }
 }
 
@@ -578,7 +580,7 @@ pub(crate) fn compute_initial_rects(
     let content_h = root.dimensions.margin_box().height;
 
     let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
-    collect_node_rects(&root, &mut rects);
+    rects.extend(layout::node_rects(&root, doc, &computed));
     let inv = if scale > 0.0 { 1.0 / scale } else { 1.0 };
     let rect_list: Vec<(usize, f32, f32, f32, f32)> = rects
         .iter()
@@ -1119,28 +1121,6 @@ pub(crate) fn find_tag(doc: &dom::Document, root: dom::NodeId, tag: &str) -> Opt
         if let Some(f) = find_tag(doc, c, tag) {
             return Some(f);
         }
-    }
-    None
-}
-
-/// True if `id` is a single-line `<input>` (not a `<textarea>`).
-pub(crate) fn is_single_line_input(doc: &dom::Document, id: dom::NodeId) -> bool {
-    matches!(&doc.get(id).data, dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("input"))
-}
-
-/// Walk up from `node` to the nearest ancestor `<form>`, if any.
-pub(crate) fn ancestor_form(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
-    let mut cur = Some(node);
-    while let Some(id) = cur {
-        if id.0 >= doc.len() {
-            break;
-        }
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("form") {
-                return Some(id);
-            }
-        }
-        cur = doc.get(id).parent;
     }
     None
 }

@@ -1,0 +1,252 @@
+{
+  "version": 1,
+  "sites": [
+    {
+      "id": "example",
+      "name": "Example Domain",
+      "url": "https://example.com/",
+      "steps": [
+        {
+          "name": "Example title",
+          "action": "assert",
+          "selector": "title",
+          "text": "Example Domain"
+        },
+        {
+          "name": "Example content",
+          "action": "assert",
+          "selector": "p[lang=en]",
+          "text": "documentation examples",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Follow IANA link",
+          "action": "click",
+          "selector": "a"
+        },
+        {
+          "name": "IANA destination",
+          "action": "assert",
+          "url_contains": "iana.org/",
+          "selector": "h1",
+          "text": "Example Domains",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Back to example",
+          "action": "back"
+        },
+        {
+          "name": "History restored",
+          "action": "assert",
+          "url_contains": "example.com",
+          "selector": "title",
+          "text": "Example Domain"
+        }
+      ]
+    },
+    {
+      "id": "wikipedia",
+      "name": "Wikipedia",
+      "url": "https://www.wikipedia.org/",
+      "steps": [
+        {
+          "name": "Portal search available",
+          "action": "assert",
+          "selector": "#searchInput",
+          "count": 1,
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Enter article search",
+          "action": "type",
+          "selector": "#searchInput",
+          "text": "Web browser"
+        },
+        {
+          "name": "Submit search",
+          "action": "click",
+          "selector": "#search-form button[type=submit]"
+        },
+        {
+          "name": "Read searched article",
+          "action": "assert",
+          "url_contains": "en.wikipedia.org/wiki/Web_browser",
+          "selector": "#firstHeading",
+          "text": "Web browser",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Article body rendered",
+          "action": "assert",
+          "selector": "#mw-content-text",
+          "text": "World Wide Web",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Back to search portal",
+          "action": "back"
+        },
+        {
+          "name": "Portal restored",
+          "action": "assert",
+          "selector": "#searchInput",
+          "count": 1,
+          "min_rendered_count": 1
+        }
+      ]
+    },
+    {
+      "id": "hackernews",
+      "name": "Hacker News",
+      "url": "https://news.ycombinator.com/",
+      "steps": [
+        {
+          "name": "Front page stories",
+          "action": "assert",
+          "selector": ".titleline > a",
+          "min_count": 1,
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Open first discussion",
+          "action": "click",
+          "selector": ".subline > a[href^=\"item?id=\"]"
+        },
+        {
+          "name": "Discussion page",
+          "action": "assert",
+          "url_contains": "news.ycombinator.com/item?id=",
+          "selector": ".fatitem .titleline > a",
+          "min_count": 1,
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Back to stories",
+          "action": "back"
+        },
+        {
+          "name": "Front page restored",
+          "action": "assert",
+          "selector": ".titleline > a",
+          "min_count": 2,
+          "min_rendered_count": 2
+        }
+      ]
+    },
+    {
+      "id": "react-todomvc",
+      "name": "React TodoMVC",
+      "url": "https://todomvc.com/examples/react/dist/",
+      "steps": [
+        {
+          "name": "React mounted",
+          "action": "assert",
+          "selector": ".new-todo",
+          "count": 1,
+          "min_rendered_count": 1
+        },
+        {
+          "name": "App stylesheet applied",
+          "action": "assert",
+          "selector": ".todoapp",
+          "count": 1,
+          "min_rendered_count": 1,
+          "css": {
+            "position": "relative"
+          }
+        },
+        {
+          "name": "Add first task with Enter",
+          "action": "type",
+          "selector": ".new-todo",
+          "text": "Read the browser docs\ue007"
+        },
+        {
+          "name": "First task created",
+          "action": "assert",
+          "selector": ".todo-list li",
+          "count": 1,
+          "text": "Read the browser docs",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Add second task with Enter",
+          "action": "type",
+          "selector": ".new-todo",
+          "text": "Test a real website\ue007"
+        },
+        {
+          "name": "Two tasks",
+          "action": "assert",
+          "selector": ".todo-list li",
+          "count": 2,
+          "min_rendered_count": 2
+        },
+        {
+          "name": "Complete first task",
+          "action": "click",
+          "selector": ".todo-list li .toggle"
+        },
+        {
+          "name": "Completed state",
+          "action": "assert",
+          "selector": ".todo-list li.completed",
+          "count": 1,
+          "text": "Read the browser docs",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Show active tasks",
+          "action": "click",
+          "selector": ".filters a[href='#/active']"
+        },
+        {
+          "name": "Active filter",
+          "action": "assert",
+          "selector": ".todo-list li",
+          "count": 1,
+          "text": "Test a real website",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Show completed tasks",
+          "action": "click",
+          "selector": ".filters a[href='#/completed']"
+        },
+        {
+          "name": "Completed filter",
+          "action": "assert",
+          "selector": ".todo-list li",
+          "count": 1,
+          "text": "Read the browser docs",
+          "min_rendered_count": 1
+        },
+        {
+          "name": "Delete completed task",
+          "action": "click",
+          "selector": ".clear-completed"
+        },
+        {
+          "name": "Completed task deleted",
+          "action": "assert",
+          "selector": ".todo-list li",
+          "count": 0
+        },
+        {
+          "name": "Show all tasks",
+          "action": "click",
+          "selector": ".filters a[href='#/']"
+        },
+        {
+          "name": "Only active task remains",
+          "action": "assert",
+          "selector": ".todo-list li",
+          "count": 1,
+          "text": "Test a real website",
+          "min_rendered_count": 1
+        }
+      ]
+    }
+  ]
+}

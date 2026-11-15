@@ -387,7 +387,7 @@ pub struct ComputedStyle {
     pub right_spec: InsetValue,
     pub bottom_spec: InsetValue,
     pub left_spec: InsetValue,
-    /// Stacking `z-index` (`None` = auto). Parsed but not yet used for paint ordering.
+    /// Stacking `z-index` (`None` = auto), used for positioned sibling paint ordering.
     pub z_index: Option<i32>,
     /// Explicit content `width` in px (`None` = auto/percentage; see `width_pct`).
     pub width: Option<f32>,

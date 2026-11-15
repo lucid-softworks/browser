@@ -274,7 +274,10 @@ pub(crate) fn layout_flex(
         for &mi in line {
             let item_main = size_of(mi);
             let meta = &metas[mi];
-            let child = &mut boxx.children[meta.idx];
+            // The final pass needs the original structure (not already-flattened table rows
+            // or inline fragments). Measure and read baselines from a scratch subtree.
+            let mut probe = boxx.children[meta.idx].clone();
+            let child = &mut probe;
             // Tentatively size the content box so contents lay out at the right main extent.
             let content_main = (item_main - meta.main_edges).max(0.0);
             if main_horizontal {
@@ -320,12 +323,7 @@ pub(crate) fn layout_flex(
                 )
             {
                 let last = matches!(resolved, style::AlignSelf::LastBaseline);
-                item_baseline[mi] = Some(flex_item_baseline(
-                    &boxx.children[metas[mi].idx],
-                    last,
-                    vertical_wm,
-                    styles,
-                ));
+                item_baseline[mi] = Some(flex_item_baseline(child, last, vertical_wm, styles));
             }
         }
 
@@ -838,10 +836,16 @@ pub(crate) fn intrinsic_cross_height(
     // One line of text at the box's font size (0 if it has none) …
     let fs = boxx.style.font_size;
     let line_h = if has_any_text(boxx) {
-        measurer.line_height(
-            if fs > 0.0 { fs } else { 16.0 },
-            boxx.style.font_family.as_deref(),
-        )
+        // A specified `line-height` *is* the line box's height, so it has to win over the font's
+        // natural metric here as it does everywhere else the two are combined. Grid takes the greater
+        // of this estimate and the item's laid-out height, so a too-tall estimate is not a harmless
+        // over-guess — it becomes the row's height.
+        boxx.style.line_height.unwrap_or_else(|| {
+            measurer.line_height(
+                if fs > 0.0 { fs } else { 16.0 },
+                boxx.style.font_family.as_deref(),
+            )
+        })
     } else {
         0.0
     };
