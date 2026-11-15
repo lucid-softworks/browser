@@ -85,6 +85,7 @@ pub fn layout_document(
     let ctx = Ctx {
         positioned: viewport,
         viewport,
+        scrollport: None,
     };
     layout_block(&mut root, containing, ctx, styles, measurer);
     root
@@ -396,6 +397,101 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_block_margins_collapse_to_the_larger_margin() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let a = doc.append_element(body, "div");
+        let b = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    bottom: 30.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    top: 50.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let a_bottom = rect_of(&root_box, a).y + rect_of(&root_box, a).height;
+        let b_top = rect_of(&root_box, b).y;
+        assert_eq!(b_top - a_bottom, 50.0);
+    }
+
+    #[test]
+    fn margins_collapse_through_an_empty_block() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let a = doc.append_element(body, "div");
+        let empty = doc.append_element(body, "div");
+        let b = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    bottom: 10.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            empty,
+            style::ComputedStyle {
+                display_block: true,
+                margin: style::Edges {
+                    top: 30.0,
+                    bottom: 40.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            b,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(20.0),
+                margin: style::Edges {
+                    top: 25.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let a_bottom = rect_of(&root_box, a).y + rect_of(&root_box, a).height;
+        let b_top = rect_of(&root_box, b).y;
+        assert_eq!(b_top - a_bottom, 40.0);
+    }
+
+    #[test]
     fn padding_and_border_offset_content_rect() {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -591,6 +687,30 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         assert_eq!(abox.dimensions.content.width, 200.0);
+    }
+
+    #[test]
+    fn aspect_ratio_derives_auto_height_from_width() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let item = doc.append_element(body, "div");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            item,
+            style::ComputedStyle {
+                display_block: true,
+                width: Some(120.0),
+                aspect_ratio_set: true,
+                aspect_ratio: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let rect = rect_of(&root_box, item);
+        assert_eq!((rect.width, rect.height), (120.0, 60.0));
     }
 
     #[test]
@@ -2185,6 +2305,55 @@ mod tests {
     }
 
     #[test]
+    fn vertical_grid_with_orthogonal_items_terminates_with_finite_geometry() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let grid = doc.append_element(body, "div");
+        let horizontal = doc.append_element(grid, "div");
+        let vertical = doc.append_element(grid, "div");
+        doc.append_child(horizontal, dom::NodeData::Text("horizontal item".into()));
+        doc.append_child(vertical, dom::NodeData::Text("vertical item".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            grid,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                writing_mode: style::WritingMode::VerticalLr,
+                width: Some(240.0),
+                height: Some(180.0),
+                grid_template_columns: vec![style::TrackSize::Fr(1.0)],
+                grid_template_rows: vec![style::TrackSize::Fr(1.0), style::TrackSize::Fr(1.0)],
+                ..Default::default()
+            },
+        );
+        styles.insert(horizontal, block_style(true));
+        styles.insert(
+            vertical,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                writing_mode: style::WritingMode::VerticalRl,
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        for node in [grid, horizontal, vertical] {
+            let rect = rect_of(&root_box, node);
+            assert!(
+                [rect.x, rect.y, rect.width, rect.height]
+                    .into_iter()
+                    .all(f32::is_finite),
+                "vertical/orthogonal grid geometry must stay finite: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
     fn grid_align_self_end_positions_item_at_cell_bottom() {
         // An `align-self: end` grid item (height 20) in a 60px row sits at the cell bottom (offset
         // 40), content-sized rather than stretched to fill the cell.
@@ -3615,6 +3784,34 @@ mod tests {
     }
 
     #[test]
+    fn table_caption_intrinsic_width_enlarges_table() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let table = doc.append_element(body, "table");
+        let caption = doc.append_element(table, "caption");
+        let wide = doc.append_element(caption, "span");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            table,
+            style::ComputedStyle {
+                display: style::Display::Table,
+                width: Some(50.0),
+                border: style::Edges::all(2.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(caption, disp(style::Display::TableCaption));
+        styles.insert(wide, inline_block(100.0, 10.0));
+        build_row(&mut doc, &mut styles, table, "td", &[""]);
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let table_box = find_box(&root_box, &|x| x.node == Some(table)).unwrap();
+        assert_eq!(table_box.dimensions.border_box().width, 100.0);
+    }
+
+    #[test]
     fn table_caption_side_bottom_sits_below_rows() {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -3842,6 +4039,8 @@ mod tests {
         styles.insert(col1, c1s);
 
         let cells = build_row(&mut doc, &mut styles, table, "td", &["a", "b"]);
+        // A larger cell width is also a column measure and wins over the narrower `<col>` width.
+        styles.get_mut(&cells[0]).unwrap().width = Some(200.0);
 
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let bx = |n: dom::NodeId| {
@@ -3854,10 +4053,7 @@ mod tests {
         };
         let w0 = bx(cells[0]).width;
         let w1 = bx(cells[1]).width;
-        assert!(
-            (w0 - 150.0).abs() < 1.5,
-            "col0 width should be 150, got {w0}"
-        );
+        assert!((w0 - 200.0).abs() < 1.5, "cell width should win, got {w0}");
         assert!((w1 - 50.0).abs() < 1.5, "col1 width should be 50, got {w1}");
     }
 

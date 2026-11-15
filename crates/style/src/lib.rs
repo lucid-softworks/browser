@@ -37,20 +37,13 @@ pub(crate) use queries::*;
 pub(crate) use variables::*;
 
 #[cfg(test)]
+mod concurrency;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use dom::NodeData;
     use std::collections::HashMap;
-
-    /// Serializes tests that read or mutate the process-global OS-appearance / root-color-scheme
-    /// flags (`set_color_scheme_dark` / `root_used_scheme_dark`), which `cargo test` would otherwise
-    /// run in parallel and race on. Poisoning is irrelevant (we only need exclusion), so callers
-    /// ignore a poisoned guard.
-    static SCHEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn scheme_guard() -> std::sync::MutexGuard<'static, ()> {
-        SCHEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn elem(doc: &dom::Document, tag_and_pred: impl Fn(&dom::ElementData) -> bool) -> dom::NodeId {
         // Find first element matching predicate (depth-first).
@@ -856,6 +849,13 @@ mod tests {
             parse_track_list("repeat(3, 1fr)"),
             vec![TrackSize::Fr(1.0), TrackSize::Fr(1.0), TrackSize::Fr(1.0)]
         );
+        assert_eq!(
+            parse_track_list("repeat(auto-fill, 10px) repeat(auto-fit, 20px)"),
+            vec![
+                TrackSize::AutoRepeatFill(10.0),
+                TrackSize::AutoRepeatFit(20.0)
+            ]
+        );
         // Pathological input (grid-template-columns-crash.html builds 100k chained repeats) must not
         // expand without bound: the total track count is capped instead of exhausting memory.
         let mut huge = String::new();
@@ -1065,7 +1065,6 @@ mod tests {
 
     #[test]
     fn media_prefers_color_scheme_tracks_os_appearance() {
-        let _g = scheme_guard();
         let sheet = css::parse(
             "p { color: rgb(10,20,30) } \
              @media (prefers-color-scheme: dark) { p { color: rgb(1,2,3) } } \
@@ -1158,10 +1157,8 @@ mod tests {
 
     #[test]
     fn root_dark_scheme_themes_default_text() {
-        let _g = scheme_guard();
         // :root { color-scheme: dark } → root used scheme dark → default UA text light. The map's
-        // colors are captured during the cascade (which holds CASCADE_LOCK, so the root-scheme
-        // global it writes is the one it reads back), so they're race-free to assert on.
+        // colors are captured using this thread's root scheme, independently of other cascades.
         let sheet = css::parse(":root { color-scheme: dark }");
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         set_color_scheme_dark(false);
@@ -1173,7 +1170,6 @@ mod tests {
 
     #[test]
     fn root_light_scheme_keeps_black_text() {
-        let _g = scheme_guard();
         let sheet = css::parse(":root { color-scheme: light }");
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         set_color_scheme_dark(true); // OS dark, but page opts only into light
@@ -1184,7 +1180,6 @@ mod tests {
 
     #[test]
     fn meta_color_scheme_dark_opts_in() {
-        let _g = scheme_guard();
         // <meta name="color-scheme" content="dark"> with no CSS property.
         let doc = html::parse(
             r#"<html><head><meta name="color-scheme" content="dark"></head><body><p>t</p></body></html>"#,
@@ -1422,6 +1417,29 @@ mod tests {
         assert_eq!(parse_border_radius("4px 8px 12px 16px"), Some(4.0));
         // elliptical syntax: use horizontal radii before `/`
         assert_eq!(parse_border_radius("10px / 20px"), Some(10.0));
+        assert_eq!(parse_border_radius_pct("50%"), Some(0.5));
+
+        let sheet = css::parse("div { border-radius: 25% }");
+        let doc = html::parse("<html><body><div></div></body></html>");
+        let map = cascade(&doc, &[sheet]);
+        let div = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&div].border_radius_pct, Some(0.25));
+        assert_eq!(map[&div].get_property("border-radius"), "25%");
+    }
+
+    #[test]
+    fn gradient_pixel_stops_remain_absolute_until_paint() {
+        let g = parse_gradient(
+            "linear-gradient(to right, red 20px, blue 80px)",
+            (0, 0, 0),
+            (0, 0, 0),
+        )
+        .unwrap();
+        let Gradient::Linear { stops, .. } = g else {
+            panic!("expected linear gradient");
+        };
+        assert_eq!((stops[0].pos, stops[0].px), (0.0, 20.0));
+        assert_eq!((stops[1].pos, stops[1].px), (0.0, 80.0));
     }
 
     #[test]
@@ -2435,6 +2453,93 @@ mod tests {
     }
 
     #[test]
+    fn flex_computed_values_serialize_canonically() {
+        let cs = cs_of(
+            "<html><body><div style='font-size:40px;flex:2 3;flex-basis:calc(10px + 0.5em)'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.get_property("flex-basis"), "30px");
+        assert_eq!(cs.get_property("flex"), "2 3 30px");
+
+        let cs = cs_of(
+            "<html><body><div style='flex-basis:min-content;flex-flow:column wrap-reverse'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.get_property("flex-basis"), "min-content");
+        assert_eq!(cs.get_property("flex-flow"), "column wrap-reverse");
+    }
+
+    #[test]
+    fn alignment_items_keep_cssom_values_and_legacy_inheritance() {
+        let sheet = css::parse(
+            "#a { align-items: safe self-end; justify-items: legacy center } #b { align-items: first baseline }",
+        );
+        let doc = html::parse(
+            "<html><body><div id=a><span id=child></span></div><div id=b></div></body></html>",
+        );
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "a"));
+        let b = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "b"));
+        let child = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "child"));
+        assert_eq!(map[&a].get_property("align-items"), "safe self-end");
+        assert_eq!(map[&b].get_property("align-items"), "baseline");
+        assert_eq!(map[&a].get_property("justify-items"), "legacy center");
+        assert_eq!(map[&child].get_property("justify-items"), "legacy center");
+    }
+
+    #[test]
+    fn self_alignment_keeps_cssom_values_and_explicit_inheritance() {
+        let sheet = css::parse(
+            "#a { align-self: safe self-end; justify-self: safe left } #child { align-self: inherit; justify-self: inherit } #b { justify-self: first baseline }",
+        );
+        let doc = html::parse(
+            "<html><body><div id=a><span id=child></span></div><div id=b></div></body></html>",
+        );
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "a"));
+        let b = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "b"));
+        let child = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "child"));
+        assert_eq!(map[&a].get_property("align-self"), "safe self-end");
+        assert_eq!(map[&a].get_property("justify-self"), "safe left");
+        assert_eq!(map[&child].get_property("align-self"), "safe self-end");
+        assert_eq!(map[&child].get_property("justify-self"), "safe left");
+        assert_eq!(map[&b].get_property("justify-self"), "baseline");
+    }
+
+    #[test]
+    fn content_alignment_keeps_cssom_values_and_explicit_inheritance() {
+        let sheet = css::parse(
+            "#a { align-content: last baseline; justify-content: safe left } #child { align-content: inherit; justify-content: inherit } #b { align-content: first baseline }",
+        );
+        let doc = html::parse(
+            "<html><body><div id=a><span id=child></span></div><div id=b></div></body></html>",
+        );
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "a"));
+        let b = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "b"));
+        let child = elem(&doc, |e| e.attrs.get("id").is_some_and(|id| id == "child"));
+        assert_eq!(map[&a].get_property("align-content"), "last baseline");
+        assert_eq!(map[&a].get_property("justify-content"), "safe left");
+        assert_eq!(map[&child].get_property("align-content"), "last baseline");
+        assert_eq!(map[&child].get_property("justify-content"), "safe left");
+        assert_eq!(map[&b].get_property("align-content"), "baseline");
+    }
+
+    #[test]
+    fn css_text_values_are_retained_for_computed_style() {
+        let cs = cs_of(
+            "<html><body><div style='hyphens:auto;text-indent:20%;text-wrap:pretty'></div></body></html>",
+            "",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.get_property("hyphens"), "auto");
+        assert_eq!(cs.get_property("text-indent"), "20%");
+        assert_eq!(cs.get_property("text-wrap"), "pretty");
+    }
+
+    #[test]
     fn get_property_untracked_returns_empty() {
         let cs = cs_of("<html><body><div></div></body></html>", "", |e| {
             e.tag == "div"
@@ -2755,6 +2860,58 @@ mod tests {
             ("rgb(0, 0, 255)", true)
         );
         assert_eq!(split_importance("10px"), ("10px", false));
+    }
+
+    #[test]
+    fn contain_intrinsic_size_sets_both_physical_axes() {
+        let cs = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { contain: size; contain-intrinsic-size: 100px auto 50px }",
+            |e| e.tag == "div",
+        );
+        assert!(cs.contain_width && cs.contain_height);
+        assert_eq!(cs.contain_intrinsic_width, Some(100.0));
+        assert_eq!(cs.contain_intrinsic_height, Some(50.0));
+        assert_eq!(cs.get_property("contain-intrinsic-size"), "100px auto 50px");
+    }
+
+    #[test]
+    fn aspect_ratio_retains_value_and_auto_mode() {
+        let fallback = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { aspect-ratio: auto 2 / 1 }",
+            |e| e.tag == "div",
+        );
+        assert_eq!(fallback.aspect_ratio, Some(2.0));
+        assert!(fallback.aspect_ratio_auto);
+
+        let preferred = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { aspect-ratio: 3 / 2 }",
+            |e| e.tag == "div",
+        );
+        assert_eq!(preferred.aspect_ratio, Some(1.5));
+        assert!(!preferred.aspect_ratio_auto);
+    }
+
+    #[test]
+    fn contain_intrinsic_size_is_not_inherited_without_keyword() {
+        let parent = cs_of(
+            "<html><body><div><span></span></div></body></html>",
+            "div { contain-intrinsic-size: 25px 30px }",
+            |e| e.tag == "span",
+        );
+        assert_eq!(parent.get_property("contain-intrinsic-size"), "none");
+
+        let inherited = cs_of(
+            "<html><body><div><span></span></div></body></html>",
+            "div { contain-intrinsic-size: 25px 30px } span { contain-intrinsic-size: inherit }",
+            |e| e.tag == "span",
+        );
+        assert_eq!(
+            inherited.get_property("contain-intrinsic-size"),
+            "25px 30px"
+        );
     }
 
     #[test]

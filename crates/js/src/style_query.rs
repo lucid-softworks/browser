@@ -8,6 +8,7 @@ pub(crate) fn with_computed_style<R>(
     id: dom::NodeId,
     f: impl FnOnce(Option<&style::ComputedStyle>) -> R,
 ) -> R {
+    sync_style_context(state);
     let version = state.dom_version.get();
     {
         let mut cache = state.computed_cache.borrow_mut();
@@ -211,6 +212,7 @@ pub(crate) fn with_cascade_map<R>(
     state: &HostState,
     f: impl FnOnce(&dom::Document, &HashMap<dom::NodeId, style::ComputedStyle>) -> R,
 ) -> R {
+    sync_style_context(state);
     let version = state.dom_version.get();
     {
         let mut cache = state.computed_cache.borrow_mut();
@@ -242,6 +244,7 @@ pub(crate) fn with_pseudo_style<R>(
     pseudo_key: &str,
     f: impl FnOnce(Option<&style::ComputedStyle>) -> R,
 ) -> R {
+    sync_style_context(state);
     let version = state.dom_version.get();
     {
         let mut cache = state.computed_cache.borrow_mut();
@@ -590,20 +593,91 @@ pub(crate) fn ancestor_display_none(
     false
 }
 
+fn resolved_grid_tracks(
+    tracks: &[style::TrackSize],
+    available: f32,
+    gap: f32,
+    item_count: usize,
+    columns: bool,
+) -> String {
+    let mut expanded = Vec::new();
+    for track in tracks {
+        match *track {
+            style::TrackSize::AutoRepeatFill(size) | style::TrackSize::AutoRepeatFit(size) => {
+                let repetitions = (available + gap).max(0.0) / (size + gap).max(f32::EPSILON);
+                // In an indefinite inline axis, auto-fit uses the largest whole number that fits;
+                // the block axis and auto-fill cover the minimum size with a final repetition.
+                let count = if columns && matches!(track, style::TrackSize::AutoRepeatFit(_)) {
+                    repetitions.floor()
+                } else {
+                    repetitions.ceil()
+                } as usize;
+                let count = count.max(1);
+                for index in 0..count {
+                    let used = if matches!(track, style::TrackSize::AutoRepeatFit(_))
+                        && index >= item_count
+                    {
+                        0.0
+                    } else {
+                        size
+                    };
+                    expanded.push(style::TrackSize::Px(used));
+                }
+            }
+            other => expanded.push(other),
+        }
+    }
+    let tracks = expanded.as_slice();
+    let track_space = (available - gap * tracks.len().saturating_sub(1) as f32).max(0.0);
+    let mut fixed = 0.0;
+    let mut fr_total = 0.0;
+    let mut auto_count = 0usize;
+    for track in tracks {
+        match track {
+            style::TrackSize::Px(value) => fixed += value,
+            style::TrackSize::Pct(percent) => fixed += track_space * (percent / 100.0),
+            style::TrackSize::Fr(fraction) => fr_total += fraction,
+            style::TrackSize::Auto => auto_count += 1,
+            style::TrackSize::AutoRepeatFill(_) | style::TrackSize::AutoRepeatFit(_) => {}
+        }
+    }
+    let remaining = (track_space - fixed).max(0.0);
+    let auto_size = if fr_total == 0.0 && auto_count > 0 {
+        remaining / auto_count as f32
+    } else {
+        0.0
+    };
+    let fr_size = if fr_total > 0.0 {
+        (remaining - auto_size * auto_count as f32).max(0.0) / fr_total
+    } else {
+        0.0
+    };
+    tracks
+        .iter()
+        .map(|track| {
+            let value = match track {
+                style::TrackSize::Px(value) => *value,
+                style::TrackSize::Pct(percent) => track_space * (percent / 100.0),
+                style::TrackSize::Fr(fraction) => fr_size * fraction,
+                style::TrackSize::Auto => auto_size,
+                style::TrackSize::AutoRepeatFill(_) | style::TrackSize::AutoRepeatFit(_) => 0.0,
+            };
+            style::serialize_px(value)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `__computedStyleProp(id, name) -> string` — the computed value of CSS property `name` (kebab,
 /// lowercased by JS) for node `id`, or "" if there's no computed style (non-element / unknown id) or
 /// the property isn't tracked.
-pub(crate) fn prim_computed_style_prop(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_computed_style_prop(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 2));
     // A 4th truthy arg requests the *computed* value (computedStyleMap) rather than the resolved
     // value (getComputedStyle) — they differ for colors the forced-colors override replaced.
-    let raw = args.get(3).is_true();
+    let raw = matches!(args.get(3), Value::Bool(true));
     let get = |cs: &style::ComputedStyle| {
         if raw {
             cs.get_property_computed(&name)
@@ -618,6 +692,11 @@ pub(crate) fn prim_computed_style_prop(
             with_pseudo_style(&state, n, key, |cs| cs.map(get).unwrap_or_default())
         }
         (Some(n), style::GcsPseudo::Element) => {
+            let grid_axis_is_columns = match name.as_str() {
+                "grid-template-columns" => Some(true),
+                "grid-template-rows" => Some(false),
+                _ => None,
+            };
             // Inset longhands need the CSSOM resolved-value algorithm (position + containing
             // block), which reads more than one element's style — handle them via the cascade map.
             let inset_side = match name.as_str() {
@@ -645,7 +724,48 @@ pub(crate) fn prim_computed_style_prop(
             };
             // min-width / min-height: auto resolves to 0px, except a box with a preferred aspect
             // ratio or a flex/grid item keeps `auto`; a box-less element (no layout box) is 0px.
-            if matches!(name.as_str(), "min-width" | "min-height") {
+            if let Some(columns) = grid_axis_is_columns {
+                crate::forced_layout::ensure_layout_fresh(&state);
+                let item_count = state.doc.borrow().get(n).children.len();
+                with_computed_style(&state, n, |cs| {
+                    let Some(cs) = cs else {
+                        return String::new();
+                    };
+                    if !matches!(
+                        cs.display,
+                        style::Display::Grid | style::Display::InlineGrid
+                    ) {
+                        return cs.get_property(&name);
+                    }
+                    let tracks = if columns {
+                        &cs.grid_template_columns
+                    } else {
+                        &cs.grid_template_rows
+                    };
+                    if tracks.is_empty() {
+                        return "none".to_string();
+                    }
+                    let Some(&(_, _, width, height)) = state.layout_rects.borrow().get(&n.0) else {
+                        return cs.get_property(&name);
+                    };
+                    let available = if columns {
+                        width
+                            - cs.border.left
+                            - cs.border.right
+                            - cs.padding.left
+                            - cs.padding.right
+                    } else {
+                        height
+                            - cs.border.top
+                            - cs.border.bottom
+                            - cs.padding.top
+                            - cs.padding.bottom
+                    }
+                    .max(0.0);
+                    let gap = if columns { cs.column_gap } else { cs.row_gap };
+                    resolved_grid_tracks(tracks, available, gap, item_count, columns)
+                })
+            } else if matches!(name.as_str(), "min-width" | "min-height") {
                 with_cascade_map(&state, |doc, map| {
                     let cs = match map.get(&n) {
                         Some(c) => c,
@@ -780,11 +900,7 @@ pub(crate) fn computed_names_with_custom(cs: &style::ComputedStyle) -> Vec<Strin
 
 /// `__computedStyleNames(id) -> [name...]` — the property names with non-empty computed values for
 /// node `id` (backs `length`/`item(i)`/index access/iteration). Empty array for non-elements.
-pub(crate) fn prim_computed_style_names(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_computed_style_names(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 1));
     let state = host_state(scope);
@@ -802,11 +918,7 @@ pub(crate) fn prim_computed_style_names(
 }
 
 /// `__setAttr(id, name, val)`
-pub(crate) fn prim_set_attr(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_set_attr(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let value = arg_str(scope, &args, 2);
@@ -837,11 +949,7 @@ pub(crate) fn prim_set_attr(
 }
 
 /// `__removeAttr(id, name)`
-pub(crate) fn prim_remove_attr(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_remove_attr(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let state = host_state(scope);
@@ -872,11 +980,7 @@ pub(crate) fn prim_remove_attr(
 }
 
 /// `__attrNames(id) -> [name...]`
-pub(crate) fn prim_attr_names(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_attr_names(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let state = host_state(scope);
     let names: Vec<String> = node

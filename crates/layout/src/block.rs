@@ -172,13 +172,19 @@ pub(crate) fn layout_block(
     // Definite content height (box-sizing aware): `border-box` heights include padding+border, so
     // strip them. Set on the content rect now — BEFORE laying out children — so a percentage-height
     // child resolves against this box's definite height (threaded as the child's `containing.height`).
-    let definite_content_h = explicit_h.map(|h| {
-        if border_box {
-            (h - (padding.top + padding.bottom + border.top + border.bottom)).max(0.0)
-        } else {
-            h
-        }
-    });
+    let pb_v = padding.top + padding.bottom + border.top + border.bottom;
+    let definite_content_h = explicit_h
+        .map(|h| if border_box { (h - pb_v).max(0.0) } else { h })
+        .or_else(|| {
+            let cs = style_of(boxx, styles)?;
+            let ratio = cs.aspect_ratio.filter(|ratio| *ratio > 0.0)?;
+            explicit_w?;
+            Some(if border_box && !cs.aspect_ratio_auto {
+                ((content_width + pb_h) / ratio - pb_v).max(0.0)
+            } else {
+                (content_width / ratio).max(0.0)
+            })
+        });
     boxx.dimensions.content = Rect {
         x,
         y,
@@ -194,53 +200,66 @@ pub(crate) fn layout_block(
     // If this box is positioned (relative/absolute/fixed/sticky), it becomes the containing
     // block for its absolutely-positioned descendants. Update the context's `positioned` rect to
     // this box's padding box for children.
-    let child_ctx = if !matches!(position_of(boxx, styles), style::Position::Static) {
-        Ctx {
-            positioned: boxx.dimensions.padding_box(),
-            viewport: ctx.viewport,
-        }
-    } else {
-        ctx
-    };
+    let mut child_ctx = ctx;
+    if !matches!(position_of(boxx, styles), style::Position::Static) {
+        child_ctx.positioned = boxx.dimensions.padding_box();
+    }
+    if style_of(boxx, styles).is_some_and(|cs| cs.overflow_scrollport) {
+        child_ctx.scrollport = Some(boxx.dimensions.content);
+    }
 
     // Dispatch on the display mode of this box.
     let display = display_of(boxx, styles);
-    let content_height = match display {
-        style::Display::Flex | style::Display::InlineFlex => {
-            layout_flex(boxx, child_ctx, styles, measurer)
-        }
-        style::Display::Grid | style::Display::InlineGrid => {
-            layout_grid(boxx, child_ctx, styles, measurer)
-        }
-        style::Display::Table => layout_table(boxx, child_ctx, styles, measurer),
-        _ if style_of(boxx, styles)
-            .and_then(|cs| cs.column_count)
-            .is_some() =>
-        {
-            layout_multicol(boxx, child_ctx, styles, measurer)
-        }
-        _ => {
-            // Block / inline-block / (anonymous, root): normal block-or-inline formatting.
-            let any_block = boxx.children.iter().any(|c| {
-                matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
-                    || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
-                        && image_is_block(c, styles))
-            });
-            if any_block {
-                layout_block_children(boxx, child_ctx, styles, measurer)
-            } else if !boxx.children.is_empty() {
-                let align = text_align_of(boxx.node, styles);
-                let indent = text_indent_of(boxx.node, styles);
-                layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
-            } else {
-                0.0
+    let content_hidden = style_of(boxx, styles).is_some_and(|cs| {
+        cs.extra_properties
+            .get("content-visibility")
+            .is_some_and(|v| v == "hidden")
+    });
+    let content_height = if content_hidden {
+        0.0
+    } else {
+        match display {
+            style::Display::Flex | style::Display::InlineFlex => {
+                layout_flex(boxx, child_ctx, styles, measurer)
+            }
+            style::Display::Grid | style::Display::InlineGrid => {
+                layout_grid(boxx, child_ctx, styles, measurer)
+            }
+            style::Display::Table => layout_table(boxx, child_ctx, styles, measurer),
+            _ if style_of(boxx, styles)
+                .and_then(|cs| cs.column_count)
+                .is_some() =>
+            {
+                layout_multicol(boxx, child_ctx, styles, measurer)
+            }
+            _ => {
+                // Block / inline-block / (anonymous, root): normal block-or-inline formatting.
+                let any_block = boxx.children.iter().any(|c| {
+                    matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+                        || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
+                            && image_is_block(c, styles))
+                });
+                if any_block {
+                    layout_block_children(boxx, child_ctx, styles, measurer)
+                } else if !boxx.children.is_empty() {
+                    let align = text_align_of(boxx.node, styles);
+                    let indent = text_indent_of(boxx.node, styles);
+                    layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
+                } else {
+                    0.0
+                }
             }
         }
     };
 
     // A definite height (explicit px or resolved percentage, box-sizing already applied) wins over the
     // content-derived height.
-    let final_height = definite_content_h.unwrap_or(content_height);
+    let final_height = definite_content_h.unwrap_or_else(|| {
+        style_of(boxx, styles)
+            .filter(|cs| cs.contain_height)
+            .and_then(|cs| cs.contain_intrinsic_height)
+            .unwrap_or(content_height)
+    });
     // Clamp the used height to min-height / max-height (% against the containing block height).
     let final_height = clamp_height(boxx, final_height, containing.height, styles);
     boxx.dimensions.content.height = final_height;
@@ -258,6 +277,7 @@ pub(crate) fn layout_block(
         Ctx {
             positioned: boxx.dimensions.padding_box(),
             viewport: child_ctx.viewport,
+            scrollport: child_ctx.scrollport,
         }
     } else {
         child_ctx
@@ -265,12 +285,48 @@ pub(crate) fn layout_block(
     resolve_out_of_flow(boxx, resolve_ctx, styles, measurer);
 
     // Apply a `position: relative` offset (after normal flow, without affecting siblings).
-    apply_relative_offset(boxx, containing, styles);
+    apply_relative_offset(boxx, containing, ctx.scrollport, styles);
 }
 
-/// Lay out a block's block-level children top-to-bottom. Returns the total content height
-/// (sum of child margin-box heights). No margin collapsing (kept simple). Out-of-flow children
-/// are skipped here (they take no space) and resolved later.
+#[derive(Default)]
+struct CollapsingMargin {
+    largest_positive: f32,
+    smallest_negative: f32,
+}
+
+impl CollapsingMargin {
+    fn add(&mut self, margin: f32) {
+        self.largest_positive = self.largest_positive.max(margin);
+        self.smallest_negative = self.smallest_negative.min(margin);
+    }
+
+    fn value(&self) -> f32 {
+        self.largest_positive + self.smallest_negative
+    }
+
+    fn replace(&mut self, margin: f32) {
+        *self = Self::default();
+        self.add(margin);
+    }
+}
+
+fn margin_collapses_through(boxx: &LayoutBox) -> bool {
+    let d = boxx.dimensions;
+    d.content.height.abs() <= f32::EPSILON
+        && [
+            d.padding.top,
+            d.padding.bottom,
+            d.border.top,
+            d.border.bottom,
+        ]
+        .into_iter()
+        .all(|v| v.abs() <= f32::EPSILON)
+        && boxx.children.is_empty()
+}
+
+/// Lay out a block's block-level children top-to-bottom. Returns the total content height.
+/// Adjacent vertical margins collapse, including both margins of an empty block. Out-of-flow
+/// children are skipped here (they take no space) and resolved later.
 pub(crate) fn layout_block_children(
     boxx: &mut LayoutBox,
     ctx: Ctx,
@@ -303,7 +359,9 @@ pub(crate) fn layout_block_children(
         let lh = boxx.children[li].dimensions.margin_box().height;
         content_offset = (lh - boxx.dimensions.border.top).max(0.0);
     }
-    let mut cursor_y = content.y + content_offset;
+    let mut collapse_anchor = content.y + content_offset;
+    let mut pending_margin = CollapsingMargin::default();
+    let mut cursor_y = collapse_anchor;
     // Floats placed by this container (its own block formatting context). Empty for the common
     // float-free page, in which case every helper below is a cheap no-op and the flow is unchanged.
     let mut floats = FloatCtx::new(content.x, content.x + content.width);
@@ -317,14 +375,14 @@ pub(crate) fn layout_block_children(
 
         let float = float_of(child, styles);
         let clear = clear_of(child, styles);
-        // `clear` drops a box below the relevant earlier floats before it's placed.
-        let start_y = if floats.is_empty() {
-            cursor_y
-        } else {
-            floats.clear_to(clear, cursor_y)
-        };
 
         if float != style::Float::None {
+            // `clear` drops a float below the relevant earlier floats before it's placed.
+            let start_y = if floats.is_empty() {
+                cursor_y
+            } else {
+                floats.clear_to(clear, cursor_y)
+            };
             layout_float_child(
                 child,
                 content,
@@ -341,12 +399,25 @@ pub(crate) fn layout_block_children(
             continue;
         }
 
+        let collapsible = matches!(child.content, BoxContent::Block)
+            && !child_is_inline_level(child, styles)
+            && clear == style::Clear::None;
+        let child_top_margin = child.dimensions.margin.top;
+        if collapsible {
+            pending_margin.add(child_top_margin);
+            cursor_y = collapse_anchor + pending_margin.value() - child_top_margin;
+        } else {
+            cursor_y = collapse_anchor + pending_margin.value();
+        }
+        if !floats.is_empty() {
+            cursor_y = floats.clear_to(clear, cursor_y);
+        }
+
         // In-flow content stacks below previous siblings. A block-level box keeps the container's
         // FULL content width beside floats (per CSS, only its line boxes shorten — narrowing the box
         // would wrongly re-resolve a percentage `width` against the reduced band). But inline-level
         // content (inline-block/-flex/-grid, or an anonymous box holding inline content) flows
         // *beside* earlier floats, so we narrow its containing rect to the float band at this y.
-        cursor_y = start_y;
         let containing = if !floats.is_empty() && child_is_inline_level(child, styles) {
             // Query the band over a nominal 1px height at the top so a float starting exactly at this
             // y is detected; the inline content then begins at the band's left edge.
@@ -411,7 +482,20 @@ pub(crate) fn layout_block_children(
                 );
             }
         }
-        cursor_y += child.dimensions.margin_box().height;
+        if collapsible && margin_collapses_through(child) {
+            pending_margin.add(child.dimensions.margin.bottom);
+            cursor_y = collapse_anchor + pending_margin.value();
+        } else if collapsible {
+            // Use the normal-flow position, not the box's final y: relative/sticky positioning may
+            // have visually shifted its geometry but must not move following siblings.
+            collapse_anchor = cursor_y + child_top_margin + child.dimensions.border_box().height;
+            pending_margin.replace(child.dimensions.margin.bottom);
+            cursor_y = collapse_anchor + pending_margin.value();
+        } else {
+            collapse_anchor = cursor_y + child.dimensions.margin_box().height;
+            pending_margin = CollapsingMargin::default();
+            cursor_y = collapse_anchor;
+        }
     }
     // The container must be tall enough to contain its floats (it owns their formatting context).
     floats.max_bottom(cursor_y) - content.y
@@ -769,13 +853,30 @@ pub(crate) fn layout_out_of_flow(
     let inset_top = cs.top_spec.resolve_px(cb.height).or(cs.top);
     let inset_bottom = cs.bottom_spec.resolve_px(cb.height).or(cs.bottom);
 
-    let explicit_w = cs
+    let specified_w = cs
         .width
         .or_else(|| cs.width_pct.map(|p| (cb.width * p).max(0.0)));
-    let explicit_h = cs.height.or_else(|| {
+    let specified_h = cs.height.or_else(|| {
         cs.height_pct
             .filter(|_| cb.height > 0.0)
             .map(|p| (cb.height * p).max(0.0))
+    });
+    let own_h_edges = padding.left + padding.right + border.left + border.right;
+    let own_v_edges = padding.top + padding.bottom + border.top + border.bottom;
+    let border_box = cs.box_sizing == style::BoxSizing::BorderBox;
+    let explicit_w = specified_w.map(|width| {
+        if border_box {
+            (width - own_h_edges).max(0.0)
+        } else {
+            width
+        }
+    });
+    let explicit_h = specified_h.map(|height| {
+        if border_box {
+            (height - own_v_edges).max(0.0)
+        } else {
+            height
+        }
     });
 
     // Content width:
@@ -788,6 +889,12 @@ pub(crate) fn layout_out_of_flow(
         replaced_w
     } else if let Some(w) = explicit_w {
         w
+    } else if let (Some(height), Some(ratio)) = (explicit_h, cs.aspect_ratio) {
+        if border_box && !cs.aspect_ratio_auto {
+            ((height + own_v_edges) * ratio - own_h_edges).max(0.0)
+        } else {
+            (height * ratio).max(0.0)
+        }
     } else if let (Some(l), Some(r)) = (inset_left, inset_right) {
         (cb.width - l - r - horizontal).max(0.0)
     } else {
@@ -861,6 +968,7 @@ pub(crate) fn layout_out_of_flow(
     let child_ctx = Ctx {
         positioned: boxx.dimensions.padding_box(),
         viewport: ctx.viewport,
+        scrollport: ctx.scrollport,
     };
 
     let display = display_of(boxx, styles);
@@ -974,40 +1082,80 @@ pub(crate) fn layout_out_of_flow(
     let resolve_ctx = Ctx {
         positioned: boxx.dimensions.padding_box(),
         viewport: ctx.viewport,
+        scrollport: ctx.scrollport,
     };
     resolve_out_of_flow(boxx, resolve_ctx, styles, measurer);
 }
 
-/// Apply a `position: relative` offset to `boxx` and its whole subtree by the resolved
-/// (left/right, top/bottom) insets, without affecting siblings.
+/// Apply relative or sticky positioning to `boxx` and its whole subtree without affecting siblings.
 pub(crate) fn apply_relative_offset(
     boxx: &mut LayoutBox,
     containing: Rect,
+    scrollport: Option<Rect>,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) {
     let cs = match style_of(boxx, styles) {
         Some(cs) => cs,
         None => return,
     };
-    if cs.position != style::Position::Relative {
+    if !matches!(
+        cs.position,
+        style::Position::Relative | style::Position::Sticky
+    ) {
         return;
     }
     // Percentage insets resolve against the containing block (width for left/right, height for
     // top/bottom); `*_spec` carries them symbolically until now. Fall back to the pre-resolved px
     // field for any path that set only it (e.g. the `inset` shorthand).
-    let dx = if let Some(l) = cs.left_spec.resolve_px(containing.width).or(cs.left) {
-        l
-    } else if let Some(r) = cs.right_spec.resolve_px(containing.width).or(cs.right) {
-        -r
+    let inset_containing = if cs.position == style::Position::Sticky {
+        scrollport.unwrap_or(containing)
     } else {
-        0.0
+        containing
     };
-    let dy = if let Some(t) = cs.top_spec.resolve_px(containing.height).or(cs.top) {
-        t
-    } else if let Some(b) = cs.bottom_spec.resolve_px(containing.height).or(cs.bottom) {
-        -b
+    let left = cs.left_spec.resolve_px(inset_containing.width).or(cs.left);
+    let right = cs
+        .right_spec
+        .resolve_px(inset_containing.width)
+        .or(cs.right);
+    let top = cs.top_spec.resolve_px(inset_containing.height).or(cs.top);
+    let bottom = cs
+        .bottom_spec
+        .resolve_px(inset_containing.height)
+        .or(cs.bottom);
+    let (dx, dy) = if cs.position == style::Position::Sticky {
+        let margin_box = boxx.dimensions.margin_box();
+        let dx = if let Some(left) = left {
+            (inset_containing.x + left - margin_box.x)
+                .max(0.0)
+                .min(containing.x + containing.width - margin_box.x - margin_box.width)
+        } else if let Some(right) = right {
+            (inset_containing.x + inset_containing.width
+                - right
+                - (margin_box.x + margin_box.width))
+                .min(0.0)
+                .max(containing.x - margin_box.x)
+        } else {
+            0.0
+        };
+        let dy = if let Some(top) = top {
+            (inset_containing.y + top - margin_box.y)
+                .max(0.0)
+                .min(containing.y + containing.height - margin_box.y - margin_box.height)
+        } else if let Some(bottom) = bottom {
+            (inset_containing.y + inset_containing.height
+                - bottom
+                - (margin_box.y + margin_box.height))
+                .min(0.0)
+                .max(containing.y - margin_box.y)
+        } else {
+            0.0
+        };
+        (dx, dy)
     } else {
-        0.0
+        (
+            left.or_else(|| right.map(|r| -r)).unwrap_or(0.0),
+            top.or_else(|| bottom.map(|b| -b)).unwrap_or(0.0),
+        )
     };
     if dx != 0.0 || dy != 0.0 {
         shift_subtree(boxx, dx, dy);

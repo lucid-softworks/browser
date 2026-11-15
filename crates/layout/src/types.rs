@@ -132,6 +132,8 @@ pub struct PaintExtras {
     /// Uniform corner radius (px) for the background/border (0 = square). Lives here (rather than on
     /// the hot `PaintStyle`) to keep the per-box paint style small for deeply nested layouts.
     pub border_radius: f32,
+    /// Uniform radius percentage, resolved against the smaller border-box dimension at paint.
+    pub border_radius_pct: Option<f32>,
     /// A `mask-image` source (the icon technique), if any. When set, the painter composites the
     /// box's background through the mask's opaque (alpha) pixels. `None` = unmasked.
     pub mask_image: Option<style::MaskImage>,
@@ -173,11 +175,12 @@ impl Default for PaintStyle {
 impl PaintStyle {
     /// The uniform corner radius (px); 0 when no `border-radius` is set (it lives in [`PaintExtras`]
     /// to keep the common `PaintStyle` small).
-    pub fn border_radius(&self) -> f32 {
-        self.extras
-            .as_deref()
-            .map(|e| e.border_radius)
-            .unwrap_or(0.0)
+    pub fn border_radius_for(&self, width: f32, height: f32) -> f32 {
+        self.extras.as_deref().map_or(0.0, |e| {
+            e.border_radius_pct
+                .map(|p| p * width.min(height))
+                .unwrap_or(e.border_radius)
+        })
     }
 }
 

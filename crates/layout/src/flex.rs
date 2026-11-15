@@ -928,6 +928,7 @@ pub(crate) fn layout_flex_item_contents(
         Ctx {
             positioned: boxx.dimensions.padding_box(),
             viewport: ctx.viewport,
+            scrollport: ctx.scrollport,
         }
     } else {
         ctx

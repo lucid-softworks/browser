@@ -3,6 +3,7 @@ use crate::*;
 impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle {
+            extra_properties: Default::default(),
             // Initial text color: black on a light canvas, or a light grey when the root opted into
             // a dark `color-scheme` (resolved before the cascade — see `root_used_scheme_dark`). The
             // root inherits this, so every box gets themed default text unless author CSS overrides.
@@ -48,8 +49,16 @@ impl Default for ComputedStyle {
             width: None,
             width_pct: None,
             aspect_ratio_set: false,
+            aspect_ratio: None,
+            aspect_ratio_auto: false,
             height_pct: None,
             height: None,
+            width_authored: false,
+            height_authored: false,
+            contain_intrinsic_width: None,
+            contain_intrinsic_height: None,
+            contain_width: false,
+            contain_height: false,
             min_width: None,
             max_width: None,
             min_height: None,
@@ -65,13 +74,20 @@ impl Default for ComputedStyle {
             flex_direction: FlexDirection::Row,
             flex_wrap: FlexWrap::NoWrap,
             justify_content: JustifyContent::FlexStart,
+            justify_content_css: "normal".to_string(),
             align_items: AlignItems::Stretch,
+            align_items_css: "normal".to_string(),
+            justify_items: "normal".to_string(),
             align_content: None,
+            align_content_css: "normal".to_string(),
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
             flex_basis_pct: None,
+            flex_basis_css: "auto".to_string(),
             align_self: AlignSelf::Auto,
+            align_self_css: "auto".to_string(),
+            justify_self: "auto".to_string(),
             order: 0,
             row_gap: 0.0,
             column_gap: 0.0,
@@ -98,6 +114,7 @@ impl Default for ComputedStyle {
             vertical_align: VerticalAlign::Baseline,
             opacity: 1.0,
             border_radius: 0.0,
+            border_radius_pct: None,
             background_gradient: None,
             background_image_url: None,
             background_size: BgSize::Auto,
@@ -290,6 +307,72 @@ impl ComputedStyle {
         }
         // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
         let name = trimmed.to_ascii_lowercase();
+        if name == "white-space" && !self.extra_properties.contains_key("white-space") {
+            let collapse = self
+                .extra_properties
+                .get("white-space-collapse")
+                .map_or("collapse", String::as_str);
+            let wrap = self
+                .extra_properties
+                .get("text-wrap-mode")
+                .map_or("wrap", String::as_str);
+            return match (collapse, wrap) {
+                ("collapse", "wrap") => "normal".to_string(),
+                ("collapse", "nowrap") => "nowrap".to_string(),
+                ("preserve", "nowrap") => "pre".to_string(),
+                ("preserve", "wrap") => "pre-wrap".to_string(),
+                ("preserve-breaks", "wrap") => "pre-line".to_string(),
+                ("break-spaces", "wrap") => "break-spaces".to_string(),
+                _ => format!("{collapse} {wrap}"),
+            };
+        }
+        if name == "contain-intrinsic-size" && !self.extra_properties.contains_key(&name) {
+            let width = self.get_property("contain-intrinsic-width");
+            let height = self.get_property("contain-intrinsic-height");
+            return if width == height {
+                width
+            } else {
+                format!("{width} {height}")
+            };
+        }
+        if let Some(value) = self.extra_properties.get(&name) {
+            return value.clone();
+        }
+        let extra_initial = match name.as_str() {
+            "hanging-punctuation"
+            | "hyphens"
+            | "text-fit"
+            | "text-group-align"
+            | "word-space-transform" => Some("none"),
+            "hyphenate-character"
+            | "hyphenate-limit-chars"
+            | "line-break"
+            | "text-align-last"
+            | "text-justify"
+            | "text-wrap-style" => Some("auto"),
+            "text-autospace" => Some("normal"),
+            "overflow-wrap"
+            | "white-space-collapse"
+            | "word-break"
+            | "word-wrap"
+            | "text-spacing"
+            | "text-spacing-trim" => Some("normal"),
+            "tab-size" => Some("8"),
+            "text-align-all" => Some("start"),
+            "text-indent" | "word-spacing" => Some("0px"),
+            "text-wrap" | "text-wrap-mode" => Some("wrap"),
+            "contain-intrinsic-width"
+            | "contain-intrinsic-height"
+            | "contain-intrinsic-inline-size"
+            | "contain-intrinsic-block-size"
+            | "contain-intrinsic-size" => Some("none"),
+            "contain" => Some("none"),
+            "content-visibility" => Some("visible"),
+            _ => None,
+        };
+        if let Some(value) = extra_initial {
+            return value.to_string();
+        }
         // Color-valued properties we only store opaquely (fill, stroke, …): serialize from the map.
         if let Some(extra) = &self.extra_colors {
             if let Some(&c) = extra.get(&name) {
@@ -330,6 +413,8 @@ impl ComputedStyle {
                 Position::Sticky => "sticky",
             }
             .to_string(),
+            // Author `auto` is overridden by the UA rule while the element is outside the top layer.
+            "overlay" => "none".to_string(),
             // `content` is meaningful for pseudo-elements; `None` (no generated content) serializes
             // as the initial `normal`, otherwise as a quoted string.
             "content" => match &self.content {
@@ -384,7 +469,10 @@ impl ComputedStyle {
                 if self.font_variant_emoji_emoji { "emoji" } else { "text" }.to_string()
             }
             "opacity" => num(self.opacity),
-            "border-radius" => px(self.border_radius),
+            "border-radius" => self
+                .border_radius_pct
+                .map(|p| format!("{}%", num(p * 100.0)))
+                .unwrap_or_else(|| px(self.border_radius)),
 
             // --- typography ---
             "font-family" => self.font_family.clone().unwrap_or_default(),
@@ -543,35 +631,28 @@ impl ComputedStyle {
                 FlexWrap::WrapReverse => "wrap-reverse",
             }
             .to_string(),
-            "justify-content" => justify_content_str(self.justify_content).to_string(),
-            "align-items" => match self.align_items {
-                AlignItems::Stretch => "stretch",
-                AlignItems::FlexStart => "flex-start",
-                AlignItems::FlexEnd => "flex-end",
-                AlignItems::Center => "center",
-                AlignItems::Baseline => "baseline",
-                AlignItems::LastBaseline => "last baseline",
-            }
-            .to_string(),
-            "align-content" => match self.align_content {
-                Some(jc) => justify_content_str(jc).to_string(),
-                None => "normal".to_string(),
-            },
+            "flex-flow" => format!(
+                "{} {}",
+                self.get_property("flex-direction"),
+                self.get_property("flex-wrap")
+            ),
+            "justify-content" => self.justify_content_css.clone(),
+            "align-items" => self.align_items_css.clone(),
+            "justify-items" => self.justify_items.clone(),
+            "align-content" => self.align_content_css.clone(),
 
             // --- flex item ---
             "flex-grow" => num(self.flex_grow),
             "flex-shrink" => num(self.flex_shrink),
-            "flex-basis" => self.flex_basis.map(px).unwrap_or_else(|| "auto".to_string()),
-            "align-self" => match self.align_self {
-                AlignSelf::Auto => "auto",
-                AlignSelf::Stretch => "stretch",
-                AlignSelf::FlexStart => "flex-start",
-                AlignSelf::FlexEnd => "flex-end",
-                AlignSelf::Center => "center",
-                AlignSelf::Baseline => "baseline",
-                AlignSelf::LastBaseline => "last baseline",
-            }
-            .to_string(),
+            "flex-basis" => self.flex_basis_css.clone(),
+            "flex" => format!(
+                "{} {} {}",
+                num(self.flex_grow),
+                num(self.flex_shrink),
+                self.flex_basis_css
+            ),
+            "align-self" => self.align_self_css.clone(),
+            "justify-self" => self.justify_self.clone(),
             "order" => self.order.to_string(),
 
             // --- gaps ---
@@ -713,6 +794,12 @@ impl ComputedStyle {
         const NAMES: &[&str] = &[
             "display",
             "position",
+            "overlay",
+            "contain-intrinsic-size",
+            "contain-intrinsic-width",
+            "contain-intrinsic-height",
+            "contain-intrinsic-inline-size",
+            "contain-intrinsic-block-size",
             "color",
             "background-color",
             "border-color",
@@ -730,6 +817,30 @@ impl ComputedStyle {
             "text-align",
             "text-transform",
             "letter-spacing",
+            "word-spacing",
+            "text-indent",
+            "tab-size",
+            "hyphens",
+            "hyphenate-character",
+            "hyphenate-limit-chars",
+            "line-break",
+            "overflow-wrap",
+            "word-wrap",
+            "word-break",
+            "hanging-punctuation",
+            "text-align-all",
+            "text-align-last",
+            "text-autospace",
+            "text-fit",
+            "text-group-align",
+            "text-justify",
+            "text-spacing",
+            "text-spacing-trim",
+            "text-wrap",
+            "text-wrap-mode",
+            "text-wrap-style",
+            "white-space-collapse",
+            "word-space-transform",
             "line-height",
             "white-space",
             "list-style-type",
@@ -767,11 +878,13 @@ impl ComputedStyle {
             "flex-wrap",
             "justify-content",
             "align-items",
+            "justify-items",
             "align-content",
             "flex-grow",
             "flex-shrink",
             "flex-basis",
             "align-self",
+            "justify-self",
             "order",
             "row-gap",
             "column-gap",
