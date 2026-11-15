@@ -665,6 +665,222 @@ mod tests {
     }
 
     #[test]
+    fn absolute_font_size_keywords_parse() {
+        assert_eq!(parse_font_size("medium", 40.0), Some(16.0));
+        assert_eq!(parse_font_size("x-large", 40.0), Some(24.0));
+        // Absolute, so the parent size doesn't enter into it — unlike `smaller`/`larger`.
+        assert_eq!(parse_font_size("small", 100.0), Some(13.0));
+    }
+
+    #[test]
+    fn font_shorthand_cascades_size_before_relative_properties() {
+        for (decls, size, height) in [
+            ("font:20px/2 serif; font-size:30px", 30.0, 60.0),
+            ("font-size:30px; font:20px/2 serif", 20.0, 40.0),
+            ("font:20px/2 serif!important; font-size:30px", 20.0, 40.0),
+            ("font:20px/2 serif; font-size:30px!important", 30.0, 60.0),
+            ("font-size:30px!important; font:20px/2 serif", 30.0, 60.0),
+            (
+                "font:20px/2 serif!important; font-size:30px!important",
+                30.0,
+                60.0,
+            ),
+            (
+                "font-size:30px!important; font:20px/2 serif!important",
+                20.0,
+                40.0,
+            ),
+            ("font:20px/1.5em serif; font-size:30px", 30.0, 45.0),
+            ("font:20px/150% serif; font-size:30px", 30.0, 45.0),
+            ("line-height:2; font:20px/1.5 serif", 20.0, 30.0),
+            ("font:20px serif; line-height:2", 20.0, 40.0),
+        ] {
+            let cs = cs_of(
+                "<div>x</div>",
+                &format!("div {{ margin:1em; {decls} }}"),
+                |e| e.tag == "div",
+            );
+            assert_eq!(cs.font_size, size, "{decls}");
+            assert_eq!(cs.line_height, Some(height), "{decls}");
+            assert_eq!(
+                cs.get_property("margin-top"),
+                format!("{size}px"),
+                "{decls}"
+            );
+        }
+    }
+
+    #[test]
+    fn font_shorthand_prefix_categories_and_math() {
+        for prefix in ["bold normal", "normal bold", "normal normal bold normal"] {
+            let cs = cs_of(
+                "<div>x</div>",
+                &format!("div {{ font:{prefix} calc(10px + 2px)/calc(1em + 2px) serif }}"),
+                |e| e.tag == "div",
+            );
+            assert!(cs.bold, "{prefix}");
+            assert_eq!(cs.font_size, 12.0);
+            assert_eq!(cs.line_height, Some(14.0));
+        }
+    }
+
+    #[test]
+    fn font_shorthand_invalid_values_preserve_all_longhands() {
+        for value in [
+            "italic oblique 16px serif",
+            "bold 700 16px serif",
+            "condensed expanded 16px serif",
+            "small-caps small-caps 16px serif",
+            "normal normal normal bold italic 16px serif",
+            "-10px serif",
+            "infpx serif",
+            "NaNpx serif",
+            "10px/-1 serif",
+            "10px/-2px serif",
+            "10px/NaN serif",
+            "10px/infpx serif",
+        ] {
+            let cs = cs_of(
+                "<div>x</div>",
+                &format!("div {{ font:italic bold 18px/2 monospace; font:{value} }}"),
+                |e| e.tag == "div",
+            );
+            assert_eq!(
+                (cs.font_size, cs.line_height, cs.bold, cs.italic),
+                (18.0, Some(36.0), true, true),
+                "{value}"
+            );
+            assert_eq!(cs.font_family.as_deref(), Some("monospace"), "{value}");
+        }
+    }
+
+    #[test]
+    fn font_shorthand_sets_size_and_family() {
+        // The WPT idiom: without the shorthand these tests measure at the default 16px, so every
+        // Ahem-based geometry assertion in the suite silently compares the wrong numbers.
+        let sheet = css::parse("p { font: 10px/1 Ahem }");
+        let doc = html::parse("<html><body><p>t</p></body></html>");
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].font_size, 10.0);
+        assert_eq!(map[&p].font_family.as_deref(), Some("Ahem"));
+        // Unitless line-height multiplies this declaration's own size, not the one it replaced.
+        assert_eq!(map[&p].line_height, Some(10.0));
+    }
+
+    #[test]
+    fn font_shorthand_accepts_the_optional_prefixes() {
+        let sheet = css::parse(
+            "#a { font: italic bold 12px serif }\
+             #b { font: small-caps 700 condensed 2em / 150% \"Some Font\", sans-serif }\
+             #c { font: 16px sans-serif }",
+        );
+        let doc = html::parse("<html><body><p id=a>t</p><p id=b>t</p><p id=c>t</p></body></html>");
+        let map = cascade(&doc, &[sheet]);
+
+        let a = &map[&elem(&doc, |e| e.id() == Some("a"))];
+        assert_eq!((a.font_size, a.bold, a.italic), (12.0, true, true));
+
+        // Prefixes in any order, a numeric weight, an unmodelled stretch keyword, `em` size and a
+        // percentage line-height all in one; the quoted family keeps its case.
+        let b = &map[&elem(&doc, |e| e.id() == Some("b"))];
+        assert_eq!(b.font_size, 32.0);
+        assert!(b.bold);
+        assert_eq!(b.font_family.as_deref(), Some("Some Font, sans-serif"));
+        assert_eq!(b.line_height, Some(48.0));
+
+        // No prefixes and no line-height: both must come out at their initial values.
+        let c = &map[&elem(&doc, |e| e.id() == Some("c"))];
+        assert_eq!((c.bold, c.italic, c.line_height), (false, false, None));
+    }
+
+    #[test]
+    fn font_shorthand_resets_longhands_it_covers() {
+        // Being a shorthand, it must reset what it doesn't mention. Order matters: the longhands
+        // come first, so the shorthand overrides them.
+        let sheet = css::parse(
+            "p { font-weight: bold; font-style: italic; line-height: 3; font: 20px serif }",
+        );
+        let doc = html::parse("<html><body><p>t</p></body></html>");
+        let map = cascade(&doc, &[sheet]);
+        let p = &map[&elem(&doc, |e| e.tag == "p")];
+        assert!(!p.bold, "font shorthand should reset font-weight");
+        assert!(!p.italic, "font shorthand should reset font-style");
+        assert_eq!(
+            p.line_height, None,
+            "font shorthand should reset line-height"
+        );
+
+        // A longhand after the shorthand still wins.
+        let sheet = css::parse("p { font: 20px serif; font-weight: bold }");
+        let map = cascade(&doc, &[sheet]);
+        assert!(map[&elem(&doc, |e| e.tag == "p")].bold);
+    }
+
+    #[test]
+    fn invalid_font_shorthand_is_ignored_entirely() {
+        // Size and family are both required. A value missing either is invalid, and an invalid
+        // declaration must leave every longhand it would have set untouched — including the ones a
+        // partial parse would have been tempted to write.
+        for bad in [
+            "font: serif",       // no size
+            "font: 12px",        // no family
+            "font: bold serif",  // prefix but no size
+            "font: 12px/ serif", // slash with no line-height
+            "font: nonsense serif; ",
+        ] {
+            let sheet = css::parse(&format!(
+                "p {{ font-size: 30px; font-weight: bold; {bad} }}"
+            ));
+            let doc = html::parse("<html><body><p>t</p></body></html>");
+            let map = cascade(&doc, &[sheet]);
+            let p = &map[&elem(&doc, |e| e.tag == "p")];
+            assert_eq!(p.font_size, 30.0, "{bad:?} should not change font-size");
+            assert!(p.bold, "{bad:?} should not reset font-weight");
+        }
+    }
+
+    #[test]
+    fn font_shorthand_slash_spacing_variants_agree() {
+        let doc = html::parse("<html><body><p>t</p></body></html>");
+        for v in [
+            "10px/2 serif",
+            "10px/ 2 serif",
+            "10px /2 serif",
+            "10px / 2 serif",
+        ] {
+            let sheet = css::parse(&format!("p {{ font: {v} }}"));
+            let map = cascade(&doc, &[sheet]);
+            let p = &map[&elem(&doc, |e| e.tag == "p")];
+            assert_eq!(p.font_size, 10.0, "{v:?}");
+            assert_eq!(p.line_height, Some(20.0), "{v:?}");
+            assert_eq!(p.font_family.as_deref(), Some("serif"), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn font_shorthand_inherit_and_system_keywords() {
+        let sheet = css::parse(
+            "body { font: italic 24px/2 serif }\
+             #i { font: inherit }\
+             #s { font: menu }",
+        );
+        let doc = html::parse("<html><body><p id=i>t</p><p id=s>t</p></body></html>");
+        let map = cascade(&doc, &[sheet]);
+
+        let i = &map[&elem(&doc, |e| e.id() == Some("i"))];
+        assert_eq!(
+            (i.font_size, i.italic, i.line_height),
+            (24.0, true, Some(48.0))
+        );
+
+        // We can't ask the platform what `menu` is, so it lands on the UA default — but it still
+        // resets, rather than inheriting body's italic 24px.
+        let s = &map[&elem(&doc, |e| e.id() == Some("s"))];
+        assert_eq!((s.font_size, s.italic, s.line_height), (16.0, false, None));
+    }
+
+    #[test]
     fn margin_shorthand_one_value() {
         assert_eq!(parse_edges_shorthand("10px", 16.0), Some(Edges::all(10.0)));
     }

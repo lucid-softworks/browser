@@ -1189,21 +1189,30 @@ pub(crate) fn compute_element_style<'a>(
     // `font-size` must be resolved before any other declaration, because `em`-based values
     // (insets, line-height, edges…) compute against *this element's* font size regardless of
     // declaration order. Apply the winning `font-size` first, then everything else.
-    for m in &matches {
-        for (prop, val) in m.decls {
-            if prop.eq_ignore_ascii_case("font-size") {
-                let (val, _imp) = split_importance(val);
-                let resolved = resolve_vars(val, &vars);
-                let current_color = style.color;
-                apply_declaration(
-                    &mut style,
-                    prop,
-                    &resolved,
-                    parent,
-                    current_color,
-                    inherited_color,
-                    m.base,
-                );
+    for important_pass in [false, true] {
+        for m in &matches {
+            for (prop, val) in m.decls {
+                if prop.eq_ignore_ascii_case("font-size") || prop.eq_ignore_ascii_case("font") {
+                    let (val, important) = split_importance(val);
+                    if important != important_pass {
+                        continue;
+                    }
+                    let resolved = resolve_vars(val, &vars);
+                    // Only carry the size out: other shorthand longhands participate in their
+                    // ordinary cascade below, after the element's final size is known.
+                    let mut font = style.clone();
+                    let current_color = font.color;
+                    apply_declaration(
+                        &mut font,
+                        prop,
+                        &resolved,
+                        parent,
+                        current_color,
+                        inherited_color,
+                        m.base,
+                    );
+                    style.font_size = font.font_size;
+                }
             }
         }
     }
@@ -1218,6 +1227,12 @@ pub(crate) fn compute_element_style<'a>(
                 continue; // important declarations are applied in the final pass below
             }
             let resolved = resolve_vars(val, &vars);
+            if prop.eq_ignore_ascii_case("font") {
+                crate::declaration::apply_font_shorthand_preserving_size(
+                    &mut style, &resolved, parent,
+                );
+                continue;
+            }
             let current_color = style.color;
             apply_declaration(
                 &mut style,
@@ -1234,7 +1249,7 @@ pub(crate) fn compute_element_style<'a>(
     // cascade order so the most-specific/last important declaration takes effect.
     for m in &matches {
         for (prop, val) in m.decls {
-            if prop.starts_with("--") {
+            if prop.starts_with("--") || prop.eq_ignore_ascii_case("font-size") {
                 continue;
             }
             let (val, important) = split_importance(val);
@@ -1242,6 +1257,12 @@ pub(crate) fn compute_element_style<'a>(
                 continue;
             }
             let resolved = resolve_vars(val, &vars);
+            if prop.eq_ignore_ascii_case("font") {
+                crate::declaration::apply_font_shorthand_preserving_size(
+                    &mut style, &resolved, parent,
+                );
+                continue;
+            }
             let current_color = style.color;
             apply_declaration(
                 &mut style,
