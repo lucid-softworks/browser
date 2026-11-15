@@ -2407,6 +2407,63 @@ mod tests {
     }
 
     #[test]
+    fn auto_grid_row_honours_the_items_line_height() {
+        // An auto row takes the greater of the single-line intrinsic estimate and the item's
+        // laid-out height. The estimate came from the font metric alone, so a `line-height` shorter
+        // than that metric was overridden by the estimate and the row came out too tall — one line
+        // of 10px text with `line-height: 10px` gave a 13px row (10 × the stub's 1.3 factor).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let g = doc.append_element(body, "div");
+        let a = doc.append_element(g, "div");
+        doc.append_child(a, dom::NodeData::Text("XX".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            g,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                width: Some(200.0),
+                grid_template_columns: vec![style::TrackSize::Px(50.0)],
+                grid_template_rows: vec![style::TrackSize::Auto],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                font_size: 10.0,
+                line_height: Some(10.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        assert!(
+            (abox.dimensions.content.height - 10.0).abs() < 0.5,
+            "row should be the specified 10px line-height, got {}",
+            abox.dimensions.content.height
+        );
+
+        // Without a specified line-height the font metric is still the estimate, so the fix must not
+        // have replaced one hard-coded answer with another.
+        styles.get_mut(&a).unwrap().line_height = None;
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        assert!(
+            (abox.dimensions.content.height - 13.0).abs() < 0.5,
+            "`line-height: normal` should still use the font metric (13), got {}",
+            abox.dimensions.content.height
+        );
+    }
+
+    #[test]
     fn abspos_grid_child_percentage_size_uses_grid_area_containing_block() {
         let mut doc = dom::Document::new();
         let root = doc.root();
