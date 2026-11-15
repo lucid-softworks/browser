@@ -1704,6 +1704,28 @@ mod tests {
     }
 
     #[test]
+    fn xml_mixed_text_and_cdata_preserve_style_and_script_order() {
+        let doc = html::xml::parse_xml(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head>
+            <style>div { <![CDATA[color: green;]]> height: 3px; }</style>
+            <script>var before = 1;<![CDATA[var middle = before < 2;]]>var after = middle;</script>
+            </head><body></body></html>"#,
+        );
+        assert_eq!(
+            collect_style_sources(&doc, "https://example.com/"),
+            vec![StyleSource::Inline(
+                "div { color: green; height: 3px; }".into()
+            )]
+        );
+        assert_eq!(
+            collect_script_sources(&doc, "https://example.com/"),
+            vec![ScriptSource::Inline(
+                "var before = 1;var middle = before < 2;var after = middle;".into()
+            )]
+        );
+    }
+
+    #[test]
     fn xml_parsed_cdata_style_body_is_collected() {
         // The sibling test below covers a `.xht` served as `text/html`, where the lenient parser
         // leaves the CDATA markers in the text and they get stripped as a string. Served as
