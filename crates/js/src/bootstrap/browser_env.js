@@ -3144,7 +3144,18 @@
       for (var i = 0; i < d.length; i++) { if (isCustomProp(d[i][0]) || restrict(d[i][0])) out.push(d[i]); }
       return out;
     }
-    function read() { return filterDecls(parseStyleDecls(get())); }
+    // Reuse parsed declarations while the backing text is unchanged. In particular, a getter
+    // after setProperty must not scan a potentially megabyte-sized value again in JavaScript.
+    // Compare the live backing text on every read so setAttribute/removeAttribute stay visible.
+    var cachedText = null, cachedDecls = [];
+    function copyDecls(d) { return d.map(function (entry) { return entry.slice(); }); }
+    function remember(text, d) { cachedText = text; cachedDecls = copyDecls(filterDecls(d)); }
+    function read() {
+      var text = get();
+      if (text !== cachedText) remember(text, parseStyleDecls(text));
+      // Setters edit the returned triples before write() compares against the current value.
+      return copyDecls(cachedDecls);
+    }
     // The backing store holds the EXPANDED longhand form (engine-readable). Shorthand grouping is
     // applied only when serializing for the CSSOM `cssText` getter / `item`/`length` enumeration.
     // Only write when the serialized result actually differs from the current backing store: this
@@ -3160,12 +3171,15 @@
       // attribute or fire a spurious mutation record.
       if (next === serializeForStore(read())) return;
       set(next);
+      remember(next, d);
       try { globalThis.__scheduleMODelivery(); } catch (e) {}
     }
     // Like write(), but always writes (used by the cssText setter, which must reflect even an
     // equal-but-reparsed value as an attribute mutation per the WPT MutationObserver tests).
     function writeAlways(d) {
-      set(serializeForStore(d));
+      var next = serializeForStore(d);
+      set(next);
+      remember(next, d);
       try { globalThis.__scheduleMODelivery(); } catch (e) {}
     }
     // The serialized value of property `name` per CSSOM (shorthand serialization, custom verbatim).

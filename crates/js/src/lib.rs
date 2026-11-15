@@ -2224,6 +2224,48 @@ mod tests {
     }
 
     #[test]
+    fn inline_style_cached_reads_follow_attribute_changes_and_mutations() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var el = document.createElement('div'), s = el.style;
+                function check(ok, message) { if (!ok) throw new Error(message); }
+                var observer = new MutationObserver(function () {});
+                observer.observe(el, {attributes: true, attributeOldValue: true});
+                s.color = 'red';
+                check(s.color === 'red', 'setter/getter');
+                check(observer.takeRecords().length === 1, 'first setter writes');
+                s.color = 'red';
+                s.setProperty('not-a-property', 'invalid');
+                check(observer.takeRecords().length === 0, 'no-op setters do not write');
+                s.color = 'blue';
+                check(s.color === 'blue' && el.getAttribute('style') === 'color: blue;',
+                      'setter must not mutate cached comparison state');
+                check(observer.takeRecords().length === 1, 'changed setter writes');
+                el.setAttribute('style', 'color: green !important; margin: 1px 2px');
+                check(s.color === 'green' && s.getPropertyPriority('color') === 'important',
+                      'external attribute replacement');
+                check(s.marginLeft === '2px', 'external shorthand expansion');
+                check(s.removeProperty('color') === 'green' && s.color === '', 'remove property');
+                el.removeAttribute('style');
+                check(s.length === 0 && s.marginLeft === '', 'external attribute removal');
+                s.cssText = 'padding: 3px; color: red';
+                check(s.paddingTop === '3px' && s.color === 'red', 'cssText replaces cache');
+                observer.takeRecords();
+                s.cssText = s.cssText;
+                check(observer.takeRecords().length === 1, 'equal cssText still writes');
+                observer.disconnect();
+                'ok'
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("ok"));
+    }
+
+    #[test]
     fn inline_style_overflow_collapses_to_shorthand() {
         let (doc, _) = doc_with_body("");
         let (_d, out) = run_with_dom(
