@@ -30,7 +30,7 @@ BUILD_SHA="$5"
 [[ "$BUILD_SHA" =~ ^[0-9a-fA-F]{7,40}$ ]] || {
     echo "BUILD_SHA must be a Git commit hash." >&2; exit 2;
 }
-lipo -verify_arch "$ARCH" "$BINARY"
+lipo "$BINARY" -verify_arch "$ARCH"
 
 # A CI runner's Homebrew/build-directory dylib must never leak into the downloadable app.
 # The Rune executable is statically linked except for macOS system libraries/frameworks.
