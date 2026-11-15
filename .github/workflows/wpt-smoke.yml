@@ -29,6 +29,8 @@ env:
   WPT_REVISION: c0f2b11f490d5849bf4d48c276b68681e894b1fb
   CARGO_INCREMENTAL: 0
   CARGO_BUILD_JOBS: 2
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   run:
@@ -55,7 +57,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-source -> target
+          # This checkout has a different target path from the root CI/nightly builds.
           shared-key: wpt-smoke-${{ matrix.engine }}
+          cache-on-failure: true
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
