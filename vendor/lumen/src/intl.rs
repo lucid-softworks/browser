@@ -1,0 +1,453 @@
+//! A from-scratch subset of ECMA-402 (`Intl`). No external ICU/CLDR dependency: the locale data
+//! (aliases, number symbols, date patterns, …) is embedded as small Rust tables, grown as the
+//! intl402 test262 score climbs. The structural machinery — BCP-47 tag parsing/canonicalization,
+//! option coercion, locale negotiation — is complete; the per-locale data is a deliberate subset.
+
+use crate::interpreter::Interp;
+use crate::value::{set_builtin, Gc, Object, Property, Value};
+use std::rc::Rc;
+
+mod collator;
+mod data;
+mod datetimeformat;
+mod displaynames;
+mod durationformat;
+mod listformat;
+mod locale;
+mod numberformat;
+mod pluralrules;
+mod relativetimeformat;
+mod segmenter;
+mod service;
+mod tags;
+
+pub use tags::{canonicalize_language_tag, is_structurally_valid_tag};
+
+fn arg(args: &[Value], i: usize) -> Value {
+    args.get(i).cloned().unwrap_or(Value::Undefined)
+}
+
+/// Install `Intl` and its services on the global object.
+pub fn install(it: &mut Interp) {
+    let intl = Object::new(Some(it.object_proto.clone()));
+
+    // Intl[@@toStringTag] = "Intl" { writable:false, enumerable:false, configurable:true }.
+    if let Some(key) = crate::builtins::to_string_tag_key(it) {
+        intl.borrow_mut()
+            .props
+            .insert(key, Property::data(Value::str("Intl"), false, false, true));
+    }
+
+    // The per-realm %Intl%.[[FallbackSymbol]] backing the legacy constructed-instance behavior
+    // (kept in a holder object so it snapshots with the realm's extra_protos).
+    let fsym = it.new_symbol(Some("IntlLegacyConstructedSymbol".into()));
+    let holder = Object::new(None);
+    holder
+        .borrow_mut()
+        .props
+        .insert("sym", Property::data(fsym, false, false, false));
+    it.extra_protos.insert("%IntlFallbackSymbol%", holder);
+
+    // Intl.getCanonicalLocales(locales) — returns a fresh Array of canonicalized tags.
+    let f = it.make_native("getCanonicalLocales", 1, |i, _t, a| {
+        let list = canonicalize_locale_list(i, &arg(a, 0))?;
+        Ok(i.make_array(list.into_iter().map(Value::from_string).collect()))
+    });
+    set_builtin(&intl, "getCanonicalLocales", Value::Obj(f));
+
+    // Intl.supportedValuesOf(key).
+    let f = it.make_native("supportedValuesOf", 1, |i, _t, a| {
+        supported_values_of(i, &arg(a, 0))
+    });
+    set_builtin(&intl, "supportedValuesOf", Value::Obj(f));
+
+    locale::install(it, &intl);
+    listformat::install(it, &intl);
+    pluralrules::install(it, &intl);
+    relativetimeformat::install(it, &intl);
+    numberformat::install(it, &intl);
+    collator::install(it, &intl);
+    displaynames::install(it, &intl);
+    segmenter::install(it, &intl);
+    durationformat::install(it, &intl);
+    datetimeformat::install(it, &intl);
+
+    // Cache the service constructors as intrinsics: toLocaleString and friends delegate to
+    // %Intl.NumberFormat% etc. directly, so tainting the Intl globals can't break them.
+    for svc in [
+        "NumberFormat",
+        "DateTimeFormat",
+        "Collator",
+        "ListFormat",
+        "PluralRules",
+        "RelativeTimeFormat",
+        "DisplayNames",
+        "Segmenter",
+        "DurationFormat",
+        "Locale",
+    ] {
+        let ctor = intl.borrow().props.get(svc).map(|p| p.value());
+        if let Some(Value::Obj(c)) = ctor {
+            let key: &'static str = Box::leak(format!("%Intl.{svc}%").into_boxed_str());
+            it.extra_protos.insert(key, c);
+        }
+    }
+    it.global
+        .borrow_mut()
+        .props
+        .insert("Intl", Property::builtin(Value::Obj(intl)));
+}
+
+/// CanonicalizeLocaleList(locales): `undefined` → empty; a String is treated as a single-element
+/// list; otherwise an array-like whose elements must be Strings or Locale objects. Returns the
+/// deduplicated list of canonical tags (throwing RangeError on a structurally invalid tag).
+pub(crate) fn canonicalize_locale_list(
+    i: &mut Interp,
+    locales: &Value,
+) -> Result<Vec<String>, Value> {
+    let mut seen: Vec<String> = Vec::new();
+    if matches!(locales, Value::Undefined) {
+        return Ok(seen);
+    }
+    // A String or Locale value is a single-element list; otherwise iterate the array-like, reading
+    // and canonicalizing each element in turn (an element's ToString may mutate later indices).
+    match locales {
+        Value::Str(_) => process_locale_item(i, locales, &mut seen)?,
+        Value::Obj(o) if o.borrow().props.contains("__locale_tag") => {
+            process_locale_item(i, locales, &mut seen)?
+        }
+        Value::Null => return Err(i.make_error("TypeError", "Cannot convert null to object")),
+        _ => {
+            // CanonicalizeLocaleList does ToObject(locales) first, so a primitive (number, boolean,
+            // symbol) is boxed and its inherited `length`/indexed properties are read.
+            let obj = crate::builtins::box_primitive_pub(i, locales.clone());
+            let lenv = ab(i.get_member(&obj, "length"))?;
+            let len = to_length(i, &lenv)?;
+            for k in 0..len {
+                let key = k.to_string();
+                if ab(i.js_has_property(&obj, &key))? {
+                    let item = ab(i.get_member(&obj, &key))?;
+                    process_locale_item(i, &item, &mut seen)?;
+                }
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// Canonicalize one locale-list element (a String, Locale, or Object) and append it (deduplicated).
+fn process_locale_item(i: &mut Interp, item: &Value, seen: &mut Vec<String>) -> Result<(), Value> {
+    let tag = match item {
+        Value::Obj(o) if o.borrow().props.contains("__locale_tag") => {
+            match o.borrow().props.get("__locale_tag").map(|p| p.value()) {
+                Some(Value::Str(s)) => s.to_string(),
+                _ => String::new(),
+            }
+        }
+        Value::Str(_) | Value::Obj(_) => {
+            let s = ab(i.to_string(item))?;
+            if !is_structurally_valid_tag(&s) {
+                return Err(i.make_error(
+                    "RangeError",
+                    format!("Incorrect locale information provided: {s}"),
+                ));
+            }
+            match canonicalize_language_tag(&s) {
+                Some(c) => c,
+                None => {
+                    return Err(i.make_error(
+                        "RangeError",
+                        format!("Incorrect locale information provided: {s}"),
+                    ));
+                }
+            }
+        }
+        _ => return Err(i.make_error("TypeError", "locale must be a string or object")),
+    };
+    if !seen.contains(&tag) {
+        seen.push(tag);
+    }
+    Ok(())
+}
+
+fn supported_values_of(i: &mut Interp, key: &Value) -> Result<Value, Value> {
+    let k = ab(i.to_string(key))?;
+    // The `timeZone` list is every canonical IANA zone; the others are static. SupportedValuesOf must
+    // return a sorted array with no duplicates.
+    if &*k == "timeZone" {
+        // Etc/GMT and Etc/UTC canonicalize to "UTC" and must not appear themselves.
+        let mut zs: Vec<&str> = crate::tz::canonical_zone_names();
+        zs.retain(|z| *z != "Etc/GMT" && *z != "Etc/UTC");
+        if !zs.contains(&"UTC") {
+            zs.push("UTC");
+        }
+        zs.sort_unstable();
+        zs.dedup();
+        return Ok(i.make_array(zs.iter().map(|s| Value::str(*s)).collect()));
+    }
+    if &*k == "numberingSystem" {
+        // Every numeric system with a simple digit mapping, plus latn.
+        let mut ns: Vec<&str> = crate::numbering::NUMBERING
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        ns.push("latn");
+        ns.sort_unstable();
+        return Ok(i.make_array(ns.iter().map(|s| Value::str(*s)).collect()));
+    }
+    let vals: &[&str] = match &*k {
+        // "islamic" and "islamic-rgsa" resolve to islamic-civil, so they are not fixed points
+        // of DateTimeFormat and are excluded (the era/monthCode proposal's required set).
+        "calendar" => &[
+            "buddhist",
+            "chinese",
+            "coptic",
+            "dangi",
+            "ethioaa",
+            "ethiopic",
+            "gregory",
+            "hebrew",
+            "indian",
+            "islamic-civil",
+            "islamic-tbla",
+            "islamic-umalqura",
+            "iso8601",
+            "japanese",
+            "persian",
+            "roc",
+        ],
+        // Exactly the collations some locale's Collator resolves (see collator::supported_collation).
+        "collation" => &[
+            "big5han", "compat", "dict", "emoji", "eor", "gb2312", "phonebk", "phonetic", "pinyin",
+            "reformed", "searchjl", "stroke", "trad", "unihan", "zhuyin",
+        ],
+        "currency" => &["USD", "EUR", "GBP", "JPY", "CNY"],
+        "numberingSystem" => &[
+            "adlm", "ahom", "arab", "arabext", "bali", "beng", "deva", "fullwide", "gujr", "guru",
+            "hanidec", "khmr", "knda", "laoo", "latn", "mlym", "mymr", "orya", "tamldec", "telu",
+            "thai", "tibt",
+        ],
+        "unit" => &crate::units::SANCTIONED_UNITS,
+        _ => return Err(i.make_error("RangeError", format!("invalid key: {k}"))),
+    };
+    let mut v: Vec<&str> = vals.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    Ok(i.make_array(v.iter().map(|s| Value::str(*s)).collect()))
+}
+
+// ----- shared helpers used across the intl services --------------------------------------------
+
+/// Map an interpreter `Abrupt` to the native `Result<_, Value>` contract.
+pub(crate) fn ab<T>(r: Result<T, crate::interpreter::Abrupt>) -> Result<T, Value> {
+    r.map_err(|a| match a {
+        crate::interpreter::Abrupt::Throw(v) => v,
+        _ => Value::Undefined,
+    })
+}
+
+/// Build a constructor/prototype pair with the given `@@toStringTag`, install it on `ns`.
+pub(crate) fn make_service(
+    it: &mut Interp,
+    ns: &Gc,
+    name: &'static str,
+    len: usize,
+    ctor_fn: crate::value::NativeFn,
+) -> (Gc, Gc) {
+    let proto = Object::new(Some(it.object_proto.clone()));
+    let ctor = it.make_native(name, len, ctor_fn);
+    ctor.borrow_mut().is_constructor = true;
+    ctor.borrow_mut().props.insert(
+        "prototype",
+        Property::data(Value::Obj(proto.clone()), false, false, false),
+    );
+    proto
+        .borrow_mut()
+        .props
+        .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
+    if let Some(key) = crate::builtins::to_string_tag_key(it) {
+        proto.borrow_mut().props.insert(
+            key,
+            Property::data(Value::str(format!("Intl.{name}")), false, false, true),
+        );
+    }
+    it.extra_protos.insert(
+        Box::leak(format!("Intl.{name}").into_boxed_str()),
+        proto.clone(),
+    );
+    set_builtin(ns, name, Value::Obj(ctor.clone()));
+    (ctor, proto)
+}
+
+/// UnwrapNumberFormat / UnwrapDateTimeFormat: a receiver without the brand may carry a legacy
+/// chained instance under the realm's %Intl%.[[FallbackSymbol]].
+pub(crate) fn brand_slot_legacy(
+    i: &mut Interp,
+    this: &Value,
+    marker: &str,
+    proto_key: &str,
+) -> Result<Gc, Value> {
+    if let Some(o) = this.as_obj() {
+        if o.borrow().props.contains(marker) {
+            return Ok(o.clone());
+        }
+        let symv = i
+            .extra_protos
+            .get("%IntlFallbackSymbol%")
+            .and_then(|h| h.borrow().props.get("sym").map(|p| p.value()));
+        if let Some(Value::Sym(sd)) = symv {
+            if inherits_service_proto(i, o, proto_key) {
+                let key = crate::interpreter::Interp::sym_key(&sd);
+                let v = ab(i.get_member(this, &key))?;
+                if let Some(inner) = v.as_obj() {
+                    if inner.borrow().props.contains(marker) {
+                        return Ok(inner.clone());
+                    }
+                }
+            }
+        }
+    }
+    Err(i.make_error("TypeError", "method called on an incompatible receiver"))
+}
+
+/// Whether `o` inherits from the service prototype registered under `proto_key`.
+fn inherits_service_proto(i: &Interp, o: &Gc, proto_key: &str) -> bool {
+    let proto = match i.extra_protos.get(proto_key) {
+        Some(p) => p.clone(),
+        None => return false,
+    };
+    let mut cur = o.borrow().proto.clone();
+    for _ in 0..64 {
+        match cur {
+            Some(p) => {
+                if Rc::ptr_eq(&p, &proto) {
+                    return true;
+                }
+                cur = p.borrow().proto.clone();
+            }
+            None => break,
+        }
+    }
+    false
+}
+
+/// The legacy Intl-constructor chain behavior (%Intl%.[[FallbackSymbol]]): when a service
+/// constructor is *called* on an object inheriting from its prototype, the fresh instance is
+/// defined on that object under the realm's fallback symbol and the object itself is returned.
+pub(crate) fn legacy_chain(
+    i: &mut Interp,
+    this: &Value,
+    proto_key: &str,
+    instance: &Gc,
+) -> Option<Value> {
+    let this_o = this.as_obj()?;
+    if !inherits_service_proto(i, this_o, proto_key) {
+        return None;
+    }
+    let symv = i
+        .extra_protos
+        .get("%IntlFallbackSymbol%")?
+        .borrow()
+        .props
+        .get("sym")
+        .map(|p| p.value());
+    match symv {
+        Some(Value::Sym(sd)) => {
+            this_o.borrow_mut().props.insert(
+                crate::interpreter::Interp::sym_key(&sd),
+                Property::data(Value::Obj(instance.clone()), false, false, false),
+            );
+            Some(this.clone())
+        }
+        _ => None,
+    }
+}
+
+// (get_string_option removed; per-service option readers live in each module)
+
+/// GetOption(options, property, "boolean", …).
+#[allow(dead_code)]
+pub(crate) fn get_boolean_option(
+    i: &mut Interp,
+    options: &Value,
+    property: &str,
+    fallback: bool,
+) -> Result<bool, Value> {
+    let v = ab(i.get_member(options, property))?;
+    if matches!(v, Value::Undefined) {
+        return Ok(fallback);
+    }
+    Ok(i.to_boolean(&v))
+}
+
+/// CoerceOptionsToObject: `undefined` → a fresh ordinary object; an object is used as-is; `null`
+/// throws; other primitives yield an empty object (their reads fall through to option defaults).
+pub(crate) fn coerce_options(i: &mut Interp, options: &Value) -> Result<Value, Value> {
+    match options {
+        // CoerceOptionsToObject(undefined) = OrdinaryObjectCreate(null): a null-prototype object, so
+        // option reads never observe Object.prototype pollution.
+        Value::Undefined => Ok(Value::Obj(Object::new(None))),
+        Value::Obj(_) => Ok(options.clone()),
+        Value::Null => Err(i.make_error("TypeError", "options cannot be null")),
+        // CoerceOptionsToObject: a primitive is ToObject-boxed (so inherited properties are read).
+        _ => Ok(crate::builtins::box_primitive_pub(i, options.clone())),
+    }
+}
+
+/// GetOptionsObject: `undefined` → a fresh null-prototype object; an object is used as-is; any other
+/// value is a TypeError. Used by the newer services (ListFormat, PluralRules, …).
+pub(crate) fn get_options_object(i: &mut Interp, options: &Value) -> Result<Value, Value> {
+    match options {
+        Value::Undefined => Ok(Value::Obj(Object::new(None))),
+        Value::Obj(_) => Ok(options.clone()),
+        _ => Err(i.make_error("TypeError", "options must be an object or undefined")),
+    }
+}
+
+/// ToLength on an already-evaluated value.
+pub(crate) fn to_length(i: &mut Interp, v: &Value) -> Result<usize, Value> {
+    let n = ab(i.to_number(v))?;
+    if n.is_nan() || n <= 0.0 {
+        return Ok(0);
+    }
+    Ok(n.min(9007199254740991.0) as usize)
+}
+
+/// Install a getter-only accessor on `proto`.
+pub(crate) fn def_getter(it: &mut Interp, proto: &Gc, name: &str, f: crate::value::NativeFn) {
+    let g = it.make_native(&format!("get {name}"), 0, f);
+    proto.borrow_mut().props.insert(
+        name,
+        Property::accessor_prop(Some(Value::Obj(g)), None, false, true),
+    );
+}
+
+#[allow(dead_code)]
+pub(crate) fn install_service_common(it: &mut Interp, ctor: &Gc, proto: &Gc) {
+    // Intl.<Service>.supportedLocalesOf(locales, options).
+    let f = it.make_native("supportedLocalesOf", 1, |i, _t, a| {
+        let requested = canonicalize_locale_list(i, &arg(a, 0))?;
+        // A minimal (best-fit == lookup) matcher: `en` and any exactly-supported tag pass through.
+        let out: Vec<Value> = requested
+            .into_iter()
+            .filter(|t| locale::is_supported(t))
+            .map(Value::from_string)
+            .collect();
+        Ok(i.make_array(out))
+    });
+    ctor.borrow_mut()
+        .props
+        .insert("supportedLocalesOf", Property::builtin(Value::Obj(f)));
+
+    // resolvedOptions / the per-service format methods are attached by each service; here we just
+    // ensure `prototype` is non-configurable already (done in make_service).
+    let _ = proto;
+}
+
+#[allow(dead_code)]
+pub(crate) fn tag_of_str(v: &Value) -> Option<Rc<str>> {
+    match v {
+        Value::Str(s) => Some(s.clone().into()),
+        _ => None,
+    }
+}

@@ -1,0 +1,64 @@
+[package]
+name = "lumen"
+version = "0.1.3"
+edition = "2021"
+license = "MIT"
+
+# A from-scratch JavaScript engine. No dependencies — std only — so it builds in ~1s and links no
+# native code (the opposite of V8). It is the eventual replacement for the `v8` backend in the `js`
+# crate; today it covers the language core and is driven by the test262 conformance loop. See the
+# `js` crate's `backend-lumen` feature for how it slots in.
+
+[dependencies]
+
+[features]
+default = ["intl", "temporal"]
+# ECMA-402 (`Intl`) and the CLDR data tables backing it — the single largest contributor to
+# binary size. Disable (`--no-default-features`) for a small build: the `Intl` global is absent
+# and the `toLocale*` methods degrade to their locale-independent forms (like engines built
+# without i18n support).
+intl = []
+# TC39 Temporal globals and Date.prototype.toTemporalInstant. Default-on for compatibility;
+# embedders that do not need the proposal can exclude the public surface with
+# `--no-default-features` or `--no-default-features --features intl`.
+temporal = []
+# The curated embedder surface (`lumen::embed`: Ctx, host state, define_global, event-loop
+# hooks) used by the lumen-host/lumen-runtime crates. Off by default: everything under it is a
+# public-API commitment on a published crate, gated until it stabilizes with those crates.
+embed = []
+# Exposes internal compilation stages (`lumen::bench_api`) for the `internals` benchmark. Not a
+# stability commitment — for measurement only.
+bench = []
+
+[lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+doc_lazy_continuation = "allow"
+needless_range_loop = "allow"
+
+# Std-only benchmark harness (see benches/support/harness.rs) — no third-party bench crate.
+[[bench]]
+name = "engine"
+harness = false
+
+[[bench]]
+name = "collections"
+harness = false
+
+[[bench]]
+name = "jit_boundaries"
+harness = false
+
+[[bench]]
+name = "array_elements"
+harness = false
+
+[[bench]]
+name = "typed_array_stores"
+harness = false
+
+# Internal-stage benchmarks (lexer/parser/snapshot). Needs the `bench` feature for `bench_api`.
+[[bench]]
+name = "internals"
+harness = false
+required-features = ["bench"]

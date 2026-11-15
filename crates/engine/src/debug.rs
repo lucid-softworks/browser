@@ -1,6 +1,12 @@
 use crate::*;
 
 impl Engine {
+    /// Whether the current page's JavaScript was stopped by a deadline or host cancellation.
+    pub fn script_execution_stopped(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(js::Session::execution_stopped)
+    }
     /// Visible text of the currently-loaded document (empty if none). Handy for tests/diagnostics.
     pub fn visible_text(&self) -> String {
         match &self.state {

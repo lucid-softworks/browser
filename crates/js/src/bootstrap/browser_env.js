@@ -1508,41 +1508,10 @@
     // `counter(name, decimal)` / `counters(name, sep, decimal)`: the default `decimal` style is
     // omitted on serialization.
     val = val.replace(/counter\(\s*([^,)]+?)\s*,\s*decimal\s*\)/gi, function (_m, nm) { return "counter(" + nm.trim() + ")"; });
-    var out = "";
-    var i = 0, n = val.length;
-    // Sticky number matcher: anchored at `lastIndex`, so we never slice the tail of `val` (which
-    // would make this loop O(n²) — a 1.8MB value, e.g. grid-template-columns-crash.html, then hangs).
-    var numRe = /[-+]?(?:\d+\.?\d*|\.\d+)/y;
-    while (i < n) {
-      var ch = val[i];
-      // Skip quoted strings verbatim (property-specific quote canonicalization happens in pushDecl).
-      if (ch === '"' || ch === "'") {
-        var q = ch; out += ch; i++;
-        while (i < n && val[i] !== q) { if (val[i] === "\\" && i + 1 < n) { out += val[i] + val[i + 1]; i += 2; continue; } out += val[i]; i++; }
-        if (i < n) { out += val[i]; i++; }
-        continue;
-      }
-      // A number token: optional sign, digits with optional single decimal point.
-      numRe.lastIndex = i;
-      var m = numRe.exec(val);
-      if (m && m[0].length > 0) {
-        // Only treat as a number if not part of an identifier (preceding char isn't a letter/_).
-        // Read the preceding char from `val` (O(1)), NOT `out[out.length-1]` — indexing the growing
-        // result rope per number token forces repeated flattening, making this O(n²) (a 1.8MB
-        // grid-template-columns value then hangs). `val` is fixed for the loop and number
-        // normalization never adds/removes letters, so `val[i-1]` is an equivalent predecessor.
-        var prev = i > 0 ? val[i - 1] : "";
-        var startsAlpha = /[A-Za-z_]/.test(prev);
-        if (!startsAlpha) {
-          out += normalizeNumberToken(m[0]);
-          i += m[0].length;
-          continue;
-        }
-      }
-      out += ch; i++;
-    }
-    return out;
+    // Numeric scanning crosses the host boundary once, so large grid values stay linear.
+    return __normalizeCssNumbers(val);
   }
+
   // Re-quote every top-level CSS string in `val` to double-quote form (CSSOM "serialize a string").
   // Used for properties whose <string> values are always quoted on serialization (content, quotes).
   function requoteStrings(val) {
@@ -7724,7 +7693,7 @@
     var anyActive = globalThis.__moRegistry.some(function (e) { return e.targets.length; });
     if (!anyActive) { return; }
     globalThis.__moMicrotaskQueued = true;
-    // Use a native (V8) microtask via Promise.resolve().then so delivery interleaves with the page's
+    // Use a native Promise microtask via Promise.resolve().then so delivery interleaves with the page's
     // own `await Promise.resolve()` continuations (the polyfilled queueMicrotask runs on a separate,
     // later-drained queue).
     try {
@@ -10441,12 +10410,13 @@
       Object.defineProperty(IFP, "contentDocument", {
         get: function () {
           // A loaded frame (real nested realm) exposes its own parsed document. Wrap it so
-          // `contentDocument.defaultView` is the contentWindow proxy: the raw frame window can't be
-          // read across realms (V8 access check → "no access"), but the proxy reads via __frameGet.
-          if (this.__frameLoadedKey && this.__frameLoadedKey !== "about:blank" && typeof __frameGet === "function") {
+          // `contentDocument.defaultView` is the contentWindow proxy. Native origin checks
+          // deny access to foreign or sandboxed documents.
+          if (this.__frameLoadedKey && typeof __frameGet === "function") {
             try {
               var rdoc = __frameGet(this.__node, "document");
-              if (rdoc) {
+              if (!rdoc) { return null; }
+              if (this.__frameLoadedKey !== "about:blank") {
                 var elc = this;
                 if (typeof globalThis.Proxy === "function") {
                   if (!elc.__cdocWrap) {
@@ -10458,7 +10428,7 @@
                 }
                 return rdoc;
               }
-            } catch (e) {}
+            } catch (e) { return null; }
           }
           if (!this.__cdoc) {
             var body = document.createElement("body");
@@ -10536,7 +10506,7 @@
 
   // --- Real iframe browsing contexts -------------------------------------------------------
   // When an <iframe> has a src/srcdoc, load it as a REAL nested context (crates/js/src/iframe.rs):
-  // the frame's document + scripts run in their own V8 realm with their own window/performance/fetch.
+  // the frame's document + scripts run in their own Lumen realm with their own window/performance/fetch.
   // We trigger the load on src/srcdoc assignment and on connection, fire load/error here, and bridge
   // cross-frame postMessage. contentWindow returns the real bridge for loaded frames (falling back to
   // the lightweight facade above for srcdoc-via-document.write frames that have no realm).
@@ -11241,7 +11211,7 @@
     });
   }
   // --- Dedicated Workers --------------------------------------------------------------------
-  // A dedicated worker runs in its OWN V8 context (a real, separate global object) in the page's
+  // A dedicated worker runs in its OWN Lumen realm (a real, separate global object) in the page's
   // isolate, created and driven from Rust (crates/js/src/worker.rs + bootstrap/worker_env.js): `new
   // Worker(url)` calls the `__workerCreate` native, which builds the worker context, installs the
   // browser environment + a worker overlay, and runs the worker script there. Because the worker
@@ -12495,7 +12465,7 @@
     // via a memory map, and throws DataCloneError for non-cloneable values (functions, symbols, DOM
     // nodes, exotic objects) the way the spec requires — instead of the old JSON round-trip that
     // silently dropped Maps/Sets/cycles and returned the original on failure. Transfer-list
-    // ArrayBuffers are copied into the result and detached through the V8 host primitive only after
+    // ArrayBuffers are copied into the result and detached through the Lumen host primitive only after
     // the graph has been cloned, so typed-array metadata remains readable during traversal.
     def(globalThis, "structuredClone", function (value, options) {
       var seen = new Map();
@@ -13223,10 +13193,13 @@
     return out;
   });
 
-  // crypto: real OS randomness via the __cryptoRandom native (falls back to a PRNG if unavailable).
+  // crypto: platform CSPRNG via the host; failure must never produce predictable bytes.
   function __randBytes(n) {
-    try { var b = __cryptoRandom(n); if (b && b.length === n) { return b; } } catch (e) {}
-    var out = []; for (var i = 0; i < n; i++) { out.push((Math.floor((i * 2654435761) % 256)) || 1); } return out;
+    var bytes = __cryptoRandom(n);
+    if (!bytes || bytes.length !== n) {
+      throw new DOMException("Secure randomness is unavailable", "OperationError");
+    }
+    return bytes;
   }
   globalThis.crypto = {
     getRandomValues: function (arr) {

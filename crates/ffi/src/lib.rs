@@ -163,7 +163,7 @@ pub unsafe extern "C" fn browser_engine_scroll_by(engine: *mut Engine, dy: f32) 
     }
 }
 
-/// V8 heap used by this tab's JS, in bytes (0 if no live session). For the tab tooltip.
+/// JS heap bytes, currently 0 because Lumen does not expose heap accounting. For the tab tooltip.
 ///
 /// # Safety
 /// `engine` must be a valid handle from [`browser_engine_new`].

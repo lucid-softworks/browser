@@ -48,7 +48,20 @@ fi
 #    sparse checkout pulls it into the working tree instead of silently finding 0 tests.
 #    `images` holds shared raster test images (e.g. /images/blue.png) that reftests load as CSS
 #    backgrounds / `<img>` / `<object>` sources.
-( cd "$WPT" && git sparse-checkout add tools third_party docs resources common css/support fonts quirks interfaces images "${TESTS[@]}" >/dev/null 2>&1 || true )
+# Cone mode with a file path includes sibling files but omits sibling resource directories.
+# Check out each selected file's containing directory so ./resources fixtures are available.
+CHECKOUT=()
+for test in "${TESTS[@]}"; do
+  path="${test%%\?*}"
+  path="${path#/}"
+  case "$path" in
+    *.html|*.htm|*.xhtml|*.svg|*.js|*.xml|*.py) path="$(dirname "$path")" ;;
+  esac
+  CHECKOUT+=("$path")
+done
+if [ "$(git -C "$WPT" config --get core.sparseCheckout || true)" = true ]; then
+  ( cd "$WPT" && git sparse-checkout add --skip-checks tools third_party docs resources common css/support fonts quirks interfaces images "${CHECKOUT[@]}" )
+fi
 
 # 2. Install our product into the checkout's wptrunner.browsers package (the checkout is gitignored,
 #    so the canonical copy lives in tools/wpt/). Register the product name in BUILTIN_PRODUCTS.
