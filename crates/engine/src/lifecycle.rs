@@ -2,7 +2,13 @@ use crate::*;
 
 impl Engine {
     pub fn new() -> Self {
+        let js_context = js::HostContext::default();
+        {
+            let _host = js_context.enter();
+            js::set_device_metrics(800, 600, 1.0);
+        }
         Engine {
+            js_context,
             vp_w: 800,
             vp_h: 600,
             scale: 1.0,
@@ -34,6 +40,32 @@ impl Engine {
         }
     }
 
+    /// Set the default page font from host-supplied TrueType/OpenType or WOFF2 bytes.
+    /// Desktop shells can bundle a font instead of relying on OS-specific discovery paths.
+    /// Invalid data leaves the current font and rendered frame unchanged.
+    pub fn set_font_data(&mut self, bytes: Vec<u8>) -> bool {
+        let _host = self.js_context.enter();
+        let bytes = if bytes.starts_with(b"wOF2") {
+            let Some(decoded) = crate::woff2::decode(&bytes) else {
+                return false;
+            };
+            decoded
+        } else {
+            bytes
+        };
+        let Some(font) = SystemFont::from_bytes(bytes.clone()) else {
+            return false;
+        };
+        js::set_font_data(bytes);
+        self.font = Some(font);
+        self.layout_cache = None;
+        self.framebuffer = None;
+        // Canvas/SVG text and geometry may have used the old default face. Rebuild on render.
+        self.canvas_bitmaps.clear();
+        self.svg_bitmaps.clear();
+        true
+    }
+
     /// Install (or clear, with `None`) the progressive-load frame callback. When set, `load_url`
     /// invokes `cb(ctx, frame_view)` synchronously on the load thread each time it paints a partial
     /// or final frame as HTML streams in. The `FrameView` pixels are valid only for the duration of
@@ -49,6 +81,7 @@ impl Engine {
     }
 
     pub fn set_viewport(&mut self, w: u32, h: u32, scale: f32) {
+        let _host = self.js_context.enter();
         self.vp_w = w.max(1);
         self.vp_h = h.max(1);
         self.scale = if scale > 0.0 { scale } else { 1.0 };
@@ -64,11 +97,12 @@ impl Engine {
     ///   - the CSS cascade: `@media (prefers-color-scheme: dark|light)` rules,
     /// then invalidates the layout cache so the next `render` re-cascades with the new appearance.
     pub fn set_color_scheme(&mut self, is_dark: bool) {
+        let _host = self.js_context.enter();
         if self.is_dark == is_dark {
             return; // no change → don't churn the layout cache / re-dispatch
         }
         self.is_dark = is_dark;
-        // Process-global flags read by the JS worker and the cascade respectively.
+        // Browser-owned JS settings and this thread's cascade settings.
         js::set_color_scheme_dark(is_dark);
         style::set_color_scheme_dark(is_dark);
         // Re-cascade on the next render so @media (prefers-color-scheme) rules re-apply.
@@ -102,7 +136,7 @@ impl Engine {
     ///    [`PARTIAL_PAINT_INTERVAL`], take a partial DOM snapshot, install it as a PARTIAL loaded
     ///    state with INLINE-ONLY styles (no blocking network), paint, and emit a frame.
     /// 3. After the body finishes, run the EXACT same finalize as the non-streaming path
-    ///    (`finish` → base_url → `start_session` (V8) → full `collect_stylesheets` (external CSS) →
+    ///    (`finish` → base_url → `start_session` (Lumen) → full `collect_stylesheets` (external CSS) →
     ///    `collect_images` → `prune_invalid` → `deliver_observations`), so the FINAL state and frame
     ///    are byte-for-byte what the engine produced before — streaming only ADDS earlier frames.
     /// The URL currently committed in this engine — the *resolved* final URL after fixup, HSTS
@@ -123,6 +157,7 @@ impl Engine {
     }
 
     pub fn load_url(&mut self, url: &str) -> i32 {
+        let _host = self.js_context.enter();
         self.scroll_y = 0.0; // new navigation starts at the top
         self.element_scroll_offsets.clear();
         self.layout_cache = None; // invalidate cached layout for the previous page
@@ -134,6 +169,10 @@ impl Engine {
         self.session = None; // drop the previous page's runtime (stops its thread)
         self.selection = None; // a new page starts with nothing selected
         js::set_active_selection(None); // and no programmatic (::selection) selection
+        js::set_interaction_state(None, None);
+        js::take_pending_scroll();
+        js::set_cross_origin_isolated(false);
+        js::set_response_body_size(0);
         js::clear_active_highlights(); // and no CSS Custom Highlight registrations
         self.inspect_node = None; // and nothing highlighted in the Elements inspector
         self.favicon = None; // and no site icon until this page's loads
@@ -919,6 +958,7 @@ impl Engine {
 
     /// Paint the current state into a fresh framebuffer and return a reference to it.
     pub fn render(&mut self) -> &Framebuffer {
+        let _host = self.js_context.enter();
         let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
         let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
         // No engine inset: page paints flush at (0,0); margin/padding come from CSS.
@@ -1210,7 +1250,7 @@ impl Engine {
         self.framebuffer.as_ref()
     }
 
-    /// V8 heap used by this tab's JS, in bytes (0 if no live session). For the tab tooltip.
+    /// JS heap bytes, currently 0 because Lumen does not expose heap accounting. For the tab tooltip.
     pub fn heap_bytes(&self) -> u64 {
         self.session.as_ref().map(|s| s.heap_bytes()).unwrap_or(0)
     }

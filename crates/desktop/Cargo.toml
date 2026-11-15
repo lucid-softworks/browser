@@ -1,0 +1,18 @@
+[package]
+name = "browser-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.99"
+
+[[bin]]
+name = "browser"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
+# The reusable window/input/GPU toolkit stays behind this desktop-shell boundary.
+rune = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af", default-features = false, features = ["embedded-fonts", "accessibility", "dbus", "metal-backend", "tooling"] }
+
+[lints]
+workspace = true

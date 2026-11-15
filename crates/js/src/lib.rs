@@ -1,73 +1,43 @@
-//! JavaScript runtime (Phase: scripting).
-//!
-//! Wraps Google's V8 JavaScript engine behind our own small API so the engine could be swapped
-//! later — same pattern as `net`/ureq and `paint`/fontdue. Nothing outside this crate knows V8
-//! exists. V8 gives us full JS speed plus complete language support, including real ES modules
-//! and dynamic `import()`.
-//!
-//! ## V8 integration shape
-//! - V8 is process-global-initialized exactly once (`std::sync::Once`).
-//! - A V8 `Isolate` is single-thread-bound, so every entry point that owns an isolate either runs
-//!   on the calling thread ([`Runtime`]) or creates the isolate on a dedicated worker thread
-//!   ([`eval_batch`]/[`run_with_dom`]/[`run_modules`]).
-//! - Native callbacks in V8 are bare C function pointers and cannot capture Rust state. We share
-//!   the page DOM and console buffer with them through a [`HostState`] stored on the **context
-//!   slot** (`Context::set_slot`/`get_slot`), retrieved inside each callback via
-//!   `scope.get_current_context().get_slot::<HostState>()`. The DOM is only ever touched on the
-//!   isolate's own thread, so `Rc<RefCell<dom::Document>>` is fine (no `Send` needed).
-//!
-//! ## DOM exposure
-//! Rather than port dozens of bespoke per-node wrapper closures, we expose a *small* set of native
-//! primitive functions on `globalThis`, keyed by integer node ids (`dom::NodeId` is a `usize`),
-//! and build the `document`/element objects in JavaScript on top of them (the
-//! `DOCUMENT_BOOTSTRAP`, `TIMERS_BOOTSTRAP`, and `BROWSER_ENV_BOOTSTRAP` strings). All the
-//! framework-compatibility machinery (per-node wrapper cache + expandos, `style`/`classList`/
-//! `dataset` write-through, the DOM interface class hierarchy + `instanceof`, navigator/location/
-//! storage/observers, the timer/event loop) lives in that reused, engine-agnostic JavaScript.
+//! JavaScript and browser bindings backed by Lumen.
 
-#[cfg(feature = "backend-v8")]
+use lumen::{
+    embed::{Ctx, Value},
+    Engine,
+};
+mod embedding;
+pub(crate) use embedding::*;
+mod realms;
+pub(crate) use realms::*;
+
 mod inner_text;
 
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::cell::Cell;
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::cell::RefCell;
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::collections::HashMap;
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::rc::Rc;
-#[cfg(feature = "backend-v8")]
-pub(crate) use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-#[cfg(feature = "backend-v8")]
+pub(crate) use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) use std::sync::mpsc::{Receiver, Sender};
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::sync::Arc;
-#[cfg(feature = "backend-v8")]
-pub(crate) use std::sync::Once;
 
 /// A completion delivered from a background request thread back to the worker: `(request id,
 /// response-envelope JSON or None on transport error)`. Drained on the worker thread inside
 /// [`drain_event_loop`] to resolve/reject the pending JS `fetch()` promise.
-#[cfg(feature = "backend-v8")]
 type FetchCompletion = (u64, Option<String>);
 
 /// A WebSocket event delivered from a background socket thread to the worker: `(socket id, kind,
 /// payload)`. kind `0`=open, `1`=text, `2`=binary(base64), `3`=close("code:reason"), `4`=error.
 /// Drained opportunistically (non-blocking) inside [`drain_event_loop`] and dispatched to JS via
 /// `__wsDeliver`. A socket is long-lived, so — unlike a fetch — it never touches `in_flight`.
-#[cfg(feature = "backend-v8")]
 type WsEvent = (u64, u8, String);
 
 /// An outgoing WebSocket command from JS to a background socket thread: `(kind, payload)`.
 /// kind `0`=send text, `1`=send binary(base64), `2`=close. Sent over a per-socket channel whose
 /// receiver lives on that socket's `net::ws_run` thread.
-#[cfg(feature = "backend-v8")]
 type WsOut = (u8, String);
 
 /// Host WebSocket connector (built by the engine, mirroring `request_fetcher`): given
 /// `(url, id, ws_evt_tx)` it spawns the socket thread and returns the per-socket outgoing sender,
 /// or `Err` if the thread couldn't start. Crosses the crate boundary with PRIMITIVE tuples only.
-#[cfg(feature = "backend-v8")]
 type WsConnector =
     Arc<dyn Fn(String, u64, Sender<WsEvent>) -> Result<Sender<WsOut>, String> + Send + Sync>;
 
@@ -80,23 +50,11 @@ pub struct EvalOutput {
     pub error: Option<String>,
 }
 
-/// Initialize the V8 platform exactly once for the whole process. Safe to call repeatedly.
-#[cfg(feature = "backend-v8")]
-fn ensure_v8_initialized() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let platform = v8::new_default_platform(0, false).make_shared();
-        v8::V8::initialize_platform(platform);
-        v8::V8::initialize();
-    });
-}
-
 // ---------------------------------------------------------------------------------------------
-// Shared host state (lives on the V8 context slot; retrieved inside native callbacks).
+// Shared host state (lives on the Lumen realm slot; retrieved inside native callbacks).
 // ---------------------------------------------------------------------------------------------
 
 /// A shared, mutable handle to the page's DOM.
-#[cfg(feature = "backend-v8")]
 type SharedDoc = Rc<RefCell<dom::Document>>;
 
 /// A single DOM mutation recorded by the native mutation primitives while at least one
@@ -104,7 +62,6 @@ type SharedDoc = Rc<RefCell<dom::Document>>;
 /// (`__deliverMutations`) drains these as JSON, matches them against the JS-side observer
 /// registry, and builds the spec `MutationRecord` objects. We keep this Rust-side struct (rather
 /// than tracking mutations in JS) because the mutations happen inside the Rust DOM primitives.
-#[cfg(feature = "backend-v8")]
 struct MutationRec {
     /// "childList" | "attributes" | "characterData".
     kind: &'static str,
@@ -120,10 +77,8 @@ struct MutationRec {
     removed: Vec<dom::NodeId>,
 }
 
-/// State shared between Rust and the native primitive callbacks. Stored on the context slot as an
-/// `Rc<HostState>` so any callback can recover it from `scope.get_current_context().get_slot()`.
-/// Interior mutability via `RefCell` since the slot only hands out `&HostState` (well, `Rc`).
-#[cfg(feature = "backend-v8")]
+/// State shared between Rust and native callbacks, registered per realm in Lumen OpState.
+/// Callbacks recover an Rc through host_state; RefCell permits DOM mutation on the session thread.
 struct HostState {
     doc: SharedDoc,
     console: RefCell<Vec<String>>,
@@ -195,6 +150,7 @@ struct HostState {
     /// A geometry read whose `dom_version` is ahead of this re-lays-out the dirty DOM in-Session, so
     /// `getBoundingClientRect` etc. reflect script mutations the blocked engine hasn't rendered yet.
     rects_dom_version: Cell<u64>,
+    style_context_revision: Cell<u64>,
     /// CSSOM *used* inset values per positioned box, keyed by node id, pushed by the engine
     /// alongside `layout_rects`. `(top, right, bottom, left)` in CSS px. Read by `resolved_inset_value`
     /// so `getComputedStyle(el).top` etc. report the used value when the element has a box; absent for
@@ -231,7 +187,6 @@ struct HostState {
     cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
 }
 
-#[cfg(feature = "backend-v8")]
 impl HostState {
     fn new(doc: SharedDoc) -> Rc<Self> {
         // No-DOM paths: dead-end channels (their receivers are dropped immediately) and a connector
@@ -300,6 +255,7 @@ impl HostState {
             computed_cache: RefCell::new(None),
             layout_rects: RefCell::new(HashMap::new()),
             rects_dom_version: Cell::new(0),
+            style_context_revision: Cell::new(0),
             used_insets: RefCell::new(HashMap::new()),
             used_margins: RefCell::new(HashMap::new()),
             image_natural: RefCell::new(HashMap::new()),
@@ -326,75 +282,37 @@ impl HostState {
     }
 }
 
-/// Recover the `Rc<HostState>` from the current context's slot. Panics only if state was never
-/// installed, which is a programming error (every context we run callbacks in installs it).
-#[cfg(feature = "backend-v8")]
-fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
-    let context = scope.get_current_context();
-    context
-        .get_slot::<HostState>()
-        .expect("HostState must be installed on the context")
-}
-
 // ---------------------------------------------------------------------------------------------
 // DOM helpers (engine-agnostic; operate directly on `dom::Document`). Reused from the prior
 // implementation — these are pure Rust and unchanged in behavior.
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(feature = "backend-v8")]
 mod dom_helpers;
-#[cfg(feature = "backend-v8")]
 mod eval_loop;
-#[cfg(feature = "backend-v8")]
 mod forced_layout;
-#[cfg(feature = "backend-v8")]
+mod host_context;
 mod iframe;
-#[cfg(feature = "backend-v8")]
 mod modules;
-#[cfg(feature = "backend-v8")]
 mod primitives;
-#[cfg(feature = "backend-v8")]
 mod runtime;
-#[cfg(feature = "backend-v8")]
 mod selector;
-#[cfg(feature = "backend-v8")]
 mod session;
-#[cfg(feature = "backend-v8")]
 mod style_query;
-#[cfg(feature = "backend-v8")]
 mod worker;
 
-#[cfg(feature = "backend-v8")]
 pub(crate) use dom_helpers::*;
-#[cfg(feature = "backend-v8")]
-pub use eval_loop::*;
-#[cfg(feature = "backend-v8")]
+pub(crate) use eval_loop::*;
+pub use host_context::*;
 pub use iframe::*;
-#[cfg(feature = "backend-v8")]
 pub use modules::*;
-#[cfg(feature = "backend-v8")]
-pub use primitives::*;
-#[cfg(feature = "backend-v8")]
+pub(crate) use primitives::*;
 pub use runtime::*;
-#[cfg(feature = "backend-v8")]
 pub(crate) use selector::*;
-#[cfg(feature = "backend-v8")]
 pub use session::*;
-#[cfg(feature = "backend-v8")]
 pub(crate) use style_query::*;
-#[cfg(feature = "backend-v8")]
 pub use worker::*;
 
-// The from-scratch backend. Implements the language-evaluation slice of the public API
-// (`Runtime`/`eval`/`eval_batch`) on top of `lumen`; the DOM `Session` surface is still V8-only and
-// will grow into lumen in a later milestone. (Named `lumen_backend`, not `lumen`, to avoid clashing
-// with the `lumen` crate.)
-#[cfg(feature = "backend-lumen")]
-mod lumen_backend;
-#[cfg(feature = "backend-lumen")]
-pub use lumen_backend::*;
-
-#[cfg(all(test, feature = "backend-v8"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3973,6 +3891,25 @@ mod tests {
     }
 
     #[test]
+    fn crypto_random_failure_never_returns_fallback_bytes() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+            __cryptoRandom = function () { return null; };
+            var values = new Uint8Array([17, 23]), errors = [];
+            try { crypto.getRandomValues(values); } catch (e) { errors.push(e.name); }
+            try { crypto.randomUUID(); } catch (e) { errors.push(e.name); }
+            errors.join(',') + ':' + values.join(',')
+        "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("OperationError,OperationError:17,23")
+        );
+    }
+
+    #[test]
     fn crypto_get_random_values_fills_nonzero() {
         // Assert the buffer was filled with randomness, not left zeroed. We check that *some* byte
         // is nonzero rather than *every* byte: with a correct RNG any single byte is zero ~1/256 of
@@ -5093,6 +5030,7 @@ mod tests {
         modules.insert(
             entry.clone(),
             r#"console.log(import.meta.url);
+               const globalThis = {}, URL = null, Function = null;
                console.log(import.meta.resolve("./other.css"));"#
                 .to_string(),
         );
@@ -5470,7 +5408,7 @@ mod tests {
 
     #[test]
     fn dedicated_worker_importscripts_shares_top_level_declarations() {
-        // The realm fix: each worker is its own V8 context, so `self === globalThis` and top-level
+        // The realm fix: each worker is its own Lumen realm, so `self === globalThis` and top-level
         // `function`/`var` declarations in an importScripts'd file become worker globals visible to
         // later scripts — exactly what canvas-tests.js et al. rely on (bare `function _assertSame`).
         // Here helper.js declares a bare `function helperFn` and a bare `var helperVar`; the worker
@@ -6249,9 +6187,9 @@ mod tests {
                 });
                 var f = document.body.appendChild(document.createElement('iframe'));
                 f.onload = function () {
-                  document.body.setAttribute('data-q', f.contentDocument.querySelector('a').search);
+                  document.body.setAttribute('data-denied', String(f.contentDocument === null));
                 };
-                f.src = "data:text/html,<a href='http://h/?q=1'>x</a><script>parent.postMessage('ran','*')<\/script>";
+                f.src = "data:text/html,<a href='http://h/?q=1'>x</a><script>parent.postMessage('ran:' + document.querySelector('a').search,'*')<\/script>";
             "#
             .to_string(),
         );
@@ -6275,13 +6213,13 @@ mod tests {
         };
         assert_eq!(
             attr("data-msg").as_deref(),
-            Some("ran"),
+            Some("ran:?q=1"),
             "data: frame script runs + posts"
         );
         assert_eq!(
-            attr("data-q").as_deref(),
-            Some("?q=1"),
-            "frame anchor decomposition"
+            attr("data-denied").as_deref(),
+            Some("true"),
+            "data URL frame has an opaque origin"
         );
     }
 
@@ -6743,10 +6681,8 @@ mod tests {
 
     #[test]
     fn async_fetches_run_concurrently() {
-        // Five fetches each sleeping 100ms in the host fetcher; fired together with Promise.all. If
-        // they were serialized the init drain would take >=500ms; running concurrently (one
-        // background thread per request) it finishes in well under that. We also assert all five
-        // resolved (their bodies collected into a DOM attribute).
+        // All five host requests must enter before any completes. Measure overlap directly:
+        // engine bootstrap and machine load must not affect a network-concurrency assertion.
         let (doc, body) = doc_with_body("");
         let entry = "https://x/app.js".to_string();
         let mut modules = std::collections::HashMap::new();
@@ -6759,16 +6695,29 @@ mod tests {
             "#
             .to_string(),
         );
+        let arrivals = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let arrivals_host = arrivals.clone();
+        let overlapped_host = overlapped.clone();
         let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
-            Arc::new(|_m, u, _b, _h| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            Arc::new(move |_m, u, _b, _h| {
+                let (lock, ready) = &*arrivals_host;
+                let mut count = lock.lock().unwrap();
+                *count += 1;
+                ready.notify_all();
+                let (count, _) = ready
+                    .wait_timeout_while(count, std::time::Duration::from_secs(2), |n| *n < 5)
+                    .unwrap();
+                if *count < 5 {
+                    overlapped_host.store(false, Ordering::Relaxed);
+                }
+                drop(count);
                 // Echo the last path segment back as the body so we can verify all five resolved.
                 let seg = u.rsplit('/').next().unwrap_or("");
                 Some(format!(
                     r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/plain","body":"{seg}"}}"#
                 ))
             });
-        let start = std::time::Instant::now();
         let (_session, snapshot, out) = Session::new(
             doc,
             vec![],
@@ -6782,7 +6731,6 @@ mod tests {
             noop_cookie_set(),
             None,
         );
-        let elapsed = start.elapsed();
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         let got = match &snapshot.get(body).data {
             dom::NodeData::Element(e) => e.attrs.get("data-all").cloned(),
@@ -6793,10 +6741,9 @@ mod tests {
             Some("a,b,c,d,e"),
             "all five fetches should resolve"
         );
-        // Concurrent: 5x100ms serialized would be >=500ms; concurrently it is ~100ms + overhead.
         assert!(
-            elapsed < std::time::Duration::from_millis(400),
-            "fetches should run concurrently, took {elapsed:?}"
+            overlapped.load(Ordering::Relaxed),
+            "all five host fetches must overlap"
         );
     }
 
@@ -7330,6 +7277,55 @@ mod tests {
             out.value.as_deref(),
             Some("svg:path|true|path|function|true")
         );
+    }
+
+    #[test]
+    fn concurrent_sessions_keep_host_context_isolated() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [false, true].into_iter().map(|dark| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let context = HostContext::default();
+                let _host = context.enter();
+                let width = if dark { 640 } else { 320 };
+                let bytes = if dark { 2200 } else { 1100 };
+                set_device_metrics(width, 400, if dark { 2.0 } else { 1.0 });
+                set_color_scheme_dark(dark);
+                set_cross_origin_isolated(dark);
+                set_response_body_size(bytes);
+                // Both tabs have installed their settings before either JS worker starts.
+                barrier.wait();
+                let (session, _, outputs) = Session::new(
+                    html::parse("<style>#box{width:50vw;color:rgb(1,2,3)}@media(prefers-color-scheme:dark){#box{color:rgb(4,5,6)}}</style><div id=box>text</div>"),
+                    vec!["window.ready = true".to_string()], Vec::new(), HashMap::new(),
+                    "https://example.com/", no_fetch(), no_request(), no_ws(),
+                    noop_cookie_get(), noop_cookie_set(), None,
+                );
+                assert!(outputs[0].error.is_none(), "{:?}", outputs[0]);
+                let (metrics,_,_) = session.repl_eval("[innerWidth,innerHeight,devicePixelRatio,crossOriginIsolated,performance.getEntriesByType('navigation')[0].encodedBodySize].join(',')");
+                assert_eq!(metrics,format!("{width},400,{},{dark},{bytes}",if dark {2} else {1}));
+                let (initial,_,_) = session.repl_eval("getComputedStyle(document.getElementById('box')).width");
+                assert_eq!(initial,format!("{}px",width/2));
+                let marker = if dark { 7 } else { 3 };
+                let script = format!("__commitSelection({marker},1,{marker},4); __clearHighlights(); __addHighlight('tab{marker}',{marker}); window.scrollTo(0,{});",width/2);
+                session.repl_eval(&script);
+                barrier.wait();
+                assert_eq!(active_selection(),Some((marker,1,marker,4)));
+                assert_eq!(active_highlights(),vec![(marker,format!("tab{marker}"))]);
+                assert_eq!(take_pending_scroll(),Some((width/2) as f32));
+                assert_eq!(take_pending_scroll(),None);
+                // Live host changes must reach the already-running session and invalidate its
+                // CSS cache even when its DOM version remains unchanged.
+                set_device_metrics(width+100,400,1.0);
+                set_color_scheme_dark(!dark);
+                barrier.wait();
+                let (live,_,_) = session.repl_eval("[matchMedia('(prefers-color-scheme: dark)').matches,getComputedStyle(document.getElementById('box')).width,getComputedStyle(document.getElementById('box')).color].join('|')");
+                assert_eq!(live,format!("{}|{}px|{}",!dark,(width+100)/2,if dark {"rgb(1, 2, 3)"} else {"rgb(4, 5, 6)"}));
+            })
+        }).collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     // --- persistent Session ------------------------------------------------------------------

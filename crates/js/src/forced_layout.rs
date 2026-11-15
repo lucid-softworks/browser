@@ -76,7 +76,7 @@ const FALLBACK_CANDIDATES: &[&str] = &[];
 /// A `TextMeasurer` over the system font + a broad-coverage fallback chain. Mirrors the engine's
 /// `FontMeasurer` (advance-sum + ~1px/glyph faux-bold, 1.3× line height) so geometry agrees.
 struct Measurer {
-    primary: Option<fontdue::Font>,
+    primary: Option<std::sync::Arc<fontdue::Font>>,
     fallback: Vec<fontdue::Font>,
 }
 
@@ -86,7 +86,8 @@ impl Measurer {
         let primary = FONT_CANDIDATES
             .iter()
             .filter_map(|p| std::fs::read(p).ok())
-            .find_map(|b| fontdue::Font::from_bytes(b, opts).ok());
+            .find_map(|b| fontdue::Font::from_bytes(b, opts).ok())
+            .map(std::sync::Arc::new);
         let fallback = FALLBACK_CANDIDATES
             .iter()
             .filter_map(|p| std::fs::read(p).ok())
@@ -127,16 +128,17 @@ impl layout::TextMeasurer for Measurer {
 
 thread_local! {
     // Loaded once per Session worker thread (fonts are immutable).
-    static MEASURER: Measurer = Measurer::load();
+    static MEASURER: std::cell::RefCell<Measurer> = std::cell::RefCell::new(Measurer::load());
 }
 
 /// If the DOM has changed since the rects in `layout_rects` were computed, recompute the box tree
 /// from the live document and refresh `layout_rects` (+ document height). Cheap no-op when clean.
 pub(crate) fn ensure_layout_fresh(state: &HostState) {
+    crate::sync_style_context(state);
     if state.dom_version.get() == state.rects_dom_version.get() {
         return;
     }
-    let (vw, vh, _dpr) = crate::eval_loop::device_metrics();
+    let (vw, vh, _dpr) = crate::device_metrics();
     if vw <= 0.0 || vh <= 0.0 {
         return;
     }
@@ -147,7 +149,12 @@ pub(crate) fn ensure_layout_fresh(state: &HostState) {
         .map(|(&k, &v)| (dom::NodeId(k), v))
         .collect();
     crate::style_query::with_cascade_map(state, |doc, styles| {
-        MEASURER.with(|m| {
+        MEASURER.with(|cell| {
+            let mut measurer = cell.borrow_mut();
+            if let Some(font) = crate::host_context::font() {
+                measurer.primary = Some(font);
+            }
+            let m = &*measurer;
             let root =
                 layout::layout_document(doc, styles, vw as f32, vh as f32, m, &intrinsics, None);
             let mut rects = state.layout_rects.borrow_mut();

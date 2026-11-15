@@ -1,11 +1,11 @@
 use crate::*;
 
-/// A JS runtime. Owns one V8 isolate + global context so state persists across `eval` calls.
+/// A JS runtime. Owns one Lumen engine + global context so state persists across `eval` calls.
 ///
-/// The isolate is single-thread-bound, so a `Runtime` must be created and used on the same thread.
+/// The engine is single-thread-bound, so a `Runtime` must be created and used on the same thread.
 pub struct Runtime {
-    isolate: v8::OwnedIsolate,
-    context: v8::Global<v8::Context>,
+    engine: Engine,
+    host_context: HostContext,
 }
 
 impl Default for Runtime {
@@ -18,55 +18,45 @@ impl Runtime {
     /// Build a fresh runtime with `console` + timers installed (no DOM). State persists across
     /// `eval` calls via the owned global context.
     pub fn new() -> Self {
-        ensure_v8_initialized();
-        let mut isolate = new_guarded_isolate();
-        let context = {
-            v8::scope!(let handle_scope, &mut isolate);
-            let context = v8::Context::new(handle_scope, Default::default());
-            let scope = &mut v8::ContextScope::new(handle_scope, context);
-            // No DOM on this path, but install a HostState so console works (doc is an empty doc).
-            let state = HostState::new(Rc::new(RefCell::new(dom::Document::new())));
-            scope.get_current_context().set_slot(state);
-            let global = scope.get_current_context().global(scope);
-            install_console_sink(scope, global);
-            eval_internal(scope, TIMERS_BOOTSTRAP, "<timers>");
-            v8::Global::new(scope, context)
-        };
-        Runtime { isolate, context }
+        let mut engine = Engine::new();
+        let scope = engine.ctx();
+        let state = HostState::new(Rc::new(RefCell::new(dom::Document::new())));
+        install_host_state(scope, state);
+        let global = scope.global_this();
+        install_console_sink(scope, &global);
+        eval_internal(scope, TIMERS_BOOTSTRAP, "<timers>");
+        Runtime {
+            engine,
+            host_context: HostContext::current(),
+        }
     }
 
     /// Evaluate a script in the owned context. Globals persist across calls. Never panics on a JS
     /// error — it is captured into `EvalOutput.error`.
     pub fn eval(&mut self, source: &str) -> EvalOutput {
-        let context = self.context.clone();
-        v8::scope!(let handle_scope, &mut self.isolate);
-        let local_ctx = v8::Local::new(handle_scope, &context);
-        let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
-        eval_source(scope, source, "<eval>")
+        let _host = self.host_context.enter();
+        eval_source(self.engine.ctx(), source, "<eval>")
     }
 }
 
 /// Run `sources` in order on a single fresh runtime (so later scripts see earlier globals) and
 /// return one [`EvalOutput`] per source.
 ///
-/// Runs on a dedicated worker thread with a generous stack so a runaway script (or deep
-/// recursion) can't block or fault the caller; the V8 isolate is created on that worker thread
-/// (isolates are single-thread-bound). A panic on the worker is isolated and surfaced as an error.
+/// Runs on a dedicated worker thread with a generous stack to isolate script execution
+/// from the calling thread; the Lumen engine is created on that worker thread
+/// (engines are single-thread-bound). A panic on the worker is isolated and surfaced as an error.
 pub fn eval_batch(sources: Vec<String>) -> Vec<EvalOutput> {
     let count = sources.len();
+    let host_context = HostContext::current();
     let worker = std::thread::Builder::new()
         .name("js-eval".to_string())
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
+            let _host = host_context.enter();
             let mut rt = Runtime::new();
             let mut results: Vec<EvalOutput> = sources.iter().map(|s| rt.eval(s)).collect();
             // Drive the event loop so timers/microtasks the scripts registered actually run.
-            let context = rt.context.clone();
-            v8::scope!(let handle_scope, &mut rt.isolate);
-            let local_ctx = v8::Local::new(handle_scope, &context);
-            let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
-            // No async fetches on the bare eval path (no real fetcher), so pass no receiver.
-            drain_event_loop(scope, &mut results, None, None);
+            drain_runtime(&mut rt.engine, &mut results, None, None);
             results
         });
 
@@ -95,7 +85,7 @@ pub fn eval_batch(sources: Vec<String>) -> Vec<EvalOutput> {
 /// The DOM-aware sibling of [`eval_batch`]: the context gets the full browser environment
 /// (`window`/`self`/`globalThis`, `location`, a DOM-wired `document`, timers, navigator/etc.) so
 /// scripts mutate the real tree and the change is visible in the returned document. Runs on a
-/// dedicated worker thread; the V8 isolate, the `Rc<RefCell<Document>>`, and all wrappers live on
+/// dedicated worker thread; the Lumen engine, the `Rc<RefCell<Document>>`, and all wrappers live on
 /// that thread and never cross the boundary.
 pub fn run_with_dom(
     doc: dom::Document,
@@ -108,32 +98,32 @@ pub fn run_with_dom(
     // pre-script DOM rather than hang. `fallback` is that pre-script DOM.
     let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
     let fallback = doc.clone();
+    let host_context = HostContext::current();
     let worker = std::thread::Builder::new()
         .name("js-eval-dom".to_string())
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
+            let _host = host_context.enter();
             let result: (dom::Document, Vec<EvalOutput>) = {
-                ensure_v8_initialized();
                 let shared: SharedDoc = Rc::new(RefCell::new(doc));
-                let mut isolate = new_guarded_isolate();
-                let mut results: Vec<EvalOutput> = Vec::with_capacity(sources.len());
-                {
-                    v8::scope!(let handle_scope, &mut isolate);
-                    let context = v8::Context::new(handle_scope, Default::default());
-                    let scope = &mut v8::ContextScope::new(handle_scope, context);
-                    let state = HostState::new(Rc::clone(&shared));
-                    scope.get_current_context().set_slot(state);
-                    install_browser_environment(scope, &url);
-
-                    for source in &sources {
-                        results.push(eval_source(scope, source, "<script>"));
-                    }
-                    // run_with_dom installs no real fetcher, so no async fetches are ever started.
-                    drain_event_loop(scope, &mut results, None, None);
-                }
-                // Recover the owned Document. Dropping the isolate releases the context (and HostState
+                let mut engine = Engine::new();
+                let scope = engine.ctx();
+                install_host_state(scope, HostState::new(Rc::clone(&shared)));
+                install_browser_environment(scope, &url);
+                crate::set_page_context(
+                    crate::realms::Realm::current(scope)
+                        .unwrap_or_else(|_| panic!("page realm must be available")),
+                );
+                let mut results: Vec<EvalOutput> = sources
+                    .iter()
+                    .map(|source| eval_source(scope, source, "<script>"))
+                    .collect();
+                drain_runtime(&mut engine, &mut results, None, None);
+                crate::clear_workers();
+                crate::clear_frames();
+                // Recover the owned Document. Dropping the engine releases the context (and HostState
                 // slot, which holds the only other Rc clone of `shared`), so `try_unwrap` succeeds.
-                drop(isolate);
+                drop(engine);
                 let doc = match Rc::try_unwrap(shared) {
                     Ok(cell) => cell.into_inner(),
                     Err(rc) => rc.borrow().clone(),
@@ -172,5 +162,75 @@ pub fn run_with_dom(
 }
 
 // ---------------------------------------------------------------------------------------------
-// ES modules + dynamic import (run_modules). V8 handles modules natively; we wire resolution.
+// ES modules + dynamic import (run_modules). Lumen handles modules natively; we wire resolution.
 // ---------------------------------------------------------------------------------------------
+
+/// Drain browser tasks, then report promise rejections after handlers have had a chance to attach.
+/// Rejections belong to the engine rather than a particular callback context.
+pub(crate) fn drain_runtime(
+    engine: &mut Engine,
+    results: &mut [EvalOutput],
+    fetch_rx: Option<&Receiver<FetchCompletion>>,
+    ws_evt_rx: Option<&Receiver<WsEvent>>,
+) -> bool {
+    let did_work = drain_event_loop(engine.ctx(), results, fetch_rx, ws_evt_rx);
+    let rejected = engine.take_unhandled_rejections();
+    let had_rejections = !rejected.is_empty();
+    if let Some(last) = results.last_mut() {
+        for reason in rejected {
+            let scope = engine.ctx();
+            let stack = scope.member_get(&reason, "stack").ok();
+            let text = match stack {
+                Some(Value::Str(stack)) => stack.to_string(),
+                _ => render_value(scope, reason),
+            };
+            last.console.push(format!("⚠ Unhandled rejection: {text}"));
+        }
+    }
+    did_work || had_rejections
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lexical_bindings_persist_between_scripts() {
+        let mut runtime = Runtime::new();
+        let first =
+            runtime.eval("let lexicalCounter = 1; const increment = () => ++lexicalCounter;");
+        assert!(first.error.is_none(), "{:?}", first.error);
+        let second = runtime.eval("increment()");
+        assert!(second.error.is_none(), "{:?}", second.error);
+        assert_eq!(second.value.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn unhandled_rejections_are_reported_after_drain() {
+        let outputs = eval_batch(vec![
+            "Promise.reject(new Error('rejection-probe'));".to_string()
+        ]);
+        assert!(
+            outputs[0].console.iter().any(
+                |line| line.contains("Unhandled rejection") && line.contains("rejection-probe")
+            ),
+            "{:?}",
+            outputs[0]
+        );
+    }
+
+    #[test]
+    fn handled_rejections_are_not_reported() {
+        let outputs = eval_batch(vec![
+            "Promise.reject(new Error('handled-probe')).catch(() => {});".to_string(),
+        ]);
+        assert!(
+            !outputs[0]
+                .console
+                .iter()
+                .any(|line| line.contains("Unhandled rejection")),
+            "{:?}",
+            outputs[0]
+        );
+    }
+}

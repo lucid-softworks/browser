@@ -40,7 +40,9 @@ for d in "$ROOT/target/debug" "$ROOT/target/debug/deps"; do
     mkdir -p "$d"
     for ext in a dylib; do
         src="$RUST_LIBDIR/libbrowser_ffi.$ext"; [[ -f "$src" ]] || src="$RUST_LIBDIR/deps/libbrowser_ffi.$ext"
-        [[ -f "$src" ]] && cp -f "$src" "$d/libbrowser_ffi.$ext"
+        if [[ -f "$src" && ! "$src" -ef "$d/libbrowser_ffi.$ext" ]]; then
+            cp -f "$src" "$d/libbrowser_ffi.$ext"
+        fi
     done
 done
 # SwiftPM doesn't track the .a/.dylib as a dependency and caches the resolved lib, so an
@@ -72,7 +74,7 @@ if [[ "$MODE" == "release-app" ]]; then
     cp "$APP" "$MACOS/Browser"
     cp "$PKG/Info.plist" "$BUNDLE/Contents/Info.plist"
 
-    # The engine dylib is self-contained (V8 statically inside, only system deps). Bundle it and
+    # The engine dylib is self-contained (Lumen statically inside, only system deps). Bundle it and
     # rewrite its absolute build-path load command to an @rpath relative to the executable.
     DYLIB="$RUST_LIBDIR/libbrowser_ffi.dylib"; [[ -f "$DYLIB" ]] || DYLIB="$RUST_LIBDIR/deps/libbrowser_ffi.dylib"
     cp "$DYLIB" "$FRAMEWORKS/libbrowser_ffi.dylib"

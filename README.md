@@ -4,10 +4,10 @@ A web browser written from scratch.
 
 - **Rust** is "the inners": the actual engine — networking, parsing, DOM, style,
   layout, and paint. The engine is **platform-agnostic** and produces an RGBA framebuffer.
-- The **app shell** (window, URL bar, tabs, event loop) is a thin **native** layer per OS:
-  - **macOS** — Swift / AppKit *(current)*
-  - **Linux** — GTK4 *(planned)*
-  - **Windows** — Win32 *(planned)*
+- The **desktop app** (window, URL bar, tabs, event loop) is a shared **Rust / Rune** shell
+  for **Windows, Linux, and macOS**. The original **Swift / AppKit** shell remains available
+  on macOS. Both use the same Rust engine and Lumen JavaScript runtime. The shared desktop
+  app bundles Inter so page text works without a standard system-font installation.
 
 ## Guiding constraint
 
@@ -19,8 +19,9 @@ it for a hand-written implementation later is a localized change, not a refactor
 |---|---|---|
 | `ureq` (HTTP/TLS) | `net::fetch` → `net::Response` | hand-written HTTP/1.1 (TLS likely stays reused — DIY TLS is unsafe) |
 | `fontdue` (glyph raster) | `paint::GlyphRasterizer` trait | hand-written rasterizer |
-| `v8` (JS VM) | `js::Runtime` / `js::eval` | hand-written JS engine |
+| `lumen` (our JS VM) | `js::Runtime` / `js::Session` | maintained in the Lumen repository |
 | `cbindgen` (header gen) | build script only | n/a (build tooling) |
+| `rune` (desktop UI) | `crates/desktop` | our own native shell |
 
 Everything else — HTML tokenizer/tree-builder, CSS parser, DOM, cascade, layout, the
 compositor — is ours.
@@ -29,8 +30,10 @@ compositor — is ours.
 
 ### Prerequisites
 
-- **Rust** (stable) — install via [rustup](https://rustup.rs).
-- For App Shell: **Xcode command-line tools** (`xcode-select --install`)
+- **Rust 1.99.1 or newer** for the shared desktop app — install via [rustup](https://rustup.rs).
+- **Windows:** Rust MSVC toolchain and Visual Studio C++ build tools.
+- **Linux:** Wayland/XKB development libraries and a Vulkan driver; see [desktop setup](docs/desktop.md#linux).
+- **macOS:** Xcode command-line tools (`xcode-select --install`).
 
 Enable the versioned git hooks (a `pre-push` hook that runs the same `rustfmt` +
 `clippy` gate as CI, so lint never fails the PR after the fact):
@@ -44,13 +47,28 @@ git config core.hooksPath .githooks   # one-time, per clone
 The engine is plain Rust and builds on **macOS, Linux, and Windows**:
 
 ```sh
-cargo build --workspace # Build
-cargo test --workspace  # Build and run tests
+cargo build --workspace --exclude browser-desktop
+cargo test --workspace --exclude browser-desktop
 ```
 
-### The App shell (macOS only)
+Page scripts, DOM bindings, modules, workers, and iframe realms use our
+[Lumen JavaScript engine](https://github.com/lucid-softworks/lumen), pinned in `Cargo.lock`.
+No V8 library is needed. Run the browser binding tests with `cargo test -p js --locked`.
 
-The app shell currently ships for **macOS** (Swift / AppKit), so a graphical browser today requires macOS.
+### Desktop app (Windows, Linux, macOS)
+
+```sh
+cargo run --locked -p browser-desktop -- --url https://example.com
+cargo build --locked --release -p browser-desktop
+```
+
+Launch `target/release/browser` (`browser.exe` on Windows), or use
+`scripts/run-browser.sh` / `scripts/run-browser.ps1`. The shared app uses Rune for native
+windowing and UI; page content is rendered by our own engine. See
+[desktop setup, headless tooling, and platform details](docs/desktop.md).
+
+### Optional Swift/AppKit shell (macOS)
+
 Run from the repo root:
 
 ```sh
@@ -67,23 +85,23 @@ open dist/Browser.app              # launch
 ## Architecture
 
 ```
-URL ─▶ net (fetch) ─▶ html::parse ─▶ DOM ─▶ style (cascade) ─▶ layout ─▶ paint ─▶ RGBA
-                                                                                   │
-                                            crates/ffi (C ABI) ◀──────────────────┘
-                                                   │
-                                       Swift app blits the framebuffer to a layer
+URL ─▶ net ─▶ HTML / DOM ─▶ style ─▶ layout ─▶ paint ─▶ RGBA
+                                                       ├─▶ desktop (Rune: Windows / Linux / macOS)
+                                                       └─▶ ffi (C ABI) ─▶ Swift / AppKit (macOS)
+
 ```
 
-Rust paints an RGBA framebuffer; Swift uploads it to an `NSView` via `CGImage` each frame.
-This is the simplest possible Rust↔Swift boundary. (A display-list + CoreText path, or a
-GPU surface, can replace it later without touching the engine.)
+Rust paints an RGBA framebuffer. The shared desktop shell presents it through Rune; its
+page worker owns the engine while the UI remains responsive. The optional Swift shell
+uploads the same framebuffer to an `NSView` via the C ABI. OS and toolkit code stays outside
+the platform-agnostic engine.
 
 ### Rust workspace (`crates/`)
 - `net` — fetch a URL → bytes + content-type *(reuses `ureq`)*
 - `html` — hand-written HTML tokenizer + tree builder → DOM
 - `dom` — arena-based node tree
-- `js` — JS runtime + DOM/`window`/`self` bindings; runs page scripts. Compile-time backend
-  switch: `backend-v8` (default, *reuses `v8`*) or `backend-lumen` (the from-scratch engine)
+- `js` — JS runtime + DOM/`window`/`self` bindings; runs page scripts. Uses Lumen
+  through an internal embedding boundary
 - `css` — hand-written CSS parser (`<style>` blocks + inline `style=""`)
 - `style` — cascade (UA + author + inline) → computed styles, box + flex/grid/position props
 - `layout` — block/inline/inline-block, **flexbox**, basic **grid**, and **positioning**
@@ -91,6 +109,7 @@ GPU surface, can replace it later without touching the engine.)
 - `paint` — RGBA framebuffer + fill/text primitives; `GlyphRasterizer` trait
 - `engine` — orchestrates the pipeline; produces the framebuffer
 - `ffi` — C ABI (`staticlib`); `cbindgen` generates `include/browser.h`
+- `desktop` — shared Rune desktop UI and page-worker boundary (`browser-desktop` package)
 
 ### Swift app (`swift/`)
 - `CBrowser` — system-library target wrapping `include/browser.h`
@@ -98,12 +117,11 @@ GPU surface, can replace it later without touching the engine.)
 
 ## Memory model
 
-Tabs are **not** capped at 4 GiB. Unlike Chrome — which isolates each tab in its own
-renderer process and runs V8 with pointer compression that effectively caps a tab's JS heap
-near 4 GiB — every tab here is just heap inside our single **64-bit** process, and the JS
-engine (V8) uses no pointer compression. A tab is therefore limited only by the machine's
-RAM + swap. We set no `rlimit`, and size types on the hot paths are 64-bit (`net`'s body
-backstop sits at 16 GiB, the DOM arena indexes with `usize`).
+Each tab owns a Lumen engine on its JavaScript thread within the browser process.
+The current Lumen embedding API does not expose heap-byte accounting, heap limits, or
+an execution-interruption hook. Heap telemetry reports 0 (unavailable). Event-loop budgets
+bound work between callbacks, but cannot interrupt a script stuck inside one callback.
+The DOM arena uses `usize`; the network body backstop is 16 GiB.
 
 ## Contributing
 
@@ -178,8 +196,8 @@ runs) remain out of reach without a near-complete JS/web-platform implementation
 Long pages **scroll** (mouse-wheel, per-tab, clamped to document height), and `<img>`
 **images** are fetched, decoded, and blitted (sized by CSS dims or decoded intrinsic size).
 
-Toward replacing `v8`, [**`lumen`**](https://github.com/lucid-softworks/lumen) is a from-scratch
-JS engine (std-only) behind the `backend-lumen` feature, grown against **tc39/test262** — it
+[**`lumen`**](https://github.com/lucid-softworks/lumen) is a from-scratch
+JS engine (std-only) used by the browser, grown against **tc39/test262** — it
 **passes the full suite: 53,376/53,376 (100%)**, including annexB, intl402, and staging. That
 covers the language core plus the built-ins — closures, classes, generators & `async`/`await`
 (real suspension via stackful coroutines), ES modules (top-level await, `import defer`, source

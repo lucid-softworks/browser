@@ -206,8 +206,10 @@ final class TabButton: NSView {
     /// Set the hover tooltip to the URL/title plus the tab's live memory + CPU usage.
     func refreshStatsTooltip() {
         let base = tab.urlString.isEmpty ? (tab.title.isEmpty ? "New Tab" : tab.title) : tab.urlString
-        let mb = Double(tab.memBytes) / (1024.0 * 1024.0)
-        toolTip = String(format: "%@\n%.1f MB · %.0f%% CPU", base, mb, tab.cpuPercent)
+        let memory = tab.memBytes == 0
+            ? "Memory unavailable"
+            : String(format: "%.1f MB", Double(tab.memBytes) / (1024.0 * 1024.0))
+        toolTip = String(format: "%@\n%@ · %.0f%% CPU", base, memory, tab.cpuPercent)
     }
 
     private func updateAppearance() {
