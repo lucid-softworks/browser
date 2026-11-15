@@ -11,11 +11,14 @@ mod block;
 mod build;
 mod flex;
 mod float;
+mod geometry;
 mod grid;
 mod inline;
 mod intrinsic;
+mod linebreak;
 mod sizing;
 mod table;
+mod text_units;
 mod types;
 
 pub(crate) use block::*;
@@ -33,6 +36,7 @@ pub(crate) fn grow_stack<R>(f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(64 * 1024, 1024 * 1024, f)
 }
 pub(crate) use flex::*;
+pub use geometry::node_rects;
 pub(crate) use grid::*;
 pub(crate) use inline::*;
 pub(crate) use intrinsic::*;
@@ -88,6 +92,7 @@ pub fn layout_document(
         scrollport: None,
     };
     layout_block(&mut root, containing, ctx, styles, measurer);
+    geometry::order_for_paint(&mut root, styles);
     root
 }
 
@@ -192,6 +197,51 @@ mod tests {
         v
     }
 
+    #[test]
+    fn grid_area_auto_span_covers_two_rows_three_columns() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let g = doc.append_element(root, "div");
+        let a = doc.append_element(g, "div");
+        let b = doc.append_element(g, "div");
+        let mut styles = HashMap::new();
+        styles.insert(
+            g,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                width: Some(300.0),
+                grid_template_columns: vec![style::TrackSize::Px(100.0); 3],
+                grid_template_rows: vec![style::TrackSize::Px(20.0); 3],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                grid_row: Some(style::GridPlacement {
+                    start: None,
+                    start_span: Some(2),
+                    end: style::GridEnd::Auto,
+                }),
+                grid_column: Some(style::GridPlacement {
+                    start: None,
+                    start_span: Some(3),
+                    end: style::GridEnd::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        styles.insert(b, block_style(true));
+        let tree = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ar = rect_of(&tree, a);
+        let br = rect_of(&tree, b);
+        assert_eq!(ar.width, 300.0);
+        assert_eq!(ar.height, 40.0);
+        assert_eq!(br.y - ar.y, 40.0);
+    }
     #[test]
     fn br_splits_text_onto_two_lines() {
         // body > p > "first" <br> "second"
@@ -860,6 +910,105 @@ mod tests {
     }
 
     #[test]
+    fn ideographic_segments_are_placed_without_gaps() {
+        // Breaking a CJK run into per-character segments must not insert an inter-word space
+        // between them: an ideographic break is a break *opportunity*, not a separator, so on a
+        // single line the run has to paint exactly as if it were never split.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("日本語".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(p, block_style(true));
+
+        fn texts(b: &LayoutBox, out: &mut Vec<(String, f32)>) {
+            if let BoxContent::Text(t) = &b.content {
+                out.push((t.clone(), b.dimensions.content.width));
+            }
+            for c in &b.children {
+                texts(c, out);
+            }
+        }
+
+        // Wide enough that everything fits on one line, so only the spacing is under test. The
+        // segments share a DOM node and are contiguous, so they are rejoined into a single painted
+        // run — and that rejoin must not introduce separators.
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let mut boxes = Vec::new();
+        texts(pbox, &mut boxes);
+        assert_eq!(boxes.len(), 1, "one line, so one painted run: {boxes:?}");
+        assert_eq!(
+            boxes[0].0, "日本語",
+            "no space may be inserted at a break opportunity"
+        );
+        // 3 chars * 16 * 0.6 = 28.8px. Two inserted spaces would measure 48.0.
+        assert!(
+            (boxes[0].1 - 28.8).abs() < 0.01,
+            "run measured {}, expected 28.8 — inserted spaces widen it",
+            boxes[0].1,
+        );
+
+        // Narrow enough to force wrapping: the run now breaks between ideographs, and no line may
+        // pick up a space from the split either.
+        let root_box = layout_document(&doc, &styles, 20.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let mut boxes = Vec::new();
+        texts(pbox, &mut boxes);
+        assert!(boxes.len() > 1, "expected wrapping at 20px, got {boxes:?}");
+        for (t, _) in &boxes {
+            assert!(!t.contains(' '), "wrapped line {t:?} gained a space");
+        }
+        let joined: String = boxes.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, "日本語", "wrapping must not drop or add characters");
+    }
+
+    #[test]
+    fn a_run_that_exactly_fills_the_line_does_not_wrap() {
+        // Only a segmentable run can expose this: an atomic word is placed on the line whatever its
+        // width, so the fits-exactly comparison is never consulted. Once `break-all` gives every
+        // character its own break opportunity, an off-by-a-hair `>=` test wraps text that measures
+        // exactly the content width, and the block lays out taller than the single line it needs.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("XXXXX".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            p,
+            style::ComputedStyle {
+                display_block: true,
+                word_break: style::WordBreak::BreakAll,
+                ..Default::default()
+            },
+        );
+
+        // 5 chars * 16 * 0.6 = 48.0px, so 48.0 is exactly the width the run needs.
+        let root_box = layout_document(&doc, &styles, 48.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let lines = count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)));
+        assert_eq!(lines, 1, "a run that exactly fits must stay on one line");
+        assert!(
+            (pbox.dimensions.content.height - 16.0 * 1.3).abs() < 0.01,
+            "height {} should be one line",
+            pbox.dimensions.content.height,
+        );
+
+        // One pixel narrower genuinely does not fit, so it must wrap — otherwise a fix for the above
+        // would just be "never wrap".
+        let root_box = layout_document(&doc, &styles, 47.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let lines = count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)));
+        assert_eq!(lines, 2, "a run one pixel too wide must wrap");
+    }
+
+    #[test]
     fn inline_anchor_text_box_carries_node() {
         // p > "foo " <a>"bar baz qux"</a> " end"  — the <a> wraps; its emitted line Text box(es)
         // must carry the <a>'s text node id so clicks map back to the link.
@@ -882,6 +1031,19 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 80.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
 
+        let rects = node_rects(&root_box, &doc, &styles);
+        let anchor_rect = rects.get(&a.0).expect("inline anchor has geometry");
+        assert!(anchor_rect.width > 0.0 && anchor_rect.height > 20.8);
+        for fragment in collect_text_boxes(pbox)
+            .into_iter()
+            .filter(|b| b.node == Some(a_text))
+        {
+            let r = fragment.dimensions.border_box();
+            assert!(anchor_rect.x <= r.x && anchor_rect.y <= r.y);
+            assert!(anchor_rect.x + anchor_rect.width + 0.01 >= r.x + r.width);
+            assert!(anchor_rect.y + anchor_rect.height + 0.01 >= r.y + r.height);
+        }
+
         // Some emitted Text box must carry the <a>'s text node.
         let carries_a_text = count_boxes(pbox, &|x| {
             matches!(x.content, BoxContent::Text(_)) && x.node == Some(a_text)
@@ -903,6 +1065,62 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn inline_geometry_crosses_anonymous_wrappers_but_excludes_hidden_content() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let paragraph = doc.append_element(body, "p");
+        doc.append_child(paragraph, dom::NodeData::Text("Before the link".into()));
+        let link = doc.append_element(body, "a");
+        let span = doc.append_element(link, "span");
+        doc.append_child(span, dom::NodeData::Text("Visible link".into()));
+        let hidden = doc.append_element(link, "span");
+        doc.append_child(hidden, dom::NodeData::Text("Hidden content".into()));
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(paragraph, block_style(true));
+        styles.insert(link, style::ComputedStyle::default());
+        styles.insert(span, style::ComputedStyle::default());
+        styles.insert(hidden, disp(style::Display::None));
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let rects = node_rects(&root_box, &doc, &styles);
+        assert_eq!(rects[&link.0], rects[&span.0]);
+        assert!(rects[&link.0].width > 0.0);
+        assert!(rects[&link.0].y >= rects[&paragraph.0].y + rects[&paragraph.0].height);
+        assert!(!rects.contains_key(&hidden.0));
+    }
+
+    #[test]
+    fn inline_link_bounds_exclude_positioned_popup_descendants() {
+        for position in [style::Position::Absolute, style::Position::Fixed] {
+            let mut doc = dom::Document::new();
+            let body = doc.append_element(doc.root(), "body");
+            let link = doc.append_element(body, "a");
+            let text = doc.append_child(link, dom::NodeData::Text("Link".into()));
+            let popup = doc.append_element(link, "span");
+            doc.append_child(popup, dom::NodeData::Text("Popup".into()));
+            let mut styles = HashMap::new();
+            styles.insert(body, block_style(true));
+            styles.insert(link, style::ComputedStyle::default());
+            styles.insert(
+                popup,
+                style::ComputedStyle {
+                    position,
+                    left: Some(1000.0),
+                    top: Some(500.0),
+                    width: Some(100.0),
+                    height: Some(50.0),
+                    ..Default::default()
+                },
+            );
+            let tree = layout_document(&doc, &styles, 1280.0, 900.0, &Stub, &HashMap::new(), None);
+            let rects = node_rects(&tree, &doc, &styles);
+            assert_eq!(rects[&link.0], rects[&text.0], "{position:?}");
+            assert!(rects[&popup.0].x >= 1000.0);
         }
     }
 
@@ -2407,6 +2625,63 @@ mod tests {
     }
 
     #[test]
+    fn auto_grid_row_honours_the_items_line_height() {
+        // An auto row takes the greater of the single-line intrinsic estimate and the item's
+        // laid-out height. The estimate came from the font metric alone, so a `line-height` shorter
+        // than that metric was overridden by the estimate and the row came out too tall — one line
+        // of 10px text with `line-height: 10px` gave a 13px row (10 × the stub's 1.3 factor).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let g = doc.append_element(body, "div");
+        let a = doc.append_element(g, "div");
+        doc.append_child(a, dom::NodeData::Text("XX".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            g,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                width: Some(200.0),
+                grid_template_columns: vec![style::TrackSize::Px(50.0)],
+                grid_template_rows: vec![style::TrackSize::Auto],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                font_size: 10.0,
+                line_height: Some(10.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        assert!(
+            (abox.dimensions.content.height - 10.0).abs() < 0.5,
+            "row should be the specified 10px line-height, got {}",
+            abox.dimensions.content.height
+        );
+
+        // Without a specified line-height the font metric is still the estimate, so the fix must not
+        // have replaced one hard-coded answer with another.
+        styles.get_mut(&a).unwrap().line_height = None;
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        assert!(
+            (abox.dimensions.content.height - 13.0).abs() < 0.5,
+            "`line-height: normal` should still use the font metric (13), got {}",
+            abox.dimensions.content.height
+        );
+    }
+
+    #[test]
     fn abspos_grid_child_percentage_size_uses_grid_area_containing_block() {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -3194,6 +3469,41 @@ mod tests {
     }
 
     #[test]
+    fn styled_input_fragments_do_not_reapply_control_dimensions() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let input = doc.append_element(body, "input");
+        set_attr(&mut doc, input, "value", "Web browser");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(input, inline_block(300.0, 44.0));
+        let focused = layout_document(
+            &doc,
+            &styles,
+            800.0,
+            600.0,
+            &Stub,
+            &HashMap::new(),
+            Some(input),
+        );
+        let blurred = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let caret = find_box(&focused, &|b| matches!(b.content, BoxContent::Caret)).unwrap();
+        assert_eq!(caret.dimensions.content.width, 2.0);
+        let focused_rect = node_rects(&focused, &doc, &styles)[&input.0];
+        assert_eq!(focused_rect, node_rects(&blurred, &doc, &styles)[&input.0]);
+        assert_eq!(focused_rect.width, 300.0);
+        assert_eq!(focused_rect.height, 44.0);
+        for text in collect_text_boxes(&focused) {
+            assert!(text.dimensions.content.width < 150.0);
+            assert!(
+                text.dimensions.content.y + text.dimensions.content.height
+                    <= focused_rect.y + focused_rect.height
+            );
+        }
+    }
+
+    #[test]
     fn focused_text_input_shows_caret() {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -3611,6 +3921,45 @@ mod tests {
         let c00 = cell_rect(rows[0][0]);
         let c01 = cell_rect(rows[0][1]);
         assert!(c00.x < c01.x, "column 0 sits left of column 1");
+    }
+
+    #[test]
+    fn nested_table_preserves_rows_through_cell_measurement() {
+        for parent_display in [
+            style::Display::Block,
+            style::Display::Flex,
+            style::Display::Grid,
+        ] {
+            let mut doc = dom::Document::new();
+            let root = doc.root();
+            let body = doc.append_element(root, "body");
+            let outer = doc.append_element(body, "table");
+            let mut styles = HashMap::new();
+            styles.insert(body, disp(parent_display));
+            styles.insert(outer, disp(style::Display::Table));
+            let outer_cells = build_row(&mut doc, &mut styles, outer, "td", &[""]);
+            let inner = doc.append_element(outer_cells[0], "table");
+            styles.insert(inner, disp(style::Display::Table));
+            let first = build_row(&mut doc, &mut styles, inner, "td", &["Story title", "link"]);
+            let second = build_row(
+                &mut doc,
+                &mut styles,
+                inner,
+                "td",
+                &["Story comments", "next"],
+            );
+            let root_box =
+                layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+            let rects = node_rects(&root_box, &doc, &styles);
+            for node in first.iter().chain(second.iter()).chain([&inner]) {
+                let r = rects.get(&node.0).expect("nested table cell retained");
+                assert!(r.width > 0.0 && r.height > 0.0, "{node:?}: {r:?}");
+            }
+            assert!(rects[&second[0].0].y > rects[&first[0].0].y);
+            assert!(collect_text_boxes(&root_box).iter().any(|b| {
+                matches!(&b.content, BoxContent::Text(text) if text.contains("comments"))
+            }));
+        }
     }
 
     #[test]

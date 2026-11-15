@@ -67,6 +67,8 @@ pub struct PaintStyle {
     pub bold: bool,
     pub italic: bool,
     pub background_color: Option<(u8, u8, u8)>,
+    /// Background alpha is independent of the opacity of the whole element.
+    pub background_alpha: u8,
     pub border_color: (u8, u8, u8),
     /// `border-collapse` (inherited from the table). On a collapsed table the painter draws cell
     /// borders as single shared 1px lines (top+left of each cell, plus the table's right/bottom
@@ -89,6 +91,9 @@ pub struct PaintStyle {
     /// `white-space` mode (collapse vs preserve spaces/newlines). Read by inline layout to decide
     /// whether a text run's spaces are preserved and `\n`s are forced breaks.
     pub white_space: style::WhiteSpace,
+    /// `word-break` mode. Read by inline layout to decide which soft-wrap opportunities exist inside
+    /// a text run — notably whether an ideographic run may break at all.
+    pub word_break: style::WordBreak,
     /// Per-box opacity (0.0..=1.0); the painter multiplies painted alpha by this (and threads it
     /// to the subtree). 1.0 = fully opaque.
     pub opacity: f32,
@@ -150,6 +155,7 @@ impl Default for PaintStyle {
             bold: false,
             italic: false,
             background_color: None,
+            background_alpha: 255,
             border_color: (0, 0, 0),
             border_collapse: style::BorderCollapse::Separate,
             is_table_cell: false,
@@ -159,6 +165,7 @@ impl Default for PaintStyle {
             overline: false,
             vertical_align: style::VerticalAlign::Baseline,
             white_space: style::WhiteSpace::Normal,
+            word_break: style::WordBreak::Normal,
             opacity: 1.0,
             visible: true,
             visited_link: false,

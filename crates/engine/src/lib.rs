@@ -263,6 +263,26 @@ pub(crate) use traversal::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_navigation_compares_normalized_urls() {
+        assert!(Engine::is_fragment_navigation(
+            r"file://C:\Users\runneradmin\Temp\page.html",
+            "file:///C:/Users/runneradmin/Temp/page.html#active"
+        ));
+        assert!(Engine::is_fragment_navigation(
+            "http://EXAMPLE.com:80/page#one",
+            "http://example.com/page#two"
+        ));
+        for (from, to) in [
+            ("https://example.com/a#one", "https://example.com/b#two"),
+            ("https://example.com/a?q=1", "https://example.com/a?q=2#two"),
+            ("http://EXAMPLE.com:80/a", "http://example.com/a"),
+            ("invalid", "also invalid"),
+        ] {
+            assert!(!Engine::is_fragment_navigation(from, to), "{from} -> {to}");
+        }
+    }
     #[test]
     fn interleaved_engines_keep_tab_settings_and_scroll_separate() {
         let path =
@@ -813,6 +833,99 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn live_dpr_resize_keeps_engines_isolated() {
+        let path = std::env::temp_dir().join(format!("browser_dpr_resize_{}.html", rand_suffix()));
+        std::fs::write(&path, "<body><script>window.resizes=0;addEventListener('resize',function(){resizes++})</script></body>").unwrap();
+        let url = format!("file://{}", path.display());
+        let mut first = Engine::new();
+        let mut second = Engine::new();
+        first.set_viewport(400, 300, 1.0);
+        second.set_viewport(640, 480, 1.0);
+        assert_eq!(first.load_url(&url), 0);
+        assert_eq!(second.load_url(&url), 0);
+        first.set_viewport(200, 150, 2.0);
+        let query = "[innerWidth,innerHeight,devicePixelRatio,resizes].join(',')";
+        assert_eq!(first.console_eval(query), "200,150,2,1");
+        assert_eq!(second.console_eval(query), "640,480,1,0");
+        second.set_viewport(640, 480, 2.0);
+        assert_eq!(second.console_eval(query), "640,480,2,1");
+        assert_eq!(first.console_eval(query), "200,150,2,1");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn viewport_change_invalidates_layout_without_session() {
+        let path =
+            std::env::temp_dir().join(format!("browser_no_session_resize_{}.html", rand_suffix()));
+        std::fs::write(
+            &path,
+            "<style>body { margin:0; background:red } @media(max-width:300px) { body { background:green } }</style><body></body>",
+        )
+        .unwrap();
+        let mut engine = Engine::new();
+        engine.set_viewport(400, 300, 1.0);
+        assert_eq!(engine.load_url(&format!("file://{}", path.display())), 0);
+        assert_eq!(&engine.render().pixels[..4], &[255, 0, 0, 255]);
+        engine.session = None;
+        // The framebuffer is still 400x300, but CSS layout must use the new 200px width.
+        engine.set_viewport(200, 150, 2.0);
+        assert_eq!(&engine.render().pixels[..4], &[0, 128, 0, 255]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn resize_relayouts_before_handlers_observe_geometry() {
+        // A `resize` handler exists to measure, so the pushed geometry must already describe the new
+        // viewport when it runs. The percentage-width div is the load-bearing part: the root's own
+        // `clientWidth` falls back to `innerWidth`, so asserting on that would pass even if layout
+        // had never re-run. `#half` resolves against the viewport, so its rect only reads 320 if it
+        // was laid out at the new 640px width before dispatch — it reads 500, the pre-resize value,
+        // if the stale rect table is still in place.
+        let html = "<html><body><div id=half style='width:50%;height:10px'></div><script>\
+                    window.__seen = [];\
+                    addEventListener('resize', function () {\
+                      window.__seen.push(innerWidth + 'x' + innerHeight\
+                        + '@' + devicePixelRatio\
+                        + '/' + document.getElementById('half').getBoundingClientRect().width);\
+                    });\
+                    </script></body></html>";
+        let path = std::env::temp_dir().join(format!("browser_resize_{}.html", rand_suffix()));
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(1000, 800, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let _ = e.render();
+        assert_eq!(
+            e.console_eval("document.getElementById('half').getBoundingClientRect().width"),
+            "500",
+            "sanity: the div is half of the initial 1000px viewport",
+        );
+
+        e.set_viewport(640, 480, 1.0);
+        assert_eq!(
+            e.console_eval("window.__seen.length"),
+            "1",
+            "resize should fire exactly once per viewport change",
+        );
+        assert_eq!(
+            e.console_eval("window.__seen[0]"),
+            "640x480@1/320",
+            "handler should see the new metrics AND the re-laid-out geometry",
+        );
+
+        // An unchanged viewport must not re-enter JS at all.
+        e.set_viewport(640, 480, 1.0);
+        assert_eq!(
+            e.console_eval("window.__seen.length"),
+            "1",
+            "a no-op set_viewport should not fire resize",
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Render `html` at `os_dark` appearance and return the top-left canvas pixel (r, g, b).
     /// Holds the color-scheme test lock for the whole set+render so the OS flag can't be flipped
     /// by a parallel test mid-render.
@@ -1179,6 +1292,64 @@ mod tests {
             painted_pixels_in(&e, cr) > painted_pixels_in(&e, ur),
             "checked checkbox should differ (more fill) than unchecked"
         );
+    }
+
+    #[test]
+    fn positioned_checkbox_hits_above_later_in_flow_label() {
+        let html = r#"<html><body style="margin:0"><div style="position:relative">
+          <input id="toggle" type="checkbox" style="position:absolute;left:0;top:0;width:40px;height:40px;opacity:0">
+          <label id="caption" style="display:block;width:200px;height:60px;background:white">Task</label>
+          </div><script>var clicked = ''; document.addEventListener('click', function(e) { clicked = e.target.id; });</script>
+        </body></html>"#;
+        let mut e = load_rendered(html, "browser_positioned_checkbox_test.html", 300, 120);
+        assert_eq!(
+            e.console_eval("document.elementFromPoint(20, 20).id"),
+            "toggle"
+        );
+        e.render();
+        assert!(e.dispatch_click(20.0, 20.0));
+        assert_eq!(
+            e.console_eval("clicked + ':' + document.getElementById('toggle').checked"),
+            "toggle:true"
+        );
+    }
+
+    #[test]
+    fn translucent_background_blends_without_dimming_children() {
+        let html = r#"<html><body style="margin:0;background:white">
+          <div style="width:100px;height:80px;background:rgba(0,0,0,.1)">
+            <div style="width:20px;height:20px;background:red"></div>
+          </div></body></html>"#;
+        let e = load_rendered(html, "browser_background_alpha_test.html", 200, 120);
+        let bg = px_at(&e, 50, 50);
+        assert!(
+            bg.0 >= 228 && bg.0 <= 231 && bg.0 == bg.1 && bg.1 == bg.2,
+            "{bg:?}"
+        );
+        assert_eq!(px_at(&e, 10, 10), (255, 0, 0));
+    }
+
+    #[test]
+    fn overlapping_controls_hit_the_last_painted_sibling() {
+        let html = r#"<html><body style="margin:0">
+          <form style="position:relative;height:80px">
+            <input id="under" style="position:absolute;left:0;top:0;width:200px;height:40px">
+            <button id="over" type="button" style="position:absolute;left:100px;top:0;width:100px;height:40px">Go</button>
+          </form>
+          <script>var clicked = ''; document.addEventListener('click', function(e) { clicked = e.target.id; });</script>
+        </body></html>"#;
+        let mut e = load_rendered(html, "browser_overlapping_controls_test.html", 300, 120);
+        let button = e.node_by_attr_id("over").unwrap();
+        let r = e.node_device_rect(button).unwrap();
+        let (x, y) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        assert_eq!(
+            e.console_eval(&format!("document.elementFromPoint({x}, {y}).id")),
+            "over"
+        );
+        // Evaluating JS invalidates the layout snapshot; rebuild as the native host does.
+        e.render();
+        assert!(e.dispatch_click(x, y));
+        assert_eq!(e.console_eval("clicked"), "over");
     }
 
     #[test]
@@ -1701,6 +1872,61 @@ mod tests {
             "importer main.css should come second: {sheets:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xml_mixed_text_and_cdata_preserve_style_and_script_order() {
+        let doc = html::xml::parse_xml(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head>
+            <style>div { <![CDATA[color: green;]]> height: 3px; }</style>
+            <script>var before = 1;<![CDATA[var middle = before < 2;]]>var after = middle;</script>
+            </head><body></body></html>"#,
+        );
+        assert_eq!(
+            collect_style_sources(&doc, "https://example.com/"),
+            vec![StyleSource::Inline(
+                "div { color: green; height: 3px; }".into()
+            )]
+        );
+        assert_eq!(
+            collect_script_sources(&doc, "https://example.com/"),
+            vec![ScriptSource::Inline(
+                "var before = 1;var middle = before < 2;var after = middle;".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn xml_parsed_cdata_style_body_is_collected() {
+        // The sibling test below covers a `.xht` served as `text/html`, where the lenient parser
+        // leaves the CDATA markers in the text and they get stripped as a string. Served as
+        // `application/xhtml+xml` the XML parser instead resolves the section into a `Cdata` node,
+        // so there is no wrapper to strip and the body is not a `Text` child — collecting only
+        // `Text` dropped the whole stylesheet on the floor. WPT's most-used shared reference
+        // (`/css/reference/ref-filled-green-100px-square.xht`, cited by ~2.5k tests) is exactly
+        // this shape, so it rendered blank and took every test citing it down with it.
+        let doc = html::xml::parse_xml(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head>
+               <style type="text/css"><![CDATA[
+               div { background-color: green; height: 3px; width: 96px; }
+               ]]></style></head><body><div></div></body></html>"#,
+        );
+        let sources = collect_style_sources(&doc, "https://example.com/page.xht");
+        let inline = sources
+            .iter()
+            .find_map(|s| match s {
+                StyleSource::Inline(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("an inline <style> source");
+        assert!(
+            inline.contains("background-color: green"),
+            "CDATA style body was dropped: {inline:?}"
+        );
+        assert!(
+            !inline.contains("CDATA") && !inline.contains("]]>"),
+            "CDATA markers leaked into the CSS: {inline:?}"
+        );
     }
 
     #[test]

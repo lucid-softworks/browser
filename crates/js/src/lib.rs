@@ -430,6 +430,81 @@ mod tests {
     }
 
     #[test]
+    fn outer_html_preserves_detached_wrapper_attributes_and_void_elements() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var aside = document.createElement('aside');
+                    aside.className = 'sidebar';
+                    aside.setAttribute('title', 'a"b&c');
+                    aside.innerHTML = '<h2>A &amp; B</h2><input disabled>';
+                    var markup = aside.outerHTML;
+                    document.body.insertAdjacentHTML('afterbegin', markup);
+                    var copy = document.body.firstElementChild;
+                    [markup,
+                     copy.tagName + ':' + copy.className,
+                     copy.querySelector('h2').textContent,
+                     copy.querySelector('input').outerHTML,
+                     document.documentElement.outerHTML.indexOf('<html>') === 0
+                    ].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(
+                r#"<aside class="sidebar" title="a&quot;b&amp;c"><h2>A &amp; B</h2><input disabled=""></aside>|ASIDE:sidebar|A & B|<input disabled="">|true"#
+            )
+        );
+    }
+
+    #[test]
+    fn outer_html_preserves_html_raw_text_and_escapes_ordinary_text() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var results = [];
+            ['script', 'style'].forEach(function(tag) {
+                var node = document.createElement(tag);
+                node.textContent = 'a < b && c > d';
+                results.push(node.innerHTML, node.outerHTML);
+                var holder = document.createElement('div');
+                holder.innerHTML = node.outerHTML;
+                results.push(holder.firstChild.textContent);
+            });
+            var span = document.createElement('span');
+            span.textContent = '<script>&';
+            results.push(span.outerHTML);
+            results.join('|')
+        "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(concat!(
+                "a < b && c > d|<script>a < b && c > d</script>|a < b && c > d|",
+                "a < b && c > d|<style>a < b && c > d</style>|a < b && c > d|",
+                "<span>&lt;script&gt;&amp;</span>"
+            ))
+        );
+        // The native serializer must not apply HTML raw-text rules in other namespaces.
+        let mut doc = dom::Document::new();
+        let svg_script = doc.append_element(doc.root(), "script");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(svg_script).data {
+            e.namespace = Some("http://www.w3.org/2000/svg".into());
+        }
+        doc.append_child(svg_script, dom::NodeData::Text("a < b".into()));
+        assert_eq!(
+            crate::dom_helpers::outer_html(&doc, svg_script),
+            "<script>a &lt; b</script>"
+        );
+    }
+
+    #[test]
     fn structured_clone_deep_copies_cycles_and_throws_on_uncloneable() {
         // Replaces the old JSON-roundtrip stub: must deep-copy Maps, preserve cycles and shared
         // ArrayBuffer aliasing, and raise DataCloneError on a function — none of which the stub did.
@@ -1875,6 +1950,33 @@ mod tests {
     }
 
     #[test]
+    fn linked_stylesheet_cascade_fetches_relative_href_against_document_base() {
+        let doc = html::parse(
+            r#"<html><head><base href="../assets/"><link rel="stylesheet" href="app.css"></head>
+               <body><div class="app"></div></body></html>"#,
+        );
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&requests);
+        let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> = Rc::new(move |url| {
+            seen.borrow_mut().push(url.to_owned());
+            (url == "https://example.test/assets/app.css").then(|| {
+                (
+                    ".app { position: relative; }".to_owned(),
+                    "text/css".to_owned(),
+                )
+            })
+        });
+        let sheets = collect_author_sheets(&doc, &fetcher, "https://example.test/demo/index.html");
+        let styles = style::cascade(&doc, &sheets);
+        let app = find_by_tag(&doc, doc.root(), "div").unwrap();
+        assert_eq!(styles[&app].position, style::Position::Relative);
+        assert_eq!(
+            &*requests.borrow(),
+            &["https://example.test/assets/app.css"]
+        );
+    }
+
+    #[test]
     fn computed_style_applies_style_element_rule() {
         // A `<style>` rule `.x{display:flex}` is collected in-Session and applied via the cascade.
         let (mut doc, body) = doc_with_body("");
@@ -2221,6 +2323,48 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some(value.trim()));
+    }
+
+    #[test]
+    fn inline_style_cached_reads_follow_attribute_changes_and_mutations() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var el = document.createElement('div'), s = el.style;
+                function check(ok, message) { if (!ok) throw new Error(message); }
+                var observer = new MutationObserver(function () {});
+                observer.observe(el, {attributes: true, attributeOldValue: true});
+                s.color = 'red';
+                check(s.color === 'red', 'setter/getter');
+                check(observer.takeRecords().length === 1, 'first setter writes');
+                s.color = 'red';
+                s.setProperty('not-a-property', 'invalid');
+                check(observer.takeRecords().length === 0, 'no-op setters do not write');
+                s.color = 'blue';
+                check(s.color === 'blue' && el.getAttribute('style') === 'color: blue;',
+                      'setter must not mutate cached comparison state');
+                check(observer.takeRecords().length === 1, 'changed setter writes');
+                el.setAttribute('style', 'color: green !important; margin: 1px 2px');
+                check(s.color === 'green' && s.getPropertyPriority('color') === 'important',
+                      'external attribute replacement');
+                check(s.marginLeft === '2px', 'external shorthand expansion');
+                check(s.removeProperty('color') === 'green' && s.color === '', 'remove property');
+                el.removeAttribute('style');
+                check(s.length === 0 && s.marginLeft === '', 'external attribute removal');
+                s.cssText = 'padding: 3px; color: red';
+                check(s.paddingTop === '3px' && s.color === 'red', 'cssText replaces cache');
+                observer.takeRecords();
+                s.cssText = s.cssText;
+                check(observer.takeRecords().length === 1, 'equal cssText still writes');
+                observer.disconnect();
+                'ok'
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("ok"));
     }
 
     #[test]

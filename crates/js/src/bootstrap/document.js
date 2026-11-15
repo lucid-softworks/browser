@@ -918,7 +918,7 @@
       enumerable: true, configurable: true
     });
     Object.defineProperty(el, "outerHTML", {
-      get: function () { try { return __innerHTML(__parent(id) >= 0 ? id : id); } catch (e) { return ""; } },
+      get: function () { return __outerHTML(id); },
       enumerable: true, configurable: true
     });
     // innerText / outerText are HTMLElement-only (not on SVG/MathML elements). The getter is the

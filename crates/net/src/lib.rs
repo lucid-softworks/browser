@@ -543,7 +543,7 @@ fn agent() -> &'static ureq::Agent {
         // so that document.cookie and HTTP requests share the same jar. We intentionally do NOT
         // call .cookie_store(...) here; we inject the Cookie header and parse Set-Cookie ourselves.
         // Test-driving env knobs (no effect on normal browsing):
-        //  - `WPT_INSECURE_TLS`: accept any server certificate. The WebDriver server sets this so
+        //  - `WPT_INSECURE_TLS=1`: accept any server certificate. The WebDriver server sets this so
         //    `.https` WPT tests load over TLS against `wpt serve`'s self-signed cert without needing
         //    the checkout's CA path (matches the `acceptInsecureCerts` capability it advertises).
         //  - `WPT_CA_FILE`: trust a specific extra CA (the WPT `tools/certs/cacert.pem`).
@@ -573,14 +573,14 @@ fn agent_no_redirect() -> &'static ureq::Agent {
 }
 
 /// A test-only rustls client config, or `None` to leave the agent on its default trust store.
-/// `WPT_INSECURE_TLS` disables certificate verification entirely; otherwise `WPT_CA_FILE` adds an
+/// `WPT_INSECURE_TLS=1` disables certificate verification entirely; otherwise `WPT_CA_FILE` adds an
 /// extra trusted CA on top of the usual webpki roots. A missing/unparseable `WPT_CA_FILE` degrades
 /// gracefully to `None`.
 fn wpt_tls_config() -> Option<rustls::ClientConfig> {
     // `ring` is a hard dependency, so the provider is always present — no default-provider panic.
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
 
-    if std::env::var_os("WPT_INSECURE_TLS").is_some() {
+    if insecure_tls_enabled(std::env::var("WPT_INSECURE_TLS").ok().as_deref()) {
         return rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .ok()?
@@ -603,6 +603,10 @@ fn wpt_tls_config() -> Option<rustls::ClientConfig> {
         .with_root_certificates(roots)
         .with_no_client_auth()
         .into()
+}
+
+fn insecure_tls_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 /// A rustls verifier that accepts any server certificate — for driving WPT (`wpt serve` uses a
@@ -1615,7 +1619,7 @@ pub fn ws_run(
         loop {
             match out_rx.try_recv() {
                 Ok((0, text)) => {
-                    if socket.send(Message::Text(text)).is_err() {
+                    if socket.send(Message::Text(text.into())).is_err() {
                         let _ = evt_tx.send((id, 4, "send failed".to_string()));
                         closing = true;
                         break;
@@ -1625,7 +1629,7 @@ pub fn ws_run(
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(b64.as_bytes())
                         .unwrap_or_default();
-                    if socket.send(Message::Binary(bytes)).is_err() {
+                    if socket.send(Message::Binary(bytes.into())).is_err() {
                         let _ = evt_tx.send((id, 4, "send failed".to_string()));
                         closing = true;
                         break;
@@ -1651,7 +1655,7 @@ pub fn ws_run(
         // (b) Attempt one non-blocking read.
         match socket.read() {
             Ok(Message::Text(t)) => {
-                let _ = evt_tx.send((id, 1, t));
+                let _ = evt_tx.send((id, 1, t.to_string()));
             }
             Ok(Message::Binary(b)) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&b);
@@ -1755,6 +1759,23 @@ fn set_ws_nonblocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insecure_tls_requires_explicit_opt_in() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("FALSE"),
+            Some("typo"),
+        ] {
+            assert!(!insecure_tls_enabled(value), "{value:?}");
+        }
+        for value in [Some("1"), Some("true"), Some("TRUE")] {
+            assert!(insecure_tls_enabled(value), "{value:?}");
+        }
+    }
 
     #[test]
     fn invalid_url_is_err() {
@@ -2211,6 +2232,53 @@ mod tests {
             !events.iter().any(|(_, k, _)| *k == 0),
             "must not open on an unreachable host, got {events:?}"
         );
+    }
+
+    #[test]
+    fn ws_local_text_and_binary_round_trip() {
+        use std::net::TcpListener;
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let text = socket.read().unwrap();
+            assert_eq!(text, tungstenite::Message::Text("hello 🦀".into()));
+            socket.send(text).unwrap();
+            let binary = socket.read().unwrap();
+            assert_eq!(
+                binary,
+                tungstenite::Message::Binary(vec![0, 255, 128, 1].into())
+            );
+            socket.send(binary).unwrap();
+            assert!(matches!(
+                socket.read().unwrap(),
+                tungstenite::Message::Close(_)
+            ));
+        });
+        let (events, incoming) = channel();
+        let (outgoing, commands) = channel();
+        let client =
+            std::thread::spawn(move || ws_run(format!("ws://{addr}"), 42, events, commands));
+        let receive = || incoming.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(receive(), (42, 0, String::new()));
+        outgoing.send((0, "hello 🦀".into())).unwrap();
+        assert_eq!(receive(), (42, 1, "hello 🦀".into()));
+        let payload = base64::engine::general_purpose::STANDARD.encode([0, 255, 128, 1]);
+        outgoing.send((1, payload.clone())).unwrap();
+        assert_eq!(receive(), (42, 2, payload));
+        outgoing.send((2, String::new())).unwrap();
+        assert_eq!(receive().1, 3);
+        client.join().unwrap();
+        server.join().unwrap();
     }
 
     #[test]

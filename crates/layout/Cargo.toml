@@ -10,6 +10,7 @@ style = { path = "../style" }
 # Grows the stack on demand at the two layout recursion points (box-tree build + block layout) so
 # deeply-nested DOMs don't overflow the (smaller) debug stack. Same approach rustc/servo use.
 stacker = "0.1"
+unicode-segmentation = "1.13.3"
 
 [lints]
 workspace = true

@@ -387,7 +387,7 @@ pub struct ComputedStyle {
     pub right_spec: InsetValue,
     pub bottom_spec: InsetValue,
     pub left_spec: InsetValue,
-    /// Stacking `z-index` (`None` = auto). Parsed but not yet used for paint ordering.
+    /// Stacking `z-index` (`None` = auto), used for positioned sibling paint ordering.
     pub z_index: Option<i32>,
     /// Explicit content `width` in px (`None` = auto/percentage; see `width_pct`).
     pub width: Option<f32>,
@@ -520,6 +520,9 @@ pub struct ComputedStyle {
     pub text_indent: f32,
     /// `white-space` processing mode (collapse vs preserve spaces/newlines). Inherits.
     pub white_space: WhiteSpace,
+    /// `word-break` soft-wrap opportunity policy (whether CJK may break, whether every character
+    /// may). Inherits.
+    pub word_break: WordBreak,
     /// `list-style-type` marker style for `display: list-item` boxes (`ul`/`ol`/`li`). Inherits.
     pub list_style_type: ListStyleType,
 
@@ -850,6 +853,25 @@ impl WhiteSpace {
             WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::PreLine
         )
     }
+}
+
+/// CSS `word-break`: which soft-wrap opportunities exist *within* a word. Inherits.
+///
+/// Only the opportunities differ between these; the line-breaking algorithm proper (UAX #14, in
+/// `layout::linebreak`) still decides which pairs of characters may be separated, so e.g. `break-all`
+/// does not license a break before a closing bracket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WordBreak {
+    /// Break at ordinary opportunities: between words, and between ideographs (CJK text has no
+    /// spaces, so this is the only thing that keeps it inside its container).
+    #[default]
+    Normal,
+    /// Break between *any* two characters, including within Latin words. Used to force long
+    /// unbreakable strings to wrap.
+    BreakAll,
+    /// Never break between ideographs — CJK runs behave like a single unbreakable word, and only
+    /// spaces and explicit opportunities remain. The inverse of `normal` for CJK.
+    KeepAll,
 }
 
 /// CSS `list-style-type`: the marker drawn before a `display: list-item` box. Inherits.

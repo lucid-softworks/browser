@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib"]
 engine = { path = "../engine" }
 
 [build-dependencies]
-cbindgen = "0.27"
+cbindgen = "0.29"
 
 [lints]
 workspace = true

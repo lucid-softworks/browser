@@ -201,22 +201,14 @@ pub(crate) fn ensure_layout_fresh(state: &HostState) {
         );
         let mut rects = state.layout_rects.borrow_mut();
         rects.clear();
-        collect_rects(&root, &mut rects);
+        rects.extend(
+            layout::node_rects(&root, doc, styles)
+                .into_iter()
+                .map(|(id, r)| (id, (r.x, r.y, r.width, r.height))),
+        );
         state.doc_height.set(root.dimensions.border_box().height);
     });
     state.rects_dom_version.set(state.dom_version.get());
-}
-
-fn collect_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, (f32, f32, f32, f32)>) {
-    if let Some(node) = b.node {
-        out.entry(node.0).or_insert_with(|| {
-            let r = b.dimensions.border_box();
-            (r.x, r.y, r.width, r.height)
-        });
-    }
-    for c in &b.children {
-        collect_rects(c, out);
-    }
 }
 
 #[cfg(test)]
