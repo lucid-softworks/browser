@@ -1,0 +1,477 @@
+//! lumen — a from-scratch JavaScript engine (std-only, no dependencies).
+//!
+//! lumen is the eventual in-house replacement for the V8 backend in the `js` crate. Today it is a
+//! tree-walking interpreter covering the ECMAScript language core, driven by the tc39/test262
+//! conformance suite (see `crates/test262-runner`). It deliberately implements a growing *subset* —
+//! the test262 score is the roadmap.
+//!
+//! ## Shape
+//! - [`lexer`] tokenizes, [`parser`] builds the [`ast`], [`interpreter`] + `eval` walk it.
+//! - [`value`] is the prototype-based object model (`Rc<RefCell<Object>>`, reference-counted — no
+//!   real GC yet, so reference cycles leak; fine for the per-test runner).
+//! - [`builtins`] installs the realm (`globalThis`, `Object`/`Array`/`Function`/`Math`, the error
+//!   constructors, global functions).
+//!
+//! ## Public API
+//! [`Engine::new`] builds a fresh realm; [`Engine::eval`] runs a script and reports a [`Completion`]
+//! (a value, or a thrown error with its constructor name + message) or a parse-phase [`ParseError`].
+//! The error name + phase distinction is exactly what a test262 negative-test matcher needs.
+
+// The ECMAScript abstract operations (`to_number`/`to_string`/`to_primitive`/…) take `&mut self`
+// on purpose: converting an object can run user `valueOf`/`toString`/getters, which mutate the
+// realm. That trips clippy's `wrong_self_convention`, which assumes `to_*` is a cheap borrow.
+#![allow(clippy::wrong_self_convention)]
+
+mod ast;
+mod bigint;
+mod builtins;
+pub mod bytecode;
+mod coroutine;
+mod eval;
+pub mod execution;
+/// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
+/// per JS object/scope) run 15-30% faster than on the system allocator. NOT registered here: a
+/// library must not preempt an embedder's `#[global_allocator]` (the test262 runner caps
+/// worker allocations with its own). Binaries opt in:
+/// `#[global_allocator] static A: lumen::fastalloc::ClassAlloc = lumen::fastalloc::ClassAlloc;`
+#[cfg(not(target_arch = "wasm32"))]
+pub mod fastalloc;
+mod fasthash;
+mod host;
+mod interpreter;
+#[cfg(feature = "intl")]
+mod intl;
+mod jit;
+mod jit_ir;
+mod jstr;
+mod lexer;
+mod lstr;
+mod modules;
+#[cfg(feature = "intl")]
+mod numbering;
+mod parser;
+mod regex;
+mod regex_emoji;
+mod regex_fold;
+mod snapshot;
+mod temporal;
+mod token;
+mod tz;
+#[rustfmt::skip]
+mod tzdata;
+#[rustfmt::skip]
+mod umalqura;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod cldr_likely;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod cldr_dates;
+#[rustfmt::skip]
+#[cfg(feature = "intl")]
+mod cldr_units;
+#[rustfmt::skip]
+mod units;
+mod unicode_norm;
+mod unicode_norm_impl;
+mod unicode_props;
+mod value;
+
+use interpreter::Interp;
+use value::Value;
+
+/// Internal-stage entry points, exposed only for benchmarking (`bench` feature). These reach past
+/// the stable public API to time individual compilation stages (lex → parse → snapshot encode →
+/// decode) — the breakdown behind cold-boot cost. Not a stability commitment; do not depend on it.
+#[cfg(feature = "bench")]
+pub mod bench_api {
+    pub use crate::ast::Stmt;
+    pub use crate::lexer::tokenize;
+    pub use crate::parser::{parse_module, parse_script};
+    pub use crate::snapshot::{decode, encode};
+}
+
+/// Host wall-clock override: milliseconds since the Unix epoch. Targets without a usable
+/// `SystemTime` (wasm32-unknown-unknown) install one at startup; when unset, `Date`/`Temporal.Now`
+/// fall back to `SystemTime`.
+static HOST_CLOCK: std::sync::OnceLock<fn() -> f64> = std::sync::OnceLock::new();
+
+/// Install a process-wide wall-clock source (first call wins). The embedder's `f` returns
+/// milliseconds since the Unix epoch.
+pub fn set_host_clock(f: fn() -> f64) {
+    let _ = HOST_CLOCK.set(f);
+}
+
+/// The installed host clock's current time, if one was set.
+pub(crate) fn host_now_ms() -> Option<f64> {
+    HOST_CLOCK.get().map(|f| f())
+}
+
+/// Parse `src` as a script and encode its AST to a snapshot blob — a build-time helper (used
+/// from op crates' `build.rs`) so static JS glue is parsed once at build and decoded, not
+/// re-parsed, on every boot. Decode it at runtime with [`Engine::eval_snapshot`]. `Err` is a
+/// parse-error message.
+pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
+    let body =
+        parser::parse_script(src, false).map_err(|e| format!("{} (line {})", e.message, e.line))?;
+    Ok(snapshot::encode(&body))
+}
+
+/// A parse-phase failure. test262 reports these as a `SyntaxError` thrown during parsing.
+#[derive(Debug)]
+pub struct ParseError {
+    pub message: String,
+    pub line: u32,
+    /// The parse failed only because the input ended too soon (e.g. an unclosed block or
+    /// template). A REPL treats this as "keep reading lines", not a SyntaxError.
+    pub at_eof: bool,
+}
+
+/// The outcome of evaluating a script.
+pub enum Completion {
+    /// Ran to completion; the last statement value rendered to a string (best-effort).
+    Value(String),
+    /// A value was thrown. `name` is the error's constructor name (`"TypeError"`, …) when the
+    /// thrown value is an Error object, else `""`.
+    Throw { name: String, message: String },
+}
+
+/// A JavaScript engine instance: one realm (global object + intrinsics) that persists across
+/// [`eval`](Engine::eval) calls.
+pub struct Engine {
+    interp: Interp,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) { self.interp.dispose_for_host(); }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Engine {
+    pub fn new() -> Engine {
+        interpreter::sym_for_reset();
+        Engine {
+            interp: Interp::new(),
+        }
+    }
+
+    /// Run `src` as a spawned `$262.agent`: the agent may block in `Atomics.wait`, receives
+    /// SharedArrayBuffer broadcasts on `broadcast_rx`, and reports back via `report_tx`.
+    /// Whether this agent may block in `Atomics.wait` (test262's CanBlockIsTrue flag).
+    pub fn set_can_block(&mut self, b: bool) {
+        self.interp.can_block = b;
+    }
+
+    pub fn run_as_agent(
+        &mut self,
+        src: &str,
+        broadcast_rx: std::sync::mpsc::Receiver<(u64, usize)>,
+        report_tx: std::sync::mpsc::Sender<String>,
+    ) {
+        self.interp.can_block = true;
+        self.interp.agent = Some(Box::new(interpreter::AgentChannels {
+            agent_broadcast_txs: Vec::new(),
+            report_rx: None,
+            report_tx,
+            broadcast_rx: Some(broadcast_rx),
+        }));
+        let _ = self.eval(src, false);
+    }
+
+    /// Parse and run `src`. `strict` forces strict mode (used for the test262 strict variant); a
+    /// `"use strict"` directive in the source also enables it.
+    pub fn eval(&mut self, src: &str, strict: bool) -> Result<Completion, ParseError> {
+        let body = parser::parse_script(src, strict).map_err(|e| ParseError {
+            message: e.message,
+            line: e.line,
+            at_eof: e.at_eof,
+        })?;
+        // A top-level `"use strict"` directive prologue turns on strict mode for the whole script.
+        let directive_strict = matches!(
+            body.first(),
+            Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
+        );
+        self.interp.strict = strict || directive_strict;
+        let result = self.interp.run_program(&body);
+        // Run queued promise reactions (the microtask checkpoint after the script).
+        self.interp.run_agent_event_loop();
+        match result {
+            Ok(v) => Ok(Completion::Value(self.render(&v))),
+            Err(thrown) => Ok(self.describe_throw(thrown)),
+        }
+    }
+
+    /// Like [`eval`](Engine::eval), but the script body comes from a precompiled snapshot blob
+    /// (see [`compile_snapshot`]) instead of parsing source — the runtime uses this to skip
+    /// re-lexing/parsing its static JS glue on every boot. A decode failure (version skew,
+    /// corruption) surfaces as `Err(ParseError)` so the caller can fall back to `eval` on the
+    /// original source; the resulting AST is otherwise identical to a parsed one, so execution
+    /// is byte-for-byte the same.
+    pub fn eval_snapshot(&mut self, bytes: &[u8], strict: bool) -> Result<Completion, ParseError> {
+        let body = snapshot::decode(bytes).map_err(|message| ParseError {
+            message,
+            line: 0,
+            at_eof: false,
+        })?;
+        let directive_strict = matches!(
+            body.first(),
+            Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
+        );
+        self.interp.strict = strict || directive_strict;
+        let result = self.interp.run_program(&body);
+        self.interp.run_agent_event_loop();
+        match result {
+            Ok(v) => Ok(Completion::Value(self.render(&v))),
+            Err(thrown) => Ok(self.describe_throw(thrown)),
+        }
+    }
+
+    /// Install a host module loader used by dynamic `import()` (and `eval_module`). `loader(specifier,
+    /// referrer)` returns the imported module's `(canonical_key, source)`.
+    pub fn set_module_loader(
+        &mut self,
+        loader: impl Fn(&str, &str) -> Option<(String, String)> + 'static,
+    ) {
+        self.interp.module_loader = Some(std::rc::Rc::new(
+            move |s: &str, r: &str, _a: Option<&str>| loader(s, r),
+        ));
+    }
+
+    /// [`Engine::set_module_loader`], with import attributes: the loader also receives the
+    /// import's `with { type: ... }` attribute (`Some("json" | "text" | "bytes")` for the types
+    /// the engine synthesizes). An attribute-aware host returns the RAW file contents for those —
+    /// text/JSON per its own decoding policy, binary latin-1-decoded (one char per byte) — and
+    /// the engine builds the synthetic module (default-exporting the parsed JSON, the string, or
+    /// an immutable-backed `Uint8Array`) keyed separately from any ordinary module of the file.
+    pub fn set_module_loader_attrs(
+        &mut self,
+        loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
+    ) {
+        self.interp.module_loader = Some(std::rc::Rc::new(loader));
+    }
+
+    /// The default referrer for a bare `import()` in script code (so relative specifiers resolve).
+    pub fn set_import_base(&mut self, base: &str) {
+        self.interp.import_base = base.to_string();
+    }
+
+    /// Evaluate `src` as an ES module identified by `key`. `loader(specifier, referrer)` resolves an
+    /// imported specifier to its `(canonical_key, source)`; it is consulted for every dependency.
+    pub fn eval_module(
+        &mut self,
+        src: &str,
+        key: &str,
+        loader: impl Fn(&str, &str) -> Option<(String, String)> + 'static,
+    ) -> Result<Completion, ParseError> {
+        self.eval_module_attrs(src, key, move |s, r, _a| loader(s, r))
+    }
+
+    /// [`Engine::eval_module`] with an attribute-aware loader (see
+    /// [`Engine::set_module_loader_attrs`] for the contract).
+    pub fn eval_module_attrs(
+        &mut self,
+        src: &str,
+        key: &str,
+        loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
+    ) -> Result<Completion, ParseError> {
+        self.interp.module_loader = Some(std::rc::Rc::new(loader));
+        let result = self.interp.load_module(key, src);
+        self.interp.run_agent_event_loop();
+        Ok(match result {
+            Ok(_) => Completion::Value(String::new()),
+            Err(a) => self.describe_throw(interpreter::abrupt_value(a)),
+        })
+    }
+
+    /// Select the execution tier (see [`bytecode::Tier`]). `Interp` — the default — never
+    /// touches any codegen path; `Bytecode` compiles eligible functions after
+    /// [`set_tier_threshold`](Engine::set_tier_threshold) calls.
+    pub fn set_tier(&mut self, tier: bytecode::Tier) {
+        self.interp.tier = if self.interp.execution_control.is_some() && tier == bytecode::Tier::Jit { bytecode::Tier::Bytecode } else { tier };
+    }
+
+    /// Calls before a function is considered for bytecode compilation (0 = immediately).
+    pub fn set_tier_threshold(&mut self, threshold: u32) {
+        self.interp.tier_threshold = threshold;
+    }
+
+    /// Drain anything written to `console.*` since the last call.
+    pub fn take_console(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.interp.console)
+    }
+
+    fn render(&mut self, v: &Value) -> String {
+        self.interp
+            .to_string(v)
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+
+    fn describe_throw(&mut self, thrown: Value) -> Completion {
+        // Pull the constructor name + message off an Error object; fall back to the rendered value.
+        let name = match self.interp.get_member(&thrown, "name") {
+            Ok(Value::Undefined) | Err(_) => {
+                // No own/inherited `name` (e.g. Test262Error): use the constructor's name.
+                match self.interp.get_member(&thrown, "constructor") {
+                    Ok(ctor @ Value::Obj(_)) => match self.interp.get_member(&ctor, "name") {
+                        Ok(Value::Undefined) | Err(_) => String::new(),
+                        Ok(v) => self.render(&v),
+                    },
+                    _ => String::new(),
+                }
+            }
+            Ok(v) => self.render(&v),
+        };
+        let message = match &thrown {
+            Value::Obj(_) => match self.interp.get_member(&thrown, "message") {
+                Ok(Value::Undefined) | Err(_) => String::new(),
+                Ok(v) => self.render(&v),
+            },
+            other => self.render(other),
+        };
+        Completion::Throw { name, message }
+    }
+}
+
+/// The curated embedder surface (`feature = "embed"`), for runtime layers (event loop, host
+/// APIs) built on top of the engine. Gated because everything here is a semver commitment on a
+/// published crate; it stabilizes together with the `lumen-host`/`lumen-runtime` crates.
+#[cfg(feature = "embed")]
+pub mod embed {
+    pub use crate::host::{OpState, ResourceId, ResourceTable};
+    /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
+    /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
+    pub use crate::interpreter::Interp as Ctx;
+    /// JS values. Matching/constructing the primitive variants is supported API; object
+    /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
+    /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
+    /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
+    pub use crate::value::{NativeClosure, NativeFn, Value};
+}
+
+/// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`
+/// pointers (they cannot capture); Rust state lives in [`embed::OpState`], reached through the
+/// `&mut Ctx` argument.
+#[cfg(feature = "embed")]
+impl Engine {
+    /// Direct access to the native-function context (also where [`embed::OpState`] lives, via
+    /// [`embed::Ctx::op_state`]).
+    pub fn ctx(&mut self) -> &mut embed::Ctx {
+        &mut self.interp
+    }
+
+    /// The realm's global object — the root from which an embedder reaches user-defined JS
+    /// (e.g. `ctx().get_member(&engine.global_this(), "myCallback")`).
+    pub fn global_this(&self) -> embed::Value {
+        Value::Obj(self.interp.global.clone())
+    }
+
+    /// [`eval`](Engine::eval), but the completion comes back as real values (`Err` = the
+    /// thrown value) and NO microtask checkpoint runs — the caller owns the event loop and
+    /// decides when jobs fire (a REPL runs its runtime to quiescence between inputs). The
+    /// spec's EMPTY completion (a value-less final statement) is lowered to `undefined`.
+    pub fn eval_value(
+        &mut self,
+        src: &str,
+    ) -> Result<Result<embed::Value, embed::Value>, ParseError> {
+        let body = parser::parse_script(src, false).map_err(|e| ParseError {
+            message: e.message,
+            line: e.line,
+            at_eof: e.at_eof,
+        })?;
+        let directive_strict = matches!(
+            body.first(),
+            Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
+        );
+        self.interp.strict = directive_strict;
+        Ok(match self.interp.run_program(&body) {
+            Ok(Value::Empty) => Ok(Value::Undefined),
+            result => result,
+        })
+    }
+
+    /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
+    pub fn define_global(&mut self, name: &str, len: usize, f: embed::NativeFn) {
+        let global = self.interp.global.clone();
+        self.interp.def_method(&global, name, len, f);
+    }
+
+    /// Define `globalThis.<name>` as a namespace object (like `Math`) with the given
+    /// `(name, arity, fn)` native methods.
+    pub fn define_namespace(&mut self, name: &str, ops: &[(&str, usize, embed::NativeFn)]) {
+        let ns = self.interp.new_object();
+        for (op, len, f) in ops {
+            self.interp.def_method(&ns, op, *len, *f);
+        }
+        self.interp
+            .global
+            .borrow_mut()
+            .props
+            .insert(name, crate::value::Property::builtin(Value::Obj(ns)));
+    }
+
+    /// Call a JS function value; `Err` is the thrown value. This is how the runtime's event
+    /// loop re-enters the engine to fire a timer/IO callback, so it must work on every
+    /// execution tier, not just the interpreter.
+    pub fn call_function(
+        &mut self,
+        func: &embed::Value,
+        this: embed::Value,
+        args: &[embed::Value],
+    ) -> Result<embed::Value, embed::Value> {
+        self.interp
+            .call(func.clone(), this, args)
+            .map_err(interpreter::abrupt_value)
+    }
+
+    /// Drain the microtask (promise-reaction) queue to quiescence.
+    pub fn run_microtasks(&mut self) {
+        self.interp.drain_microtasks();
+    }
+
+    /// Drain and return the reasons of promises rejected without a handler (after a microtask
+    /// checkpoint, these are genuine unhandled rejections). The runtime reports them; the bare
+    /// engine ignores them, so test262 semantics are unaffected.
+    pub fn take_unhandled_rejections(&mut self) -> Vec<embed::Value> {
+        self.take_unhandled_rejections_full()
+            .into_iter()
+            .map(|(_promise, reason)| reason)
+            .collect()
+    }
+
+    /// [`Engine::take_unhandled_rejections`], keeping the promise alongside each reason (what a
+    /// global `unhandledrejection` handler receives as `event.promise` / `event.reason`).
+    pub fn take_unhandled_rejections_full(&mut self) -> Vec<(embed::Value, embed::Value)> {
+        if self.interp.unhandled_rejections.is_empty() {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.interp.unhandled_rejections)
+            .into_values()
+            .collect()
+    }
+
+    /// Whether promise-reaction jobs are queued (the loop uses this to decide when a turn is
+    /// really over).
+    pub fn has_pending_jobs(&self) -> bool {
+        !self.interp.microtasks.is_empty()
+    }
+
+    /// Run a single queued job; `false` when the queue was empty.
+    pub fn run_one_job(&mut self) -> bool {
+        match self.interp.microtasks.pop_front() {
+            Some(job) => {
+                self.interp.run_job(job);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -8,6 +8,7 @@ pub(crate) fn with_computed_style<R>(
     id: dom::NodeId,
     f: impl FnOnce(Option<&style::ComputedStyle>) -> R,
 ) -> R {
+    sync_style_context(state);
     let version = state.dom_version.get();
     {
         let mut cache = state.computed_cache.borrow_mut();
@@ -211,6 +212,7 @@ pub(crate) fn with_cascade_map<R>(
     state: &HostState,
     f: impl FnOnce(&dom::Document, &HashMap<dom::NodeId, style::ComputedStyle>) -> R,
 ) -> R {
+    sync_style_context(state);
     let version = state.dom_version.get();
     {
         let mut cache = state.computed_cache.borrow_mut();
@@ -242,6 +244,7 @@ pub(crate) fn with_pseudo_style<R>(
     pseudo_key: &str,
     f: impl FnOnce(Option<&style::ComputedStyle>) -> R,
 ) -> R {
+    sync_style_context(state);
     let version = state.dom_version.get();
     {
         let mut cache = state.computed_cache.borrow_mut();
@@ -668,17 +671,13 @@ fn resolved_grid_tracks(
 /// `__computedStyleProp(id, name) -> string` — the computed value of CSS property `name` (kebab,
 /// lowercased by JS) for node `id`, or "" if there's no computed style (non-element / unknown id) or
 /// the property isn't tracked.
-pub(crate) fn prim_computed_style_prop(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_computed_style_prop(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 2));
     // A 4th truthy arg requests the *computed* value (computedStyleMap) rather than the resolved
     // value (getComputedStyle) — they differ for colors the forced-colors override replaced.
-    let raw = args.get(3).is_true();
+    let raw = matches!(args.get(3), Value::Bool(true));
     let get = |cs: &style::ComputedStyle| {
         if raw {
             cs.get_property_computed(&name)
@@ -901,11 +900,7 @@ pub(crate) fn computed_names_with_custom(cs: &style::ComputedStyle) -> Vec<Strin
 
 /// `__computedStyleNames(id) -> [name...]` — the property names with non-empty computed values for
 /// node `id` (backs `length`/`item(i)`/index access/iteration). Empty array for non-elements.
-pub(crate) fn prim_computed_style_names(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_computed_style_names(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let pseudo = style::parse_gcs_pseudo(&arg_str(scope, &args, 1));
     let state = host_state(scope);
@@ -923,11 +918,7 @@ pub(crate) fn prim_computed_style_names(
 }
 
 /// `__setAttr(id, name, val)`
-pub(crate) fn prim_set_attr(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_set_attr(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let value = arg_str(scope, &args, 2);
@@ -958,11 +949,7 @@ pub(crate) fn prim_set_attr(
 }
 
 /// `__removeAttr(id, name)`
-pub(crate) fn prim_remove_attr(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_remove_attr(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let state = host_state(scope);
@@ -993,11 +980,7 @@ pub(crate) fn prim_remove_attr(
 }
 
 /// `__attrNames(id) -> [name...]`
-pub(crate) fn prim_attr_names(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+pub(crate) fn prim_attr_names(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node = arg_node(scope, &args, 0);
     let state = host_state(scope);
     let names: Vec<String> = node
