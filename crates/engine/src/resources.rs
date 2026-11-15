@@ -26,7 +26,7 @@ pub(crate) const MAX_EXTERNAL_STYLESHEETS: usize = 100;
 pub(crate) const MAX_EXTERNAL_SCRIPTS: usize = 24;
 /// Skip fetched script bodies larger than this (mirrors the inline-script cap). Large SPA
 /// frameworks ship multi-MB bundles (e.g. youtube's main app bundle is ~10.5 MB), so the cap is
-/// generous; V8 parses lazily and the per-run execution budget bounds the time.
+/// generous; script execution runs on a dedicated session thread.
 pub(crate) const MAX_SCRIPT_BYTES: usize = 32 * 1024 * 1024;
 
 /// One author stylesheet source in document order: either an inline `<style>` body or an
@@ -943,7 +943,7 @@ fn decode_svg_object(bytes: &[u8], base: &str) -> Option<DecodedImage> {
     let css = collect_svg_style_text(&doc, svg_id);
     let mut backdrop = vec![0u8; (w as usize) * (h as usize) * 4];
     if let Some((r, g, b, a)) = css_background_color(&css) {
-        for px in backdrop.chunks_exact_mut(4) {
+        for px in backdrop.as_chunks_mut::<4>().0 {
             px[0] = r;
             px[1] = g;
             px[2] = b;

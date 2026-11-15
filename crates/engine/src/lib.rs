@@ -124,7 +124,22 @@ pub struct SelectHit {
     pub selected: usize,
 }
 
+/// Thread-safe cancellation of the currently loaded page. A later navigation installs a new token.
+#[derive(Clone)]
+pub struct InterruptHandle(js::HostContext);
+impl InterruptHandle {
+    pub fn interrupt(&self) {
+        self.0.cancel_execution();
+    }
+    /// Permanently stop this browser owner, including a navigation still loading its response.
+    pub fn shutdown(&self) {
+        self.0.shutdown_execution();
+    }
+}
+
 pub struct Engine {
+    /// Browser-owned settings and outputs shared with this tab's JS worker.
+    js_context: js::HostContext,
     /// Logical viewport size in points and the backing scale factor (e.g. 2.0 on Retina).
     vp_w: u32,
     vp_h: u32,
@@ -151,7 +166,7 @@ pub struct Engine {
     /// Retained so the FFI layer can hand out a pointer that stays valid until the next
     /// render or until the engine is dropped.
     framebuffer: Option<Framebuffer>,
-    /// Live per-page JS runtime (persistent V8 isolate) kept alive after load so page event
+    /// Live per-page JS runtime (persistent Lumen engine) kept alive after load so page event
     /// handlers fire and timers keep running — i.e. the page is interactive. Replaced (old one
     /// dropped → its thread stops) on each navigation; `None` for pages without scripts.
     session: Option<js::Session>,
@@ -248,16 +263,44 @@ pub(crate) use traversal::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes tests that drive the process-global OS appearance (`set_color_scheme`) and then
-    /// read color-scheme-dependent output, which `cargo test` would otherwise race on. Poisoning is
-    /// irrelevant (we only need exclusion).
-    static COLOR_SCHEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn color_scheme_guard() -> std::sync::MutexGuard<'static, ()> {
-        COLOR_SCHEME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    #[test]
+    fn interleaved_engines_keep_tab_settings_and_scroll_separate() {
+        let path =
+            std::env::temp_dir().join(format!("browser_host_context_{}.html", std::process::id()));
+        std::fs::write(
+            &path,
+            "<body style='height:3000px'><script>window.ready=true</script>page</body>",
+        )
+        .unwrap();
+        let url = format!("file://{}", path.display());
+        let mut first = Engine::new();
+        let mut second = Engine::new();
+        first.set_viewport(320, 240, 1.0);
+        first.set_color_scheme(true);
+        second.set_viewport(640, 480, 2.0);
+        assert_eq!(first.load_url(&url), 0);
+        assert_eq!(second.load_url(&url), 0);
+        let query = "[innerWidth,innerHeight,devicePixelRatio,matchMedia('(prefers-color-scheme:dark)').matches].join(',')";
+        assert_eq!(first.console_eval(query), "320,240,1,true");
+        assert_eq!(second.console_eval(query), "640,480,2,false");
+        first.console_eval("scrollTo(0,75)");
+        second.console_eval("scrollTo(0,125)");
+        assert!(first.apply_pending_scroll());
+        assert!(second.apply_pending_scroll());
+        assert_eq!(first.scroll_y, 75.0);
+        assert_eq!(second.scroll_y, 250.0);
+        assert!(!first.apply_pending_scroll());
+        first.set_color_scheme(false);
+        second.set_color_scheme(true);
+        assert_eq!(
+            first.console_eval("matchMedia('(prefers-color-scheme:dark)').matches"),
+            "false"
+        );
+        assert_eq!(
+            second.console_eval("matchMedia('(prefers-color-scheme:dark)').matches"),
+            "true"
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     /// Column of RGB pixels down the middle of a framebuffer (for comparing renders).
@@ -478,7 +521,7 @@ mod tests {
         // Two words on (likely) one line: a drag from the left of "Hello" to the middle of "world"
         // should select "Hello wor" (or similar). Using a wide viewport keeps it on one line.
         let html = "<html><body><p>Hello world</p></body></html>";
-        let path = std::env::temp_dir().join("browser_select_test.html");
+        let path = std::env::temp_dir().join("browser_drag_selection_test.html");
         std::fs::write(&path, html).unwrap();
 
         let mut e = Engine::new();
@@ -632,10 +675,11 @@ mod tests {
             "framebuffer is the logical viewport x backing scale"
         );
 
-        // CSS px is invariant to the backing scale — same values as the scale-1 test above. This is
-        // driven by the engine's per-instance `scale`, so it's deterministic. (We deliberately don't
-        // assert `window.innerWidth`/`devicePixelRatio` here: those read process-global display
-        // metrics that other tests sharing the process clobber under parallel execution.)
+        // CSS px is invariant to backing scale, and JS metrics belong to this engine.
+        assert_eq!(
+            e.console_eval("innerWidth + 'x' + innerHeight + '@' + devicePixelRatio"),
+            "800x600@2"
+        );
         let wh = e.console_eval(
             "var r = document.querySelector('div').getBoundingClientRect(); r.width + 'x' + r.height",
         );
@@ -711,7 +755,6 @@ mod tests {
 
     #[test]
     fn matchmedia_prefers_color_scheme_tracks_os_appearance() {
-        let _g = color_scheme_guard();
         // A page with a script so the engine keeps a live JS Session we can console_eval against.
         let html = "<html><body><script>window.__ready = true;</script></body></html>";
         let path = std::env::temp_dir().join("browser_color_scheme_test.html");
@@ -771,6 +814,50 @@ mod tests {
     }
 
     #[test]
+    fn live_dpr_resize_keeps_engines_isolated() {
+        let path = std::env::temp_dir().join(format!("browser_dpr_resize_{}.html", rand_suffix()));
+        std::fs::write(&path, "<body><script>window.resizes=0;addEventListener('resize',function(){resizes++})</script></body>").unwrap();
+        let url = format!("file://{}", path.display());
+        let mut first = Engine::new();
+        let mut second = Engine::new();
+        first.set_viewport(400, 300, 1.0);
+        second.set_viewport(640, 480, 1.0);
+        assert_eq!(first.load_url(&url), 0);
+        assert_eq!(second.load_url(&url), 0);
+        first.set_viewport(200, 150, 2.0);
+        let query = "[innerWidth,innerHeight,devicePixelRatio,resizes].join(',')";
+        assert_eq!(first.console_eval(query), "200,150,2,1");
+        assert_eq!(second.console_eval(query), "640,480,1,0");
+        second.set_viewport(640, 480, 2.0);
+        assert_eq!(second.console_eval(query), "640,480,2,1");
+        assert_eq!(first.console_eval(query), "200,150,2,1");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn viewport_change_invalidates_layout_without_session() {
+        let path =
+            std::env::temp_dir().join(format!("browser_no_session_resize_{}.html", rand_suffix()));
+        std::fs::write(
+            &path,
+            "<body><div style='width:50%;height:10px'></div></body>",
+        )
+        .unwrap();
+        let mut engine = Engine::new();
+        engine.set_viewport(400, 300, 1.0);
+        assert_eq!(engine.load_url(&format!("file://{}", path.display())), 0);
+        engine.render();
+        assert!(engine.layout_cache.is_some());
+        engine.session = None;
+        // The framebuffer is still 400x300, but CSS layout must use the new 200px width.
+        engine.set_viewport(200, 150, 2.0);
+        assert!(engine.layout_cache.is_none());
+        engine.render();
+        assert!(engine.layout_cache.is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn resize_relayouts_before_handlers_observe_geometry() {
         // A `resize` handler exists to measure, so the pushed geometry must already describe the new
         // viewport when it runs. The percentage-width div is the load-bearing part: the root's own
@@ -826,7 +913,6 @@ mod tests {
     /// Holds the color-scheme test lock for the whole set+render so the OS flag can't be flipped
     /// by a parallel test mid-render.
     fn canvas_top_left(html: &str, os_dark: bool) -> (u8, u8, u8) {
-        let _g = color_scheme_guard();
         let path = std::env::temp_dir().join(format!(
             "browser_color_scheme_canvas_{}.html",
             rand_suffix()
@@ -928,7 +1014,6 @@ mod tests {
 
     #[test]
     fn color_scheme_dynamic_toggle_updates_canvas() {
-        let _g = color_scheme_guard();
         // `light dark` page: toggling the OS appearance re-resolves the used scheme on next render.
         let html = "<html style=\"color-scheme: light dark\"><body>hi</body></html>";
         let path = std::env::temp_dir().join(format!(
@@ -2425,7 +2510,7 @@ mod tests {
         let img = decode_image(RED_2X2_JXL).expect("jxl-oxide should decode the codestream");
         assert_eq!((img.w, img.h), (2, 2));
         assert_eq!(img.rgba.len(), 2 * 2 * 4);
-        for px in img.rgba.chunks_exact(4) {
+        for px in img.rgba.chunks(4) {
             // Lossless red: ~(255, 0, 0, 255). Allow a tiny slack for color conversion rounding.
             assert!(px[0] > 247, "R≈255, got {}", px[0]);
             assert!(px[1] < 8, "G≈0, got {}", px[1]);

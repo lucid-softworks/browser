@@ -648,7 +648,7 @@ fn navigate(id: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
 fn load_and_wait(session: &mut Session, url: &str, timeout: Duration) {
     session.engine.load_url(url);
     let start = Instant::now();
-    while start.elapsed() < timeout {
+    while start.elapsed() < timeout && !session.engine.script_execution_stopped() {
         for _ in 0..5 {
             session.engine.tick();
         }
@@ -659,6 +659,9 @@ fn load_and_wait(session: &mut Session, url: &str, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(5));
     }
     for _ in 0..10 {
+        if session.engine.script_execution_stopped() {
+            break;
+        }
         session.engine.tick();
     }
 }

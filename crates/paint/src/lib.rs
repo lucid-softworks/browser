@@ -52,7 +52,7 @@ impl Framebuffer {
         let stride = width * 4;
         let mut pixels = vec![0u8; (stride * height) as usize];
         // Opaque alpha so a CGImage built from this isn't fully transparent.
-        for px in pixels.chunks_exact_mut(4) {
+        for px in pixels.as_chunks_mut::<4>().0 {
             px[3] = 255;
         }
         Self {
@@ -88,7 +88,7 @@ impl Framebuffer {
 
     /// Fill the whole buffer with a solid color.
     pub fn clear(&mut self, c: Color) {
-        for px in self.pixels.chunks_exact_mut(4) {
+        for px in self.pixels.as_chunks_mut::<4>().0 {
             px[0] = c.r;
             px[1] = c.g;
             px[2] = c.b;

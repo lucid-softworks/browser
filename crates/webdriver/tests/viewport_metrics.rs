@@ -1,9 +1,5 @@
 //! A new session's window size must reach page JS as `window.innerWidth`/`innerHeight`.
 //!
-//! Lives in its own integration binary because the engine publishes those metrics through
-//! process-global atomics: sharing a process with another test that sets a different viewport would
-//! make the assertions race.
-
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
@@ -108,10 +104,7 @@ fn session_window_size_is_seeded_into_page_js() {
         .expect("sessionId")
         .to_string();
 
-    // A session with no requested size is 800×600, which is also a fresh engine's own default — so
-    // this is the case where `set_viewport` is handed the size it already holds. The metrics page JS
-    // reads are process-global and start at their own unrelated default, so skipping the publish on
-    // an unchanged viewport leaves every document reporting that default instead of the real window.
+    // Even a default-sized session must seed its own per-engine metrics before navigation.
     assert_eq!(
         seeded_inner_size(port, &sid, "wd_viewport_default.html"),
         "800x600",
