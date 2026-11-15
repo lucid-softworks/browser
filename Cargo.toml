@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/lumen"]
 members = [
     "crates/net",
     "crates/html",
@@ -13,6 +14,7 @@ members = [
     "crates/engine",
     "crates/ffi",
     "crates/webdriver",
+    "crates/desktop",
 ]
 
 [workspace.package]
@@ -38,8 +40,28 @@ needless_range_loop = "allow"
 opt-level = 3
 lto = "thin"
 
+# Rune recommends line tables: full debug information for its GPU/text stack is very large.
+[profile.dev]
+debug = "line-tables-only"
+
+# The JS engine executes large browser bootstraps even in debug builds. Keep its interpreter
+# optimized while retaining fast incremental builds and debug checks for our browser crates.
+[profile.dev.package.lumen]
+opt-level = 2
+
 # Patch ureq to accept obs-text (0x80–0xFF) header-value bytes, which RFC 7230 §3.2.6 allows but
 # upstream 2.12.1 drops — without this a Set-Cookie response header carrying UTF-8 (e.g. a BOM) is
 # silently discarded. The vendored copy is byte-identical to crates.io 2.12.1 except that one rule.
 [patch.crates-io]
 ureq = { path = "vendor/ureq" }
+
+# Rune requires these upstream patches; dependency patch sections do not propagate.
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "1dba3423fd1f1904553422e7814700f817abe8af" }
+
+# Local host cancellation / realm-lifetime patch to the pinned upstream engine.
+[patch."https://github.com/lucid-softworks/lumen"]
+lumen = { path = "vendor/lumen" }

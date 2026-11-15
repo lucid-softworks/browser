@@ -37,20 +37,13 @@ pub(crate) use queries::*;
 pub(crate) use variables::*;
 
 #[cfg(test)]
+mod concurrency;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use dom::NodeData;
     use std::collections::HashMap;
-
-    /// Serializes tests that read or mutate the process-global OS-appearance / root-color-scheme
-    /// flags (`set_color_scheme_dark` / `root_used_scheme_dark`), which `cargo test` would otherwise
-    /// run in parallel and race on. Poisoning is irrelevant (we only need exclusion), so callers
-    /// ignore a poisoned guard.
-    static SCHEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn scheme_guard() -> std::sync::MutexGuard<'static, ()> {
-        SCHEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     fn elem(doc: &dom::Document, tag_and_pred: impl Fn(&dom::ElementData) -> bool) -> dom::NodeId {
         // Find first element matching predicate (depth-first).
@@ -1094,7 +1087,6 @@ mod tests {
 
     #[test]
     fn media_prefers_color_scheme_tracks_os_appearance() {
-        let _g = scheme_guard();
         let sheet = css::parse(
             "p { color: rgb(10,20,30) } \
              @media (prefers-color-scheme: dark) { p { color: rgb(1,2,3) } } \
@@ -1187,10 +1179,8 @@ mod tests {
 
     #[test]
     fn root_dark_scheme_themes_default_text() {
-        let _g = scheme_guard();
         // :root { color-scheme: dark } → root used scheme dark → default UA text light. The map's
-        // colors are captured during the cascade (which holds CASCADE_LOCK, so the root-scheme
-        // global it writes is the one it reads back), so they're race-free to assert on.
+        // colors are captured using this thread's root scheme, independently of other cascades.
         let sheet = css::parse(":root { color-scheme: dark }");
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         set_color_scheme_dark(false);
@@ -1202,7 +1192,6 @@ mod tests {
 
     #[test]
     fn root_light_scheme_keeps_black_text() {
-        let _g = scheme_guard();
         let sheet = css::parse(":root { color-scheme: light }");
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         set_color_scheme_dark(true); // OS dark, but page opts only into light
@@ -1213,7 +1202,6 @@ mod tests {
 
     #[test]
     fn meta_color_scheme_dark_opts_in() {
-        let _g = scheme_guard();
         // <meta name="color-scheme" content="dark"> with no CSS property.
         let doc = html::parse(
             r#"<html><head><meta name="color-scheme" content="dark"></head><body><p>t</p></body></html>"#,

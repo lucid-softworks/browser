@@ -1,0 +1,21 @@
+# Same fixed test files run for the PR base and head. Keep resources alongside them in WPT.
+dom/nodes/Node-appendChild.html
+dom/nodes/Node-cloneNode.html
+dom/nodes/Node-insertBefore.html
+dom/nodes/Node-isEqualNode.html
+dom/nodes/Node-removeChild.html
+dom/nodes/Node-replaceChild.html
+dom/nodes/ParentNode-querySelector-All-comma-selector.html
+dom/nodes/MutationObserver-attributes.html
+dom/nodes/MutationObserver-childList.html
+html/semantics/scripting-1/the-script-element/module/imports.html
+html/semantics/scripting-1/the-script-element/module/nested-imports.html
+html/semantics/scripting-1/the-script-element/module/duplicated-imports-1.html
+html/semantics/scripting-1/the-script-element/module/dynamic-import/dynamic-imports.html
+workers/Worker-messageport.html
+workers/Worker-terminate-forever.html
+workers/Worker-terminate-forever-during-evaluation.html
+workers/WorkerGlobalScope-close.html
+html/semantics/embedded-content/the-iframe-element/iframe-load-event.html
+html/semantics/embedded-content/the-iframe-element/srcdoc-attribute-reset.html
+html/semantics/embedded-content/the-iframe-element/srcdoc_process_attributes.html
