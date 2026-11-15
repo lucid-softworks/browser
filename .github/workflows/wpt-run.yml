@@ -54,15 +54,21 @@ jobs:
     # Scoped to this job: the `wpt` matrix legs run the prebuilt binary and never invoke rustc, so
     # they need neither the wrapper nor the sccache install.
     env:
+      # Match release CI's Rust environment: rust-cache includes these variables in its key.
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-deps
+          cache-on-failure: true
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Build WebDriver server
         run: cargo build --release -p webdriver

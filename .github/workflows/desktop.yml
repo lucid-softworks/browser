@@ -17,6 +17,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Keep dependency artifacts and cache unchanged workspace compilation on every platform.
+  # sccache cannot cache incremental builds; final binary linking still runs normally.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: 0
 
 jobs:
   desktop:
@@ -48,6 +53,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: desktop-${{ matrix.platform }}
+          # A failed test or packaging check must not discard a successful dependency build.
+          cache-on-failure: true
+      - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install Linux libraries and fonts
         if: runner.os == 'Linux'
         run: |

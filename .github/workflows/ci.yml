@@ -15,13 +15,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Swatinem/rust-cache caches the *dependencies* in target/ but deliberately evicts the workspace
-  # crates' own artifacts before saving — so every run otherwise recompiles all 11 crates from
-  # scratch (the ~1m the build takes). sccache is a content-addressed compiler cache: each rustc
-  # invocation (incl. the per-crate --test harness builds) is keyed by its inputs and stored in the
-  # GitHub Actions cache, so unchanged crates restore instead of recompiling. Both jobs below install
-  # the sccache binary, so wiring RUSTC_WRAPPER at workflow scope is safe. Incremental must be off
-  # for sccache to cache (release already defaults to 0; set it explicitly so it holds everywhere).
+  # rust-cache preserves dependency artifacts; sccache also reuses unchanged workspace library
+  # compilation. Binary/test linking still runs. Both jobs install the wrapper, and incremental
+  # compilation must be disabled for sccache to work.
   RUSTC_WRAPPER: sccache
   SCCACHE_GHA_ENABLED: "true"
   CARGO_INCREMENTAL: 0
@@ -44,6 +40,8 @@ jobs:
           toolchain: '1.99.1'
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install desktop build libraries
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev
@@ -66,6 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-deps
+          cache-on-failure: true
       - uses: mozilla-actions/sccache-action@v0.0.9
       # Rune links Wayland/XKB; engine-only tests still exercise system-font discovery.
       - name: Install desktop libraries and test fonts
