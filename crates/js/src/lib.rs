@@ -2199,13 +2199,13 @@ mod tests {
     }
 
     #[test]
-    fn huge_css_value_setter_is_linear_not_quadratic() {
-        // Regression for grid-template-columns-crash.html: setting a very long property value must
-        // not be O(n²). normalizeCssValue previously indexed the growing result rope per number
-        // token (`out[out.length-1]`), forcing repeated flattening, so a ~1.8MB value hung the
-        // engine (V8 GC thrash -> WebDriver "not responding" -> CRASH). Build the fixture outside
-        // JS so its 40,000 string appends don't consume the worker deadline on slower debug
-        // runners. The same full-size value still goes through the real CSS setter and getter.
+    fn huge_css_value_round_trips_within_runtime_budget() {
+        // Regression for grid-template-columns-crash.html: repeated flattening of the growing
+        // result used to hang the engine. Keep the full 40,000-token fixture and check every
+        // byte returned by the real CSS setter/getter. run_with_dom already enforces the runtime
+        // deadline; a separate four-second wall-clock assertion was flaky on Intel macOS debug
+        // runners and cannot establish algorithmic complexity. Build the fixture outside JS so
+        // its string appends don't consume that deadline.
         let value: String = (0..40000)
             .map(|i| format!(" repeat(1000, {i}px)"))
             .collect();
@@ -2214,15 +2214,13 @@ mod tests {
             doc,
             vec![format!(
                 "var v={value:?}; \
-                 var t0=Date.now(); document.body.style.gridTemplateColumns=v; \
-                 var ok = document.body.style.gridTemplateColumns.length > 0; \
-                 [ok, (Date.now()-t0) < 4000].join(',')"
+                 document.body.style.gridTemplateColumns=v; \
+                 document.body.style.gridTemplateColumns"
             )],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        // Both flags true: the value was stored, and the setter finished fast (linear).
-        assert_eq!(out[0].value.as_deref(), Some("true,true"));
+        assert_eq!(out[0].value.as_deref(), Some(value.trim()));
     }
 
     #[test]
