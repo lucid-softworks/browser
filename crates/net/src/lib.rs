@@ -543,7 +543,7 @@ fn agent() -> &'static ureq::Agent {
         // so that document.cookie and HTTP requests share the same jar. We intentionally do NOT
         // call .cookie_store(...) here; we inject the Cookie header and parse Set-Cookie ourselves.
         // Test-driving env knobs (no effect on normal browsing):
-        //  - `WPT_INSECURE_TLS`: accept any server certificate. The WebDriver server sets this so
+        //  - `WPT_INSECURE_TLS=1`: accept any server certificate. The WebDriver server sets this so
         //    `.https` WPT tests load over TLS against `wpt serve`'s self-signed cert without needing
         //    the checkout's CA path (matches the `acceptInsecureCerts` capability it advertises).
         //  - `WPT_CA_FILE`: trust a specific extra CA (the WPT `tools/certs/cacert.pem`).
@@ -573,14 +573,14 @@ fn agent_no_redirect() -> &'static ureq::Agent {
 }
 
 /// A test-only rustls client config, or `None` to leave the agent on its default trust store.
-/// `WPT_INSECURE_TLS` disables certificate verification entirely; otherwise `WPT_CA_FILE` adds an
+/// `WPT_INSECURE_TLS=1` disables certificate verification entirely; otherwise `WPT_CA_FILE` adds an
 /// extra trusted CA on top of the usual webpki roots. A missing/unparseable `WPT_CA_FILE` degrades
 /// gracefully to `None`.
 fn wpt_tls_config() -> Option<rustls::ClientConfig> {
     // `ring` is a hard dependency, so the provider is always present — no default-provider panic.
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
 
-    if std::env::var_os("WPT_INSECURE_TLS").is_some() {
+    if insecure_tls_enabled(std::env::var("WPT_INSECURE_TLS").ok().as_deref()) {
         return rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .ok()?
@@ -603,6 +603,10 @@ fn wpt_tls_config() -> Option<rustls::ClientConfig> {
         .with_root_certificates(roots)
         .with_no_client_auth()
         .into()
+}
+
+fn insecure_tls_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 /// A rustls verifier that accepts any server certificate — for driving WPT (`wpt serve` uses a
@@ -1755,6 +1759,23 @@ fn set_ws_nonblocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn insecure_tls_requires_explicit_opt_in() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("FALSE"),
+            Some("typo"),
+        ] {
+            assert!(!insecure_tls_enabled(value), "{value:?}");
+        }
+        for value in [Some("1"), Some("true"), Some("TRUE")] {
+            assert!(insecure_tls_enabled(value), "{value:?}");
+        }
+    }
 
     #[test]
     fn invalid_url_is_err() {

@@ -154,6 +154,10 @@ failing test, exact subtest counts, the relevant spec section, and a one-line re
 suite locally — the real `wpt run` harness driving the engine over WebDriver — is documented in
 [`docs/running-wpt.md`](docs/running-wpt.md).
 
+For interactive compatibility checks against example.com, Wikipedia, Hacker News, and React
+TodoMVC, see [`docs/site-compatibility.md`](docs/site-compatibility.md). The manual live-site
+runner drives this engine through WebDriver and saves step reports, screenshots, and page source.
+
 **Claiming an issue:** comment `/claim` (or `.take`) on any open issue to have it assigned to you —
 a bot assigns you and labels it `claimed`, no maintainer needed. Comment `/unclaim` to release it.
 Then open a PR that says `Closes #<n>` so it auto-closes on merge.

@@ -11,6 +11,7 @@ mod block;
 mod build;
 mod flex;
 mod float;
+mod geometry;
 mod grid;
 mod inline;
 mod intrinsic;
@@ -33,6 +34,7 @@ pub(crate) fn grow_stack<R>(f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(64 * 1024, 1024 * 1024, f)
 }
 pub(crate) use flex::*;
+pub use geometry::node_rects;
 pub(crate) use grid::*;
 pub(crate) use inline::*;
 pub(crate) use intrinsic::*;
@@ -88,6 +90,7 @@ pub fn layout_document(
         scrollport: None,
     };
     layout_block(&mut root, containing, ctx, styles, measurer);
+    geometry::order_for_paint(&mut root, styles);
     root
 }
 
@@ -882,6 +885,19 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 80.0, 600.0, &Stub, &HashMap::new(), None);
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
 
+        let rects = node_rects(&root_box, &doc, &styles);
+        let anchor_rect = rects.get(&a.0).expect("inline anchor has geometry");
+        assert!(anchor_rect.width > 0.0 && anchor_rect.height > 20.8);
+        for fragment in collect_text_boxes(pbox)
+            .into_iter()
+            .filter(|b| b.node == Some(a_text))
+        {
+            let r = fragment.dimensions.border_box();
+            assert!(anchor_rect.x <= r.x && anchor_rect.y <= r.y);
+            assert!(anchor_rect.x + anchor_rect.width + 0.01 >= r.x + r.width);
+            assert!(anchor_rect.y + anchor_rect.height + 0.01 >= r.y + r.height);
+        }
+
         // Some emitted Text box must carry the <a>'s text node.
         let carries_a_text = count_boxes(pbox, &|x| {
             matches!(x.content, BoxContent::Text(_)) && x.node == Some(a_text)
@@ -903,6 +919,62 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn inline_geometry_crosses_anonymous_wrappers_but_excludes_hidden_content() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let paragraph = doc.append_element(body, "p");
+        doc.append_child(paragraph, dom::NodeData::Text("Before the link".into()));
+        let link = doc.append_element(body, "a");
+        let span = doc.append_element(link, "span");
+        doc.append_child(span, dom::NodeData::Text("Visible link".into()));
+        let hidden = doc.append_element(link, "span");
+        doc.append_child(hidden, dom::NodeData::Text("Hidden content".into()));
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(paragraph, block_style(true));
+        styles.insert(link, style::ComputedStyle::default());
+        styles.insert(span, style::ComputedStyle::default());
+        styles.insert(hidden, disp(style::Display::None));
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let rects = node_rects(&root_box, &doc, &styles);
+        assert_eq!(rects[&link.0], rects[&span.0]);
+        assert!(rects[&link.0].width > 0.0);
+        assert!(rects[&link.0].y >= rects[&paragraph.0].y + rects[&paragraph.0].height);
+        assert!(!rects.contains_key(&hidden.0));
+    }
+
+    #[test]
+    fn inline_link_bounds_exclude_positioned_popup_descendants() {
+        for position in [style::Position::Absolute, style::Position::Fixed] {
+            let mut doc = dom::Document::new();
+            let body = doc.append_element(doc.root(), "body");
+            let link = doc.append_element(body, "a");
+            let text = doc.append_child(link, dom::NodeData::Text("Link".into()));
+            let popup = doc.append_element(link, "span");
+            doc.append_child(popup, dom::NodeData::Text("Popup".into()));
+            let mut styles = HashMap::new();
+            styles.insert(body, block_style(true));
+            styles.insert(link, style::ComputedStyle::default());
+            styles.insert(
+                popup,
+                style::ComputedStyle {
+                    position,
+                    left: Some(1000.0),
+                    top: Some(500.0),
+                    width: Some(100.0),
+                    height: Some(50.0),
+                    ..Default::default()
+                },
+            );
+            let tree = layout_document(&doc, &styles, 1280.0, 900.0, &Stub, &HashMap::new(), None);
+            let rects = node_rects(&tree, &doc, &styles);
+            assert_eq!(rects[&link.0], rects[&text.0], "{position:?}");
+            assert!(rects[&popup.0].x >= 1000.0);
         }
     }
 
@@ -3251,6 +3323,41 @@ mod tests {
     }
 
     #[test]
+    fn styled_input_fragments_do_not_reapply_control_dimensions() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let input = doc.append_element(body, "input");
+        set_attr(&mut doc, input, "value", "Web browser");
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(input, inline_block(300.0, 44.0));
+        let focused = layout_document(
+            &doc,
+            &styles,
+            800.0,
+            600.0,
+            &Stub,
+            &HashMap::new(),
+            Some(input),
+        );
+        let blurred = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let caret = find_box(&focused, &|b| matches!(b.content, BoxContent::Caret)).unwrap();
+        assert_eq!(caret.dimensions.content.width, 2.0);
+        let focused_rect = node_rects(&focused, &doc, &styles)[&input.0];
+        assert_eq!(focused_rect, node_rects(&blurred, &doc, &styles)[&input.0]);
+        assert_eq!(focused_rect.width, 300.0);
+        assert_eq!(focused_rect.height, 44.0);
+        for text in collect_text_boxes(&focused) {
+            assert!(text.dimensions.content.width < 150.0);
+            assert!(
+                text.dimensions.content.y + text.dimensions.content.height
+                    <= focused_rect.y + focused_rect.height
+            );
+        }
+    }
+
+    #[test]
     fn focused_text_input_shows_caret() {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -3668,6 +3775,45 @@ mod tests {
         let c00 = cell_rect(rows[0][0]);
         let c01 = cell_rect(rows[0][1]);
         assert!(c00.x < c01.x, "column 0 sits left of column 1");
+    }
+
+    #[test]
+    fn nested_table_preserves_rows_through_cell_measurement() {
+        for parent_display in [
+            style::Display::Block,
+            style::Display::Flex,
+            style::Display::Grid,
+        ] {
+            let mut doc = dom::Document::new();
+            let root = doc.root();
+            let body = doc.append_element(root, "body");
+            let outer = doc.append_element(body, "table");
+            let mut styles = HashMap::new();
+            styles.insert(body, disp(parent_display));
+            styles.insert(outer, disp(style::Display::Table));
+            let outer_cells = build_row(&mut doc, &mut styles, outer, "td", &[""]);
+            let inner = doc.append_element(outer_cells[0], "table");
+            styles.insert(inner, disp(style::Display::Table));
+            let first = build_row(&mut doc, &mut styles, inner, "td", &["Story title", "link"]);
+            let second = build_row(
+                &mut doc,
+                &mut styles,
+                inner,
+                "td",
+                &["Story comments", "next"],
+            );
+            let root_box =
+                layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+            let rects = node_rects(&root_box, &doc, &styles);
+            for node in first.iter().chain(second.iter()).chain([&inner]) {
+                let r = rects.get(&node.0).expect("nested table cell retained");
+                assert!(r.width > 0.0 && r.height > 0.0, "{node:?}: {r:?}");
+            }
+            assert!(rects[&second[0].0].y > rects[&first[0].0].y);
+            assert!(collect_text_boxes(&root_box).iter().any(|b| {
+                matches!(&b.content, BoxContent::Text(text) if text.contains("comments"))
+            }));
+        }
     }
 
     #[test]

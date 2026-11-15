@@ -263,6 +263,26 @@ pub(crate) use traversal::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_navigation_compares_normalized_urls() {
+        assert!(Engine::is_fragment_navigation(
+            r"file://C:\Users\runneradmin\Temp\page.html",
+            "file:///C:/Users/runneradmin/Temp/page.html#active"
+        ));
+        assert!(Engine::is_fragment_navigation(
+            "http://EXAMPLE.com:80/page#one",
+            "http://example.com/page#two"
+        ));
+        for (from, to) in [
+            ("https://example.com/a#one", "https://example.com/b#two"),
+            ("https://example.com/a?q=1", "https://example.com/a?q=2#two"),
+            ("http://EXAMPLE.com:80/a", "http://example.com/a"),
+            ("invalid", "also invalid"),
+        ] {
+            assert!(!Engine::is_fragment_navigation(from, to), "{from} -> {to}");
+        }
+    }
     #[test]
     fn interleaved_engines_keep_tab_settings_and_scroll_separate() {
         let path =
@@ -1179,6 +1199,64 @@ mod tests {
             painted_pixels_in(&e, cr) > painted_pixels_in(&e, ur),
             "checked checkbox should differ (more fill) than unchecked"
         );
+    }
+
+    #[test]
+    fn positioned_checkbox_hits_above_later_in_flow_label() {
+        let html = r#"<html><body style="margin:0"><div style="position:relative">
+          <input id="toggle" type="checkbox" style="position:absolute;left:0;top:0;width:40px;height:40px;opacity:0">
+          <label id="caption" style="display:block;width:200px;height:60px;background:white">Task</label>
+          </div><script>var clicked = ''; document.addEventListener('click', function(e) { clicked = e.target.id; });</script>
+        </body></html>"#;
+        let mut e = load_rendered(html, "browser_positioned_checkbox_test.html", 300, 120);
+        assert_eq!(
+            e.console_eval("document.elementFromPoint(20, 20).id"),
+            "toggle"
+        );
+        e.render();
+        assert!(e.dispatch_click(20.0, 20.0));
+        assert_eq!(
+            e.console_eval("clicked + ':' + document.getElementById('toggle').checked"),
+            "toggle:true"
+        );
+    }
+
+    #[test]
+    fn translucent_background_blends_without_dimming_children() {
+        let html = r#"<html><body style="margin:0;background:white">
+          <div style="width:100px;height:80px;background:rgba(0,0,0,.1)">
+            <div style="width:20px;height:20px;background:red"></div>
+          </div></body></html>"#;
+        let e = load_rendered(html, "browser_background_alpha_test.html", 200, 120);
+        let bg = px_at(&e, 50, 50);
+        assert!(
+            bg.0 >= 228 && bg.0 <= 231 && bg.0 == bg.1 && bg.1 == bg.2,
+            "{bg:?}"
+        );
+        assert_eq!(px_at(&e, 10, 10), (255, 0, 0));
+    }
+
+    #[test]
+    fn overlapping_controls_hit_the_last_painted_sibling() {
+        let html = r#"<html><body style="margin:0">
+          <form style="position:relative;height:80px">
+            <input id="under" style="position:absolute;left:0;top:0;width:200px;height:40px">
+            <button id="over" type="button" style="position:absolute;left:100px;top:0;width:100px;height:40px">Go</button>
+          </form>
+          <script>var clicked = ''; document.addEventListener('click', function(e) { clicked = e.target.id; });</script>
+        </body></html>"#;
+        let mut e = load_rendered(html, "browser_overlapping_controls_test.html", 300, 120);
+        let button = e.node_by_attr_id("over").unwrap();
+        let r = e.node_device_rect(button).unwrap();
+        let (x, y) = (r.x + r.width / 2.0, r.y + r.height / 2.0);
+        assert_eq!(
+            e.console_eval(&format!("document.elementFromPoint({x}, {y}).id")),
+            "over"
+        );
+        // Evaluating JS invalidates the layout snapshot; rebuild as the native host does.
+        e.render();
+        assert!(e.dispatch_click(x, y));
+        assert_eq!(e.console_eval("clicked"), "over");
     }
 
     #[test]

@@ -357,7 +357,7 @@ pub(crate) fn paint_box_opacity(
                     r,
                     g,
                     b: bl,
-                    a: scale_alpha(255, opacity),
+                    a: scale_alpha(b.style.background_alpha, opacity),
                 };
                 paint_masked_bg(fb, xf, border, cov, c, axis);
             } else if let Some(grad) = extras.and_then(|e| e.background_gradient.as_ref()) {
@@ -372,7 +372,7 @@ pub(crate) fn paint_box_opacity(
                 r,
                 g,
                 b: bl,
-                a: scale_alpha(255, opacity),
+                a: scale_alpha(b.style.background_alpha, opacity),
             };
             // Forced-colors backplate: a per-line text fragment's Canvas background is painted by the
             // separate `paint_backplates` pre-pass (full line-box width, before any glyphs), so skip

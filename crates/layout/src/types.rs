@@ -67,6 +67,8 @@ pub struct PaintStyle {
     pub bold: bool,
     pub italic: bool,
     pub background_color: Option<(u8, u8, u8)>,
+    /// Background alpha is independent of the opacity of the whole element.
+    pub background_alpha: u8,
     pub border_color: (u8, u8, u8),
     /// `border-collapse` (inherited from the table). On a collapsed table the painter draws cell
     /// borders as single shared 1px lines (top+left of each cell, plus the table's right/bottom
@@ -150,6 +152,7 @@ impl Default for PaintStyle {
             bold: false,
             italic: false,
             background_color: None,
+            background_alpha: 255,
             border_color: (0, 0, 0),
             border_collapse: style::BorderCollapse::Separate,
             is_table_cell: false,

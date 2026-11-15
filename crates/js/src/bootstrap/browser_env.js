@@ -451,17 +451,44 @@
     locationState.hostname = p.hostname; locationState.port = p.port; locationState.pathname = p.pathname;
     locationState.search = p.search; locationState.hash = p.hash; locationState.origin = p.origin;
   }
-  function __setLocationHref(v) {
-    var p = parseURL(String(v), locationState.href || parts.href);
+  function __notifyFragmentTraversal(oldURL, newURL) {
+    globalThis.dispatchEvent(new globalThis.PopStateEvent("popstate", { state: history.state }));
+    if (oldURL !== newURL) {
+      setTimeout(function () {
+        globalThis.dispatchEvent(new globalThis.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: newURL }));
+      }, 0);
+    }
+  }
+  // The host already moved its history index. Update this realm without issuing another
+  // navigation request, which would append an entry or reload and discard application state.
+  def(globalThis, "__traverseFragmentHistory", function (url) {
+    var oldURL = locationState.href, p = parseURL(String(url), oldURL);
+    if (!p || p.__invalid || oldURL === p.href || oldURL.split("#")[0] !== p.href.split("#")[0]) { return false; }
     __syncLocation(p);
+    __notifyFragmentTraversal(oldURL, p.href);
+    return true;
+  });
+  function __setLocationHref(v, replace) {
+    var oldURL = locationState.href;
+    var p = parseURL(String(v), locationState.href || parts.href);
+    if (!p || p.__invalid) { return; }
+    __syncLocation(p);
+    if (oldURL && oldURL !== p.href && oldURL.split("#")[0] === p.href.split("#")[0]) {
+      __notifyFragmentTraversal(oldURL, p.href);
+    }
+    // Child realms have their own navigation lifecycle. Only the top-level window hands
+    // a request back to the browser host once the current event finishes.
+    if ((!globalThis.top || globalThis.top === globalThis) && typeof __navigate === "function") {
+      __navigate(p.href, replace === true);
+    }
   }
   function __setLocationUrlPart(prop, v) {
     var json = __urlSet(locationState.href || parts.href, prop, String(v));
-    if (json != null) { try { __syncLocation(JSON.parse(json)); } catch (e) {} }
+    if (json != null) { try { __setLocationHref(JSON.parse(json).href); } catch (e) {} }
   }
   var location = {
     assign: function (url) { __setLocationHref(url); },
-    replace: function (url) { __setLocationHref(url); },
+    replace: function (url) { __setLocationHref(url, true); },
     reload: fn,
     toString: function () { return locationState.href; }
   };
@@ -858,6 +885,8 @@
     return !!options;
   }
   var __eventHandlerProps = [
+    "oninput", "onchange", "onbeforeinput", "onkeydown", "onkeyup",
+    "onfocus", "onblur", "onfocusin", "onfocusout", "onsubmit",
     "onanimationstart", "onanimationend", "onanimationiteration", "ontransitionend",
     "onwebkitanimationstart", "onwebkitanimationend", "onwebkitanimationiteration",
     "onwebkittransitionend"
@@ -1030,10 +1059,55 @@
     return null;
   }
   function __findForm(control) {
+    var owner = control && control.getAttribute && control.getAttribute("form");
+    if (owner) { return document.getElementById(owner); }
     for (var cur = control && control.parentNode; cur; cur = cur.parentNode) {
       if (__activationTag(cur) === "form") { return cur; }
     }
     return null;
+  }
+  function __submitForm(form, submitter, fireEvent) {
+    if (!form) { return; }
+    if (fireEvent) {
+      var ev = new globalThis.Event("submit", { bubbles: true, cancelable: true });
+      ev.submitter = submitter || null;
+      if (!form.dispatchEvent(ev)) { return; }
+    }
+    var method = (submitter && submitter.getAttribute("formmethod")) || form.getAttribute("method") || "get";
+    if (String(method).toLowerCase() !== "get") {
+      console.warn("Form submission method is not supported: " + method);
+      return;
+    }
+    var action = (submitter && submitter.getAttribute("formaction")) || form.getAttribute("action") || location.href;
+    var destination;
+    try { destination = new URL(action, document.baseURI || location.href); } catch (e) { return; }
+    var params = new URLSearchParams();
+    var controls = document.querySelectorAll("input,select,textarea,button");
+    for (var i = 0; i < controls.length; i++) {
+      var control = controls[i], name = control.getAttribute("name"), tag = __activationTag(control);
+      if (!name || __findForm(control) !== form || control.hasAttribute("disabled")) { continue; }
+      var type = __activationType(control, tag === "button" ? "submit" : "text");
+      if ((type === "checkbox" || type === "radio") && !control.checked) { continue; }
+      if (type === "reset" || type === "button" || type === "file" || type === "image") { continue; }
+      if ((tag === "button" || type === "submit") && control !== submitter) { continue; }
+      if (tag === "select") {
+        var options = control.querySelectorAll("option"), selected = false;
+        for (var j = 0; j < options.length; j++) {
+          if (options[j].selected && !options[j].disabled) {
+            params.append(name, options[j].value); selected = true;
+          }
+        }
+        if (!selected && !control.multiple && options.length && !options[0].disabled) {
+          params.append(name, options[0].value);
+        }
+      } else {
+        var value = control.value;
+        if ((type === "checkbox" || type === "radio") && !control.hasAttribute("value")) { value = "on"; }
+        params.append(name, String(value == null ? "" : value).replace(/\r?\n/g, "\r\n"));
+      }
+    }
+    destination.search = params.toString();
+    location.href = destination.href;
   }
   function __radioGroup(input) {
     var form = __findForm(input), scope = form || document, name = "", radios = [];
@@ -1051,17 +1125,23 @@
     var el = activation.element;
     if (activation.kind === "checkbox") {
       var oldChecked = !!el.checked;
-      el.checked = !oldChecked;
+      __setNativeChecked(el, !oldChecked);
       return { elements: [el], checked: [oldChecked] };
     }
     var group = __radioGroup(el), old = [];
     if (group.indexOf(el) < 0) { group.push(el); }
-    for (var i = 0; i < group.length; i++) { old.push(!!group[i].checked); group[i].checked = group[i] === el; }
+    for (var i = 0; i < group.length; i++) { old.push(!!group[i].checked); __setNativeChecked(group[i], group[i] === el); }
     return { elements: group, checked: old };
+  }
+  function __setNativeChecked(el, checked) {
+    // User activation changes the backing control state. Calling an own JS setter would
+    // update framework trackers before their click/change listeners can observe the edit.
+    if (checked) { __setAttr(el.__node, "checked", ""); }
+    else { __removeAttr(el.__node, "checked"); }
   }
   function __restorePreActivation(state) {
     if (!state) { return; }
-    for (var i = 0; i < state.elements.length; i++) { state.elements[i].checked = state.checked[i]; }
+    for (var i = 0; i < state.elements.length; i++) { __setNativeChecked(state.elements[i], state.checked[i]); }
   }
   function __dispatchActivationEvent(target, type, bubbles, cancelable) {
     try { return target.dispatchEvent(new globalThis.Event(type, { bubbles: bubbles, cancelable: cancelable })); }
@@ -1078,10 +1158,10 @@
     }
     if (kind === "submit" || kind === "reset") {
       var form = __findForm(el);
-      // This activation belongs to exactly one form. Keeping the synthetic submit/reset event at
-      // that form prevents invalid programmatic nested-form trees from invoking an ancestor form's
-      // activation handler as a second activation.
-      if (form) { __dispatchActivationEvent(form, kind, false, true); }
+      // Only the activated control's owner form runs the default action. Submit bubbles so
+      // delegated handlers may cancel it; reset retains its existing event behavior.
+      if (kind === "submit") { __submitForm(form, el, true); }
+      else if (form) { __dispatchActivationEvent(form, kind, false, true); }
       return;
     }
     if (kind === "summary") {
@@ -1099,19 +1179,10 @@
       return;
     }
     if (kind === "link") {
-      var oldURL = String(globalThis.location.href || ""), newURL = "";
+      var newURL = "";
       try { newURL = String(el.href || el.getAttribute("href") || ""); } catch (e5) {}
       if (!newURL) { return; }
       globalThis.location.href = newURL;
-      newURL = String(globalThis.location.href || newURL);
-      if (oldURL !== newURL && oldURL.split("#")[0] === newURL.split("#")[0]) {
-        setTimeout(function () {
-          var hev;
-          try { hev = new globalThis.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: newURL }); }
-          catch (e6) { hev = new globalThis.Event("hashchange"); try { hev.oldURL = oldURL; hev.newURL = newURL; } catch (e7) {} }
-          globalThis.dispatchEvent(hev);
-        }, 0);
-      }
     }
   }
   // Shared dispatch for `target.dispatchEvent(ev)`. Drives constructed Event objects (which carry
@@ -6585,15 +6656,19 @@
     if (typeof el.after !== "function") { def(el, "after", function () { var p = this.parentNode; if (!p) { return; } var ref = this.nextSibling; for (var i = 0; i < arguments.length; i++) { p.insertBefore(__toNode(arguments[i]), ref); } }); }
     if (typeof el.replaceWith !== "function") { def(el, "replaceWith", function () { var p = this.parentNode; if (!p) { return; } var ref = this.nextSibling; for (var i = 0; i < arguments.length; i++) { p.insertBefore(__toNode(arguments[i]), ref); } p.removeChild(this); }); }
     // Form-control methods. stepUp/stepDown adjust a numeric <input> by its step; setSelectionRange/
-    // select track a text field's selection; submit/requestSubmit/requestClose are accepted (no real
-    // navigation/dialog top-layer). These exist on every element here but are only called on the
+    // select track a text field's selection; submit/requestSubmit support GET navigation.
+    // These exist on every element here but are only called on the
     // right ones in practice.
     if (typeof el.stepUp !== "function") { def(el, "stepUp", function (n) { var s = parseFloat(this.getAttribute("step")) || 1, v = parseFloat(this.value) || 0; this.value = String(v + s * (n == null ? 1 : n)); }); }
     if (typeof el.stepDown !== "function") { def(el, "stepDown", function (n) { var s = parseFloat(this.getAttribute("step")) || 1, v = parseFloat(this.value) || 0; this.value = String(v - s * (n == null ? 1 : n)); }); }
     if (typeof el.setSelectionRange !== "function") { def(el, "setSelectionRange", function (start, end, dir) { def(this, "selectionStart", start | 0); def(this, "selectionEnd", end | 0); def(this, "selectionDirection", dir || "none"); }); }
     if (typeof el.select !== "function") { def(el, "select", function () { var v = this.value == null ? "" : String(this.value); def(this, "selectionStart", 0); def(this, "selectionEnd", v.length); }); }
-    if (typeof el.submit !== "function") { def(el, "submit", fn); }
-    if (typeof el.requestSubmit !== "function") { def(el, "requestSubmit", fn); }
+    if (typeof el.submit !== "function") { def(el, "submit", function () {
+      if (__activationTag(this) === "form") { __submitForm(this, null, false); }
+    }); }
+    if (typeof el.requestSubmit !== "function") { def(el, "requestSubmit", function (submitter) {
+      if (__activationTag(this) === "form") { __submitForm(this, submitter || null, true); }
+    }); }
     if (typeof el.requestClose !== "function") { def(el, "requestClose", function () { try { this.open = false; this.removeAttribute("open"); } catch (e) {} }); }
     // <audio>/<video>: no media pipeline, so playback methods are accepted (play resolves immediately).
     if (typeof el.play !== "function") { def(el, "play", function () { return Promise.resolve(); }); }
@@ -7396,6 +7471,24 @@
     function visit(nodeId) {
       var kids;
       try { kids = __children(nodeId); } catch (e) { kids = []; }
+      // Match layout's sibling paint ordering: positioned boxes sit above in-flow siblings,
+      // with negative stack levels below them. Equal levels retain tree order.
+      var ordered = [];
+      for (var k = 0; k < kids.length; k++) {
+        var group = 1, z = 0;
+        if (__nodeType(kids[k]) === 1) {
+          try {
+            var cs = getComputedStyle(__nodeFor(kids[k]));
+            if (cs.position && cs.position !== "static") {
+              z = parseInt(cs.getPropertyValue("z-index"), 10) || 0;
+              group = z < 0 ? 0 : 2;
+            }
+          } catch (e2) {}
+        }
+        ordered.push({ id: kids[k], group: group, z: z, index: k });
+      }
+      ordered.sort(function (a, b) { return a.group - b.group || a.z - b.z || a.index - b.index; });
+      kids = ordered.map(function (item) { return item.id; });
       for (var i = kids.length - 1; i >= 0; i--) {
         var hit = visit(kids[i]);
         if (hit >= 0) { return hit; }
@@ -7489,7 +7582,12 @@
     return r;
   });
   if (typeof document.hasFocus !== "function") { def(document, "hasFocus", function () { return true; }); }
-  if (!("activeElement" in document)) { Object.defineProperty(document, "activeElement", { get: function () { try { return document.body; } catch (e) { return null; } }, enumerable: true, configurable: true }); }
+  if (!("activeElement" in document)) { Object.defineProperty(document, "activeElement", { get: function () {
+    try {
+      var id = typeof __focusedNode === "function" ? __focusedNode() : -1;
+      return id >= 0 && (!globalThis.top || globalThis.top === globalThis) ? canon(__wrapNode(id)) : document.body;
+    } catch (e) { return null; }
+  }, enumerable: true, configurable: true }); }
   if (!("visibilityState" in document)) { document.visibilityState = "visible"; }
   if (!("hidden" in document)) { document.hidden = false; }
   // The document's character encoding reflects its <meta charset> (or content-type meta), per the
@@ -15153,8 +15251,13 @@
           next = cur + key; mutated = true;
         }
         if (mutated) {
-          try { el.value = next; } catch (e7) {}
+          // A native edit changes the control's backing value without invoking an own JS
+          // setter (React installs one to distinguish programmatic writes from user input).
+          try { __setAttr(nodeId, "value", next); } catch (e7) {}
           __dispatchSyntheticEvent(nodeId, "input", {});
+        }
+        if (key === "Enter" && isTextInput) {
+          __submitForm(__findForm(el), null, true);
         }
       }
     }

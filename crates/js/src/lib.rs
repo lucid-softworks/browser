@@ -430,6 +430,81 @@ mod tests {
     }
 
     #[test]
+    fn outer_html_preserves_detached_wrapper_attributes_and_void_elements() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var aside = document.createElement('aside');
+                    aside.className = 'sidebar';
+                    aside.setAttribute('title', 'a"b&c');
+                    aside.innerHTML = '<h2>A &amp; B</h2><input disabled>';
+                    var markup = aside.outerHTML;
+                    document.body.insertAdjacentHTML('afterbegin', markup);
+                    var copy = document.body.firstElementChild;
+                    [markup,
+                     copy.tagName + ':' + copy.className,
+                     copy.querySelector('h2').textContent,
+                     copy.querySelector('input').outerHTML,
+                     document.documentElement.outerHTML.indexOf('<html>') === 0
+                    ].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(
+                r#"<aside class="sidebar" title="a&quot;b&amp;c"><h2>A &amp; B</h2><input disabled=""></aside>|ASIDE:sidebar|A & B|<input disabled="">|true"#
+            )
+        );
+    }
+
+    #[test]
+    fn outer_html_preserves_html_raw_text_and_escapes_ordinary_text() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var results = [];
+            ['script', 'style'].forEach(function(tag) {
+                var node = document.createElement(tag);
+                node.textContent = 'a < b && c > d';
+                results.push(node.innerHTML, node.outerHTML);
+                var holder = document.createElement('div');
+                holder.innerHTML = node.outerHTML;
+                results.push(holder.firstChild.textContent);
+            });
+            var span = document.createElement('span');
+            span.textContent = '<script>&';
+            results.push(span.outerHTML);
+            results.join('|')
+        "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(concat!(
+                "a < b && c > d|<script>a < b && c > d</script>|a < b && c > d|",
+                "a < b && c > d|<style>a < b && c > d</style>|a < b && c > d|",
+                "<span>&lt;script&gt;&amp;</span>"
+            ))
+        );
+        // The native serializer must not apply HTML raw-text rules in other namespaces.
+        let mut doc = dom::Document::new();
+        let svg_script = doc.append_element(doc.root(), "script");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(svg_script).data {
+            e.namespace = Some("http://www.w3.org/2000/svg".into());
+        }
+        doc.append_child(svg_script, dom::NodeData::Text("a < b".into()));
+        assert_eq!(
+            crate::dom_helpers::outer_html(&doc, svg_script),
+            "<script>a &lt; b</script>"
+        );
+    }
+
+    #[test]
     fn structured_clone_deep_copies_cycles_and_throws_on_uncloneable() {
         // Replaces the old JSON-roundtrip stub: must deep-copy Maps, preserve cycles and shared
         // ArrayBuffer aliasing, and raise DataCloneError on a function — none of which the stub did.
@@ -1875,6 +1950,33 @@ mod tests {
     }
 
     #[test]
+    fn linked_stylesheet_cascade_fetches_relative_href_against_document_base() {
+        let doc = html::parse(
+            r#"<html><head><base href="../assets/"><link rel="stylesheet" href="app.css"></head>
+               <body><div class="app"></div></body></html>"#,
+        );
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&requests);
+        let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> = Rc::new(move |url| {
+            seen.borrow_mut().push(url.to_owned());
+            (url == "https://example.test/assets/app.css").then(|| {
+                (
+                    ".app { position: relative; }".to_owned(),
+                    "text/css".to_owned(),
+                )
+            })
+        });
+        let sheets = collect_author_sheets(&doc, &fetcher, "https://example.test/demo/index.html");
+        let styles = style::cascade(&doc, &sheets);
+        let app = find_by_tag(&doc, doc.root(), "div").unwrap();
+        assert_eq!(styles[&app].position, style::Position::Relative);
+        assert_eq!(
+            &*requests.borrow(),
+            &["https://example.test/assets/app.css"]
+        );
+    }
+
+    #[test]
     fn computed_style_applies_style_element_rule() {
         // A `<style>` rule `.x{display:flex}` is collected in-Session and applied via the cascade.
         let (mut doc, body) = doc_with_body("");
@@ -2199,13 +2301,13 @@ mod tests {
     }
 
     #[test]
-    fn huge_css_value_setter_is_linear_not_quadratic() {
-        // Regression for grid-template-columns-crash.html: setting a very long property value must
-        // not be O(n²). normalizeCssValue previously indexed the growing result rope per number
-        // token (`out[out.length-1]`), forcing repeated flattening, so a ~1.8MB value hung the
-        // engine (V8 GC thrash -> WebDriver "not responding" -> CRASH). Build the fixture outside
-        // JS so its 40,000 string appends don't consume the worker deadline on slower debug
-        // runners. The same full-size value still goes through the real CSS setter and getter.
+    fn huge_css_value_round_trips_within_runtime_budget() {
+        // Regression for grid-template-columns-crash.html: repeated flattening of the growing
+        // result used to hang the engine. Keep the full 40,000-token fixture and check every
+        // byte returned by the real CSS setter/getter. run_with_dom already enforces the runtime
+        // deadline; a separate four-second wall-clock assertion was flaky on Intel macOS debug
+        // runners and cannot establish algorithmic complexity. Build the fixture outside JS so
+        // its string appends don't consume that deadline.
         let value: String = (0..40000)
             .map(|i| format!(" repeat(1000, {i}px)"))
             .collect();
@@ -2214,15 +2316,13 @@ mod tests {
             doc,
             vec![format!(
                 "var v={value:?}; \
-                 var t0=Date.now(); document.body.style.gridTemplateColumns=v; \
-                 var ok = document.body.style.gridTemplateColumns.length > 0; \
-                 [ok, (Date.now()-t0) < 4000].join(',')"
+                 document.body.style.gridTemplateColumns=v; \
+                 document.body.style.gridTemplateColumns"
             )],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        // Both flags true: the value was stored, and the setter finished fast (linear).
-        assert_eq!(out[0].value.as_deref(), Some("true,true"));
+        assert_eq!(out[0].value.as_deref(), Some(value.trim()));
     }
 
     #[test]

@@ -28,6 +28,15 @@ pub(crate) fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
 
 /// Serialize the children of `id` back to an HTML string (the `innerHTML` of `id`).
 pub(crate) fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
+    html_markup(doc, id, false)
+}
+
+/// Serialize `id` itself and its descendants (the element's `outerHTML`).
+pub(crate) fn outer_html(doc: &dom::Document, id: dom::NodeId) -> String {
+    html_markup(doc, id, true)
+}
+
+fn html_markup(doc: &dom::Document, id: dom::NodeId, include_root: bool) -> String {
     fn is_void(tag: &str) -> bool {
         matches!(
             tag.to_ascii_lowercase().as_str(),
@@ -57,7 +66,19 @@ pub(crate) fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
     }
     fn serialize_node(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
         match &doc.get(id).data {
-            dom::NodeData::Text(t) => out.push_str(&escape_text(t)),
+            dom::NodeData::Text(t) => {
+                let raw_text = doc.get(id).parent.is_some_and(|parent| {
+                    matches!(&doc.get(parent).data, dom::NodeData::Element(e)
+                        if (e.namespace.is_none() || e.namespace.as_deref() == Some("http://www.w3.org/1999/xhtml"))
+                        && matches!(e.tag.to_ascii_lowercase().as_str(),
+                            "script" | "style" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext"))
+                });
+                if raw_text {
+                    out.push_str(t);
+                } else {
+                    out.push_str(&escape_text(t));
+                }
+            }
             dom::NodeData::Cdata(c) => {
                 out.push_str("<![CDATA[");
                 out.push_str(c);
@@ -108,8 +129,12 @@ pub(crate) fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
         }
     }
     let mut out = String::new();
-    for &child in &doc.get(id).children {
-        serialize_node(doc, child, &mut out);
+    if include_root {
+        serialize_node(doc, id, &mut out);
+    } else {
+        for &child in &doc.get(id).children {
+            serialize_node(doc, child, &mut out);
+        }
     }
     out
 }
