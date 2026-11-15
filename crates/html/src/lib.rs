@@ -859,6 +859,7 @@ impl<'a> Parser<'a> {
             attrs
         };
 
+        let is_foreign = namespace.is_some();
         let node = self.doc.append_child(
             parent,
             NodeData::Element(ElementData {
@@ -868,8 +869,11 @@ impl<'a> Parser<'a> {
             }),
         );
 
-        if is_void(&tag) || self_closing {
-            // Void / self-closing elements don't open a scope.
+        if is_void(&tag) || (self_closing && is_foreign) {
+            // Void elements never open a scope. The self-closing flag is honored only in
+            // foreign content (SVG/MathML); on an HTML element it's a parse error and is
+            // ignored, so `<div/>x` keeps `x` inside the div and `<script/>` still enters
+            // raw text until `</script>`.
             return;
         }
 
@@ -1543,6 +1547,52 @@ mod tests {
         assert_eq!(tag_of(&doc, kids[0]), "br");
         assert!(children(&doc, kids[0]).is_empty());
         assert_eq!(text_of(&doc, kids[1]), Some("x"));
+    }
+
+    #[test]
+    fn self_closing_flag_ignored_on_html_elements() {
+        // A trailing "/" on a non-void HTML element is a parse error and the element
+        // still opens (html5lib-tests): `<div/>x` puts `x` inside the div.
+        let doc = parse("<div/>x");
+        let div = children(&doc, body_of(&doc))[0];
+        assert_eq!(tag_of(&doc, div), "div");
+        assert_eq!(text_of(&doc, children(&doc, div)[0]), Some("x"));
+
+        // `</div>` still closes the element it stayed open.
+        let doc = parse("<div/><p>in</p></div><p>out</p>");
+        let div = children(&doc, body_of(&doc))[0];
+        assert_eq!(tag_of(&doc, div), "div");
+        let p_in = children(&doc, div)[0];
+        assert_eq!(tag_of(&doc, p_in), "p");
+        assert_eq!(text_of(&doc, children(&doc, p_in)[0]), Some("in"));
+        let p_out = children(&doc, body_of(&doc))[1];
+        assert_eq!(tag_of(&doc, p_out), "p");
+        assert_eq!(text_of(&doc, children(&doc, p_out)[0]), Some("out"));
+    }
+
+    #[test]
+    fn self_closing_flag_does_not_escape_rawtext() {
+        // `<script/>` still opens a raw-text element: the following source stays script
+        // text (and never becomes page text) until the matching `</script>`.
+        let doc = parse("<script/>var x = 1;</script><p>after</p>");
+        let script = children(&doc, head_of(&doc))[0];
+        assert_eq!(tag_of(&doc, script), "script");
+        assert_eq!(text_of(&doc, children(&doc, script)[0]), Some("var x = 1;"));
+        let p = children(&doc, body_of(&doc))[0];
+        assert_eq!(tag_of(&doc, p), "p");
+        assert_eq!(text_of(&doc, children(&doc, p)[0]), Some("after"));
+    }
+
+    #[test]
+    fn self_closing_flag_honored_in_foreign_content() {
+        // In SVG (and MathML) the flag is honored: `<path/>` is an empty element.
+        let doc = parse("<svg><path/></svg><p>after</p>");
+        let body_kids = children(&doc, body_of(&doc));
+        assert_eq!(tag_of(&doc, body_kids[0]), "svg");
+        let path = children(&doc, body_kids[0])[0];
+        assert_eq!(tag_of(&doc, path), "path");
+        assert!(children(&doc, path).is_empty());
+        assert_eq!(tag_of(&doc, body_kids[1]), "p");
     }
 
     #[test]
