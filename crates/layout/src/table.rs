@@ -489,7 +489,11 @@ pub(crate) fn layout_table(
         cell.boxx.dimensions.content.x = content.x + col_x[start] + m.left + b.left + p.left;
         cell.boxx.dimensions.content.y = grid_top + m.top + b.top + p.top;
         cell.boxx.dimensions.content.width = cw;
-        let laid = layout_flex_item_contents(&mut cell.boxx, ctx, styles, measurer);
+        // Measurement must not consume the structural children used by final placement.
+        // In particular, nested tables flatten their row wrappers during layout; laying out
+        // that already-flattened subtree a second time would discard every nested cell.
+        let mut probe = cell.boxx.clone();
+        let laid = layout_flex_item_contents(&mut probe, ctx, styles, measurer);
         // Honor an explicit cell height as a floor.
         let explicit_h = style_of(&cell.boxx, styles)
             .and_then(|cs| cs.height)

@@ -403,7 +403,33 @@ fn with_session<T>(
         .map
         .get_mut(id)
         .ok_or_else(|| WdError::invalid_session(id))?;
-    f(session)
+    settle_navigation(session);
+    let result = f(session);
+    settle_navigation(session);
+    result
+}
+
+/// Complete page-requested navigations after event handlers return, preserving driver history.
+fn settle_navigation(session: &mut Session) {
+    // Bound script redirect chains; each document also has its own execution deadline.
+    for _ in 0..5 {
+        let Some((url, replace)) = session.engine.take_navigation_request() else {
+            break;
+        };
+        let same_document =
+            url != session.url && url.split('#').next() == session.url.split('#').next();
+        if replace {
+            session.history[session.history_index] = url.clone();
+        } else {
+            session.history.truncate(session.history_index + 1);
+            session.history.push(url.clone());
+            session.history_index = session.history.len() - 1;
+        }
+        session.url = url.clone();
+        if !same_document {
+            load_and_wait(session, &url, Duration::from_secs(8));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -464,7 +490,13 @@ fn new_session(body: &str, sessions: &Mutex<Sessions>) -> WdResult {
         ("browserName", Json::Str("from-scratch-browser".to_string())),
         ("browserVersion", Json::Str("0.1.0".to_string())),
         ("platformName", Json::Str(std::env::consts::OS.to_string())),
-        ("acceptInsecureCerts", Json::Bool(true)),
+        (
+            "acceptInsecureCerts",
+            Json::Bool(
+                std::env::var("WPT_INSECURE_TLS")
+                    .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true")),
+            ),
+        ),
         ("setWindowRect", Json::Bool(true)),
         ("proxy", obj(vec![])),
     ]);
@@ -664,6 +696,11 @@ fn load_and_wait(session: &mut Session, url: &str, timeout: Duration) {
         }
         session.engine.tick();
     }
+    // HTTP redirects belong to the current history entry, rather than adding another entry.
+    if let Some(url) = session.engine.current_url() {
+        session.url = url.to_owned();
+        session.history[session.history_index] = session.url.clone();
+    }
 }
 
 fn traverse_history(id: &str, delta: isize, sessions: &Mutex<Sessions>) -> WdResult {
@@ -675,7 +712,9 @@ fn traverse_history(id: &str, delta: isize, sessions: &Mutex<Sessions>) -> WdRes
         s.history_index = next;
         let url = s.history[next].clone();
         s.url = url.clone();
-        load_and_wait(s, &url, Duration::from_secs(8));
+        if !s.engine.traverse_same_document_history(&url) {
+            load_and_wait(s, &url, Duration::from_secs(8));
+        }
         Ok(Json::Null)
     })
 }
@@ -683,7 +722,7 @@ fn traverse_history(id: &str, delta: isize, sessions: &Mutex<Sessions>) -> WdRes
 fn get_url(id: &str, sessions: &Mutex<Sessions>) -> WdResult {
     with_session(id, sessions, |s| {
         // Prefer the live document URL; fall back to the last requested URL.
-        let live = s.engine.console_eval("document.URL || location.href");
+        let live = s.engine.console_eval("location.href || document.URL");
         let url = if live.is_empty() || live == "undefined" || live == "(no live page)" {
             s.url.clone()
         } else {
@@ -1180,43 +1219,60 @@ fn element_click(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResult {
     })
 }
 
-/// Send keys to an element. Best-effort: focus, set `.value` (appending), and fire `input`/`change`.
-/// Note: this does not go through a real per-keystroke key event path — documented as best-effort.
+/// Send keys through the same focus and per-keystroke input path as the desktop shell.
 fn element_value(id: &str, eid: &str, body: &str, sessions: &Mutex<Sessions>) -> WdResult {
     let parsed = parse(body).unwrap_or(Json::Null);
     let text = parsed
         .get("text")
         .and_then(|v| v.as_str())
         .ok_or_else(|| WdError::invalid_argument("missing text"))?;
+    // Validate before typing so unsupported modifier chords cannot partially edit a field.
+    let keys = text
+        .chars()
+        .map(webdriver_key)
+        .collect::<Result<Vec<_>, _>>()?;
     let node = handle_node_js(eid)?;
-    let text_js = js_string(text);
     let expr = format!(
-        r#"(function(){{ var __n = {node}; if (!__n) return '__WD_NOELEM__';
-  try {{
-    if (typeof __n.focus === 'function') __n.focus();
-    if ('value' in __n) {{ __n.value = (__n.value || '') + {text_js}; }}
-    else if (__n.isContentEditable) {{ __n.textContent = (__n.textContent||'') + {text_js}; }}
-    var ev = (typeof Event === 'function') ? new Event('input', {{bubbles:true}}) : null;
-    if (ev && __n.dispatchEvent) __n.dispatchEvent(ev);
-    var ev2 = (typeof Event === 'function') ? new Event('change', {{bubbles:true}}) : null;
-    if (ev2 && __n.dispatchEvent) __n.dispatchEvent(ev2);
-    return 'null';
-  }} catch(e){{ return '__WD_ERR__' + (e && e.message ? e.message : String(e)); }}
-}})()"#
+        "(function(){{ var n = {node}; return n ? String(n.__node) : '__WD_NOELEM__'; }})()"
     );
     with_session(id, sessions, |s| {
         let raw = s.engine.console_eval(&expr);
         if raw == "__WD_NOELEM__" {
             return Err(WdError::no_such_element());
         }
-        if let Some(msg) = raw.strip_prefix("__WD_ERR__") {
-            return Err(WdError::javascript_error(msg.to_string()));
+        let node_id = raw
+            .parse::<usize>()
+            .map_err(|_| WdError::javascript_error("invalid element node id"))?;
+        if !s.engine.focus_text_field(node_id) {
+            return Err(WdError::invalid_argument(
+                "element is not an editable text field",
+            ));
+        }
+        for (key, code) in keys {
+            s.engine.dispatch_key(&key, code);
         }
         for _ in 0..3 {
             s.engine.tick();
         }
         Ok(Json::Null)
     })
+}
+
+/// W3C special keys supported by the engine. Unsupported chords fail explicitly instead of
+/// inserting private-use characters into the page's value.
+fn webdriver_key(ch: char) -> Result<(String, &'static str), WdError> {
+    let key = match ch {
+        '\u{e003}' => ("Backspace", "Backspace"),
+        '\u{e006}' | '\u{e007}' | '\n' | '\r' => ("Enter", "Enter"),
+        '\u{e00c}' => ("Escape", "Escape"),
+        '\u{e00d}' => (" ", "Space"),
+        '\u{e017}' => ("Delete", "Delete"),
+        '\u{e000}'..='\u{e05d}' => {
+            return Err(WdError::invalid_argument("unsupported WebDriver key"))
+        }
+        _ => return Ok((ch.to_string(), "")),
+    };
+    Ok((key.0.to_string(), key.1))
 }
 
 // ---------------------------------------------------------------------------------------------

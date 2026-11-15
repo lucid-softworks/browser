@@ -85,7 +85,7 @@ curl -s -X POST localhost:4444/session/browser-wd-00000001/execute/sync \
 | Get Element Tag Name | `GET /session/{id}/element/{eid}/name` | ✅ |
 | Get Element Rect | `GET /session/{id}/element/{eid}/rect` | ✅ (`getBoundingClientRect`) |
 | Element Click | `POST /session/{id}/element/{eid}/click` | ✅ (rect center → `dispatch_click`) |
-| Element Send Keys | `POST /session/{id}/element/{eid}/value` | ⚠️ **best-effort** (focus + set `.value` + fire `input`/`change`; not a real per-keystroke key path) |
+| Element Send Keys | `POST /session/{id}/element/{eid}/value` | Native text-control key path (text, Enter, Backspace, Delete, Escape) |
 | Take Screenshot | `GET /session/{id}/screenshot` | ✅ (base64 PNG) |
 | Take Element Screenshot | `GET /session/{id}/element/{eid}/screenshot` | ⚠️ **best-effort** (full-page render cropped to the element rect) |
 | Get Window Rect | `GET /session/{id}/window/rect` | ✅ |
@@ -100,9 +100,14 @@ Responses are `{"value": <result>}` with HTTP 200 on success. Errors are
 
 ## Known limitations / stubs (easy to find later)
 
-- **Send keys** (`element/value`) is best-effort: it sets `.value` and fires `input`/`change`
-  rather than dispatching real key events per character.
+- **Send keys** (`element/value`) supports editable input/textarea controls through the desktop
+  key path. Modifier chords and caret movement are not implemented; unsupported WebDriver keys
+  return `invalid argument` instead of inserting private-use characters.
 - **Element screenshot** crops the full-page framebuffer to the element rect rather than rendering
   the element in isolation.
+- **Form navigation** supports GET submissions, cancellation, and submitter values. POST/file
+  uploads, constraint validation, and named navigation targets remain unsupported.
+- **History** preserves the live document for fragment Back/Forward. JavaScript
+  `history.pushState`/`replaceState` do not yet update the host's history entries.
 - **`data:` URLs** are not supported by the `net` layer; navigate to `http(s)://`, `file://`, or
   `about:blank`.

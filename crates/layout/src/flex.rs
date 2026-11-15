@@ -274,7 +274,10 @@ pub(crate) fn layout_flex(
         for &mi in line {
             let item_main = size_of(mi);
             let meta = &metas[mi];
-            let child = &mut boxx.children[meta.idx];
+            // The final pass needs the original structure (not already-flattened table rows
+            // or inline fragments). Measure and read baselines from a scratch subtree.
+            let mut probe = boxx.children[meta.idx].clone();
+            let child = &mut probe;
             // Tentatively size the content box so contents lay out at the right main extent.
             let content_main = (item_main - meta.main_edges).max(0.0);
             if main_horizontal {
@@ -320,12 +323,7 @@ pub(crate) fn layout_flex(
                 )
             {
                 let last = matches!(resolved, style::AlignSelf::LastBaseline);
-                item_baseline[mi] = Some(flex_item_baseline(
-                    &boxx.children[metas[mi].idx],
-                    last,
-                    vertical_wm,
-                    styles,
-                ));
+                item_baseline[mi] = Some(flex_item_baseline(child, last, vertical_wm, styles));
             }
         }
 

@@ -22,6 +22,7 @@ struct HostData {
     selection: Option<(usize, u32, usize, u32)>,
     highlights: Vec<(usize, String)>,
     scroll: Option<f32>,
+    navigation: Option<(String, bool)>,
     interaction: (Option<usize>, Option<usize>),
     revision: u64,
     font: Option<Arc<fontdue::Font>>,
@@ -39,6 +40,7 @@ impl Default for HostContext {
             selection: None,
             highlights: Vec::new(),
             scroll: None,
+            navigation: None,
             interaction: (None, None),
             revision: 0,
             font: None,
@@ -141,6 +143,13 @@ pub fn take_pending_scroll() -> Option<f32> {
 pub(crate) fn set_pending_scroll(y: f32) {
     with_data(|d| d.scroll = Some(y));
 }
+/// Take a top-level page navigation request: destination and whether to replace history.
+pub fn take_pending_navigation() -> Option<(String, bool)> {
+    with_data(|d| d.navigation.take())
+}
+pub(crate) fn set_pending_navigation(url: String, replace: bool) {
+    with_data(|d| d.navigation = Some((url, replace)));
+}
 pub fn set_device_metrics(width: u32, height: u32, ratio: f32) {
     with_data(|d| {
         let metrics = (width.max(1), height.max(1), ratio.max(0.1));
@@ -171,6 +180,9 @@ pub fn set_interaction_state(hover: Option<usize>, focus: Option<usize>) {
             d.revision += 1;
         }
     });
+}
+pub(crate) fn focused_node() -> Option<usize> {
+    with_data(|d| d.interaction.1)
 }
 /// Install decoded font bytes used by the host painter for synchronous JS geometry queries.
 pub fn set_font_data(bytes: Vec<u8>) -> bool {

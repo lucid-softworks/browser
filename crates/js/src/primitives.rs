@@ -331,16 +331,11 @@ pub(crate) fn prim_get_attr(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeRe
 // the *same* `style::cascade` here over the live DOM, caching it and invalidating on every DOM
 // mutation (via `dom_version`).
 //
-// Limitation: only inline `<style>` blocks (and the UA sheet that `cascade` auto-prepends) are
-// honoured. External `<link rel=stylesheet>` CSS is not available in-Session (the engine fetches it
-// out of band and it isn't surfaced to the worker), so author rules from external sheets do not
-// affect these computed values. That's fine for feature-detection, which probes inline styles on
-// throwaway elements — it never relies on external CSS.
+// Author sheets include inline `<style>` blocks and enabled external stylesheet links, fetched
+// through the host capability using the document's base URL. Each sheet retains its own base for
+// relative CSS resources. The cascade also adds the UA sheet and inline style attributes.
 // ---------------------------------------------------------------------------------------------
 
-/// Walk the document for `<style>` elements, concatenate their text content, and parse it into a
-/// single author stylesheet. Returns an empty `Vec` when there are no `<style>` blocks (the cascade
-/// then runs with just the UA sheet + inline `style=""` attributes).
 /// Join `href` onto `base` (both treated as URLs); returns `base` if either fails to parse.
 pub(crate) fn join_url(base: &str, href: &str) -> String {
     wurl::resolve(href.trim(), base).unwrap_or_else(|| base.to_string())
@@ -371,6 +366,7 @@ pub(crate) fn document_base_url(doc: &dom::Document, page_url: &str) -> String {
     }
 }
 
+/// Collect applicable inline and linked author stylesheets in document order, preserving bases.
 pub(crate) fn collect_author_sheets(
     doc: &dom::Document,
     fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>,
@@ -437,14 +433,15 @@ pub(crate) fn collect_author_sheets(
                 let disabled = e.attrs.contains_key("disabled");
                 if is_stylesheet && !disabled {
                     if let Some(href) = e.attrs.get("href") {
-                        if let Some(css) = fetch_link_css(href, fetcher) {
+                        let resolved = join_url(doc_base, href);
+                        if let Some(css) = fetch_link_css(&resolved, fetcher) {
                             // The link sheet's rules resolve against the link's own (absolute) URL.
                             out.push(SheetEntry {
                                 title: e.attrs.get("title").cloned(),
                                 alternate: is_alternate,
                                 css,
                                 seq: id.0,
-                                base: join_url(doc_base, href),
+                                base: resolved,
                             });
                         }
                     }
@@ -619,6 +616,15 @@ pub(crate) fn prim_scroll_set(scope: &mut Ctx, args: NativeArgs, _rv: &mut Nativ
     let y = args.get(0).number_value(scope).unwrap_or(0.0);
     let y = if y.is_finite() { y.max(0.0) } else { 0.0 };
     set_pending_scroll(y.round() as f32);
+}
+
+pub(crate) fn prim_navigate(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
+    let url = arg_str(scope, &args, 0);
+    let replace = arg_str(scope, &args, 1) == "true";
+    set_pending_navigation(url, replace);
+}
+pub(crate) fn prim_focused_node(_scope: &mut Ctx, _args: NativeArgs, rv: &mut NativeReturn) {
+    rv.set_double(focused_node().map_or(-1.0, |id| id as f64));
 }
 
 /// `__scrollIntoView(id)` — request a scroll so node `id`'s top is near the viewport top.
@@ -1294,6 +1300,17 @@ pub(crate) fn prim_inner_html(scope: &mut Ctx, args: NativeArgs, rv: &mut Native
     let state = host_state(scope);
     let s = node
         .map(|n| inner_html(&state.doc.borrow(), n))
+        .unwrap_or_default();
+    let v = js_str(scope, &s);
+    rv.set(v);
+}
+
+/// `__outerHTML(id) -> string`
+pub(crate) fn prim_outer_html(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let s = node
+        .map(|n| outer_html(&state.doc.borrow(), n))
         .unwrap_or_default();
     let v = js_str(scope, &s);
     rv.set(v);
@@ -2165,6 +2182,8 @@ pub(crate) fn install_dom_primitives(scope: &mut Ctx, global: &Value) {
     set_fn(scope, global, "__scrollY", prim_scroll_y);
     set_fn(scope, global, "__prefersDark", prim_prefers_dark);
     set_fn(scope, global, "__scrollSet", prim_scroll_set);
+    set_fn(scope, global, "__navigate", prim_navigate);
+    set_fn(scope, global, "__focusedNode", prim_focused_node);
     set_fn(scope, global, "__scrollIntoView", prim_scroll_into_view);
     set_fn(scope, global, "__appendChild", prim_append_child);
     set_fn(scope, global, "__insertBefore", prim_insert_before);
@@ -2188,6 +2207,7 @@ pub(crate) fn install_dom_primitives(scope: &mut Ctx, global: &Value) {
     set_fn(scope, global, "__textContent", prim_text_content);
     set_fn(scope, global, "__setTextContent", prim_set_text_content);
     set_fn(scope, global, "__innerHTML", prim_inner_html);
+    set_fn(scope, global, "__outerHTML", prim_outer_html);
     set_fn(scope, global, "__setInnerHTML", prim_set_inner_html);
     set_fn(
         scope,
