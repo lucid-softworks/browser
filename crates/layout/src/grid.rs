@@ -510,7 +510,7 @@ pub(crate) fn placement_to_cell(
                         1
                     }
                 }
-                style::GridEnd::Auto => 1,
+                style::GridEnd::Auto => pl.start_span.unwrap_or(1).max(1) as usize,
             };
             let start = pl
                 .start

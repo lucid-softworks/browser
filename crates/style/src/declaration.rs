@@ -629,7 +629,7 @@ pub(crate) fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
         }
     };
 
-    if start.is_none() && matches!(end, GridEnd::Auto) {
+    if start.is_none() && span_from_start.is_none() && matches!(end, GridEnd::Auto) {
         return None;
     }
     Some(GridPlacement {
@@ -637,6 +637,43 @@ pub(crate) fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
         start_span: span_from_start,
         end,
     })
+}
+
+/// Is this a `<grid-line>` we can resolve — `auto`, an integer line, or `span <n>`?
+///
+/// Named lines and named areas aren't modelled, so an identifier can't be turned into a track index.
+/// Callers use this to reject such a declaration outright instead of dropping the ident and placing
+/// the item somewhere it wasn't asked to go.
+fn is_resolvable_grid_line(s: &str) -> bool {
+    let s = s.trim().to_ascii_lowercase();
+    if s == "auto" {
+        return true;
+    }
+    let tokens: Vec<_> = s.split_whitespace().collect();
+    match tokens.as_slice() {
+        ["span", n] => n.parse::<i32>().is_ok_and(|n| n > 0),
+        [n] => n.parse::<i32>().is_ok_and(|n| n != 0),
+        _ => false,
+    }
+}
+
+/// Parse the `grid-area` shorthand: `<row-start> [ / <column-start> [ / <row-end> [ / <column-end> ]]]`.
+///
+/// The four lines interleave the two axes — rows are the 1st and 3rd values, columns the 2nd and 4th
+/// — so this is not simply `grid-row / grid-column`. Omitted values are `auto`, which is what the
+/// spec prescribes for any line that isn't a `<custom-ident>`; since idents can't be resolved at all
+/// they make the whole value invalid rather than partially applying it.
+fn parse_grid_area(val: &str) -> Option<(Option<GridPlacement>, Option<GridPlacement>)> {
+    let parts: Vec<&str> = val.split('/').map(str::trim).collect();
+    if parts.len() > 4 || parts.iter().any(|p| !is_resolvable_grid_line(p)) {
+        return None;
+    }
+    // Absent sides read as `auto`, so the same two-sided parser handles every arity.
+    let side = |i: usize| *parts.get(i).unwrap_or(&"auto");
+    Some((
+        parse_grid_placement(&format!("{} / {}", side(0), side(2))),
+        parse_grid_placement(&format!("{} / {}", side(1), side(3))),
+    ))
 }
 
 fn normalize_grid_placement(slot: &mut Option<GridPlacement>) {
@@ -1656,18 +1693,20 @@ pub(crate) fn apply_declaration(
         }
 
         // --- Gaps ---
-        "gap" => {
+        // The `grid-*-gap` spellings are the original Grid-only names, kept as aliases of the
+        // unprefixed properties. Plenty of existing content (and test) still uses them.
+        "gap" | "grid-gap" => {
             if let Some((r, c)) = parse_gap(val) {
                 style.row_gap = r;
                 style.column_gap = c;
             }
         }
-        "row-gap" => {
+        "row-gap" | "grid-row-gap" => {
             if let Some(v) = parse_length(val) {
                 style.row_gap = v;
             }
         }
-        "column-gap" => {
+        "column-gap" | "grid-column-gap" => {
             if let Some(v) = parse_length(val) {
                 style.column_gap = v;
             }
@@ -1727,6 +1766,12 @@ pub(crate) fn apply_declaration(
         }
         "grid-row-start" => set_grid_start(&mut style.grid_row, val),
         "grid-row-end" => set_grid_end(&mut style.grid_row, val),
+        "grid-area" => {
+            if let Some((row, col)) = parse_grid_area(val) {
+                style.grid_row = row;
+                style.grid_column = col;
+            }
+        }
 
         // --- Box model: margin ---
         "margin" => {
