@@ -15,11 +15,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # rust-cache preserves dependency artifacts; sccache also reuses unchanged workspace library
-  # compilation. Binary/test linking still runs. Both jobs install the wrapper, and incremental
-  # compilation must be disabled for sccache to work.
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
+  # CI restores compiler outputs through Kache instead of retaining incremental state.
   CARGO_INCREMENTAL: 0
 
 jobs:
@@ -39,10 +35,13 @@ jobs:
         with:
           toolchain: '1.99.1'
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust compilations
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          cache-on-failure: true
-      - uses: mozilla-actions/sccache-action@v0.0.9
+          version: '2.1.1'
+          cache-key-prefix: kache-lint
+          max-size: '2GiB'
+          pr-comment: false
       - name: Install desktop build libraries
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev
       - run: cargo fmt --all --check
@@ -59,13 +58,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.99.1'
-      # Share Rust dependency artifacts with the WPT build. This lets that workflow restore
-      # the same --release dependency cache (its Linux leg builds the identical dep set).
-      - uses: Swatinem/rust-cache@v2
+      # Share eligible release compiler outputs with the nightly WebDriver build.
+      - name: Cache Rust compilations
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          shared-key: release-deps
-          cache-on-failure: true
-      - uses: mozilla-actions/sccache-action@v0.0.9
+          version: '2.1.1'
+          cache-key-prefix: kache-release
+          max-size: '2GiB'
+          pr-comment: false
       # Rune links Wayland/XKB; engine-only tests still exercise system-font discovery.
       - name: Install desktop libraries and test fonts
         run: |

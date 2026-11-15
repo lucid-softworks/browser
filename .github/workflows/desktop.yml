@@ -17,10 +17,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Keep dependency artifacts and cache unchanged workspace compilation on every platform.
-  # sccache cannot cache incremental builds; final binary linking still runs normally.
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
+  # CI restores compiler outputs through Kache instead of retaining incremental state.
   CARGO_INCREMENTAL: 0
 
 jobs:
@@ -50,12 +47,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.99.1'
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust compilations
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          shared-key: desktop-${{ matrix.platform }}
-          # A failed test or packaging check must not discard a successful dependency build.
-          cache-on-failure: true
-      - uses: mozilla-actions/sccache-action@v0.0.9
+          version: '2.1.1'
+          cache-key-prefix: kache-desktop
+          max-size: '2GiB'
+          pr-comment: false
       - name: Install Linux libraries and fonts
         if: runner.os == 'Linux'
         run: |
