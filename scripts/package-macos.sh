@@ -49,33 +49,25 @@ IMAGE_NAME="Browser-${VERSION}-macos-${ARCH}-${BUILD_SHA:0:7}.dmg"
     echo "Refusing to replace existing image: $OUTPUT_DIR/$IMAGE_NAME" >&2; exit 1;
 }
 STAGING="$(mktemp -d "${TMPDIR:-/tmp}/browser-package.XXXXXX")"
-trap 'rm -rf "$STAGING"' EXIT
+MOUNT="$STAGING/mounted"
+MOUNTED=0
+cleanup() {
+    if [[ "$MOUNTED" == 1 ]]; then
+        hdiutil detach "$MOUNT" || hdiutil detach -force "$MOUNT" || return 1
+    fi
+    rm -rf "$STAGING"
+}
+trap cleanup EXIT
 CONTENTS="$STAGING/volume/Browser.app/Contents"
 mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources"
 cp "$BINARY" "$CONTENTS/MacOS/Browser"
 chmod 755 "$CONTENTS/MacOS/Browser"
 cp "$ROOT/LICENSE" "$CONTENTS/Resources/LICENSE.txt"
 cp "$ROOT/crates/desktop/assets/Inter-LICENSE.txt" "$CONTENTS/Resources/Inter-LICENSE.txt"
-cat > "$CONTENTS/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key><string>com.lucidsoftworks.browser</string>
-    <key>CFBundleName</key><string>Browser</string>
-    <key>CFBundleDisplayName</key><string>Browser</string>
-    <key>CFBundleExecutable</key><string>Browser</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>$VERSION</string>
-    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
-    <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
-    <key>BrowserBuildCommit</key><string>$BUILD_SHA</string>
-</dict>
-</plist>
+cp "$ROOT/crates/desktop/macos/Info.plist" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$CONTENTS/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :BrowserBuildCommit $BUILD_SHA" "$CONTENTS/Info.plist"
 plutil -lint "$CONTENTS/Info.plist"
 printf 'APPL????' > "$CONTENTS/PkgInfo"
 codesign --force --deep --sign - --timestamp=none "$STAGING/volume/Browser.app"
@@ -88,7 +80,7 @@ if ! "$CONTENTS/MacOS/Browser" --help > "$STAGING/launch-help.txt" 2>&1; then
     exit 1
 fi
 ln -s /Applications "$STAGING/volume/Applications"
-cat > "$STAGING/volume/Read Me.txt" <<EOF
+cat > "$STAGING/volume/.Read Me.txt" <<INSTALL_NOTES
 Browser $VERSION ($ARCH), commit $BUILD_SHA
 
 Drag Browser.app to Applications, then eject this disk image.
@@ -99,10 +91,36 @@ macOS may block its first launch. Only if you trust this download, use
 System Settings > Privacy & Security > Open Anyway after attempting to open it.
 
 The application and bundled-font licenses are inside Browser.app/Contents/Resources.
-EOF
+INSTALL_NOTES
+# Set Finder metadata on the actual volume so background aliases have its real identity.
+: "${DMG_LAYOUT_PYTHON:?Set DMG_LAYOUT_PYTHON to Python with macos-dmg-requirements.txt installed}"
 hdiutil create -volname "Browser $VERSION" -srcfolder "$STAGING/volume" \
-    -format UDZO -fs HFS+ "$STAGING/$IMAGE_NAME"
+    -format UDRW -fs HFS+ "$STAGING/writable.dmg"
+mkdir -p "$MOUNT"
+hdiutil attach -nobrowse -mountpoint "$MOUNT" "$STAGING/writable.dmg"
+MOUNTED=1
+mkdir -p "$MOUNT/.background"
+swift "$ROOT/scripts/dmg-background.swift" "$MOUNT/.background/background.png"
+"$DMG_LAYOUT_PYTHON" "$ROOT/scripts/dmg-layout.py" "$MOUNT"
+hdiutil detach "$MOUNT"
+MOUNTED=0
+hdiutil convert "$STAGING/writable.dmg" -format UDZO -o "$STAGING/$IMAGE_NAME"
 hdiutil verify "$STAGING/$IMAGE_NAME"
+
+# Validate the shipped image, not just the staging folder. Also reproduce copying to Applications.
+hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "$STAGING/$IMAGE_NAME"
+MOUNTED=1
+"$DMG_LAYOUT_PYTHON" "$ROOT/scripts/dmg-layout.py" --verify-only "$MOUNT"
+[[ "$(readlink "$MOUNT/Applications")" == /Applications ]]
+[[ -s "$MOUNT/Browser.app/Contents/_CodeSignature/CodeResources" ]]
+plutil -lint "$MOUNT/Browser.app/Contents/Info.plist"
+codesign --verify --deep --strict --verbose=2 "$MOUNT/Browser.app"
+mkdir -p "$STAGING/installed"
+ditto "$MOUNT/Browser.app" "$STAGING/installed/Browser.app"
+codesign --verify --deep --strict --verbose=2 "$STAGING/installed/Browser.app"
+"$STAGING/installed/Browser.app/Contents/MacOS/Browser" --help > "$STAGING/installed-help.txt" 2>&1
+hdiutil detach "$MOUNT"
+MOUNTED=0
 mv "$STAGING/$IMAGE_NAME" "$OUTPUT_DIR/$IMAGE_NAME"
 (
     cd "$OUTPUT_DIR"

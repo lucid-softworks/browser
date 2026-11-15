@@ -73,6 +73,9 @@ jobs:
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: |
+          python3 -m venv "$RUNNER_TEMP/dmg-tools"
+          "$RUNNER_TEMP/dmg-tools/bin/python" -m pip install -r scripts/macos-dmg-requirements.txt
+          export DMG_LAYOUT_PYTHON="$RUNNER_TEMP/dmg-tools/bin/python"
           version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "browser-desktop"))')"
           scripts/package-macos.sh target/release/browser "dist/browser-${{ matrix.platform }}" "$version" "$PACKAGE_ARCH" "$GITHUB_SHA"
       - uses: actions/upload-artifact@v4

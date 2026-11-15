@@ -74,6 +74,7 @@ To test without installing Rust, download a build from
    (M1 or later), or `browser-macos-x86_64` for an Intel Mac. GitHub requires you to sign in
    to download Actions artifacts. Both require macOS 13 or newer.
 3. Extract the artifact ZIP, open its `.dmg`, and drag **Browser.app** onto **Applications**.
+   The installer window places Browser on the left and Applications on the right, with a drag arrow.
 4. Eject the disk image and open Browser from Applications. To update, quit Browser and
    replace the existing app with the newer build.
 
@@ -117,7 +118,9 @@ and manual dispatch. macOS jobs create and verify an app bundle and a drag-to-Ap
 DMG; Windows and Linux jobs upload portable executables. These build checks do not
 replace manual checks of windowing, GPU drivers, input methods, and display scaling on each
 OS. macOS packaging verifies the executable architecture, bundle metadata, ad-hoc signature,
-and disk-image integrity on native runners. Signing does not provide Apple notarization.
+and disk-image integrity on native runners. It then mounts the finished image read-only,
+checks the Finder layout and Applications shortcut, and verifies/launches a copy of the app
+extracted from that image. Signing does not provide Apple notarization.
 After downloading an artifact on Linux, restore its executable bit with
 `chmod +x browser` before launching.
 Each artifact includes the browser MIT license and the bundled Inter font's SIL Open Font
