@@ -269,8 +269,16 @@ fn build_browsing_context(
     nav_type: &str,
 ) -> bool {
     let page_state = host_state(scope);
-    let Ok(parent) = Realm::current(scope) else {
-        return false;
+    let parent = match Realm::current(scope) {
+        Ok(parent) => parent,
+        Err(error) => {
+            let message = error.to_rust_string_lossy(scope);
+            page_state
+                .console
+                .borrow_mut()
+                .push(format!("iframe parent realm: {message}"));
+            return false;
+        }
     };
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
@@ -334,8 +342,16 @@ fn build_browsing_context(
     let page_url = page_state.page_url.borrow().clone();
     let same_origin_parent = !opaque_origin
         && (srcdoc.is_some() || frame_url == "about:blank" || same_origin(&page_url, &frame_url));
-    let Ok(ctx_global) = Realm::new(scope) else {
-        return false;
+    let ctx_global = match Realm::new(scope) {
+        Ok(child) => child,
+        Err(error) => {
+            let message = error.to_rust_string_lossy(scope);
+            page_state
+                .console
+                .borrow_mut()
+                .push(format!("iframe creation: {message}"));
+            return false;
+        }
     };
     let shared: SharedDoc = Rc::new(RefCell::new(doc));
     let state = HostState::with_fetcher(
@@ -399,8 +415,24 @@ fn build_browsing_context(
             "<frame-lifecycle>",
         )
     })
-    .unwrap_or(false);
+    .unwrap_or_else(|error| {
+        let message = error.to_rust_string_lossy(scope);
+        page_state
+            .console
+            .borrow_mut()
+            .push(format!("iframe realm entry: {message}"));
+        false
+    });
     if !initialized {
+        if let Some(state) = scope.realm_resource_for_host::<HostState>(&ctx_global.global) {
+            page_state.console.borrow_mut().extend(
+                state
+                    .console
+                    .borrow()
+                    .iter()
+                    .map(|error| format!("iframe initialization: {error}")),
+            );
+        }
         ctx_global.retire(scope);
         scope.collect_garbage_for_host();
         return false;
@@ -780,14 +812,17 @@ mod retirement_tests {
         )
         .error
         .is_none());
-        for _ in 0..6 {
-            assert!(eval_source(
+        for iteration in 0..6 {
+            let loaded = eval_source(
                 ctx,
                 "__iframeLoad(f.__node, 'about:blank', '<body>first</body>');",
-                "load"
-            )
-            .error
-            .is_none());
+                "load",
+            );
+            assert_eq!(
+                loaded.value.as_deref(),
+                Some("true"),
+                "load {iteration}: {loaded:?}"
+            );
             let old = FRAME_REG.with(|r| {
                 let frame = r.borrow().last().unwrap().context.clone();
                 let state = ctx
@@ -795,13 +830,16 @@ mod retirement_tests {
                     .unwrap();
                 Rc::downgrade(&state)
             });
-            assert!(eval_source(
+            let replaced = eval_source(
                 ctx,
                 "__iframeLoad(f.__node, 'about:blank', '<body>second</body>');",
-                "replace"
-            )
-            .error
-            .is_none());
+                "replace",
+            );
+            assert_eq!(
+                replaced.value.as_deref(),
+                Some("true"),
+                "replace {iteration}: {replaced:?}"
+            );
             ctx.collect_garbage_for_host();
             assert!(
                 old.upgrade().is_none(),

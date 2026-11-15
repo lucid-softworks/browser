@@ -22,8 +22,13 @@ Local changes support the browser embedding:
   their original realm alive until released, including its DOM host resources.
 - `modules.rs` preserves failed module preparation/link states across subsequent
   imports and cycles, preventing missing dependency records from panicking.
+- `interpreter.rs` keeps shared property-cache keys alive and checks their contents,
+  preventing stale entries from matching a different name at a reused memory address.
 
 Regression coverage lives in the browser's `crates/js` and desktop worker tests.
 The upstream crate's own test module also references fixtures outside this vendored
-subdirectory; it is excluded from the browser workspace. Do not edit vendored WPT
-tests to accommodate these patches.
+subdirectory; it is excluded from the browser workspace. The Linux CI job fetches
+`v8-v7/base.js` and `v8-v7/richards.js` from the pinned upstream benchmark mirror
+before running `cargo test --locked -p lumen --lib stub_cache_` for the
+shared-cache regressions. See `.github/workflows/ci.yml` for the fixture URLs.
+Do not edit vendored WPT tests to accommodate these patches.

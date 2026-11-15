@@ -637,19 +637,19 @@ fn pattern_has_expr(pat: &Pattern) -> bool {
 }
 
 /// One megamorphic-stub-cache entry (see [`Interp::stub_cache`]): the derived resolution for a
-/// (receiver shape, site name pointer) pair. `name` is the identity of the *site's* interned
-/// name `Rc<str>` data pointer — two sites reading the same property text through different
-/// `Rc`s simply use separate entries. The default (`name: 0`) can't match a real probe.
-#[derive(Clone, Copy)]
+/// (receiver shape, site name pointer) pair. Each bounded slot owns its name text: a
+/// collected realm/site can release its interned name and an unrelated name can later reuse
+/// that address. Comparing text before promoting the cached shape/slot prevents that ABA.
+#[derive(Clone)]
 pub(crate) struct StubEntry {
-    pub(crate) name: usize,
+    pub(crate) name: Option<Rc<str>>,
     pub(crate) st: crate::bytecode::IcState,
 }
 
 impl Default for StubEntry {
     fn default() -> StubEntry {
         StubEntry {
-            name: 0,
+            name: None,
             st: crate::bytecode::IcState {
                 recv_shape: 0,
                 holder_shape: 0,
@@ -663,7 +663,7 @@ impl Default for StubEntry {
     }
 }
 
-/// Stub-cache capacity (power of two). 4096 × 24-byte entries = 96 KiB.
+/// Stub-cache capacity (power of two), bounding retained name storage.
 const STUB_CACHE_SIZE: usize = 4096;
 
 /// The table index for a (receiver shape, name pointer) pair. The name pointer's low bits are
@@ -854,9 +854,9 @@ pub struct Interp {
     /// both of a site's ways miss, so a site rotating through more receiver shapes than it has
     /// ways (constraint hierarchies, visitor patterns) still resolves by shape compares instead
     /// of re-walking the chain with hashed key lookups. Entries are validated by the same live
-    /// shape probe as the per-site ways, so stale entries are misses, never wrong hits — the
-    /// table needs no invalidation.
-    pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
+    /// shape probe as the per-site ways, after comparing the owned name text. This catches
+    /// both structural changes and name-address reuse without retaining old realm code.
+    pub(crate) stub_cache: Vec<std::cell::RefCell<StubEntry>>,
     /// Freelist of fixed-size raw frame buffers ([`crate::jit::FRAME_BUF`] `Value`s each) for the
     /// JIT fast call's slots + operand stack — a pop and pointer math per call instead of `Vec`
     /// bookkeeping. Buffers hold no live values while pooled.
@@ -1530,7 +1530,7 @@ impl Interp {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8),
             vm_pool: Vec::new(),
-            stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
+            stub_cache: vec![std::cell::RefCell::new(StubEntry::default()); STUB_CACHE_SIZE],
             frame_pool: FramePool(Vec::new()),
             creation_pins: Default::default(),
             global_env_pins: Vec::new(),
@@ -2713,8 +2713,8 @@ impl Interp {
         }
         if stable_name {
             let shape = unsafe { (*head).borrow().props.shape() };
-            let e = self.stub_cache[stub_slot(shape, name)].get();
-            if e.name == name.as_ptr() as usize && e.st.recv_shape == shape {
+            let e = self.stub_cache[stub_slot(shape, name)].borrow();
+            if e.name.as_deref() == Some(name) && e.st.recv_shape == shape {
                 if let Some(v) = self.ic_shape_probe(head, name, e.st) {
                     // Promote into the site (demoting the other ways): the next access hits
                     // way-first.
@@ -2949,8 +2949,8 @@ impl Interp {
                     // site don't evict this resolution for good — stable site names only
                     // (see `get_prop_keyed`).
                     if stable_name {
-                        self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
-                            name: name.as_ptr() as usize,
+                        self.stub_cache[stub_slot(recv_shape, name)].replace(StubEntry {
+                            name: Some(Rc::from(&name[..])),
                             st,
                         });
                     }
@@ -2981,8 +2981,8 @@ impl Interp {
                             };
                             self.ic_insert(cache, st);
                             if stable_name {
-                                self.stub_cache[stub_slot(recv_shape, name)].set(StubEntry {
-                                    name: name.as_ptr() as usize,
+                                self.stub_cache[stub_slot(recv_shape, name)].replace(StubEntry {
+                                    name: Some(Rc::from(&name[..])),
                                     st,
                                 });
                             }
@@ -3104,8 +3104,8 @@ impl Interp {
         // hashed existence scan below. Promote into way 1 like the get path does.
         {
             let shape = b.props.shape();
-            let e = self.stub_cache[stub_slot(shape, name)].get();
-            if e.name == name.as_ptr() as usize && e.st.recv_shape == shape && e.st.depth == 0 {
+            let e = self.stub_cache[stub_slot(shape, name)].borrow();
+            if e.name.as_deref() == Some(name) && e.st.recv_shape == shape && e.st.depth == 0 {
                 if let Some((_, p)) = b.props.entry_at(e.st.slot as usize) {
                     if !p.accessor() && p.writable() {
                         b.props
@@ -3165,8 +3165,8 @@ impl Interp {
                 };
                 self.ic_insert(cache, st);
                 // Mirror into the stub cache (see the probe above).
-                self.stub_cache[stub_slot(shape, name)].set(StubEntry {
-                    name: name.as_ptr() as usize,
+                self.stub_cache[stub_slot(shape, name)].replace(StubEntry {
+                    name: Some(Rc::from(&name[..])),
                     st,
                 });
                 true
@@ -8672,6 +8672,84 @@ mod gc_tests {
         assert!(matches!(
             engine.eval("kept.self === kept", false).unwrap(),
             crate::Completion::Value(result) if result == "true"
+        ));
+    }
+    fn empty_property_cache(
+    ) -> [std::cell::Cell<crate::bytecode::IcState>; crate::bytecode::PROP_IC_WAYS] {
+        std::array::from_fn(|_| std::cell::Cell::new(crate::bytecode::IcState::EMPTY))
+    }
+
+    #[test]
+    fn stub_cache_rejects_reused_name_storage_for_reads_and_absence() {
+        for initial_present in [true, false] {
+            let engine = crate::Engine::new();
+            let object = Object::new(None);
+            if initial_present {
+                object
+                    .borrow_mut()
+                    .props
+                    .insert("first", Property::plain(Value::Num(1.0)));
+            }
+            object
+                .borrow_mut()
+                .props
+                .insert("FIRST", Property::plain(Value::Num(2.0)));
+            let mut name = String::from("first");
+            let first = empty_property_cache();
+            engine
+                .interp
+                .try_ic_get(&object, &name, &first[0], true)
+                .unwrap();
+            // Simulate allocator address reuse deterministically: a later site's distinct
+            // name occupies exactly the same bytes as an earlier, discarded site's name.
+            let address = name.as_ptr();
+            name.make_ascii_uppercase();
+            assert_eq!(name.as_ptr(), address);
+            let second = empty_property_cache();
+            assert!(
+                matches!(
+                    engine.interp.try_ic_get(&object, &name, &second[0], true),
+                    Some(Value::Num(2.0))
+                ),
+                "stale name reused a read/absence cache"
+            );
+        }
+    }
+
+    #[test]
+    fn stub_cache_rejects_reused_name_storage_for_writes() {
+        let mut engine = crate::Engine::new();
+        let object = Object::new(None);
+        object
+            .borrow_mut()
+            .props
+            .insert("first", Property::plain(Value::Num(1.0)));
+        object
+            .borrow_mut()
+            .props
+            .insert("FIRST", Property::plain(Value::Num(2.0)));
+        let mut name: Rc<str> = Rc::from("first");
+        let first = empty_property_cache();
+        assert!(engine
+            .interp
+            .try_ic_set(&object, &name, &Value::Num(3.0), &first[0]));
+        let address = name.as_ptr();
+        Rc::get_mut(&mut name)
+            .expect("cache owns a separate key")
+            .make_ascii_uppercase();
+        assert_eq!(name.as_ptr(), address);
+        let second = empty_property_cache();
+        assert!(engine
+            .interp
+            .try_ic_set(&object, &name, &Value::Num(4.0), &second[0]));
+        let object = object.borrow();
+        assert!(
+            matches!(object.props.get("first").unwrap().value(), Value::Num(3.0)),
+            "stale name wrote another property"
+        );
+        assert!(matches!(
+            object.props.get("FIRST").unwrap().value(),
+            Value::Num(4.0)
         ));
     }
 }

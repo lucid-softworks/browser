@@ -76,3 +76,12 @@ jobs:
         run: |
           cargo build --workspace --release
           cargo test --workspace --release
+      - name: Test Lumen property-cache regressions
+        run: |
+          # Upstream's unit-test module includes these benchmark fixtures at compile time.
+          # Pin the same source used by Lumen's scripts/run-v8bench.sh.
+          mkdir -p v8-v7
+          fixture_source="https://raw.githubusercontent.com/mozilla/arewefastyet/0e2160885d0ca693577d54f1bbbe572f052282c6/benchmarks/v8-v7"
+          curl -fL --retry 3 "$fixture_source/base.js" -o v8-v7/base.js
+          curl -fL --retry 3 "$fixture_source/richards.js" -o v8-v7/richards.js
+          cargo test --locked -p lumen --lib stub_cache_
