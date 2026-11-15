@@ -66,6 +66,27 @@ containers, and CI can still run the headless tools below when a Vulkan adapter 
 
 ### macOS
 
+To test without installing Rust, download a build from
+[Desktop Actions on main](https://github.com/lucid-softworks/browser/actions/workflows/desktop.yml?query=branch%3Amain):
+
+1. Open the newest successful **push to main** run. PR runs contain unmerged code.
+2. Under **Artifacts**, download `browser-macos-arm64` for an Apple Silicon Mac
+   (M1 or later), or `browser-macos-x86_64` for an Intel Mac. GitHub requires you to sign in
+   to download Actions artifacts. Both require macOS 13 or newer.
+3. Extract the artifact ZIP, open its `.dmg`, and drag **Browser.app** onto **Applications**.
+   The installer window places Browser on the left and Applications on the right, with a drag arrow.
+4. Eject the disk image and open Browser from Applications. To update, quit Browser and
+   replace the existing app with the newer build.
+
+These are ad-hoc signed development builds, **not Apple-notarized releases**. If macOS blocks
+the first launch and you trust the build you downloaded from this repository, use
+**System Settings → Privacy & Security → Open Anyway**, following
+[Apple's instructions](https://support.apple.com/en-us/102445). Do not disable Gatekeeper.
+Each filename includes its version, architecture, and source commit. A SHA-256 checksum is
+included beside the DMG. Artifacts are retained for 30 days; every push to `main` builds new ones.
+
+For a local build instead:
+
 Install the Xcode command-line tools (`xcode-select --install`) and Rust. The shared desktop
 app is a Rust executable and uses Rune's Metal presentation. It does not require building
 the separate Swift shell. The Swift shell's existing app-bundle and signing workflow remains
@@ -92,10 +113,15 @@ Omit this flag during ordinary interactive browsing so the UI never waits for a 
 ## Validation and scope
 
 `.github/workflows/desktop.yml` checks, tests, and builds the desktop package on Windows,
-Linux, and macOS, then uploads the executable for each runner. These build checks do not
+Linux, Apple Silicon macOS, and Intel macOS. It runs on PRs, every push to `main`, version tags,
+and manual dispatch. macOS jobs create and verify an app bundle and a drag-to-Applications
+DMG; Windows and Linux jobs upload portable executables. These build checks do not
 replace manual checks of windowing, GPU drivers, input methods, and display scaling on each
-OS. The binaries are CI artifacts; they are not installers or signed application bundles.
-After downloading an artifact on Linux or macOS, restore its executable bit with
+OS. macOS packaging verifies the executable architecture, bundle metadata, ad-hoc signature,
+and disk-image integrity on native runners. It then mounts the finished image read-only,
+checks the Finder layout and Applications shortcut, and verifies/launches a copy of the app
+extracted from that image. Signing does not provide Apple notarization.
+After downloading an artifact on Linux, restore its executable bit with
 `chmod +x browser` before launching.
 Each artifact includes the browser MIT license and the bundled Inter font's SIL Open Font
 License (`Inter-LICENSE.txt`). Retain those license files when redistributing the binary.

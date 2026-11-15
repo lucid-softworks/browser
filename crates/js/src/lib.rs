@@ -2203,18 +2203,21 @@ mod tests {
         // Regression for grid-template-columns-crash.html: setting a very long property value must
         // not be O(n²). normalizeCssValue previously indexed the growing result rope per number
         // token (`out[out.length-1]`), forcing repeated flattening, so a ~1.8MB value hung the
-        // engine (V8 GC thrash -> WebDriver "not responding" -> CRASH). Build a large value and
-        // assert the round-trip completes well under the worker budget.
+        // engine (V8 GC thrash -> WebDriver "not responding" -> CRASH). Build the fixture outside
+        // JS so its 40,000 string appends don't consume the worker deadline on slower debug
+        // runners. The same full-size value still goes through the real CSS setter and getter.
+        let value: String = (0..40000)
+            .map(|i| format!(" repeat(1000, {i}px)"))
+            .collect();
         let (doc, _) = doc_with_body("");
         let (_d, out) = run_with_dom(
             doc,
-            vec![
-                "var v=''; for (var i=0;i<40000;i++){ v+=' repeat(1000, '+i+'px)'; } \
+            vec![format!(
+                "var v={value:?}; \
                  var t0=Date.now(); document.body.style.gridTemplateColumns=v; \
                  var ok = document.body.style.gridTemplateColumns.length > 0; \
                  [ok, (Date.now()-t0) < 4000].join(',')"
-                    .to_string(),
-            ],
+            )],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
