@@ -11,7 +11,7 @@ ureq = "2"
 # pinned so a process-default CryptoProvider always exists and building a ClientConfig can't panic.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 # Pure-Rust WebSocket client (handles ws:// and wss://). rustls TLS to match ureq's backend
 # (rustls 0.23) so we don't pull a second TLS stack. `webpki-roots` ships Mozilla's root store so
 # wss:// works without depending on the OS trust store.
