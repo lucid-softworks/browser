@@ -1,4 +1,4 @@
-// Worker overlay: turn a freshly browser-env'd V8 context into a DedicatedWorkerGlobalScope, then
+// Worker overlay: turn a freshly browser-env'd Lumen realm into a DedicatedWorkerGlobalScope, then
 // fetch + run the worker's top-level script. Runs (once) in the worker's OWN context, where
 // `self === globalThis` already holds (browser_env aliases them), so top-level declarations in the
 // worker script and every importScripts'd file become real worker-global properties — exactly the
