@@ -44,8 +44,8 @@ jobs:
 
   # Build the WebDriver server ONCE and share the binary with every matrix leg via an artifact.
   # Otherwise each of the dozens of `wpt` legs recompiles + relinks the `webdriver` crate (the
-  # Swatinem cache restores the V8 *dependencies*, but the workspace crate itself still builds per
-  # leg). The binary statically embeds V8, so it's self-contained and portable across the identical
+  # Swatinem cache restores the Rust dependencies, but the workspace crate itself still builds per
+  # leg). The binary statically embeds Lumen, so it's self-contained and portable across the identical
   # ubuntu-latest runners.
   webdriver:
     runs-on: ubuntu-latest
@@ -54,26 +54,22 @@ jobs:
     # Scoped to this job: the `wpt` matrix legs run the prebuilt binary and never invoke rustc, so
     # they need neither the wrapper nor the sccache install.
     env:
+      # Match release CI's Rust environment: rust-cache includes these variables in its key.
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-deps
+          cache-on-failure: true
       - uses: mozilla-actions/sccache-action@v0.0.9
-      # See ci.yml: fetch the matching prebuilt librusty_v8.a directly and point the crate at it via
-      # RUSTY_V8_ARCHIVE, so the V8 native lib is provisioned deterministically (not cache-dependent).
-      - name: Provision prebuilt V8 static lib
-        run: |
-          ver="$(cargo pkgid v8 | sed 's/.*@//')"
-          url="https://github.com/denoland/rusty_v8/releases/download/v${ver}/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz"
-          echo "Fetching $url"
-          curl -fL --retry 3 "$url" -o /tmp/librusty_v8.a.gz
-          gunzip -f /tmp/librusty_v8.a.gz
-          echo "RUSTY_V8_ARCHIVE=/tmp/librusty_v8.a" >> "$GITHUB_ENV"
       - name: Build WebDriver server
         run: cargo build --release -p webdriver
       - name: Upload WebDriver binary
@@ -119,7 +115,9 @@ jobs:
           # resources 404 — the helper test throws before registering subtests (area reports 0/0),
           # and Ahem-based geometry assertions measure with the fallback font. Add both for css/ areas.
           mapfile -t checkout_paths < <(jq -r '.[]' <<< "$CHECKOUT_JSON")
-          git sparse-checkout set tools third_party docs resources common css/support fonts quirks interfaces images "${checkout_paths[@]}"
+          # Some matrix entries are individual test files. Cone-mode sparse checkout rejects those
+          # paths unless checks are skipped, even though Git materializes the files correctly.
+          git sparse-checkout set --skip-checks tools third_party docs resources common css/support fonts quirks interfaces images "${checkout_paths[@]}"
 
       - name: Map WPT hosts
         run: |

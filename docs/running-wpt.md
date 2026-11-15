@@ -46,6 +46,32 @@ suite nightly. It generates weighted shards from the current WPT tree, sparse-ch
 shard, and runs them in parallel through `wpt run`; every shard uploads its raw report and writes a
 pass-rate summary to the job summary.
 
+[`.github/workflows/wpt-smoke.yml`](../.github/workflows/wpt-smoke.yml) runs a bounded
+regression comparison on relevant PRs. It builds the PR base and head, then runs the same
+20 DOM, module, worker, and iframe test files from
+[`tools/wpt/smoke-tests.txt`](../tools/wpt/smoke-tests.txt) against one pinned WPT revision.
+The **WPT regression gate** fails on newly failing assertions, worse harness outcomes
+(including timeouts and crashes), lost tests/subtests, and incomplete or empty reports.
+Existing failures are allowed only when the base reproduces them; there is no manually
+maintained pass-rate threshold. Both raw reports and harness logs are uploaded, and the
+comparison appears in the job summary. Add `WPT regression gate` to required branch checks
+if repository protection should enforce it. The workflow also supports manual dispatch
+with a baseline revision.
+
+To reproduce the comparison with separately built binaries and the same WPT checkout:
+
+```sh
+ENGINE_REVISION=BASE_COMMIT_SHA WEBDRIVER_BIN=/absolute/path/to/base/webdriver \
+  scripts/run-wpt-smoke.sh /tmp/wpt-base
+ENGINE_REVISION=HEAD_COMMIT_SHA WEBDRIVER_BIN=/absolute/path/to/head/webdriver \
+  scripts/run-wpt-smoke.sh /tmp/wpt-head
+python3 scripts/compare-wpt.py /tmp/wpt-base /tmp/wpt-head --output /tmp/wpt-comparison.md
+```
+
+The default wall limit is 900 seconds per engine (`WPT_SMOKE_TIMEOUT` can override it
+locally). A cutoff fails validation rather than treating a partial report as success.
+The smoke selection is a merge-time check, not a replacement for the broad nightly suite.
+
 ## Known limitations
 
 - Worker variants are supported progressively; shared-worker and worker-specific platform APIs
