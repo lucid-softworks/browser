@@ -1801,7 +1801,7 @@
     if (nid >= 0) { var p = __parent(nid); if (p >= 0) { __removeChild(p, nid); } }
     return node;
   });
-  // Rebuild a node from another V8 browsing-context realm in this realm's DOM arena. Attribute and
+  // Rebuild a node from another Lumen browsing-context realm in this realm's DOM arena. Attribute and
   // child access happens through the foreign wrapper, while every factory call creates a local node.
   function importForeignNode(node, deep) {
     if (!node || typeof node.nodeType !== "number") {
@@ -1842,7 +1842,7 @@
       throw new globalThis.DOMException("The node type is not supported.", "NotSupportedError");
     }
     if (deep && type === 1 && typeof node.innerHTML === "string" && "innerHTML" in copy) {
-      // String-valued accessors cross V8 contexts reliably even when object-valued navigation
+      // String-valued accessors cross Lumen realms reliably even when object-valued navigation
       // accessors do not. Parsing the foreign element's contents preserves its complete subtree.
       copy.innerHTML = node.innerHTML;
     } else if (deep) {
