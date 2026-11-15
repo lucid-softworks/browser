@@ -389,13 +389,19 @@ pub(crate) fn parse_items_value(
     None
 }
 
-/// Whitespace-separated tokens of `s`, each with its byte offset, so a caller can recover the
+/// Whitespace-separated tokens (preserving parenthesized math), with byte offsets to recover the
 /// untouched remainder of the input after the tokens it consumed.
 fn tokens_with_offsets(s: &str) -> Vec<(usize, &str)> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
+    let mut depth = 0usize;
     for (i, c) in s.char_indices() {
-        if c.is_whitespace() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if c.is_whitespace() && depth == 0 {
             if let Some(st) = start.take() {
                 out.push((st, &s[st..i]));
             }
@@ -444,32 +450,52 @@ struct FontShorthand {
     italic: bool,
 }
 
-/// Parse the `font` shorthand's main grammar:
+/// Parse the supported CSS2-style `font` shorthand (stretch keywords, no oblique angles):
 /// `[ <font-style> || <font-variant-css2> || <font-weight> || <font-stretch> ]? <font-size>
 ///  [ / <line-height> ]? <font-family>`.
 ///
 /// `lower` must be `trimmed` ASCII-lowercased, which leaves byte offsets aligned between the two, so
 /// keywords can be matched case-insensitively while the family is taken from the original — family
 /// names are case-preserving.
-fn parse_font_shorthand(trimmed: &str, lower: &str, parent_px: f32) -> Option<FontShorthand> {
+fn parse_font_shorthand(
+    trimmed: &str,
+    lower: &str,
+    parent_px: f32,
+    used_size: Option<f32>,
+) -> Option<FontShorthand> {
     let toks = tokens_with_offsets(lower);
     let mut i = 0;
     let mut italic = false;
     let mut bold = false;
-    // One value per category, four categories.
-    while i < 4 {
-        let Some(&(_, t)) = toks.get(i) else { break };
-        // A `/` can be glued to the size (`10px/1`), so a token containing one is never a prefix.
+    // `normal` can fill any unused category; it must not reset an explicit weight/style.
+    let mut categories = [false; 4];
+    let mut normals = 0;
+    while let Some(&(_, t)) = toks.get(i) {
         if t.contains('/') || !is_font_prefix_keyword(t) {
             break;
         }
-        match t {
-            "italic" | "oblique" => italic = true,
-            _ => {
-                if let Some(b) = parse_font_weight(t) {
-                    bold = b;
+        if t == "normal" {
+            normals += 1;
+        } else {
+            let category = match t {
+                "italic" | "oblique" => {
+                    italic = true;
+                    0
                 }
+                "small-caps" => 1,
+                _ if parse_font_weight(t).is_some() => {
+                    bold = parse_font_weight(t)?;
+                    2
+                }
+                _ => 3,
+            };
+            if categories[category] {
+                return None;
             }
+            categories[category] = true;
+        }
+        if normals + categories.iter().filter(|&&used| used).count() > 4 {
+            return None;
         }
         i += 1;
     }
@@ -478,11 +504,22 @@ fn parse_font_shorthand(trimmed: &str, lower: &str, parent_px: f32) -> Option<Fo
     i += 1;
     // The slash may be glued to the size, to the line-height, to both, or to neither, so all of
     // `10px/1`, `10px/ 1`, `10px /1` and `10px / 1` have to land in the same place.
-    let (size_str, glued) = match size_tok.split_once('/') {
+    let mut depth = 0usize;
+    let slash = size_tok.char_indices().find_map(|(offset, c)| {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '/' if depth == 0 => return Some(offset),
+            _ => {}
+        }
+        None
+    });
+    let (size_str, glued) = match slash.map(|offset| (&size_tok[..offset], &size_tok[offset + 1..]))
+    {
         Some((s, lh)) => (s, Some(lh)),
         None => (size_tok, None),
     };
-    let size = parse_font_size(size_str, parent_px)?;
+    let size = parse_font_size(size_str, parent_px).filter(|n| n.is_finite() && *n >= 0.0)?;
     // Byte offset just past the last token consumed; whatever follows is the family.
     let mut consumed = size_off + size_tok.len();
 
@@ -512,9 +549,14 @@ fn parse_font_shorthand(trimmed: &str, lower: &str, parent_px: f32) -> Option<Fo
         } else {
             rest
         };
-        // A unitless or `em` line-height multiplies this declaration's own size, not the size the
-        // element had on the way in.
-        line_height = parse_line_height(lh, size);
+        // Relative line-height uses the winning cascaded font size in the main pass.
+        if lh.starts_with('-') {
+            return None;
+        }
+        line_height = parse_line_height(lh, used_size.unwrap_or(size));
+        if line_height.is_some_and(|n| !n.is_finite() || n < 0.0) {
+            return None;
+        }
         if line_height.is_none() && lh != "normal" {
             return None;
         }
@@ -540,6 +582,25 @@ fn parse_font_shorthand(trimmed: &str, lower: &str, parent_px: f32) -> Option<Fo
 /// parsed. Being a shorthand, a successful parse also resets the longhands it covers to their
 /// initial values rather than letting an earlier `font-weight` in the same rule survive.
 pub(crate) fn apply_font_shorthand(style: &mut ComputedStyle, val: &str, parent: &ComputedStyle) {
+    apply_font_shorthand_with_size(style, val, parent, None);
+}
+
+pub(crate) fn apply_font_shorthand_preserving_size(
+    style: &mut ComputedStyle,
+    val: &str,
+    parent: &ComputedStyle,
+) {
+    let size = style.font_size;
+    apply_font_shorthand_with_size(style, val, parent, Some(size));
+    style.font_size = size;
+}
+
+fn apply_font_shorthand_with_size(
+    style: &mut ComputedStyle,
+    val: &str,
+    parent: &ComputedStyle,
+    used_size: Option<f32>,
+) {
     let trimmed = val.trim();
     let lower = trimmed.to_ascii_lowercase();
 
@@ -568,7 +629,7 @@ pub(crate) fn apply_font_shorthand(style: &mut ComputedStyle, val: &str, parent:
         return;
     }
 
-    if let Some(f) = parse_font_shorthand(trimmed, &lower, parent.font_size) {
+    if let Some(f) = parse_font_shorthand(trimmed, &lower, parent.font_size, used_size) {
         style.font_size = f.size;
         style.font_family = Some(f.family);
         style.bold = f.bold;
