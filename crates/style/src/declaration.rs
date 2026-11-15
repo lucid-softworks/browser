@@ -1949,6 +1949,15 @@ pub(crate) fn apply_declaration(
             "pre-line" => style.white_space = WhiteSpace::PreLine,
             _ => {}
         },
+        "word-break" => match val.trim().to_ascii_lowercase().as_str() {
+            "normal" => style.word_break = WordBreak::Normal,
+            "break-all" => style.word_break = WordBreak::BreakAll,
+            "keep-all" => style.word_break = WordBreak::KeepAll,
+            // `break-word` is a deprecated alias whose effect belongs to `overflow-wrap`, and
+            // `auto-phrase` needs phrase analysis we don't have — both fall back to `normal`, which
+            // is the closest defined behaviour.
+            _ => {}
+        },
         "visibility" => match val.trim().to_ascii_lowercase().as_str() {
             "visible" => style.visibility = Visibility::Visible,
             "hidden" => style.visibility = Visibility::Hidden,
