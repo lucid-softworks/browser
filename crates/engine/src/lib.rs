@@ -840,20 +840,17 @@ mod tests {
             std::env::temp_dir().join(format!("browser_no_session_resize_{}.html", rand_suffix()));
         std::fs::write(
             &path,
-            "<body><div style='width:50%;height:10px'></div></body>",
+            "<style>body { margin:0; background:red } @media(max-width:300px) { body { background:green } }</style><body></body>",
         )
         .unwrap();
         let mut engine = Engine::new();
         engine.set_viewport(400, 300, 1.0);
         assert_eq!(engine.load_url(&format!("file://{}", path.display())), 0);
-        engine.render();
-        assert!(engine.layout_cache.is_some());
+        assert_eq!(&engine.render().pixels[..4], &[255, 0, 0, 255]);
         engine.session = None;
         // The framebuffer is still 400x300, but CSS layout must use the new 200px width.
         engine.set_viewport(200, 150, 2.0);
-        assert!(engine.layout_cache.is_none());
-        engine.render();
-        assert!(engine.layout_cache.is_some());
+        assert_eq!(&engine.render().pixels[..4], &[0, 128, 0, 255]);
         std::fs::remove_file(path).unwrap();
     }
 
