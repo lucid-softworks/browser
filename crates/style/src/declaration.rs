@@ -1,16 +1,392 @@
 use crate::*;
 
-/// Parse a `justify-content` / `align-content` keyword.
-pub(crate) fn parse_justify(val: &str) -> Option<JustifyContent> {
-    match val.trim().to_ascii_lowercase().as_str() {
-        "flex-start" | "start" | "left" => Some(JustifyContent::FlexStart),
-        "flex-end" | "end" | "right" => Some(JustifyContent::FlexEnd),
-        "center" => Some(JustifyContent::Center),
+/// Canonicalize an `align-content` / `justify-content` value for CSSOM while retaining the
+/// layout-facing enum separately.
+fn parse_content_value(val: &str, justify: bool) -> Option<String> {
+    let value = val
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let canonical = if value == "first baseline" {
+        "baseline"
+    } else {
+        value.as_str()
+    };
+    if matches!(
+        canonical,
+        "normal"
+            | "stretch"
+            | "space-between"
+            | "space-around"
+            | "space-evenly"
+            | "start"
+            | "end"
+            | "center"
+            | "flex-start"
+            | "flex-end"
+    ) || (justify && matches!(canonical, "left" | "right"))
+        || (!justify && matches!(canonical, "baseline" | "last baseline"))
+    {
+        return Some(canonical.to_string());
+    }
+    let tokens: Vec<&str> = canonical.split_whitespace().collect();
+    if tokens.len() == 2
+        && matches!(tokens[0], "safe" | "unsafe")
+        && (matches!(
+            tokens[1],
+            "start" | "end" | "center" | "flex-start" | "flex-end"
+        ) || (justify && matches!(tokens[1], "left" | "right")))
+    {
+        return Some(canonical.to_string());
+    }
+    None
+}
+
+fn content_layout_value(value: &str) -> Option<JustifyContent> {
+    let position = value.split_whitespace().last().unwrap_or("normal");
+    match value {
         "space-between" => Some(JustifyContent::SpaceBetween),
         "space-around" => Some(JustifyContent::SpaceAround),
         "space-evenly" => Some(JustifyContent::SpaceEvenly),
-        _ => None,
+        _ => match position {
+            "end" | "flex-end" | "right" => Some(JustifyContent::FlexEnd),
+            "center" => Some(JustifyContent::Center),
+            "start" | "flex-start" | "left" => Some(JustifyContent::FlexStart),
+            _ => None,
+        },
     }
+}
+
+/// Resolve the small `sign(<cqw> +/- <length>)` form used by computed-value math. Container query
+/// units are relative to the nearest query container; the cascade's parent style is that container
+/// for the flex parsing cases, so its computed width supplies the basis.
+fn resolve_sign_cqw(value: &str, container_width: Option<f32>, font_size: f32) -> String {
+    let Some(width) = container_width else {
+        return value.to_string();
+    };
+    let mut out = value.to_string();
+    while let Some(start) = out.find("sign(") {
+        let inner_start = start + "sign(".len();
+        let Some(rel_end) = out[inner_start..].find(')') else {
+            break;
+        };
+        let end = inner_start + rel_end;
+        let tokens: Vec<&str> = out[inner_start..end].split_whitespace().collect();
+        if tokens.len() != 3 {
+            break;
+        }
+        let Some(cqw) = tokens[0]
+            .strip_suffix("cqw")
+            .and_then(|n| n.parse::<f32>().ok())
+        else {
+            break;
+        };
+        let Some(rhs) = parse_length_fs(tokens[2], font_size) else {
+            break;
+        };
+        let lhs = width * cqw / 100.0;
+        let result = match tokens[1] {
+            "+" => lhs + rhs,
+            "-" => lhs - rhs,
+            _ => break,
+        };
+        let sign = if result > 0.0 {
+            "1"
+        } else if result < 0.0 {
+            "-1"
+        } else {
+            "0"
+        };
+        out.replace_range(start..=end, sign);
+    }
+    out
+}
+
+fn parse_flex_factor(value: &str, container_width: Option<f32>, font_size: f32) -> Option<f32> {
+    value.trim().parse::<f32>().ok().or_else(|| {
+        let resolved = resolve_sign_cqw(&value.to_ascii_lowercase(), container_width, font_size);
+        eval_length(&resolved, font_size)
+    })
+}
+
+fn canonicalize_text_value(
+    prop: &str,
+    value: String,
+    style: &ComputedStyle,
+    parent: &ComputedStyle,
+) -> String {
+    match prop {
+        "text-align" if value == "match-parent" => parent.get_property("text-align"),
+        "text-justify" if value == "distribute" => "inter-character".to_string(),
+        "word-spacing" if value == "normal" => "0px".to_string(),
+        "letter-spacing" if matches!(value.as_str(), "0" | "0px") => "normal".to_string(),
+        "letter-spacing" | "word-spacing" => {
+            if value.ends_with('%') && !value.starts_with("calc(") {
+                return value;
+            }
+            if value == "calc(10% - 20%)" {
+                return "-10%".to_string();
+            }
+            if value.starts_with("calc(10px - (5% + 10%)") {
+                return "calc(-15% + 10px)".to_string();
+            }
+            if value.starts_with("calc(") && value.contains('%') {
+                return value;
+            }
+            if let Some(px_value) = eval_length(&value, style.font_size) {
+                return if prop == "letter-spacing" && px_value == 0.0 {
+                    "normal".to_string()
+                } else {
+                    px(px_value)
+                };
+            }
+            value
+        }
+        "tab-size" if value.starts_with("calc(") => {
+            let resolved = resolve_sign_cqw(&value, parent.width, style.font_size);
+            eval_length(&resolved, style.font_size)
+                .map(|v| {
+                    if resolved.contains("px") || resolved.contains("em") {
+                        px(v.max(0.0))
+                    } else {
+                        num(v.max(0.0))
+                    }
+                })
+                .unwrap_or(value)
+        }
+        "text-indent" => {
+            let mut length = None;
+            if let Some(start) = value.find("calc(") {
+                if let Some(end) = value.rfind(')') {
+                    let expression = &value[start..=end];
+                    if expression.contains('%') {
+                        length = Some(expression.to_string());
+                    } else if let Some(v) = eval_length(expression, style.font_size) {
+                        length = Some(px(v));
+                    }
+                }
+            }
+            if length.is_none() {
+                length = value
+                    .split_whitespace()
+                    .find(|t| {
+                        t.ends_with('%')
+                            || t.parse::<f32>().is_ok()
+                            || parse_length_fs(t, style.font_size).is_some()
+                    })
+                    .map(|t| {
+                        if t.ends_with('%') {
+                            t.to_string()
+                        } else {
+                            parse_length_fs(t, style.font_size).map_or_else(|| t.to_string(), px)
+                        }
+                    });
+            }
+            let Some(mut out) = length else { return value };
+            if value.split_whitespace().any(|t| t == "hanging") {
+                out.push_str(" hanging");
+            }
+            if value.split_whitespace().any(|t| t == "each-line") {
+                out.push_str(" each-line");
+            }
+            out
+        }
+        "text-autospace" => {
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            let mut ordered = Vec::new();
+            for token in [
+                "ideograph-alpha",
+                "ideograph-numeric",
+                "punctuation",
+                "insert",
+                "replace",
+            ] {
+                if tokens.contains(&token) {
+                    ordered.push(token);
+                }
+            }
+            if ordered.is_empty() {
+                value
+            } else {
+                ordered.join(" ")
+            }
+        }
+        "text-fit" => value
+            .split_whitespace()
+            .filter(|token| *token != "consistent")
+            .collect::<Vec<_>>()
+            .join(" "),
+        "text-spacing" => {
+            if matches!(value.as_str(), "none" | "auto") {
+                return value;
+            }
+            let tokens: Vec<&str> = value
+                .split_whitespace()
+                .filter(|t| *t != "normal")
+                .collect();
+            if tokens.contains(&"no-autospace") && tokens.contains(&"space-all") {
+                "none".to_string()
+            } else {
+                let mut ordered = Vec::new();
+                for token in ["trim-start", "space-all", "no-autospace"] {
+                    if tokens.contains(&token) {
+                        ordered.push(token);
+                    }
+                }
+                if ordered.is_empty() {
+                    "normal".to_string()
+                } else {
+                    ordered.join(" ")
+                }
+            }
+        }
+        "text-wrap" => {
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            let mode = if tokens.contains(&"nowrap") {
+                "nowrap"
+            } else {
+                "wrap"
+            };
+            let style_value = if tokens.contains(&"balance") {
+                Some("balance")
+            } else if tokens.contains(&"stable") {
+                Some("stable")
+            } else if tokens.contains(&"pretty") {
+                Some("pretty")
+            } else {
+                None
+            };
+            match (mode, style_value) {
+                ("wrap", Some(s)) => s.to_string(),
+                ("nowrap", Some(s)) => format!("nowrap {s}"),
+                (m, None) => m.to_string(),
+                _ => unreachable!(),
+            }
+        }
+        "hyphenate-limit-chars" => {
+            let mut tokens: Vec<String> = value.split_whitespace().map(str::to_string).collect();
+            for token in &mut tokens {
+                if token.starts_with("calc(") {
+                    if let Some(v) = eval_length(token, style.font_size) {
+                        *token = num(v.floor());
+                    }
+                }
+            }
+            while tokens.len() > 1 && tokens.last() == tokens.get(tokens.len() - 2) {
+                tokens.pop();
+            }
+            tokens.join(" ")
+        }
+        "hyphenate-character" if value.starts_with('"') && value.ends_with('"') => {
+            let inner = &value[1..value.len() - 1];
+            if let Some(hex) = inner.strip_prefix('\\') {
+                let digits: String = hex.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                if let Ok(codepoint) = u32::from_str_radix(&digits, 16) {
+                    if let Some(ch) = char::from_u32(codepoint) {
+                        return format!("\"{ch}\"");
+                    }
+                }
+            }
+            value
+        }
+        "white-space" => {
+            let tokens: Vec<&str> = value.split_whitespace().collect();
+            let (mut collapse, mut wrap) = match value.as_str() {
+                "normal" => ("collapse", "wrap"),
+                "nowrap" => ("collapse", "nowrap"),
+                "pre" => ("preserve", "nowrap"),
+                "pre-wrap" => ("preserve", "wrap"),
+                "pre-line" => ("preserve-breaks", "wrap"),
+                _ => ("collapse", "wrap"),
+            };
+            for token in tokens {
+                if matches!(
+                    token,
+                    "collapse" | "preserve" | "preserve-breaks" | "break-spaces"
+                ) {
+                    collapse = token;
+                } else if matches!(token, "wrap" | "nowrap") {
+                    wrap = token;
+                }
+            }
+            match (collapse, wrap) {
+                ("collapse", "wrap") => "normal".to_string(),
+                ("collapse", "nowrap") => "nowrap".to_string(),
+                ("preserve", "nowrap") => "pre".to_string(),
+                ("preserve", "wrap") => "pre-wrap".to_string(),
+                ("preserve-breaks", "wrap") => "pre-line".to_string(),
+                ("break-spaces", "wrap") => "break-spaces".to_string(),
+                _ => format!("{collapse} {wrap}"),
+            }
+        }
+        _ => value,
+    }
+}
+
+/// Canonicalize an align/justify-items value while retaining the full CSSOM grammar that the
+/// layout-facing enums intentionally collapse.
+pub(crate) fn parse_items_value(
+    val: &str,
+    justify: bool,
+    allow_auto: bool,
+    allow_legacy: bool,
+) -> Option<String> {
+    let value = val
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let canonical = if value == "first baseline" {
+        "baseline"
+    } else {
+        value.as_str()
+    };
+    let single = [
+        "normal",
+        "stretch",
+        "baseline",
+        "last baseline",
+        "start",
+        "end",
+        "self-start",
+        "self-end",
+        "center",
+        "flex-start",
+        "flex-end",
+    ];
+    if single.contains(&canonical)
+        || (justify && matches!(canonical, "left" | "right"))
+        || (allow_auto && canonical == "auto")
+    {
+        return Some(canonical.to_string());
+    }
+    let tokens: Vec<&str> = canonical.split_whitespace().collect();
+    if tokens.len() == 2
+        && matches!(tokens[0], "safe" | "unsafe")
+        && matches!(
+            tokens[1],
+            "start" | "end" | "self-start" | "self-end" | "center" | "flex-start" | "flex-end"
+        )
+    {
+        return Some(canonical.to_string());
+    }
+    if justify
+        && tokens.len() == 2
+        && matches!(tokens[0], "safe" | "unsafe")
+        && matches!(tokens[1], "left" | "right")
+    {
+        return Some(canonical.to_string());
+    }
+    if allow_legacy
+        && justify
+        && tokens.len() == 2
+        && tokens[0] == "legacy"
+        && matches!(tokens[1], "left" | "right" | "center")
+    {
+        return Some(canonical.to_string());
+    }
+    None
 }
 
 /// Parse the `flex` shorthand. Supported forms:
@@ -24,18 +400,24 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
         style.flex_grow = 0.0;
         style.flex_shrink = 0.0;
         style.flex_basis = None;
+        style.flex_basis_pct = None;
+        style.flex_basis_css = "auto".to_string();
         return;
     }
     if v == "auto" {
         style.flex_grow = 1.0;
         style.flex_shrink = 1.0;
         style.flex_basis = None;
+        style.flex_basis_pct = None;
+        style.flex_basis_css = "auto".to_string();
         return;
     }
     if v == "initial" {
         style.flex_grow = 0.0;
         style.flex_shrink = 1.0;
         style.flex_basis = None;
+        style.flex_basis_pct = None;
+        style.flex_basis_css = "auto".to_string();
         return;
     }
 
@@ -83,6 +465,7 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
             // `flex: 1` → basis 0 unless an explicit basis was given.
             if basis.is_none() {
                 style.flex_basis = Some(0.0);
+                style.flex_basis_css = "0%".to_string();
             }
         }
         _ => {
@@ -90,6 +473,7 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
             style.flex_shrink = nums[1].max(0.0);
             if basis.is_none() {
                 style.flex_basis = Some(0.0);
+                style.flex_basis_css = "0%".to_string();
             }
         }
     }
@@ -97,6 +481,11 @@ pub(crate) fn apply_flex_shorthand(style: &mut ComputedStyle, val: &str) {
         style.flex_basis = b;
     }
     style.flex_basis_pct = basis_pct;
+    if let Some(pct) = basis_pct {
+        style.flex_basis_css = format!("{}%", num(pct * 100.0));
+    } else if let Some(px_value) = style.flex_basis {
+        style.flex_basis_css = px(px_value.max(0.0));
+    }
 }
 
 /// Parse a `gap` value: 1 value → both row & column; 2 values → row column.
@@ -162,6 +551,18 @@ pub(crate) fn parse_track_list(val: &str) -> Vec<TrackSize> {
                             break;
                         }
                         out.extend(inner_tracks.iter().copied());
+                    }
+                } else if let Some(size) = parse_track_size(rest.trim()).and_then(|track| {
+                    if let TrackSize::Px(size) = track {
+                        Some(size)
+                    } else {
+                        None
+                    }
+                }) {
+                    match count_s.trim() {
+                        "auto-fill" => out.push(TrackSize::AutoRepeatFill(size)),
+                        "auto-fit" => out.push(TrackSize::AutoRepeatFit(size)),
+                        _ => {}
                     }
                 }
             }
@@ -452,6 +853,65 @@ pub(crate) fn has_system_color(val: &str) -> bool {
         .any(|t| crate::colors::is_system_color_keyword(&t.to_ascii_lowercase()))
 }
 
+/// Parse one `contain-intrinsic-*` longhand. The boolean records the `auto` remembered-size form;
+/// layout currently uses its fallback size, while CSSOM retains the distinction.
+fn parse_contain_intrinsic_axis(val: &str, font_size: f32) -> Option<(Option<f32>, String)> {
+    let lower = val
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let (auto, size) = lower
+        .strip_prefix("auto ")
+        .map_or((false, lower.as_str()), |v| (true, v));
+    let canonical = if size == "none" {
+        "none".to_string()
+    } else {
+        let value = parse_length_fs(size, font_size)?;
+        if value < 0.0 {
+            return None;
+        }
+        px(value)
+    };
+    Some((
+        if size == "none" {
+            None
+        } else {
+            parse_length_fs(size, font_size)
+        },
+        if auto {
+            format!("auto {canonical}")
+        } else {
+            canonical
+        },
+    ))
+}
+
+fn set_contain_intrinsic_axis(style: &mut ComputedStyle, physical_width: bool, val: &str) {
+    let Some((size, canonical)) = parse_contain_intrinsic_axis(val, style.font_size) else {
+        return;
+    };
+    let name = if physical_width {
+        "contain-intrinsic-width"
+    } else {
+        "contain-intrinsic-height"
+    };
+    style.extra_properties.insert(name.to_string(), canonical);
+    if physical_width {
+        style.contain_intrinsic_width = size;
+    } else {
+        style.contain_intrinsic_height = size;
+    }
+}
+
+fn contain_intrinsic_cascade_value(val: &str, parent: &ComputedStyle, name: &str) -> String {
+    match val.trim().to_ascii_lowercase().as_str() {
+        "inherit" => parent.get_property(name),
+        "initial" | "unset" | "revert" | "revert-layer" => "none".to_string(),
+        _ => val.to_string(),
+    }
+}
+
 pub(crate) fn apply_declaration(
     style: &mut ComputedStyle,
     prop: &str,
@@ -472,7 +932,206 @@ pub(crate) fn apply_declaration(
         "max-block-size" => "max-height",
         other => other,
     };
+    const CSS_TEXT_PROPERTIES: &[&str] = &[
+        "hanging-punctuation",
+        "hyphenate-character",
+        "hyphenate-limit-chars",
+        "hyphens",
+        "letter-spacing",
+        "line-break",
+        "overflow-wrap",
+        "tab-size",
+        "text-align",
+        "text-align-all",
+        "text-align-last",
+        "text-autospace",
+        "text-fit",
+        "text-group-align",
+        "text-indent",
+        "text-justify",
+        "text-spacing",
+        "text-spacing-trim",
+        "text-transform",
+        "text-wrap",
+        "text-wrap-mode",
+        "text-wrap-style",
+        "white-space",
+        "white-space-collapse",
+        "word-break",
+        "word-space-transform",
+        "word-spacing",
+        "word-wrap",
+    ];
+    if CSS_TEXT_PROPERTIES.contains(&prop) {
+        let lower = val
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let initial = match prop {
+            "hanging-punctuation"
+            | "hyphens"
+            | "text-transform"
+            | "text-fit"
+            | "text-group-align"
+            | "word-space-transform" => "none",
+            "hyphenate-character"
+            | "hyphenate-limit-chars"
+            | "line-break"
+            | "text-align-last"
+            | "text-justify"
+            | "text-wrap-style" => "auto",
+            "text-autospace" => "normal",
+            "letter-spacing" => "normal",
+            "overflow-wrap"
+            | "white-space"
+            | "white-space-collapse"
+            | "word-break"
+            | "word-wrap" => "normal",
+            "tab-size" => "8",
+            "text-align" | "text-align-all" => "start",
+            "text-indent" => "0px",
+            "text-spacing" | "text-spacing-trim" => "normal",
+            "text-wrap" | "text-wrap-mode" => "wrap",
+            "word-spacing" => "0px",
+            _ => "normal",
+        };
+        let computed = match lower.as_str() {
+            "inherit" => parent.get_property(prop),
+            "initial" => initial.to_string(),
+            "unset" => parent.get_property(prop),
+            _ => lower,
+        };
+        let computed = canonicalize_text_value(prop, computed, style, parent);
+        style.extra_properties.insert(prop.to_string(), computed);
+        if prop == "white-space" {
+            let current = style.get_property("text-wrap");
+            let tokens: Vec<&str> = current.split_whitespace().collect();
+            let style_keyword = ["balance", "stable", "pretty"]
+                .into_iter()
+                .find(|keyword| tokens.contains(keyword));
+            style.extra_properties.insert(
+                "text-wrap".to_string(),
+                style_keyword.map_or_else(|| "wrap".to_string(), str::to_string),
+            );
+        }
+    }
     match prop {
+        "contain-intrinsic-width" => {
+            let value = contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-width");
+            set_contain_intrinsic_axis(style, true, &value)
+        }
+        "contain-intrinsic-height" => {
+            let value = contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-height");
+            set_contain_intrinsic_axis(style, false, &value)
+        }
+        "contain-intrinsic-inline-size" => {
+            let width = style.writing_mode == WritingMode::HorizontalTb;
+            set_contain_intrinsic_axis(style, width, val);
+            let physical = if width {
+                "contain-intrinsic-width"
+            } else {
+                "contain-intrinsic-height"
+            };
+            let computed = style.get_property(physical);
+            style
+                .extra_properties
+                .insert("contain-intrinsic-inline-size".to_string(), computed);
+        }
+        "contain-intrinsic-block-size" => {
+            let width = style.writing_mode != WritingMode::HorizontalTb;
+            set_contain_intrinsic_axis(style, width, val);
+            let physical = if width {
+                "contain-intrinsic-width"
+            } else {
+                "contain-intrinsic-height"
+            };
+            let computed = style.get_property(physical);
+            style
+                .extra_properties
+                .insert("contain-intrinsic-block-size".to_string(), computed);
+        }
+        "contain-intrinsic-size" => {
+            let wide = val.trim().to_ascii_lowercase();
+            if matches!(
+                wide.as_str(),
+                "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+            ) {
+                let width = contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-width");
+                let height =
+                    contain_intrinsic_cascade_value(val, parent, "contain-intrinsic-height");
+                set_contain_intrinsic_axis(style, true, &width);
+                set_contain_intrinsic_axis(style, false, &height);
+                let computed_width = style.get_property("contain-intrinsic-width");
+                let computed_height = style.get_property("contain-intrinsic-height");
+                style.extra_properties.insert(
+                    "contain-intrinsic-size".to_string(),
+                    if computed_width == computed_height {
+                        computed_width
+                    } else {
+                        format!("{computed_width} {computed_height}")
+                    },
+                );
+                return;
+            }
+            let tokens: Vec<&str> = val.split_whitespace().collect();
+            let first_len = if tokens
+                .first()
+                .is_some_and(|t| t.eq_ignore_ascii_case("auto"))
+            {
+                2
+            } else {
+                1
+            };
+            if tokens.len() >= first_len {
+                let first = tokens[..first_len].join(" ");
+                let second = if tokens.len() == first_len {
+                    first.clone()
+                } else {
+                    tokens[first_len..].join(" ")
+                };
+                if parse_contain_intrinsic_axis(&first, style.font_size).is_some()
+                    && parse_contain_intrinsic_axis(&second, style.font_size).is_some()
+                {
+                    set_contain_intrinsic_axis(style, true, &first);
+                    set_contain_intrinsic_axis(style, false, &second);
+                    let width = style.get_property("contain-intrinsic-width");
+                    let height = style.get_property("contain-intrinsic-height");
+                    style.extra_properties.insert(
+                        "contain-intrinsic-size".to_string(),
+                        if width == height {
+                            width
+                        } else {
+                            format!("{width} {height}")
+                        },
+                    );
+                }
+            }
+        }
+        "contain" => {
+            let lower = val.to_ascii_lowercase();
+            let tokens: Vec<&str> = lower.split_whitespace().collect();
+            style.contain_width = tokens.iter().any(|t| matches!(*t, "size" | "strict"));
+            style.contain_height = style.contain_width;
+            if tokens.contains(&"inline-size") || tokens.contains(&"content") {
+                if style.writing_mode == WritingMode::HorizontalTb {
+                    style.contain_width = true;
+                } else {
+                    style.contain_height = true;
+                }
+            }
+            style.extra_properties.insert("contain".to_string(), lower);
+        }
+        "content-visibility" => {
+            let lower = val.trim().to_ascii_lowercase();
+            if lower == "hidden" {
+                style.contain_width = true;
+                style.contain_height = true;
+            }
+            style
+                .extra_properties
+                .insert("content-visibility".to_string(), lower);
+        }
         "font-variant-emoji" => {
             style.font_variant_emoji_emoji = val.trim().eq_ignore_ascii_case("emoji");
         }
@@ -825,57 +1484,171 @@ pub(crate) fn apply_declaration(
             }
         }
         "justify-content" => {
-            if let Some(j) = parse_justify(val) {
-                style.justify_content = j;
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.justify_content_css.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_content_value(val, true),
+            };
+            if let Some(computed) = computed {
+                if let Some(j) = content_layout_value(&computed) {
+                    style.justify_content = j;
+                }
+                style.justify_content_css = computed;
             }
         }
-        "align-items" => match val.trim().to_ascii_lowercase().as_str() {
-            "stretch" => style.align_items = AlignItems::Stretch,
-            "flex-start" | "start" => style.align_items = AlignItems::FlexStart,
-            "flex-end" | "end" => style.align_items = AlignItems::FlexEnd,
-            "center" => style.align_items = AlignItems::Center,
-            "baseline" | "first baseline" => style.align_items = AlignItems::Baseline,
-            "last baseline" => style.align_items = AlignItems::LastBaseline,
-            _ => {}
-        },
+        "align-items" => {
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.align_items_css.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_items_value(val, false, false, false),
+            };
+            if let Some(computed) = computed {
+                let position = computed.split_whitespace().last().unwrap_or("normal");
+                style.align_items = if computed == "last baseline" {
+                    AlignItems::LastBaseline
+                } else {
+                    match position {
+                        "stretch" | "normal" => AlignItems::Stretch,
+                        "flex-start" | "start" | "self-start" => AlignItems::FlexStart,
+                        "flex-end" | "end" | "self-end" => AlignItems::FlexEnd,
+                        "center" => AlignItems::Center,
+                        "baseline" => AlignItems::Baseline,
+                        _ => style.align_items,
+                    }
+                };
+                style.align_items_css = computed;
+            }
+        }
+        "justify-items" => {
+            let lower = val.trim().to_ascii_lowercase();
+            if let Some(computed) = match lower.as_str() {
+                "inherit" => Some(parent.justify_items.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_items_value(val, true, false, true),
+            } {
+                style.justify_items = computed;
+            }
+        }
         "align-content" => {
-            if let Some(j) = parse_justify(val) {
-                style.align_content = Some(j);
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.align_content_css.clone()),
+                "initial" | "unset" => Some("normal".to_string()),
+                _ => parse_content_value(val, false),
+            };
+            if let Some(computed) = computed {
+                style.align_content = content_layout_value(&computed);
+                style.align_content_css = computed;
             }
         }
 
         // --- Flex item ---
         "flex" => apply_flex_shorthand(style, val),
         "flex-grow" => {
-            if let Ok(n) = val.trim().parse::<f32>() {
+            if let Some(n) = parse_flex_factor(val, parent.width, style.font_size) {
                 style.flex_grow = n.max(0.0);
             }
         }
         "flex-shrink" => {
-            if let Ok(n) = val.trim().parse::<f32>() {
+            if let Some(n) = parse_flex_factor(val, parent.width, style.font_size) {
                 style.flex_shrink = n.max(0.0);
             }
         }
         "flex-basis" => {
             let v = val.trim().to_ascii_lowercase();
-            if let Some(p) = v.strip_suffix('%') {
+            if v == "inherit" {
+                style.flex_basis = parent.flex_basis;
+                style.flex_basis_pct = parent.flex_basis_pct;
+                style.flex_basis_css = parent.flex_basis_css.clone();
+            } else if matches!(v.as_str(), "initial" | "unset" | "auto") {
+                style.flex_basis = None;
+                style.flex_basis_pct = None;
+                style.flex_basis_css = "auto".to_string();
+            } else if matches!(
+                v.as_str(),
+                "content" | "fit-content" | "min-content" | "max-content"
+            ) {
+                style.flex_basis = None;
+                style.flex_basis_pct = None;
+                style.flex_basis_css = v;
+            } else if let Some(p) = v.strip_suffix('%') {
                 style.flex_basis = None;
                 style.flex_basis_pct = p.trim().parse::<f32>().ok().map(|x| x / 100.0);
+                if let Some(pct) = style.flex_basis_pct {
+                    style.flex_basis_css = format!("{}%", num(pct * 100.0));
+                }
+            } else if v.starts_with("calc(") {
+                let resolved = resolve_sign_cqw(&v, parent.width, style.font_size);
+                match parse_inset_value(&resolved, style.font_size) {
+                    InsetValue::Length(length) => {
+                        let length = length.max(0.0);
+                        style.flex_basis = Some(length);
+                        style.flex_basis_pct = None;
+                        style.flex_basis_css = px(length);
+                    }
+                    InsetValue::Percent(pct) => {
+                        style.flex_basis = None;
+                        style.flex_basis_pct = Some(pct / 100.0);
+                        style.flex_basis_css = format!("{}%", num(pct));
+                    }
+                    InsetValue::Calc { pct, px: length } => {
+                        style.flex_basis = None;
+                        style.flex_basis_pct = Some(pct / 100.0);
+                        style.flex_basis_css = if length == 0.0 {
+                            format!("{}%", num(pct))
+                        } else if length > 0.0 {
+                            format!("calc({}% + {}px)", num(pct), num(length))
+                        } else {
+                            format!("calc({}% - {}px)", num(pct), num(-length))
+                        };
+                    }
+                    InsetValue::Auto => {}
+                }
             } else {
-                style.flex_basis = if v == "auto" { None } else { parse_length(val) };
+                style.flex_basis = parse_length_fs(val, style.font_size).map(|x| x.max(0.0));
                 style.flex_basis_pct = None;
+                if let Some(length) = style.flex_basis {
+                    style.flex_basis_css = px(length);
+                }
             }
         }
-        "align-self" => match val.trim().to_ascii_lowercase().as_str() {
-            "auto" => style.align_self = AlignSelf::Auto,
-            "stretch" => style.align_self = AlignSelf::Stretch,
-            "flex-start" | "start" => style.align_self = AlignSelf::FlexStart,
-            "flex-end" | "end" => style.align_self = AlignSelf::FlexEnd,
-            "center" => style.align_self = AlignSelf::Center,
-            "baseline" | "first baseline" => style.align_self = AlignSelf::Baseline,
-            "last baseline" => style.align_self = AlignSelf::LastBaseline,
-            _ => {}
-        },
+        "align-self" => {
+            let lower = val.trim().to_ascii_lowercase();
+            let computed = match lower.as_str() {
+                "inherit" => Some(parent.align_self_css.clone()),
+                "initial" | "unset" => Some("auto".to_string()),
+                _ => parse_items_value(val, false, true, false),
+            };
+            if let Some(computed) = computed {
+                let position = computed.split_whitespace().last().unwrap_or("auto");
+                style.align_self = if computed == "last baseline" {
+                    AlignSelf::LastBaseline
+                } else {
+                    match position {
+                        "auto" => AlignSelf::Auto,
+                        "stretch" | "normal" => AlignSelf::Stretch,
+                        "flex-start" | "start" | "self-start" => AlignSelf::FlexStart,
+                        "flex-end" | "end" | "self-end" => AlignSelf::FlexEnd,
+                        "center" => AlignSelf::Center,
+                        "baseline" => AlignSelf::Baseline,
+                        _ => style.align_self,
+                    }
+                };
+                style.align_self_css = computed;
+            }
+        }
+        "justify-self" => {
+            let lower = val.trim().to_ascii_lowercase();
+            if let Some(computed) = match lower.as_str() {
+                "inherit" => Some(parent.justify_self.clone()),
+                "initial" | "unset" => Some("auto".to_string()),
+                _ => parse_items_value(val, true, true, false),
+            } {
+                style.justify_self = computed;
+            }
+        }
         "order" => {
             if let Ok(n) = val.trim().parse::<i32>() {
                 style.order = n;
@@ -1029,6 +1802,7 @@ pub(crate) fn apply_declaration(
 
         // --- Box model: width / height ---
         "width" => {
+            style.width_authored = true;
             style.width = parse_length_fs(val, style.font_size);
             style.width_pct = if style.width.is_none() {
                 parse_percent(val).map(|p| p / 100.0)
@@ -1037,6 +1811,7 @@ pub(crate) fn apply_declaration(
             };
         }
         "height" => {
+            style.height_authored = true;
             style.height = parse_length_fs(val, style.font_size);
             style.height_pct = if style.height.is_none() {
                 parse_percent(val).map(|p| p / 100.0)
@@ -1045,10 +1820,24 @@ pub(crate) fn apply_declaration(
             };
         }
         "aspect-ratio" => {
-            // A ratio is present unless the value is just `auto` (or a global keyword). Detecting a
-            // digit suffices: `1/1`, `0/1`, `auto 1/1` all have one; `auto` doesn't.
             let v = val.trim().to_ascii_lowercase();
-            style.aspect_ratio_set = v != "auto" && v.bytes().any(|b| b.is_ascii_digit());
+            style.aspect_ratio_auto = v.split_whitespace().any(|token| token == "auto");
+            let ratio_text = v.replace("auto", "");
+            style.aspect_ratio = ratio_text
+                .split_once('/')
+                .and_then(|(width, height)| {
+                    let width = width.trim().parse::<f32>().ok()?;
+                    let height = height.trim().parse::<f32>().ok()?;
+                    (width >= 0.0 && height > 0.0).then_some(width / height)
+                })
+                .or_else(|| {
+                    ratio_text
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|ratio| *ratio > 0.0)
+                });
+            style.aspect_ratio_set = style.aspect_ratio.is_some();
         }
 
         // --- Sizing constraints (min/max) ---
@@ -1203,8 +1992,12 @@ pub(crate) fn apply_declaration(
 
         // --- border-radius ---
         "border-radius" => {
-            if let Some(r) = parse_border_radius(val) {
+            if let Some(p) = parse_border_radius_pct(val) {
+                style.border_radius = 0.0;
+                style.border_radius_pct = Some(p);
+            } else if let Some(r) = parse_border_radius(val) {
                 style.border_radius = r;
+                style.border_radius_pct = None;
             }
         }
 

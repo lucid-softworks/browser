@@ -9,6 +9,7 @@ use std::collections::HashMap;
 pub(crate) struct Ctx {
     pub(crate) positioned: Rect,
     pub(crate) viewport: Rect,
+    pub(crate) scrollport: Option<Rect>,
 }
 
 /// The explicit content width set on a box's node (if any).

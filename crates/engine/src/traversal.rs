@@ -42,6 +42,16 @@ impl layout::TextMeasurer for FontMeasurer<'_> {
 /// searched first (and in order) so the deepest / topmost box wins; a box's own border box is
 /// its hit area.
 pub(crate) fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<dom::NodeId> {
+    // A clipping box prevents descendants outside its padding box from receiving pointer input.
+    if b.style.clips_overflow {
+        let r = b.dimensions.padding_box();
+        if x < r.x || x >= r.x + r.width || y < r.y || y >= r.y + r.height {
+            let own = b.dimensions.border_box();
+            return (x >= own.x && x < own.x + own.width && y >= own.y && y < own.y + own.height)
+                .then_some(b.node)
+                .flatten();
+        }
+    }
     // Recurse into children first so a deeper hit takes precedence over this box.
     for c in &b.children {
         if let Some(n) = deepest_node_at(c, x, y) {
@@ -54,6 +64,44 @@ pub(crate) fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<d
         b.node
     } else {
         None
+    }
+}
+
+/// Translate every descendant of the first layout box for `node`, leaving the scroll container's
+/// own border/padding/background fixed. Returns whether the container was found.
+pub(crate) fn translate_scroll_descendants(
+    b: &mut layout::LayoutBox,
+    node: dom::NodeId,
+    dx: f32,
+    dy: f32,
+) -> bool {
+    if b.node == Some(node) {
+        for child in &mut b.children {
+            translate_layout_subtree(child, dx, dy);
+        }
+        return true;
+    }
+    for child in &mut b.children {
+        if translate_scroll_descendants(child, node, dx, dy) {
+            return true;
+        }
+    }
+    false
+}
+
+fn translate_layout_subtree(b: &mut layout::LayoutBox, dx: f32, dy: f32) {
+    b.dimensions.content.x += dx;
+    b.dimensions.content.y += dy;
+    if let Some(grid) = &mut b.grid_geometry {
+        for x in &mut grid.column_lines {
+            *x += dx;
+        }
+        for y in &mut grid.row_lines {
+            *y += dy;
+        }
+    }
+    for child in &mut b.children {
+        translate_layout_subtree(child, dx, dy);
     }
 }
 
@@ -1033,78 +1081,8 @@ pub(crate) fn node_value(doc: &dom::Document, id: dom::NodeId) -> Option<String>
     }
 }
 
-/// Resolve the checkable `<input type=checkbox|radio>` that a click on `node` should toggle, if
-/// any: the nearest ancestor-or-self checkable input, OR — when `node` is (inside) a `<label for>`
-/// — the input that label points at. Returns `None` for disabled controls or when none is found.
-pub(crate) fn checkable_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
-    fn is_checkable(doc: &dom::Document, id: dom::NodeId) -> bool {
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("input") && !e.attrs.contains_key("disabled") {
-                let ty = e
-                    .attrs
-                    .get("type")
-                    .map(|s| s.trim().to_ascii_lowercase())
-                    .unwrap_or_default();
-                return ty == "checkbox" || ty == "radio";
-            }
-        }
-        false
-    }
-    // Ancestor-or-self walk for a checkable input, or a <label for>.
-    let mut cur = Some(node);
-    while let Some(id) = cur {
-        if id.0 >= doc.len() {
-            break;
-        }
-        if is_checkable(doc, id) {
-            return Some(id);
-        }
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("label") {
-                if let Some(for_id) = e.attrs.get("for") {
-                    if let Some(target) = find_by_attr_id(doc, doc.root(), for_id) {
-                        if is_checkable(doc, target) {
-                            return Some(target);
-                        }
-                    }
-                }
-            }
-        }
-        cur = doc.get(id).parent;
-    }
-    None
-}
-
-/// If the click landed on (or inside) a `<summary>`, return its nearest ancestor `<details>` so it
-/// can be toggled open/closed. `None` otherwise.
-pub(crate) fn details_toggle_target(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
-    let mut cur = Some(node);
-    while let Some(id) = cur {
-        if id.0 >= doc.len() {
-            break;
-        }
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.tag.eq_ignore_ascii_case("summary") {
-                let mut p = doc.get(id).parent;
-                while let Some(pid) = p {
-                    if pid.0 < doc.len() {
-                        if let dom::NodeData::Element(pe) = &doc.get(pid).data {
-                            if pe.tag.eq_ignore_ascii_case("details") {
-                                return Some(pid);
-                            }
-                        }
-                    }
-                    p = doc.get(pid).parent;
-                }
-                return None;
-            }
-        }
-        cur = doc.get(id).parent;
-    }
-    None
-}
-
 /// Depth-first search for the first element whose `id` attribute equals `id`.
+#[cfg(test)]
 pub(crate) fn find_by_attr_id(
     doc: &dom::Document,
     root: dom::NodeId,
@@ -1165,44 +1143,4 @@ pub(crate) fn ancestor_form(doc: &dom::Document, node: dom::NodeId) -> Option<do
         cur = doc.get(id).parent;
     }
     None
-}
-
-/// If the click on `node` lands on (or inside) a submit control — `<input type=submit>`,
-/// `<button type=submit>`, or a `<button>` with no/empty `type` — that sits inside a `<form>`,
-/// return that nearest ancestor form. Otherwise `None`.
-pub(crate) fn submit_target_form(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
-    fn is_submit_control(doc: &dom::Document, id: dom::NodeId) -> bool {
-        if let dom::NodeData::Element(e) = &doc.get(id).data {
-            if e.attrs.contains_key("disabled") {
-                return false;
-            }
-            let ty = e
-                .attrs
-                .get("type")
-                .map(|s| s.trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            if e.tag.eq_ignore_ascii_case("button") {
-                // A <button> defaults to type=submit.
-                return ty.is_empty() || ty == "submit";
-            }
-            if e.tag.eq_ignore_ascii_case("input") {
-                return ty == "submit";
-            }
-        }
-        false
-    }
-    // Find the nearest ancestor-or-self submit control.
-    let mut cur = Some(node);
-    let mut control = None;
-    while let Some(id) = cur {
-        if id.0 >= doc.len() {
-            break;
-        }
-        if is_submit_control(doc, id) {
-            control = Some(id);
-            break;
-        }
-        cur = doc.get(id).parent;
-    }
-    control.and_then(|c| ancestor_form(doc, c))
 }

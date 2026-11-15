@@ -224,6 +224,8 @@ pub enum TrackSize {
     Fr(f32),
     Pct(f32),
     Auto,
+    AutoRepeatFill(f32),
+    AutoRepeatFit(f32),
 }
 
 /// A grid line placement: `(start_line, GridSpan)`. Lines are 1-based as in CSS.
@@ -298,6 +300,8 @@ impl WritingMode {
 /// The computed style for a single element.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
+    /// Canonical computed values for CSSOM-facing properties that do not yet affect layout.
+    pub extra_properties: HashMap<String, String>,
     /// `direction` / `writing-mode` (both inherited); used for the CSSOM resolved value of insets.
     pub direction: Direction,
     pub writing_mode: WritingMode,
@@ -394,9 +398,24 @@ pub struct ComputedStyle {
     pub width_pct: Option<f32>,
     /// `height` as a fraction; resolved against the containing block's (definite) content height.
     pub height_pct: Option<f32>,
+    /// Whether CSS explicitly supplied each size, including `auto`. Replaced elements use this to
+    /// distinguish CSS `height:auto` from a missing declaration that may use the HTML attribute.
+    pub width_authored: bool,
+    pub height_authored: bool,
+    /// Physical intrinsic-size substitutes used when size containment suppresses an axis.
+    pub contain_intrinsic_width: Option<f32>,
+    pub contain_intrinsic_height: Option<f32>,
+    /// Whether `contain` applies physical width/height size containment. `content-visibility:
+    /// hidden` also suppresses both axes and uses the same substitutes.
+    pub contain_width: bool,
+    pub contain_height: bool,
     /// Whether `aspect-ratio` specifies a ratio (not just `auto`). Used for the CSSOM resolved value
     /// of `min-width`/`min-height: auto`, which stays `auto` when a box has a preferred aspect ratio.
     pub aspect_ratio_set: bool,
+    /// Preferred width / height ratio and whether `auto` requests a replaced element's natural
+    /// ratio instead of the supplied fallback ratio.
+    pub aspect_ratio: Option<f32>,
+    pub aspect_ratio_auto: bool,
     /// `min-width` constraint (`None` = 0/unset). Resolved against the containing block in layout.
     pub min_width: Option<SizeConstraint>,
     /// `max-width` constraint (`None`/`none` = no maximum).
@@ -434,9 +453,17 @@ pub struct ComputedStyle {
     pub flex_direction: FlexDirection,
     pub flex_wrap: FlexWrap,
     pub justify_content: JustifyContent,
+    /// Canonical computed content-distribution values; layout uses the compact enum alongside them.
+    pub justify_content_css: String,
     pub align_items: AlignItems,
+    /// Canonical computed `align-items` value. Kept separately because layout folds values such as
+    /// `safe end` / `self-start` into its smaller alignment enum.
+    pub align_items_css: String,
+    /// Canonical computed `justify-items` value (including `legacy left|center|right`).
+    pub justify_items: String,
     /// Cross-axis distribution of flex lines (multi-line). `None` = default (stretch-ish).
     pub align_content: Option<JustifyContent>,
+    pub align_content_css: String,
 
     // --- Flex item properties ---
     pub flex_grow: f32,
@@ -447,7 +474,12 @@ pub struct ComputedStyle {
     /// resolved in layout. `None` unless a percentage was given. Takes effect when `flex_basis` (px)
     /// is `None`.
     pub flex_basis_pct: Option<f32>,
+    /// Canonical computed `flex-basis`, including intrinsic keywords and percentage-bearing calc().
+    pub flex_basis_css: String,
     pub align_self: AlignSelf,
+    /// Canonical computed self-alignment values; layout folds these into `align_self` where needed.
+    pub align_self_css: String,
+    pub justify_self: String,
     pub order: i32,
 
     // --- Gaps (flex & grid) ---
@@ -504,6 +536,8 @@ pub struct ComputedStyle {
     pub opacity: f32,
     /// Uniform `border-radius` in px (0 = square corners). Not inherited.
     pub border_radius: f32,
+    /// Uniform percentage radius as a 0..1 fraction, resolved from the box dimensions at paint.
+    pub border_radius_pct: Option<f32>,
     /// A `background-image` gradient (linear/radial), if any. `None` = no gradient. Painted as the
     /// box's background fill (over any solid `background-color`). Not inherited.
     pub background_gradient: Option<Gradient>,
@@ -660,8 +694,10 @@ pub struct Rgba {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GradientStop {
     pub color: Rgba,
-    /// Position along the gradient line, 0.0..=1.0.
+    /// Percentage component along the gradient line, as a 0.0..=1.0 fraction.
     pub pos: f32,
+    /// Absolute component in CSS px, resolved against the actual gradient line during paint.
+    pub px: f32,
 }
 
 /// A `background-image` gradient. Simplifications: `radial-gradient` is always a centered circle
@@ -670,7 +706,7 @@ pub struct GradientStop {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gradient {
     /// A linear gradient. `angle_deg` follows the CSS convention: 0deg = to top, 90deg = to
-    /// right, 180deg = to bottom. Stops are sorted by `pos` ascending, each in 0..=1.
+    /// right, 180deg = to bottom.
     Linear {
         angle_deg: f32,
         stops: Vec<GradientStop>,

@@ -1,25 +1,15 @@
-//! Iframe browsing contexts as real, separate V8 *contexts* in the page's isolate.
-//!
-//! An `<iframe>` with a `src`/`srcdoc` gets its own `v8::Context` (like a worker realm) holding a
-//! freshly parsed document and running that document's scripts — so `self === globalThis` is the
-//! frame's own window, the frame has its own `document`/`location`/`performance`, and its scripts
-//! run in isolation. The existing event-loop drain pumps each frame cooperatively (same isolate,
-//! same thread; no real parallelism). Cross-frame `postMessage` bridges contexts via the receiver's
-//! own structuredClone, and `window.parent`/`frameElement` are wired through the bridge natives.
-//!
-//! Reuses the realm pattern from [`crate::worker`]: a frame is essentially a mini page-session that
-//! shares the page's isolate and event loop. The page context is registered via
-//! [`crate::set_page_context`] (shared with workers); [`pump_frames`] is called from
-//! [`crate::drain_event_loop`] to advance each frame's timers / fetches / message deliveries.
+//! Iframes and auxiliary windows run in separate Lumen realms.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
-use crate::primitives::{arg_str, set_fn};
+use crate::primitives::{arg_str, js_str, set_fn};
 use crate::{
     deliver_fetch_completion, deliver_ws_event, eval_internal, eval_source, host_state,
-    install_browser_environment, run_due_timers, FetchCompletion, HostState, SharedDoc, WsEvent,
+    install_browser_environment, register_host_state, run_due_timers, with_realm, Ctx,
+    FetchCompletion, HostState, NativeArgs, NativeReturn, Realm, SharedDoc, Value, ValueExt,
+    WsEvent,
 };
 
 /// JS overlay run in the frame context after the browser env is installed: wires `parent`/`top`/
@@ -29,7 +19,9 @@ const FRAME_ENV_BOOTSTRAP: &str = include_str!("bootstrap/frame_env.js");
 /// One live iframe browsing context, keyed by the host `<iframe>` element's node id (page side).
 struct FrameRealm {
     node_id: u32,
-    context: v8::Global<v8::Context>,
+    context: Realm,
+    parent: Realm,
+    same_origin_parent: bool,
     fetch_rx: Receiver<FetchCompletion>,
     ws_evt_rx: Receiver<WsEvent>,
     alive: bool,
@@ -39,14 +31,45 @@ thread_local! {
     static FRAME_REG: RefCell<Vec<FrameRealm>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Drop all frame realms (called on session teardown, before the isolate).
+/// Drop all frame realms (called on session teardown, before the interpreter).
 pub fn clear_frames() {
     FRAME_REG.with(|r| r.borrow_mut().clear());
 }
 
+/// Retire every child of a discarded browsing context, including nested frames.
+pub(crate) fn retire_children(scope: &mut Ctx, parent: &Value) {
+    let parent_addr = scope.object_addr(parent);
+    let retired = FRAME_REG.with(|r| {
+        let mut frames = r.borrow_mut();
+        let (retired, live): (Vec<_>, Vec<_>) = std::mem::take(&mut *frames)
+            .into_iter()
+            .partition(|f| scope.object_addr(&f.parent.global) == parent_addr);
+        *frames = live;
+        retired
+    });
+    for frame in retired {
+        frame.context.retire(scope);
+    }
+}
+
+fn remove_frame(scope: &mut Ctx, node_id: u32, parent_addr: Option<usize>) {
+    let retired = FRAME_REG.with(|r| {
+        let mut frames = r.borrow_mut();
+        let (retired, live): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *frames).into_iter().partition(|f| {
+                f.node_id == node_id && scope.object_addr(&f.parent.global) == parent_addr
+            });
+        *frames = live;
+        retired
+    });
+    for frame in retired {
+        frame.context.retire(scope);
+    }
+}
+
 /// Install the iframe bridge natives onto a context's global (page + frame contexts, so nested
 /// iframes work).
-pub(crate) fn register_iframe_natives(scope: &mut v8::PinScope, global: v8::Local<v8::Object>) {
+pub(crate) fn register_iframe_natives(scope: &mut Ctx, global: &Value) {
     set_fn(scope, global, "__iframeLoad", prim_iframe_load);
     set_fn(scope, global, "__windowOpen", prim_window_open);
     set_fn(
@@ -63,35 +86,68 @@ pub(crate) fn register_iframe_natives(scope: &mut v8::PinScope, global: v8::Loca
     );
     set_fn(scope, global, "__frameUnload", prim_frame_unload);
     set_fn(scope, global, "__frameGet", prim_frame_get);
+    set_fn(scope, global, "__frameSet", prim_frame_set);
 }
 
 /// `__frameGet(nodeId, prop)` -> the value of `globalThis[prop]` in the frame's context (or
 /// undefined). Used by the page's `contentWindow` proxy so `frame.contentWindow.performance` /
-/// `.location` / `.document` reach the frame realm's real objects (same isolate → the handle is
+/// `.location` / `.document` reach the frame realm's real objects (same interpreter → the value is
 /// valid in the page context).
-fn prim_frame_get(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+fn prim_frame_get(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node_id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
     let prop = arg_str(scope, &args, 1);
+    let caller = scope.global_this();
+    let caller_addr = scope.object_addr(&caller);
     let ctx_g = FRAME_REG.with(|r| {
         r.borrow()
             .iter()
-            .find(|f| f.node_id == node_id && f.alive)
+            .find(|f| {
+                f.node_id == node_id
+                    && f.alive
+                    && f.same_origin_parent
+                    && scope.object_addr(&f.parent.global) == caller_addr
+            })
             .map(|f| f.context.clone())
     });
     if let Some(ctx_g) = ctx_g {
-        let ctx = v8::Local::new(scope, &ctx_g);
-        let cscope = &mut v8::ContextScope::new(scope, ctx);
-        let global = cscope.get_current_context().global(cscope);
-        if let Some(key) = v8::String::new(cscope, &prop) {
-            if let Some(v) = global.get(cscope, key.into()) {
-                rv.set(v);
-            }
+        if let Ok(value) = with_realm(scope, &ctx_g, move |ctx| {
+            let global = ctx.global_this();
+            ctx.member_get(&global, &prop).unwrap_or(Value::Undefined)
+        }) {
+            rv.set(value);
         }
     }
+}
+
+/// `__frameSet(nodeId, prop, value)` writes a same-origin WindowProxy property into the frame's
+/// actual global object. Origin policy is enforced by the page-side proxy before calling this.
+fn prim_frame_set(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
+    let node_id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
+    let prop = arg_str(scope, &args, 1);
+    let value = args.get(2);
+    let caller = scope.global_this();
+    let caller_addr = scope.object_addr(&caller);
+    let ctx_g = FRAME_REG.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|f| {
+                f.node_id == node_id
+                    && f.alive
+                    && f.same_origin_parent
+                    && scope.object_addr(&f.parent.global) == caller_addr
+            })
+            .map(|f| f.context.clone())
+    });
+    let written = ctx_g
+        .map(|realm| {
+            with_realm(scope, &realm, move |ctx| {
+                let global = ctx.global_this();
+                ctx.member_set(&global, &prop, value).is_ok()
+            })
+            .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    rv.set_bool(written);
 }
 
 /// Walk a parsed document for runnable classic `<script>`s in document order: `(is_external, value)`
@@ -153,11 +209,7 @@ fn collect_classic_scripts(doc: &dom::Document, base: &str) -> Vec<(bool, String
 /// `__iframeLoad(nodeId, url, srcdoc) -> bool`. Build the frame's context from `srcdoc` (inline HTML)
 /// or by fetching `url`, run its classic scripts, and register the realm. Returns whether a document
 /// was loaded (false → the caller fires an `error`; true → it fires `load`).
-fn prim_iframe_load(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+fn prim_iframe_load(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let node_id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
     let url = arg_str(scope, &args, 1);
     let srcdoc: Option<String> = {
@@ -177,7 +229,7 @@ fn prim_iframe_load(
         }
     };
     let ok = build_browsing_context(scope, node_id, &url, srcdoc, false, &nav_type);
-    rv.set(v8::Boolean::new(scope, ok).into());
+    rv.set_bool(ok);
 }
 
 /// Synthetic node id for an auxiliary window (`window.open`). Uses a high base so it never collides
@@ -197,23 +249,19 @@ fn next_aux_window_id() -> u32 {
 /// target): allocate a synthetic id, load+run its document like a frame, and register the realm.
 /// Returns the synthetic id (used by the page's window proxy to message/read the new window), or 0
 /// if the document failed to load.
-fn prim_window_open(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut rv: v8::ReturnValue<v8::Value>,
-) {
+fn prim_window_open(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
     let url = arg_str(scope, &args, 0);
     let node_id = next_aux_window_id();
     let ok = build_browsing_context(scope, node_id, &url, None, true, "navigate");
-    rv.set(v8::Number::new(scope, if ok { node_id as f64 } else { 0.0 }).into());
+    rv.set_double(if ok { node_id as f64 } else { 0.0 });
 }
 
 /// Build a child browsing-context realm (an `<iframe>` when `is_aux` is false, or a `window.open`
 /// auxiliary window when true): resolve the document HTML from `srcdoc`/`url`, create a fresh
-/// `v8::Context`, install the browser env + frame overlay, run the document's classic scripts, and
+/// Lumen realm, install the browser env + frame overlay, run the document's classic scripts, and
 /// register the realm under `node_id`. Returns whether a document was loaded.
 fn build_browsing_context(
-    scope: &mut v8::PinScope,
+    scope: &mut Ctx,
     node_id: u32,
     url: &str,
     srcdoc: Option<String>,
@@ -221,6 +269,17 @@ fn build_browsing_context(
     nav_type: &str,
 ) -> bool {
     let page_state = host_state(scope);
+    let parent = match Realm::current(scope) {
+        Ok(parent) => parent,
+        Err(error) => {
+            let message = error.to_rust_string_lossy(scope);
+            page_state
+                .console
+                .borrow_mut()
+                .push(format!("iframe parent realm: {message}"));
+            return false;
+        }
+    };
     let request_fetcher = std::sync::Arc::clone(&page_state.request_fetcher);
     let ws_connector = std::sync::Arc::clone(&page_state.ws_connector);
 
@@ -280,167 +339,193 @@ fn build_browsing_context(
 
     let (fetch_tx, fetch_rx) = std::sync::mpsc::channel();
     let (ws_tx, ws_evt_rx) = std::sync::mpsc::channel();
-
-    let ctx_global = {
-        let ctx = v8::Context::new(scope, Default::default());
-        let cscope = &mut v8::ContextScope::new(scope, ctx);
-        let shared: SharedDoc = Rc::new(RefCell::new(doc));
-        let cookie_getter = std::sync::Arc::clone(&page_state.cookie_getter);
-        let cookie_setter = std::sync::Arc::clone(&page_state.cookie_setter);
-        let state = HostState::with_fetcher(
-            Rc::clone(&shared),
-            Rc::new(|_| None),
-            request_fetcher.clone(),
-            fetch_tx,
-            ws_connector,
-            ws_tx,
-            cookie_getter,
-            cookie_setter,
-        );
-        cscope.get_current_context().set_slot(state);
-        // Seed the navigation type + whether a previous document existed for this frame (a same-origin
-        // replacement unloads the old document → non-zero unloadEvent timings), before the env bootstrap
-        // so Navigation Timing reflects them.
-        let had_prev = FRAME_REG.with(|r| r.borrow().iter().any(|f| f.node_id == node_id));
-        // A same-origin redirect (the final URL differs from the requested one, same origin) is
-        // observable in Navigation Timing; a cross-origin redirect hides the count/timing (→ 0).
-        let redirect_count = if frame_url != url && same_origin(url, &frame_url) {
-            1
-        } else {
-            0
-        };
-        {
-            let g0 = cscope.get_current_context().global(cscope);
-            let knt = v8::String::new(cscope, "__navType").unwrap();
-            let vnt = crate::js_str(cscope, nav_type);
-            g0.set(cscope, knt.into(), vnt);
-            let khp = v8::String::new(cscope, "__hadPreviousDoc").unwrap();
-            let vhp = v8::Boolean::new(cscope, had_prev);
-            g0.set(cscope, khp.into(), vhp.into());
-            let krc = v8::String::new(cscope, "__redirectCount").unwrap();
-            let vrc = v8::Number::new(cscope, redirect_count as f64);
-            g0.set(cscope, krc.into(), vrc.into());
-            if opaque_origin {
-                if let Some(kop) = v8::String::new(cscope, "__opaqueOrigin") {
-                    let vop = v8::Boolean::new(cscope, true);
-                    g0.set(cscope, kop.into(), vop.into());
-                }
-            }
+    let page_url = page_state.page_url.borrow().clone();
+    let same_origin_parent = !opaque_origin
+        && (srcdoc.is_some() || frame_url == "about:blank" || same_origin(&page_url, &frame_url));
+    let ctx_global = match Realm::new(scope) {
+        Ok(child) => child,
+        Err(error) => {
+            let message = error.to_rust_string_lossy(scope);
+            page_state
+                .console
+                .borrow_mut()
+                .push(format!("iframe creation: {message}"));
+            return false;
         }
-        install_browser_environment(cscope, &frame_url);
-        // Seed the host node id so the overlay can wire frameElement/parent messaging.
-        let g = cscope.get_current_context().global(cscope);
-        let kid = v8::String::new(cscope, "__frameNodeId").unwrap();
-        let vid = v8::Number::new(cscope, node_id as f64);
-        g.set(cscope, kid.into(), vid.into());
-        // Auxiliary windows (window.open) get top-level semantics + an `opener`; the overlay keys
-        // off this flag instead of wiring parent/top/frameElement to the page.
-        if is_aux {
-            if let Some(kaux) = v8::String::new(cscope, "__frameIsAuxWindow") {
-                let vaux = v8::Boolean::new(cscope, true);
-                g.set(cscope, kaux.into(), vaux.into());
-            }
+    };
+    let shared: SharedDoc = Rc::new(RefCell::new(doc));
+    let state = HostState::with_fetcher(
+        shared,
+        Rc::clone(&page_state.fetcher),
+        request_fetcher.clone(),
+        fetch_tx,
+        ws_connector,
+        ws_tx,
+        page_state.cookie_getter.clone(),
+        page_state.cookie_setter.clone(),
+    );
+    register_host_state(scope, &ctx_global.global, state);
+    let parent_addr = scope.object_addr(&parent.global);
+    let had_prev = FRAME_REG.with(|r| {
+        r.borrow()
+            .iter()
+            .any(|f| f.node_id == node_id && scope.object_addr(&f.parent.global) == parent_addr)
+    });
+    let redirect_count = if frame_url != url && same_origin(url, &frame_url) {
+        1.0
+    } else {
+        0.0
+    };
+    let nav_type = nav_type.to_string();
+    let initialized = with_realm(scope, &ctx_global, move |ctx| {
+        let global = ctx.global_this();
+        for (key, value) in [
+            ("__navType", js_str(ctx, &nav_type)),
+            ("__hadPreviousDoc", Value::Bool(had_prev)),
+            ("__redirectCount", Value::Num(redirect_count)),
+            ("__opaqueOrigin", Value::Bool(opaque_origin)),
+        ] {
+            let _ = ctx.member_set(&global, key, value);
         }
-        // Seed the document's charset so the frame's URL parsing encodes queries with it.
-        if let Some(cs) = &frame_charset {
-            if let Some(kcs) = v8::String::new(cscope, "__documentCharset") {
-                let vcs = crate::js_str(cscope, cs);
-                g.set(cscope, kcs.into(), vcs);
-            }
+        install_browser_environment(ctx, &frame_url);
+        let _ = ctx.member_set(&global, "__frameNodeId", Value::Num(node_id as f64));
+        let _ = ctx.member_set(&global, "__frameIsAuxWindow", Value::Bool(is_aux));
+        if let Some(charset) = frame_charset {
+            let charset = js_str(ctx, &charset);
+            let _ = ctx.member_set(&global, "__documentCharset", charset);
         }
-        eval_internal(cscope, FRAME_ENV_BOOTSTRAP, "<frame-env>");
-
-        // Run the document's classic scripts in order (external ones fetched synchronously).
-        for (is_external, value) in scripts {
-            if is_external {
-                if let Some(env) = request_fetcher("GET", &value, "", "{}") {
-                    if let Some(body) = extract_envelope_body(&env) {
-                        eval_source(cscope, &body, &value);
+        if !eval_internal(ctx, FRAME_ENV_BOOTSTRAP, "<frame-env>") {
+            return false;
+        }
+        for (external, source) in scripts {
+            if external {
+                if let Some(envelope) = request_fetcher("GET", &source, "", "{}") {
+                    if let Some(body) = extract_envelope_body(&envelope) {
+                        eval_source(ctx, &body, &source);
                     }
                 }
             } else {
-                eval_source(cscope, &value, &frame_url);
+                eval_source(ctx, &source, &frame_url);
             }
         }
-        // Fire the frame's own DOMContentLoaded/load lifecycle.
         eval_internal(
-            cscope,
+            ctx,
             "if (typeof __fireLifecycleEvents === 'function') { __fireLifecycleEvents(); } \
              if (typeof __enterRealtime === 'function') { __enterRealtime(); }",
             "<frame-lifecycle>",
-        );
-        v8::Global::new(cscope, ctx)
-    };
+        )
+    })
+    .unwrap_or_else(|error| {
+        let message = error.to_rust_string_lossy(scope);
+        page_state
+            .console
+            .borrow_mut()
+            .push(format!("iframe realm entry: {message}"));
+        false
+    });
+    if !initialized {
+        if let Some(state) = scope.realm_resource_for_host::<HostState>(&ctx_global.global) {
+            page_state.console.borrow_mut().extend(
+                state
+                    .console
+                    .borrow()
+                    .iter()
+                    .map(|error| format!("iframe initialization: {error}")),
+            );
+        }
+        ctx_global.retire(scope);
+        scope.collect_garbage_for_host();
+        return false;
+    }
 
+    // Replace the old document and all of its descendant browsing contexts.
+    remove_frame(scope, node_id, parent_addr);
     FRAME_REG.with(|r| {
-        // Replace any prior realm for this node (re-navigation).
-        r.borrow_mut().retain(|f| f.node_id != node_id);
         r.borrow_mut().push(FrameRealm {
             node_id,
             context: ctx_global,
+            parent,
+            same_origin_parent,
             fetch_rx,
             ws_evt_rx,
             alive: true,
         })
     });
+    scope.collect_garbage_for_host();
     true
 }
 
 /// `__framePostToFrame(nodeId, value)`. Page → frame: deliver a message into the frame context.
-fn prim_frame_post_to_frame(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
+fn prim_frame_post_to_frame(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node_id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
     let value = args.get(1);
+    let caller = scope.global_this();
+    let caller_addr = scope.object_addr(&caller);
     let ctx_g = FRAME_REG.with(|r| {
         r.borrow()
             .iter()
-            .find(|f| f.node_id == node_id && f.alive)
+            .find(|f| {
+                f.node_id == node_id
+                    && f.alive
+                    && scope.object_addr(&f.parent.global) == caller_addr
+            })
             .map(|f| f.context.clone())
     });
     if let Some(ctx_g) = ctx_g {
-        let ctx = v8::Local::new(scope, &ctx_g);
-        let cscope = &mut v8::ContextScope::new(scope, ctx);
-        crate::worker::call_global_fn(cscope, "__frameAccept", &[value]);
+        let _ = with_realm(scope, &ctx_g, move |ctx| {
+            crate::worker::call_global_fn(ctx, "__frameAccept", &[value]);
+        });
     }
 }
 
 /// `__framePostToParent(nodeId, value)`. Frame → page: deliver a message to the page window, with
 /// the source frame's node id so the page can set `event.source` to its contentWindow.
-fn prim_frame_post_to_parent(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
+fn prim_frame_post_to_parent(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node_id = args.get(0).number_value(scope).unwrap_or(0.0);
     let value = args.get(1);
-    let page_g = crate::worker::page_context();
+    let caller_addr = scope.object_addr(&scope.global_this());
+    let page_g = FRAME_REG
+        .with(|r| {
+            r.borrow()
+                .iter()
+                .find(|f| scope.object_addr(&f.context.global) == caller_addr)
+                .map(|f| f.parent.clone())
+        })
+        .or_else(crate::worker::page_context);
     if let Some(page_g) = page_g {
-        let ctx = v8::Local::new(scope, &page_g);
-        let cscope = &mut v8::ContextScope::new(scope, ctx);
-        let id_arg = v8::Number::new(cscope, node_id).into();
-        crate::worker::call_global_fn(cscope, "__frameDeliverToParent", &[id_arg, value]);
+        let _ = with_realm(scope, &page_g, move |ctx| {
+            crate::worker::call_global_fn(
+                ctx,
+                "__frameDeliverToParent",
+                &[Value::Num(node_id), value],
+            );
+        });
     }
 }
 
 /// `__frameUnload(nodeId)`. Drop a frame realm (the `<iframe>` was removed or re-navigated).
-fn prim_frame_unload(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue<v8::Value>,
-) {
+fn prim_frame_unload(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
     let node_id = args.get(0).number_value(scope).unwrap_or(0.0) as u32;
-    FRAME_REG.with(|r| r.borrow_mut().retain(|f| f.node_id != node_id));
+    let parent_addr = scope.object_addr(&scope.global_this());
+    remove_frame(scope, node_id, parent_addr);
+    scope.collect_garbage_for_host();
 }
 
 /// Advance every live frame's loop one pass (fetches + ws + timers + microtasks), each in its own
 /// context. Returns `(did_work, in_flight)` like [`crate::worker::pump_workers`].
-pub fn pump_frames(scope: &mut v8::PinScope) -> (bool, usize) {
-    let mut ctxs: Vec<v8::Global<v8::Context>> = Vec::new();
-    let mut fetches: Vec<(v8::Global<v8::Context>, FetchCompletion)> = Vec::new();
-    let mut ws_events: Vec<(v8::Global<v8::Context>, WsEvent)> = Vec::new();
+fn realm_is_active(scope: &Ctx, realm: &Realm) -> bool {
+    let address = scope.object_addr(&realm.global);
+    FRAME_REG.with(|r| {
+        r.borrow()
+            .iter()
+            .any(|entry| scope.object_addr(&entry.context.global) == address)
+    })
+}
+
+pub fn pump_frames(scope: &mut Ctx) -> (bool, usize) {
+    let mut ctxs: Vec<Realm> = Vec::new();
+    let mut fetches: Vec<(Realm, FetchCompletion)> = Vec::new();
+    let mut ws_events: Vec<(Realm, WsEvent)> = Vec::new();
     FRAME_REG.with(|r| {
         for f in r.borrow().iter().filter(|f| f.alive) {
             ctxs.push(f.context.clone());
@@ -454,30 +539,38 @@ pub fn pump_frames(scope: &mut v8::PinScope) -> (bool, usize) {
     });
 
     let mut did_work = false;
-    for (ctx_g, completion) in fetches {
-        let ctx = v8::Local::new(scope, &ctx_g);
-        let cscope = &mut v8::ContextScope::new(scope, ctx);
-        deliver_fetch_completion(cscope, completion);
-        cscope.perform_microtask_checkpoint();
-        did_work = true;
-    }
-    for (ctx_g, (id, kind, payload)) in ws_events {
-        let ctx = v8::Local::new(scope, &ctx_g);
-        let cscope = &mut v8::ContextScope::new(scope, ctx);
-        deliver_ws_event(cscope, id, kind, &payload);
-        cscope.perform_microtask_checkpoint();
-        did_work = true;
-    }
-    let mut in_flight = 0usize;
-    for ctx_g in ctxs {
-        let ctx = v8::Local::new(scope, &ctx_g);
-        let cscope = &mut v8::ContextScope::new(scope, ctx);
-        if run_due_timers(cscope) {
-            did_work = true;
+    for (realm, completion) in fetches {
+        if !realm_is_active(scope, &realm) {
+            continue;
         }
-        cscope.perform_microtask_checkpoint();
-        if let Some(state) = cscope.get_current_context().get_slot::<HostState>() {
-            in_flight += state.in_flight.get();
+        let _ = with_realm(scope, &realm, move |ctx| {
+            deliver_fetch_completion(ctx, completion);
+            ctx.drain_microtasks_for_host();
+        });
+        did_work = true;
+    }
+    for (realm, (id, kind, payload)) in ws_events {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
+        let _ = with_realm(scope, &realm, move |ctx| {
+            deliver_ws_event(ctx, id, kind, &payload);
+            ctx.drain_microtasks_for_host();
+        });
+        did_work = true;
+    }
+    let mut in_flight = 0;
+    for realm in ctxs {
+        if !realm_is_active(scope, &realm) {
+            continue;
+        }
+        if let Ok((ran, pending)) = with_realm(scope, &realm, |ctx| {
+            let ran = run_due_timers(ctx);
+            ctx.drain_microtasks_for_host();
+            (ran, host_state(ctx).in_flight.get())
+        }) {
+            did_work |= ran;
+            in_flight += pending;
         }
     }
     (did_work, in_flight)
@@ -594,12 +687,13 @@ fn extract_envelope_body(env: &str) -> Option<String> {
 
 /// Whether two URLs share an origin (scheme + authority), for the redirect-timing same-origin check.
 fn same_origin(a: &str, b: &str) -> bool {
-    fn origin(u: &str) -> Option<(String, String)> {
-        let se = u.find("://")?;
-        let authority = u[se + 3..].split(['/', '?', '#']).next().unwrap_or("");
-        Some((u[..se].to_ascii_lowercase(), authority.to_ascii_lowercase()))
+    match (wurl::Url::parse(a), wurl::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            let origin = a.origin();
+            origin != "null" && origin == b.origin()
+        }
+        _ => false,
     }
-    matches!((origin(a), origin(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// The post-redirect final URL recorded in the response envelope (`"url"` field).
@@ -661,4 +755,114 @@ fn extract_envelope_string(env: &str, key: &str) -> Option<String> {
         j += 1;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn frame_native_access_respects_opaque_origins() {
+        let doc = html::parse("<!doctype html><body></body>");
+        let (_, results) = run_with_dom(
+            doc,
+            vec![r#"
+            var same = document.createElement('iframe');
+            same.srcdoc = '<p>same origin</p>';
+            document.body.appendChild(same);
+            var opaque = document.createElement('iframe');
+            opaque.setAttribute('sandbox', 'allow-scripts');
+            opaque.srcdoc = '<p>opaque origin</p>';
+            document.body.appendChild(opaque);
+            setTimeout(function () {
+                console.log(typeof __frameGet(same.__node, 'document'));
+                console.log(typeof __frameGet(opaque.__node, 'document'));
+                console.log(__frameSet(opaque.__node, 'secret', 'changed'));
+                console.log(opaque.contentDocument === null);
+            }, 0);
+        "#
+            .to_string()],
+            "https://example.test/",
+        );
+        assert!(results.iter().all(|r| r.error.is_none()), "{results:?}");
+        let console: Vec<_> = results.into_iter().flat_map(|r| r.console).collect();
+        assert_eq!(console, ["object", "undefined", "false", "true"]);
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::*;
+
+    #[test]
+    fn replacing_and_unloading_frames_releases_old_documents() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        install_host_state(
+            ctx,
+            HostState::new(Rc::new(RefCell::new(html::parse("<body></body>")))),
+        );
+        install_browser_environment(ctx, "https://example.test/");
+        crate::set_page_context(Realm::current(ctx).unwrap_or_else(|_| panic!("page realm")));
+        assert!(eval_source(
+            ctx,
+            "var f = document.createElement('iframe'); document.body.appendChild(f);",
+            "fixture"
+        )
+        .error
+        .is_none());
+        for iteration in 0..6 {
+            let loaded = eval_source(
+                ctx,
+                "__iframeLoad(f.__node, 'about:blank', '<body>first</body>');",
+                "load",
+            );
+            assert_eq!(
+                loaded.value.as_deref(),
+                Some("true"),
+                "load {iteration}: {loaded:?}"
+            );
+            let old = FRAME_REG.with(|r| {
+                let frame = r.borrow().last().unwrap().context.clone();
+                let state = ctx
+                    .realm_resource_for_host::<HostState>(&frame.global)
+                    .unwrap();
+                Rc::downgrade(&state)
+            });
+            let replaced = eval_source(
+                ctx,
+                "__iframeLoad(f.__node, 'about:blank', '<body>second</body>');",
+                "replace",
+            );
+            assert_eq!(
+                replaced.value.as_deref(),
+                Some("true"),
+                "replace {iteration}: {replaced:?}"
+            );
+            ctx.collect_garbage_for_host();
+            assert!(
+                old.upgrade().is_none(),
+                "renavigation must retire the old document"
+            );
+            let last = FRAME_REG.with(|r| {
+                let frame = r.borrow().last().unwrap().context.clone();
+                let state = ctx
+                    .realm_resource_for_host::<HostState>(&frame.global)
+                    .unwrap();
+                Rc::downgrade(&state)
+            });
+            assert!(eval_source(ctx, "__frameUnload(f.__node);", "unload")
+                .error
+                .is_none());
+            ctx.collect_garbage_for_host();
+            assert!(
+                last.upgrade().is_none(),
+                "unloaded document must be reclaimed"
+            );
+            assert!(FRAME_REG.with(|r| r.borrow().is_empty()));
+        }
+        clear_frames();
+        crate::clear_workers();
+    }
 }

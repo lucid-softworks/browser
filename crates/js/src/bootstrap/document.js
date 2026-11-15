@@ -157,6 +157,10 @@
   globalThis.location = { href: "" };
 
   var NODE = "__node";
+  // Numeric node ids are local to one browsing-context realm. A unique object tags wrappers so
+  // mutation methods can distinguish a foreign wrapper from a local node with the same id.
+  var __nodeRealmToken = {};
+  def(globalThis, "__nodeRealmToken", __nodeRealmToken);
 
   // --- DOM namespace / case metadata ----------------------------------------------------------
   // The Rust arena stores only a lowercased `tag` string per element, which loses the namespace,
@@ -400,7 +404,20 @@
     throw new globalThis.DOMException(msg || "The object can not be found here.", "NotFoundError");
   }
   // The node id of an argument: real DOM-arena nodes carry `__node`; strings/anything else => -1.
-  function nodeIdOf(x) { return (x && typeof x.__node === "number") ? x.__node : -1; }
+  // A node from another iframe realm is first rebuilt in this realm because its numeric id belongs
+  // to a different Rust arena.
+  function coerceNodeForRealm(x) {
+    if (x && x.__nodeRealmToken && x.__nodeRealmToken !== __nodeRealmToken &&
+        typeof globalThis.__importForeignNode === "function") {
+      return globalThis.__importForeignNode(x, true);
+    }
+    return x;
+  }
+  def(globalThis, "__coerceNodeForRealm", coerceNodeForRealm);
+  function nodeIdOf(x) {
+    x = coerceNodeForRealm(x);
+    return (x && typeof x.__node === "number") ? x.__node : -1;
+  }
   // WebIDL: a non-nullable `Node` parameter throws a TypeError (not a DOMException) when the value
   // isn't a Node. Returns the node id on success.
   function requireNodeArg(x, methodName) {
@@ -439,7 +456,7 @@
 
   // Pre-insertion validity (subset relevant here): parent must be a Document/Fragment/Element, the
   // node must not be an inclusive ancestor of parent, and `ref` (if given) must be a child of parent.
-  function ensurePreInsertValid(parentId, nodeId, refId) {
+  function ensurePreInsertValid(parentId, nodeId, refId, replacedId) {
     var pt = __nodeType(parentId);
     if (pt !== 1 && pt !== 9 && pt !== 11) {
       hierarchyRequestError("Cannot insert into a node that is not a Document, DocumentFragment, or Element.");
@@ -447,23 +464,44 @@
     if (nodeId >= 0 && isInclusiveAncestor(nodeId, parentId)) {
       hierarchyRequestError("The new child element contains the parent.");
     }
+    if (refId >= 0 && __parent(refId) !== parentId) {
+      notFoundError("The reference child is not a child of this node.");
+    }
     var nt = nodeId >= 0 ? __nodeType(nodeId) : -1;
     if (nt === 9) { hierarchyRequestError("Nodes of type Document may not be inserted."); }
     // A DocumentType may only live in a Document; a Text node may not be a child of a Document.
     if (nt === 10 && pt !== 9) { hierarchyRequestError("Only a Document may contain a DocumentType."); }
     if (nt === 3 && pt === 9) { hierarchyRequestError("A Text node may not be a child of a Document."); }
-    if (nodeId >= 0 && (nt === 1 || nt === 3 || nt === 8 || nt === 11) && (pt === 9)) {
-      // Documents have additional constraints, but our tree is HTML-shaped; allow elements/fragments.
-    }
-    if (refId >= 0 && __parent(refId) !== parentId) {
-      notFoundError("The reference child is not a child of this node.");
+    if (pt === 9) {
+      var sequence = __children(parentId).filter(function (child) {
+        // Pre-insertion validity is checked before an existing incoming node is removed. Retain it
+        // here so moving a Document's own element or doctype still observes the already-present
+        // child and fails. Replacement validation additionally omits the child being replaced.
+        return child !== replacedId;
+      });
+      var insertion = refId < 0 ? sequence.length : sequence.indexOf(refId);
+      if (insertion < 0) { insertion = sequence.length; }
+      var incoming = nt === 11 ? __children(nodeId).slice() : [nodeId];
+      sequence.splice.apply(sequence, [insertion, 0].concat(incoming));
+      var elements = 0, doctypes = 0, elementIndex = -1, doctypeIndex = -1;
+      for (var si = 0; si < sequence.length; si++) {
+        var st = __nodeType(sequence[si]);
+        if (st === 1) { elements++; elementIndex = si; }
+        else if (st === 10) { doctypes++; doctypeIndex = si; }
+        else if (st !== 7 && st !== 8) { hierarchyRequestError("This node type cannot be inserted into a Document."); }
+      }
+      if (elements > 1 || doctypes > 1 || (doctypeIndex >= 0 && elementIndex >= 0 && doctypeIndex > elementIndex)) {
+        hierarchyRequestError("The operation would yield an invalid Document tree.");
+      }
     }
   }
+  def(globalThis, "__ensurePreInsertValid", ensurePreInsertValid);
 
   // Insert `nodeId` (possibly a DocumentFragment, whose children are moved) into `parentId` before
   // `refId` (-1 = append). Returns the inserted node id. Validity must be checked by the caller.
   function insertNode(parentId, nodeId, refId) {
     if (nodeId < 0) { return nodeId; }
+    if (nodeId === refId) { return nodeId; }
     if (__nodeType(nodeId) === 11) {
       var moving = __children(nodeId).slice();
       for (var i = 0; i < moving.length; i++) { __insertBefore(parentId, moving[i], refId); }
@@ -483,6 +521,7 @@
     if (globalThis.__adoptOnInsert) { try { globalThis.__adoptOnInsert(nodeId); } catch (e) {} }
     return nodeId;
   }
+  def(globalThis, "__insertDomNode", insertNode);
 
   // The set of arg node-ids (used to skip them when picking a viable reference sibling).
   function argNodeIdSet(args) {
@@ -634,10 +673,42 @@
 
   // Build a fresh element wrapper object for a node id. Carries `__node` plus accessors/methods
   // that delegate to the native primitives. Returns null for id === -1.
+  function normalizeNode(rootId) {
+    var children = __children(rootId).slice();
+    for (var i = 0; i < children.length; i++) {
+      var childId = children[i];
+      if (__parent(childId) !== rootId) { continue; }
+      if (__nodeType(childId) !== 3) {
+        normalizeNode(childId);
+        continue;
+      }
+      var data = __textContent(childId);
+      if (data.length === 0) {
+        __removeChild(rootId, childId);
+        continue;
+      }
+      while (true) {
+        var siblings = __children(rootId);
+        var index = siblings.indexOf(childId);
+        var nextId = index >= 0 && index + 1 < siblings.length ? siblings[index + 1] : -1;
+        if (nextId < 0 || __nodeType(nextId) !== 3) { break; }
+        var nextData = __textContent(nextId);
+        if (typeof globalThis.__rangesMergeText === "function") {
+          globalThis.__rangesMergeText(childId, nextId, rootId, index + 1, data.length);
+        }
+        data += nextData;
+        __setTextContent(childId, data);
+        __removeChild(rootId, nextId);
+      }
+    }
+  }
+  def(globalThis, "__normalizeNode", normalizeNode);
+
   function wrap(id) {
     if (typeof id !== "number" || id < 0) { return null; }
     var el = {};
     def(el, NODE, id);
+    def(el, "__nodeRealmToken", __nodeRealmToken);
 
     function uc(s) { return String(s == null ? "" : s).toUpperCase(); }
 
@@ -687,6 +758,45 @@
       return __nodeType(id) === 1 ? __tag(id) : null;
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "nodeType", { get: function () { return __nodeType(id); }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "baseURI", {
+      get: function () {
+        var owner = el.ownerDocument || document;
+        return owner && owner.baseURI != null ? String(owner.baseURI) : "about:blank";
+      },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(el, "isConnected", {
+      get: function () {
+        var current = id;
+        while (current >= 0) {
+          if (__nodeType(current) === 9) { return true; }
+          // Lightweight iframe documents use a detached arena subtree whose root wrapper carries
+          // its owning Document facade. Nodes in that subtree are connected to that document even
+          // when the host iframe itself is detached from the outer document.
+          try {
+            var wrapped = globalThis.__nodeFor(current);
+            if (wrapped && wrapped.__frameDoc && wrapped.__frameDoc.nodeType === 9) { return true; }
+          } catch (e) {}
+          current = __parent(current);
+        }
+        return false;
+      },
+      enumerable: true, configurable: true
+    });
+    // Legacy identity alias from Node. A node can be surfaced through more than one wrapper, so
+    // arena-backed nodes compare by their stable node id rather than wrapper object identity alone.
+    def(el, "isSameNode", function (other) {
+      if (this === other) { return true; }
+      return other != null && typeof other.__node === "number" && other.__node === id;
+    });
+    // Install structural equality on the core wrapper rather than during element enrichment. That
+    // keeps Node.isEqualNode available on CharacterData, DocumentFragment, and DocumentType nodes.
+    def(el, "isEqualNode", function (other) {
+      if (this === other) { return true; }
+      return typeof globalThis.__nodesEqual === "function"
+        ? globalThis.__nodesEqual(this, other)
+        : false;
+    });
 
     Object.defineProperty(el, "textContent", {
       // Per spec: null for Document (9) and DocumentType (10); for everything else (Element,
@@ -752,7 +862,7 @@
       // trailing data. Per the DOM "split" algorithm, the new node is inserted (live-range insert
       // step), the split-specific live-range steps run, then the trailing data is removed from this
       // node (live-range replace-data step).
-      if (__nodeType(id) === 3) {
+      if (__nodeType(id) === 3 || __nodeType(id) === 4) {
         def(el, "splitText", function (offset) {
           if (arguments.length < 1) { throw new TypeError("Failed to execute 'splitText' on 'Text': 1 argument required, but only 0 present."); }
           offset = offset >>> 0;
@@ -866,11 +976,38 @@
       var ns = __namespaceUri(id);
       return ns == null || ns === HTML_NS;
     }
+    // The arena keys attributes by one string, while DOM permits attributes in different namespaces
+    // to share a qualified name. Namespace metadata therefore also records the public qualified name;
+    // colliding entries receive a private storage key that never leaks through the DOM API.
+    var __attrNs = {};
+    var __attrStorageSerial = 0;
+    function attrQualifiedName(key) {
+      var meta = __attrNs[key];
+      return meta && meta.qualifiedName != null ? meta.qualifiedName : key;
+    }
+    function lowercaseNamedPropertiesOnly() {
+      var owner = el.ownerDocument || document;
+      return elIsHtml() && !el.__nonHtmlDocument && (!owner || owner === document || owner.contentType === "text/html");
+    }
+    function attrKeyByQualifiedName(name) {
+      var names = __attrNames(id);
+      for (var i = 0; i < names.length; i++) {
+        if (attrQualifiedName(names[i]) === name) { return names[i]; }
+      }
+      return null;
+    }
+    function newAttrStorageKey(qualifiedName) {
+      if (__getAttr(id, qualifiedName) == null) { return qualifiedName; }
+      var key;
+      do { key = qualifiedName + "\uE000" + (++__attrStorageSerial); } while (__getAttr(id, key) != null);
+      return key;
+    }
     def(el, "getAttribute", function (name) {
       // HTML elements ASCII-lowercase the qualified name before matching (stored lowercased).
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      return __getAttr(id, nm);
+      var key = attrKeyByQualifiedName(nm);
+      return key == null ? null : __getAttr(id, key);
     });
     def(el, "setAttribute", function (name, value) {
       var nm = String(name);
@@ -884,10 +1021,13 @@
       // HTML elements ASCII-lowercase the attribute's qualified name.
       if (elIsHtml()) { nm = asciiLower(nm); }
       // Capture the old value before mutating, for a custom element's attributeChangedCallback.
-      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function") ? __getAttr(id, nm) : null;
+      var priorKey = attrKeyByQualifiedName(nm);
+      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function" && priorKey != null) ? __getAttr(id, priorKey) : null;
       // `value` is a non-nullable DOMString in WebIDL: undefined -> "undefined", null -> "null".
       var newVal = String(value);
-      __setAttr(id, nm, newVal);
+      var storageKey = attrKeyByQualifiedName(nm);
+      if (storageKey == null) { storageKey = nm; }
+      __setAttr(id, storageKey, newVal);
       if ((nm === "id" || nm === "name") && globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       // Mutating an aria element-reflection content attribute directly clears any explicitly set
       // attr-element slot, so the IDL getter falls back to ID lookup (see __aomNoteAttrChange).
@@ -897,9 +1037,9 @@
     def(el, "removeAttribute", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function") ? __getAttr(id, nm) : null;
-      __detachCachedAttr(nm);
-      __removeAttr(id, nm); delete __attrNs[nm]; delete __attrNodeCache[nm];
+      var key = attrKeyByQualifiedName(nm);
+      var ceOld = (typeof globalThis.__ceNoteAttrChange === "function" && key != null) ? __getAttr(id, key) : null;
+      if (key != null) { __detachCachedAttr(key); __removeAttr(id, key); delete __attrNs[key]; delete __attrNodeCache[key]; }
       if ((nm === "id" || nm === "name") && globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       if (typeof globalThis.__aomNoteAttrChange === "function") { globalThis.__aomNoteAttrChange(el, nm); }
       // Only a real removal is a mutation; removing an absent attribute is a no-op (oldValue null).
@@ -908,18 +1048,24 @@
     def(el, "hasAttribute", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      return __getAttr(id, nm) != null;
+      return attrKeyByQualifiedName(nm) != null;
     });
-    def(el, "getAttributeNames", function () { return __attrNames(id); });
+    def(el, "hasAttributes", function () { return __attrNames(id).length !== 0; });
+    def(el, "getAttributeNames", function () { return __attrNames(id).map(attrQualifiedName); });
 
     // Namespaced attribute accessors. The arena keys attrs by their qualified name; we keep the
     // namespace/prefix/localName split in __attrNs so getAttributeNS and Attr reflection work.
-    var __attrNs = {};
     def(el, "setAttributeNS", function (ns, qualifiedName, value) {
       var ex = validateAndExtract(ns, qualifiedName);
-      var key = String(qualifiedName);
+      var existing = attrKeyByNs(ex.namespace, ex.localName);
+      if (existing != null) {
+        __setAttr(id, existing, value == null ? "" : String(value));
+        return;
+      }
+      var publicName = String(qualifiedName);
+      var key = newAttrStorageKey(publicName);
       __setAttr(id, key, value == null ? "" : String(value));
-      __attrNs[key] = { namespaceURI: ex.namespace, prefix: ex.prefix, localName: ex.localName };
+      __attrNs[key] = { namespaceURI: ex.namespace, prefix: ex.prefix, localName: ex.localName, qualifiedName: publicName };
     });
     def(el, "getAttributeNS", function (ns, localName) {
       var want = (ns === undefined || ns === null || ns === "") ? null : String(ns);
@@ -960,11 +1106,15 @@
     var makeAttr = function (attrName) {
       if (__attrNodeCache[attrName]) { return __attrNodeCache[attrName]; }
       var meta = __attrNs[attrName];
-      var attr = { nodeName: attrName, name: attrName, nodeType: 2,
+      var publicName = attrQualifiedName(attrName);
+      var attr = { nodeName: publicName, name: publicName, nodeType: 2,
                namespaceURI: meta ? meta.namespaceURI : null,
                prefix: meta ? meta.prefix : null,
-               localName: meta ? meta.localName : attrName,
+               localName: meta ? meta.localName : publicName,
                specified: true };
+      def(attr, "__attrKey", attrName);
+      Object.defineProperty(attr, "isConnected", { get: function () { return false; }, enumerable: true, configurable: true });
+      Object.defineProperty(attr, "baseURI", { get: function () { return document.baseURI; }, enumerable: true, configurable: true });
       Object.defineProperty(attr, "ownerElement", {
         get: function () { return __getAttr(id, attrName) == null ? null : el; },
         enumerable: true, configurable: true
@@ -977,6 +1127,14 @@
       def(attr, "lookupNamespaceURI", function (prefix) { return nodeLookupNamespaceURI(id, prefix); });
       def(attr, "lookupPrefix", function (ns) { return nodeLookupPrefix(id, ns); });
       def(attr, "isDefaultNamespace", function (ns) { return nodeIsDefaultNamespace(id, ns); });
+      def(attr, "isSameNode", function (other) { return this === other; });
+      def(attr, "isEqualNode", function (other) {
+        if (this === other) { return true; }
+        return typeof globalThis.__nodesEqual === "function"
+          ? globalThis.__nodesEqual(this, other)
+          : false;
+      });
+      def(attr, "normalize", function () {});
       try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
       __attrNodeCache[attrName] = attr;
       return attr;
@@ -1028,7 +1186,7 @@
         if (prop === Symbol.iterator) { return function () { return __attrNames(id).map(makeAttr)[Symbol.iterator](); }; }
         if (typeof prop === "string" && /^\d+$/.test(prop)) { var n = __attrNames(id)[+prop]; return n == null ? undefined : makeAttr(n); }
         // Named property access: getNamedItem(prop).
-        if (typeof prop === "string" && __getAttr(id, prop) != null) { return makeAttr(prop); }
+        if (typeof prop === "string") { var namedKey = attrKeyByQualifiedName(prop); if (namedKey != null) { return makeAttr(namedKey); } }
         return t[prop];
       },
       has: function (t, prop) {
@@ -1043,7 +1201,11 @@
         var names = __attrNames(id), keys = [];
         for (var i = 0; i < names.length; i++) { keys.push(String(i)); }
         var seen = Object.create(null);
-        for (var j = 0; j < names.length; j++) { if (!seen[names[j]]) { seen[names[j]] = 1; keys.push(names[j]); } }
+        for (var j = 0; j < names.length; j++) {
+          var publicName = attrQualifiedName(names[j]);
+          if (lowercaseNamedPropertiesOnly() && asciiLower(publicName) !== publicName) { continue; }
+          if (!seen[publicName]) { seen[publicName] = 1; keys.push(publicName); }
+        }
         return keys;
       },
       getOwnPropertyDescriptor: function (t, prop) {
@@ -1053,9 +1215,11 @@
           return undefined;
         }
         if (prop === "length") { return { value: __attrNames(id).length, writable: false, enumerable: false, configurable: true }; }
-        if (typeof prop === "string" && __getAttr(id, prop) != null) {
+        if (typeof prop === "string") {
+          var namedKey = attrKeyByQualifiedName(prop);
+          if (namedKey == null || (lowercaseNamedPropertiesOnly() && asciiLower(prop) !== prop)) { return Object.getOwnPropertyDescriptor(t, prop); }
           // A named (qualified-name) own property: non-enumerable, holds the Attr.
-          return { value: makeAttr(prop), writable: false, enumerable: false, configurable: true };
+          return { value: makeAttr(namedKey), writable: false, enumerable: false, configurable: true };
         }
         return Object.getOwnPropertyDescriptor(t, prop);
       }
@@ -1084,7 +1248,8 @@
     def(el, "getAttributeNode", function (name) {
       var nm = String(name);
       if (elIsHtml()) { nm = asciiLower(nm); }
-      return __getAttr(id, nm) == null ? null : makeAttr(nm);
+      var key = attrKeyByQualifiedName(nm);
+      return key == null ? null : makeAttr(key);
     });
     def(el, "getAttributeNodeNS", function (ns, localName) {
       var want = (ns === undefined || ns === null || ns === "") ? null : String(ns);
@@ -1102,17 +1267,22 @@
       }
       var ns = attr.namespaceURI || null;
       var ln = attr.localName != null ? String(attr.localName) : String(attr.name);
-      var key = String(attr.name);
+      var publicName = String(attr.name);
       // Existing attribute with the same namespace + localName?
       var oldKey = attrKeyByNs(ns, ln);
       var oldAttr = null;
+      var key;
       if (oldKey != null) {
         oldAttr = makeAttr(oldKey);
-        if (oldKey !== key) { __removeAttr(id, oldKey); delete __attrNs[oldKey]; delete __attrNodeCache[oldKey]; }
+        __detachCachedAttr(oldKey);
+        delete __attrNodeCache[oldKey];
+        key = oldKey;
+      } else {
+        key = newAttrStorageKey(publicName);
       }
       var newVal = attr.value == null ? "" : String(attr.value);
       __setAttr(id, key, newVal);
-      __attrNs[key] = { namespaceURI: ns, prefix: attr.prefix || null, localName: ln };
+      __attrNs[key] = { namespaceURI: ns, prefix: attr.prefix || null, localName: ln, qualifiedName: publicName };
       // Adopt the SAME Attr object: re-bind its value / ownerElement getters to this element's live
       // arena attribute, and register it as the canonical cached node so getAttributeNode /
       // el.attributes[i] return the identical object (per spec the node is moved, not copied).
@@ -1140,12 +1310,15 @@
         if (vc === 0x3E || vc === 0x20 || vc === 0x09 || vc === 0x0A || vc === 0x0C || vc === 0x0D) { invalidCharacterError(); }
       }
       if (elIsHtml()) { qn = asciiLower(qn); }
-      var present = __getAttr(id, qn) != null;
+      var key = attrKeyByQualifiedName(qn);
+      var present = key != null;
       if (!present) {
         if (force === undefined || force === true) { __setAttr(id, qn, ""); return true; }
         return false;
       }
-      if (force === undefined || force === false) { __removeAttr(id, qn); delete __attrNs[qn]; return false; }
+      if (force === undefined || force === false) {
+        __detachCachedAttr(key); __removeAttr(id, key); delete __attrNs[key]; delete __attrNodeCache[key]; return false;
+      }
       return true;
     });
 
@@ -1156,24 +1329,33 @@
       return child;
     });
     def(el, "removeChild", function (child) {
-      var cid = requireNodeArg(child, "removeChild");
+      var cid = nodeIdOf(child);
+      // Lightweight frame documents are still Nodes even though they do not occupy an arena slot.
+      // They cannot be a child of an arena element, so removal reaches the normal NotFoundError.
+      if (cid < 0 && (!child || typeof child.nodeType !== "number")) {
+        throw new TypeError("Failed to execute 'removeChild': parameter is not of type 'Node'.");
+      }
       if (__parent(cid) !== id) { notFoundError("The node to be removed is not a child of this node."); }
       __removeChild(id, cid);
       if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       return child;
     });
+    def(el, "normalize", function () { normalizeNode(id); });
     def(el, "insertBefore", function (newNode, refNode) {
+      if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
       var cid = requireNodeArg(newNode, "insertBefore");
       var refId = (refNode == null) ? -1 : nodeIdOf(refNode);
-      if (refNode != null && refId < 0) { notFoundError("The reference child is not a child of this node."); }
+      if (refNode != null && refId < 0) { throw new TypeError("Failed to execute 'insertBefore': parameter 2 is not of type 'Node'."); }
       ensurePreInsertValid(id, cid, refId);
       insertNode(id, cid, refId);
       return newNode;
     });
     def(el, "replaceChild", function (newNode, oldNode) {
       var nid = requireNodeArg(newNode, "replaceChild"), oid = requireNodeArg(oldNode, "replaceChild");
-      if (__parent(oid) !== id) { notFoundError("The node to be replaced is not a child of this node."); }
+      var pt = __nodeType(id);
+      if (pt !== 1 && pt !== 9 && pt !== 11) { hierarchyRequestError(); }
       if (isInclusiveAncestor(nid, id)) { hierarchyRequestError("The new child element contains the parent."); }
+      if (__parent(oid) !== id) { notFoundError("The node to be replaced is not a child of this node."); }
       // The replacement must itself be insertable here: not a Document, and (since the parent is an
       // Element) not a DocumentType. Checked before any mutation so a failure leaves the tree intact.
       var nnt = __nodeType(nid);
@@ -1186,6 +1368,7 @@
         var ni = sibs.indexOf(nid);
         ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1;
       }
+      ensurePreInsertValid(id, nid, ref, oid);
       __removeChild(id, oid);
       if (globalThis.__documentNamedInvalidate) { globalThis.__documentNamedInvalidate(); }
       insertNode(id, nid, ref);
@@ -1380,6 +1563,8 @@
 
   // --- document --------------------------------------------------------------------------------
   var document = {};
+  def(document, NODE, 0);
+  def(document, "__nodeRealmToken", __nodeRealmToken);
   def(document, "getElementById", function (idStr) { var n = __getElementById(String(idStr)); return n >= 0 ? wrap(n) : null; });
   def(document, "getElementsByTagName", function (tag) {
     var qn = String(tag);
@@ -1494,6 +1679,8 @@
       specified: true,
       ownerElement: null
     };
+    Object.defineProperty(attr, "isConnected", { get: function () { return false; }, enumerable: true, configurable: true });
+    Object.defineProperty(attr, "baseURI", { get: function () { return document.baseURI; }, enumerable: true, configurable: true });
     Object.defineProperty(attr, "value", {
       get: function () { return value; },
       set: function (v) { value = v == null ? "" : String(v); },
@@ -1519,6 +1706,14 @@
     def(attr, "isDefaultNamespace", function (ns) {
       var oe = this.ownerElement; return oe && oe.isDefaultNamespace ? oe.isDefaultNamespace(ns) : (ns == null || ns === "");
     });
+    def(attr, "isSameNode", function (other) { return this === other; });
+    def(attr, "isEqualNode", function (other) {
+      if (this === other) { return true; }
+      return typeof globalThis.__nodesEqual === "function"
+        ? globalThis.__nodesEqual(this, other)
+        : false;
+    });
+    def(attr, "normalize", function () {});
     try { if (globalThis.Attr && globalThis.Attr.prototype) { Object.setPrototypeOf(attr, globalThis.Attr.prototype); } } catch (e) {}
     return attr;
   }
@@ -1606,9 +1801,69 @@
     if (nid >= 0) { var p = __parent(nid); if (p >= 0) { __removeChild(p, nid); } }
     return node;
   });
-  // importNode(node, deep): return a clone of `node` belonging to this document. Cross-document
-  // ownership isn't tracked, so this is a plain clone (the original stays put).
+  // Rebuild a node from another Lumen browsing-context realm in this realm's DOM arena. Attribute and
+  // child access happens through the foreign wrapper, while every factory call creates a local node.
+  function importForeignNode(node, deep) {
+    if (!node || typeof node.nodeType !== "number") {
+      throw new TypeError("Failed to execute 'importNode' on 'Document': parameter 1 is not of type 'Node'.");
+    }
+    var type = node.nodeType, copy;
+    if (type === 1) {
+      var localName = node.localName || node.nodeName || node.tagName || "div";
+      var qualifiedName = node.prefix ? (node.prefix + ":" + localName) : localName;
+      copy = document.createElementNS
+        ? document.createElementNS(node.namespaceURI == null ? null : node.namespaceURI, qualifiedName)
+        : document.createElement(qualifiedName);
+      var attrs = node.attributes;
+      if (attrs) {
+        for (var ai = 0; ai < attrs.length; ai++) {
+          var attr = attrs.item ? attrs.item(ai) : attrs[ai];
+          if (!attr) { continue; }
+          if (attr.namespaceURI != null && copy.setAttributeNS) {
+            copy.setAttributeNS(attr.namespaceURI, attr.name, attr.value);
+          } else if (copy.setAttribute) {
+            copy.setAttribute(attr.name, attr.value);
+          }
+        }
+      }
+    } else if (type === 3) {
+      copy = document.createTextNode(node.data == null ? "" : node.data);
+    } else if (type === 8) {
+      copy = document.createComment(node.data == null ? "" : node.data);
+    } else if (type === 11) {
+      copy = document.createDocumentFragment();
+    } else if (type === 10) {
+      copy = document.implementation.createDocumentType(
+        node.name || "html", node.publicId || "", node.systemId || ""
+      );
+    } else if (type === 7 && document.createProcessingInstruction) {
+      copy = document.createProcessingInstruction(node.target || node.nodeName, node.data || "");
+    } else {
+      throw new globalThis.DOMException("The node type is not supported.", "NotSupportedError");
+    }
+    if (deep && type === 1 && typeof node.innerHTML === "string" && "innerHTML" in copy) {
+      // String-valued accessors cross Lumen realms reliably even when object-valued navigation
+      // accessors do not. Parsing the foreign element's contents preserves its complete subtree.
+      copy.innerHTML = node.innerHTML;
+    } else if (deep) {
+      // Cross-context NodeList proxies can report an empty length even when navigation accessors
+      // expose the subtree. Walk the sibling chain, snapshotting `nextSibling` before insertion.
+      var child = node.firstChild;
+      while (child) {
+        var next = child.nextSibling;
+        copy.appendChild(importForeignNode(child, true));
+        child = next;
+      }
+    }
+    return copy;
+  }
+  def(globalThis, "__importForeignNode", importForeignNode);
+  // importNode(node, deep): return a clone belonging to this document. Same-realm nodes use the
+  // native arena clone; foreign iframe nodes are serialized into this realm first.
   def(document, "importNode", function (node, deep) {
+    if (node && node.__nodeRealmToken && node.__nodeRealmToken !== __nodeRealmToken) {
+      return importForeignNode(node, !!deep);
+    }
     if (node == null || typeof node.cloneNode !== "function") { return node; }
     return node.cloneNode(!!deep);
   });

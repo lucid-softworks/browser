@@ -9,35 +9,28 @@ pub fn cascade(
     doc: &dom::Document,
     sheets: &[css::Stylesheet],
 ) -> HashMap<dom::NodeId, ComputedStyle> {
-    cascade_locked(doc, sheets, None).0
+    cascade_document(doc, sheets, None).0
 }
 
 /// Like [`cascade`], but `os_dark` is the OS appearance for this document (true = Dark), applied
-/// to `@media (prefers-color-scheme)` and the `color-scheme` resolution *atomically* with the
-/// cascade (set under the cascade lock so a concurrent cascade can't clobber the shared flag), and
-/// also returns the root's resolved *used* color scheme (true = dark). The engine stores that on
-/// its layout cache so the canvas background doesn't have to re-read the racy process-global. Pass
-/// this rather than calling [`set_color_scheme_dark`] separately before [`cascade`].
+/// to `@media (prefers-color-scheme)` and the `color-scheme` resolution on the calling thread.
+/// Also returns the root's resolved *used* color scheme (true = dark), which the engine stores
+/// alongside its cached layout for later canvas painting.
 pub fn cascade_with_root_scheme(
     doc: &dom::Document,
     sheets: &[css::Stylesheet],
     os_dark: bool,
 ) -> (HashMap<dom::NodeId, ComputedStyle>, bool) {
-    cascade_locked(doc, sheets, Some(os_dark))
+    cascade_document(doc, sheets, Some(os_dark))
 }
 
-/// The shared, lock-held cascade body. When `os_dark` is `Some`, the OS-appearance flag is set
-/// under the lock first (so `@media (prefers-color-scheme)` and the `color-scheme` resolution see a
-/// stable value); when `None`, the previously-set global is used as-is (back-compat for callers
-/// that set it themselves). Returns the styles plus the root's resolved used color scheme.
-pub(crate) fn cascade_locked(
+/// The shared cascade body. When `os_dark` is `Some`, update this thread's appearance first;
+/// otherwise use its existing appearance. Returns styles and the root's used color scheme.
+pub(crate) fn cascade_document(
     doc: &dom::Document,
     sheets: &[css::Stylesheet],
     os_dark: Option<bool>,
 ) -> (HashMap<dom::NodeId, ComputedStyle>, bool) {
-    // Hold the cascade lock for the whole body: the OS-appearance flag and the root-color-scheme
-    // global are written and read back here, so concurrent cascades must not interleave.
-    let _cascade_guard = CASCADE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dark) = os_dark {
         set_color_scheme_dark(dark);
     }
@@ -261,7 +254,6 @@ pub fn cascade_subtree(
     root_id: dom::NodeId,
     sheets: &[css::Stylesheet],
 ) -> HashMap<dom::NodeId, ComputedStyle> {
-    let _cascade_guard = CASCADE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // @property registrations from this document's sheets (last wins on duplicate names).
     {
         let mut reg: Vec<css::PropertyRule> = Vec::new();
@@ -305,14 +297,13 @@ pub fn cascade_subtree(
 }
 
 /// The current viewport metrics `(width, height, device_pixel_ratio)` in CSS px — what `@media`
-/// queries are evaluated against. Lets callers save/restore around a temporary override (e.g. an
+/// queries are evaluated against on the calling thread. Lets callers save/restore an override (e.g. an
 /// iframe's own size for a subtree cascade).
 pub fn viewport_metrics() -> (f32, f32, f32) {
-    use std::sync::atomic::Ordering;
     (
-        f32::from_bits(VIEWPORT_W_BITS.load(Ordering::Relaxed)),
-        f32::from_bits(VIEWPORT_H_BITS.load(Ordering::Relaxed)),
-        f32::from_bits(VIEWPORT_DPR_BITS.load(Ordering::Relaxed)),
+        f32::from_bits(VIEWPORT_W_BITS.get()),
+        f32::from_bits(VIEWPORT_H_BITS.get()),
+        f32::from_bits(VIEWPORT_DPR_BITS.get()),
     )
 }
 
@@ -529,29 +520,41 @@ impl<'a> SelectorIndex<'a> {
 // `@container` conditions, and viewport units (`vw`/`vh`/`%`) during the cascade. The engine sets
 // these via `set_viewport_metrics` before each cascade, so they reflect the real window size and
 // backing scale — and because the cascade re-runs on resize, media/container queries and viewport
-// units respond to window resizing. Stored as f32 bits in atomics (0 = unset → fall back below).
-pub(crate) static VIEWPORT_W_BITS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-pub(crate) static VIEWPORT_H_BITS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-pub(crate) static VIEWPORT_DPR_BITS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+// units respond to window resizing. Each tab's engine and JS worker install their own context
+// on the thread doing the cascade. Stored as f32 bits (0 = unset → fall back below).
+thread_local! {
+    pub(crate) static VIEWPORT_W_BITS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    pub(crate) static VIEWPORT_H_BITS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    pub(crate) static VIEWPORT_DPR_BITS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
 
-/// Live OS appearance used to evaluate `@media (prefers-color-scheme: dark|light)` during the
-/// cascade. `true` = Dark. The engine sets this via [`set_color_scheme_dark`] on launch and on
-/// every Light/Dark toggle; the cascade re-runs (layout cache invalidated) so dark-mode stylesheet
-/// rules take effect. Mirrors the same flag in the `js` crate (which drives the JS `matchMedia`).
-pub(crate) static COLOR_SCHEME_DARK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// Live OS appearance used to evaluate `@media (prefers-color-scheme: dark|light)` during the
+// cascade. `true` = Dark. The engine sets this via [`set_color_scheme_dark`] on launch and on
+// every Light/Dark toggle; the cascade re-runs (layout cache invalidated) so dark-mode stylesheet
+// rules take effect. Mirrors the same flag in the `js` crate (which drives the JS `matchMedia`).
+thread_local! {
+    pub(crate) static COLOR_SCHEME_DARK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
-/// The root element's used `font-size` in CSS px — the basis for `rem` units. Set per cascade by a
-/// pre-pass that resolves `<html>`'s font-size (so `html { font-size: 62.5% }` makes `1rem` = 10px).
-/// Stored as f32 bits; 0 = unset → callers fall back to the 16px initial.
-pub(crate) static ROOT_EM_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// The root element's used `font-size` in CSS px — the basis for `rem` units. Set per cascade by a
+// pre-pass that resolves `<html>`'s font-size (so `html { font-size: 62.5% }` makes `1rem` = 10px).
+// Stored as f32 bits; 0 = unset → callers fall back to the 16px initial.
+thread_local! {
+    pub(crate) static ROOT_EM_BITS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// The root font-size (px) for resolving `rem`, or the 16px initial when unset.
 pub(crate) fn root_em() -> f32 {
-    let bits = ROOT_EM_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    let bits = ROOT_EM_BITS.get();
     if bits == 0 {
         16.0
     } else {
@@ -560,74 +563,67 @@ pub(crate) fn root_em() -> f32 {
 }
 
 fn set_root_em(px: f32) {
-    ROOT_EM_BITS.store(px.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    ROOT_EM_BITS.set(px.max(0.0).to_bits());
 }
 
 /// Set the logical viewport size (CSS px) and device pixel ratio used by the cascade for media
-/// queries and viewport units. Call before [`cascade`] whenever the viewport changes.
+/// queries and viewport units on the calling thread. Call before [`cascade`] whenever the viewport changes.
 pub fn set_viewport_metrics(width: f32, height: f32, device_pixel_ratio: f32) {
-    use std::sync::atomic::Ordering;
-    VIEWPORT_W_BITS.store(width.max(1.0).to_bits(), Ordering::Relaxed);
-    VIEWPORT_H_BITS.store(height.max(1.0).to_bits(), Ordering::Relaxed);
-    VIEWPORT_DPR_BITS.store(device_pixel_ratio.max(0.1).to_bits(), Ordering::Relaxed);
+    VIEWPORT_W_BITS.set(width.max(1.0).to_bits());
+    VIEWPORT_H_BITS.set(height.max(1.0).to_bits());
+    VIEWPORT_DPR_BITS.set(device_pixel_ratio.max(0.1).to_bits());
 }
 
 /// Set whether the effective OS appearance is Dark, used to evaluate
 /// `@media (prefers-color-scheme: dark|light)` in the cascade. Call before [`cascade`] (the engine
 /// does this on launch and on every appearance toggle).
 pub fn set_color_scheme_dark(is_dark: bool) {
-    COLOR_SCHEME_DARK.store(is_dark, std::sync::atomic::Ordering::Relaxed);
+    COLOR_SCHEME_DARK.set(is_dark);
 }
 
-/// Whether forced colors mode is active (drives `@media (forced-colors)` and the cascade's
-/// system-color override). Set by the engine (e.g. from an OS high-contrast setting / test config).
-pub(crate) static FORCED_COLORS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// Whether forced colors mode is active (drives `@media (forced-colors)` and the cascade's
+// system-color override). Set by the engine (e.g. from an OS high-contrast setting / test config).
+thread_local! {
+    pub(crate) static FORCED_COLORS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 pub fn set_forced_colors(active: bool) {
-    FORCED_COLORS.store(active, std::sync::atomic::Ordering::Relaxed);
+    FORCED_COLORS.set(active);
 }
 pub fn forced_colors_active() -> bool {
     // Honour the LUCID_FORCED_COLORS env var (read once) so a test run can enable forced colors for
     // the whole process without per-call engine plumbing.
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    FORCED_COLORS.load(std::sync::atomic::Ordering::Relaxed)
-        || *ENV.get_or_init(|| std::env::var("LUCID_FORCED_COLORS").is_ok())
+    FORCED_COLORS.get() || *ENV.get_or_init(|| std::env::var("LUCID_FORCED_COLORS").is_ok())
 }
 
 /// Whether the effective OS appearance is currently Dark (drives `prefers-color-scheme`).
 pub(crate) fn color_scheme_dark() -> bool {
-    COLOR_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
+    COLOR_SCHEME_DARK.get()
 }
 
-/// The root's *used* color scheme (true = dark), resolved by [`cascade`] from the page's
-/// `color-scheme` (off `<html>`/`<body>`/`<meta>`) combined with the OS appearance. Seeds the dark
-/// UA defaults: the initial/inherited text color ([`ua_default_text_color`]) and the canvas
-/// background ([`ua_default_canvas_color`], read by the engine's `page_background`). Defaults to
-/// light (false). Re-resolved every cascade, so an OS Light/Dark toggle (which re-runs the cascade)
-/// flips both the `@media` gating the page's `color-scheme` AND this used scheme.
-pub(crate) static ROOT_USED_SCHEME_DARK: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Serializes [`cascade`] across threads. `cascade` resolves the root color scheme into the
-/// process-global [`ROOT_USED_SCHEME_DARK`] and then reads it back while building UA defaults, so
-/// two concurrent cascades on different documents could otherwise clobber each other's flag. The
-/// engine runs one cascade at a time, so this only matters for parallel `cargo test`; the lock is
-/// cheap and held only for the (fast) cascade body. Poisoning is irrelevant — we only need mutual
-/// exclusion — so the guard ignores it.
-pub(crate) static CASCADE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// The root's *used* color scheme (true = dark), resolved by [`cascade`] from the page's
+// `color-scheme` (off `<html>`/`<body>`/`<meta>`) combined with the OS appearance. Seeds the dark
+// UA defaults: the initial/inherited text color ([`ua_default_text_color`]) and the canvas
+// background ([`ua_default_canvas_color`], read by the engine's `page_background`). Defaults to
+// light (false). Re-resolved every cascade, so an OS Light/Dark toggle (which re-runs the cascade)
+// flips both the `@media` gating the page's `color-scheme` AND this used scheme.
+thread_local! {
+    pub(crate) static ROOT_USED_SCHEME_DARK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 thread_local! {
     /// Registered custom properties (`@property`) in effect for the current cascade. Set at the
-    /// start of [`cascade_locked`] from the author sheets; read by `compute_element_style` to seed
+    /// start of [`cascade_document`] from the author sheets; read by `compute_element_style` to seed
     /// each element's registered-property initial values into its `custom_props` environment. Only
-    /// populated for the duration of one cascade (which holds [`CASCADE_LOCK`], so this is
-    /// effectively single-threaded). Keyed by property name (`--x`).
+    /// populated on the calling thread. Keyed by property name (`--x`).
     pub(crate) static REGISTERED_PROPERTIES: std::cell::RefCell<Vec<css::PropertyRule>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
     /// `@namespace` prefix bindings in effect for the current cascade: `(prefix -> uri)` plus an
-    /// optional default namespace (empty prefix). Set at the start of [`cascade_locked`]; read by
+    /// optional default namespace (empty prefix). Set at the start of [`cascade_document`]; read by
     /// `compound_matches` to resolve a selector's namespace component against the element's
     /// namespace. Empty when no `@namespace` rule is present (the common case), in which case
     /// namespace constraints are ignored and matching behaves exactly as before.
@@ -667,11 +663,11 @@ impl NamespaceEnv {
 
 /// Whether the root opted into a dark color scheme for this cascade (UA dark canvas + light text).
 pub fn root_used_scheme_dark() -> bool {
-    ROOT_USED_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
+    ROOT_USED_SCHEME_DARK.get()
 }
 
 pub(crate) fn set_root_used_scheme_dark(dark: bool) {
-    ROOT_USED_SCHEME_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+    ROOT_USED_SCHEME_DARK.set(dark);
 }
 
 /// UA initial/default text color: black on a light page, light grey (`#e8e8e8`) when the root used
@@ -700,22 +696,25 @@ pub fn ua_default_canvas_color() -> (u8, u8, u8) {
 // `:focus-within`/`:focus-visible` during the cascade. The engine sets these via
 // `set_interaction_state` before each cascade. We store the hovered/focused node ids (the
 // `usize` inside a `dom::NodeId`); `usize::MAX` means "none".
-pub(crate) static HOVERED_NODE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
-pub(crate) static FOCUSED_NODE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(usize::MAX);
+thread_local! {
+    pub(crate) static HOVERED_NODE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
+thread_local! {
+    pub(crate) static FOCUSED_NODE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
 
 /// Set the currently hovered and focused node ids (as the raw `usize` of their [`dom::NodeId`]),
 /// or `None` for neither. Call before [`cascade`] whenever interaction state changes so
 /// `:hover`/`:focus`/… re-evaluate. Mirrors [`set_viewport_metrics`].
 pub fn set_interaction_state(hovered: Option<usize>, focused: Option<usize>) {
-    use std::sync::atomic::Ordering;
-    HOVERED_NODE.store(hovered.unwrap_or(usize::MAX), Ordering::Relaxed);
-    FOCUSED_NODE.store(focused.unwrap_or(usize::MAX), Ordering::Relaxed);
+    HOVERED_NODE.set(hovered.unwrap_or(usize::MAX));
+    FOCUSED_NODE.set(focused.unwrap_or(usize::MAX));
 }
 
 pub(crate) fn interaction_hovered() -> Option<usize> {
-    let v = HOVERED_NODE.load(std::sync::atomic::Ordering::Relaxed);
+    let v = HOVERED_NODE.get();
     if v == usize::MAX {
         None
     } else {
@@ -723,7 +722,7 @@ pub(crate) fn interaction_hovered() -> Option<usize> {
     }
 }
 pub(crate) fn interaction_focused() -> Option<usize> {
-    let v = FOCUSED_NODE.load(std::sync::atomic::Ordering::Relaxed);
+    let v = FOCUSED_NODE.get();
     if v == usize::MAX {
         None
     } else {
@@ -732,7 +731,7 @@ pub(crate) fn interaction_focused() -> Option<usize> {
 }
 
 pub(crate) fn viewport_width() -> f32 {
-    let b = VIEWPORT_W_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    let b = VIEWPORT_W_BITS.get();
     if b == 0 {
         1280.0
     } else {
@@ -740,7 +739,7 @@ pub(crate) fn viewport_width() -> f32 {
     }
 }
 pub(crate) fn viewport_height() -> f32 {
-    let b = VIEWPORT_H_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    let b = VIEWPORT_H_BITS.get();
     if b == 0 {
         800.0
     } else {
@@ -748,7 +747,7 @@ pub(crate) fn viewport_height() -> f32 {
     }
 }
 pub(crate) fn viewport_dpr() -> f32 {
-    let b = VIEWPORT_DPR_BITS.load(std::sync::atomic::Ordering::Relaxed);
+    let b = VIEWPORT_DPR_BITS.get();
     if b == 0 {
         2.0
     } else {
@@ -819,6 +818,7 @@ pub(crate) fn compute_element_style<'a>(
 ) -> (ComputedStyle, Arc<HashMap<String, String>>) {
     // Start from inherited values; non-inherited properties get reset below.
     let mut style = ComputedStyle {
+        extra_properties: parent.extra_properties.clone(),
         custom_props: empty_vars(),
         direction: parent.direction,       // inherited
         writing_mode: parent.writing_mode, // inherited
@@ -863,8 +863,16 @@ pub(crate) fn compute_element_style<'a>(
         width: None,
         width_pct: None,
         aspect_ratio_set: false,
+        aspect_ratio: None,
+        aspect_ratio_auto: false,
         height_pct: None,
         height: None,
+        width_authored: false,
+        height_authored: false,
+        contain_intrinsic_width: None,
+        contain_intrinsic_height: None,
+        contain_width: false,
+        contain_height: false,
         min_width: None,
         max_width: None,
         min_height: None,
@@ -881,13 +889,26 @@ pub(crate) fn compute_element_style<'a>(
         flex_direction: FlexDirection::Row,
         flex_wrap: FlexWrap::NoWrap,
         justify_content: JustifyContent::FlexStart,
+        justify_content_css: "normal".to_string(),
         align_items: AlignItems::Stretch,
+        align_items_css: "normal".to_string(),
+        // `justify-items: legacy <position>` is the one form that passes to descendants; all other
+        // parent values leave an undeclared child at the initial `normal`.
+        justify_items: if parent.justify_items.starts_with("legacy ") {
+            parent.justify_items.clone()
+        } else {
+            "normal".to_string()
+        },
         align_content: None,
+        align_content_css: "normal".to_string(),
         flex_grow: 0.0,
         flex_shrink: 1.0,
         flex_basis: None,
         flex_basis_pct: None,
+        flex_basis_css: "auto".to_string(),
         align_self: AlignSelf::Auto,
+        align_self_css: "auto".to_string(),
+        justify_self: "auto".to_string(),
         order: 0,
         row_gap: 0.0,
         column_gap: 0.0,
@@ -917,6 +938,7 @@ pub(crate) fn compute_element_style<'a>(
         // Paint extras: opacity & border-radius are not inherited.
         opacity: 1.0,
         border_radius: 0.0,
+        border_radius_pct: None,
         background_gradient: None,
         background_image_url: None,
         background_size: BgSize::Auto,
@@ -934,6 +956,19 @@ pub(crate) fn compute_element_style<'a>(
         // `color-scheme` inherits (initial `Normal`).
         color_scheme: parent.color_scheme,
     };
+    // These CSSOM-only entries are non-inherited; `extra_properties` otherwise begins as the
+    // inherited text-property set.
+    for property in [
+        "contain",
+        "content-visibility",
+        "contain-intrinsic-size",
+        "contain-intrinsic-width",
+        "contain-intrinsic-height",
+        "contain-intrinsic-inline-size",
+        "contain-intrinsic-block-size",
+    ] {
+        style.extra_properties.remove(property);
+    }
     if parent_hidden {
         style.display_none = true;
         style.display = Display::None;
@@ -1306,6 +1341,7 @@ pub(crate) fn cascade_pseudo(
     ps.z_index = None;
     ps.opacity = 1.0;
     ps.border_radius = 0.0;
+    ps.border_radius_pct = None;
     ps.display = Display::Inline; // generated content is inline by default
     ps.display_block = false;
     ps.content = None;
@@ -1445,6 +1481,7 @@ pub fn compute_pseudo_style(
     ps.z_index = None;
     ps.opacity = 1.0;
     ps.border_radius = 0.0;
+    ps.border_radius_pct = None;
     ps.display = Display::Inline; // generated content is inline by default
     ps.display_block = false;
     ps.display_none = false;
