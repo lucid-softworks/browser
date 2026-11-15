@@ -312,6 +312,32 @@ impl Tab {
         self.publish(true);
     }
 
+    fn follow_page_navigation(&mut self) {
+        // One request per event-loop turn keeps a redirecting page from starving commands.
+        if let Some((url, replace)) = self.engine.take_navigation_request() {
+            if engine::Engine::is_fragment_navigation(&self.snapshot.url, &url) {
+                if replace {
+                    self.history.replace(url.clone());
+                } else {
+                    self.history.push(url.clone());
+                }
+                self.snapshot.url = url;
+                self.publish(true);
+            } else {
+                self.navigate(url, !replace);
+            }
+        }
+    }
+
+    fn traverse_history_url(&mut self, url: String) {
+        if self.engine.traverse_same_document_history(&url) {
+            self.snapshot.url = url;
+            self.publish(true);
+        } else {
+            self.navigate(url, false);
+        }
+    }
+
     fn run(mut self, receiver: mpsc::Receiver<Message>, shutdown: &AtomicBool) {
         self.publish(true);
         let mut pending = None;
@@ -331,6 +357,7 @@ impl Tab {
                 | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(Message::Barrier(reply)) => {
                     self.engine.tick();
+                    self.follow_page_navigation();
                     self.publish(true);
                     last_tick = Instant::now();
                     let _ = reply.send(());
@@ -368,6 +395,7 @@ impl Tab {
                 }
                 last_tick = Instant::now();
             }
+            self.follow_page_navigation();
         }
     }
 
@@ -379,13 +407,13 @@ impl Tab {
             }
             Command::Back => {
                 if let Some(url) = self.history.back() {
-                    self.navigate(url, false);
+                    self.traverse_history_url(url);
                 }
                 return;
             }
             Command::Forward => {
                 if let Some(url) = self.history.forward() {
-                    self.navigate(url, false);
+                    self.traverse_history_url(url);
                 }
                 return;
             }
@@ -416,16 +444,7 @@ impl Tab {
                     self.event(Event::Select(hit));
                     return;
                 }
-                let link = self.engine.link_at(x, y);
-                let dirty = self.engine.dispatch_click(x, y);
-                // Matches the existing Swift shell: dispatch_click exposes only DOM dirtiness,
-                // not the event's defaultPrevented flag. A future engine API can report whether
-                // link activation was cancelled without injecting shell-specific page listeners.
-                if let Some(url) = link {
-                    self.navigate(url, true);
-                    return;
-                }
-                dirty
+                self.engine.dispatch_click(x, y)
             }
             Command::Mouse { kind, x, y } => self.engine.dispatch_mouse(&kind, x, y),
             Command::Move { x, y } => {

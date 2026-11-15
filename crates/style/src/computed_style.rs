@@ -106,6 +106,7 @@ impl Default for ComputedStyle {
             letter_spacing: 0.0,
             text_indent: 0.0,
             white_space: WhiteSpace::Normal,
+            word_break: WordBreak::Normal,
             visibility: Visibility::Visible,
             list_style_type: ListStyleType::Disc,
             underline: false,
@@ -520,6 +521,12 @@ impl ComputedStyle {
                 WhiteSpace::Pre => "pre",
                 WhiteSpace::PreWrap => "pre-wrap",
                 WhiteSpace::PreLine => "pre-line",
+            }
+            .to_string(),
+            "word-break" => match self.word_break {
+                WordBreak::Normal => "normal",
+                WordBreak::BreakAll => "break-all",
+                WordBreak::KeepAll => "keep-all",
             }
             .to_string(),
             "visibility" => match self.visibility {

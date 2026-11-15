@@ -173,7 +173,9 @@ pub(crate) fn layout_grid(
                 w += cs.column_gap;
             }
         }
-        let child = &mut boxx.children[p.idx];
+        // Keep the structural children intact for final placement, notably nested table rows.
+        let mut probe = boxx.children[p.idx].clone();
+        let child = &mut probe;
         let m = child.dimensions.margin;
         let b = child.dimensions.border;
         let pad = child.dimensions.padding;
@@ -508,7 +510,7 @@ pub(crate) fn placement_to_cell(
                         1
                     }
                 }
-                style::GridEnd::Auto => 1,
+                style::GridEnd::Auto => pl.start_span.unwrap_or(1).max(1) as usize,
             };
             let start = pl
                 .start

@@ -174,6 +174,7 @@ impl Engine {
         js::set_active_selection(None); // and no programmatic (::selection) selection
         js::set_interaction_state(None, None);
         js::take_pending_scroll();
+        js::take_pending_navigation();
         js::set_cross_origin_isolated(false);
         js::set_response_body_size(0);
         js::clear_active_highlights(); // and no CSS Custom Highlight registrations
@@ -862,7 +863,7 @@ impl Engine {
             _ => return,
         };
         let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
-        collect_node_rects(&cache.root, &mut rects);
+        collect_node_rects(&cache.root, &self.state, &cache.styles, &mut rects);
         let inv = if self.scale > 0.0 {
             1.0 / self.scale
         } else {
@@ -1197,7 +1198,7 @@ impl Engine {
         if let Some(node) = self.inspect_node {
             if let Some(cache) = &self.layout_cache {
                 let mut rects: HashMap<usize, layout::Rect> = HashMap::new();
-                collect_node_rects(&cache.root, &mut rects);
+                collect_node_rects(&cache.root, &self.state, &cache.styles, &mut rects);
                 if let Some(r) = rects.get(&node.0) {
                     let x = r.x.round() as i32;
                     let y = (r.y - scroll_y).round() as i32;
