@@ -76,6 +76,35 @@ mod tests {
     }
 
     #[test]
+    fn grid_area_spans_and_invalid_numbers() {
+        let mut s = ComputedStyle::default();
+        apply_declaration(
+            &mut s,
+            "grid-area",
+            "span 2 / span 3",
+            &ComputedStyle::default(),
+            (0, 0, 0),
+            (0, 0, 0),
+            None,
+        );
+        assert_eq!(s.grid_row.unwrap().start_span, Some(2));
+        assert_eq!(s.grid_column.unwrap().start_span, Some(3));
+        let before = (s.grid_row, s.grid_column);
+        for bad in ["0", "span 0", "span -2", "span2", "1 / 0", "1 / span0"] {
+            apply_declaration(
+                &mut s,
+                "grid-area",
+                bad,
+                &ComputedStyle::default(),
+                (0, 0, 0),
+                (0, 0, 0),
+                None,
+            );
+            assert_eq!((s.grid_row, s.grid_column), before, "{bad}");
+        }
+    }
+
+    #[test]
     fn linear_gradient_angle_two_stops() {
         match grad("linear-gradient(90deg, red, blue)") {
             Gradient::Linear { angle_deg, stops } => {
@@ -1014,7 +1043,10 @@ mod tests {
         assert_eq!(row.unwrap().end, GridEnd::Line(4));
 
         // All-auto resolves to no placement at all, not a placement full of defaults.
-        assert_eq!(placement("grid-area: auto / auto / auto / auto"), (None, None));
+        assert_eq!(
+            placement("grid-area: auto / auto / auto / auto"),
+            (None, None)
+        );
     }
 
     #[test]

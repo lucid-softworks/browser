@@ -629,7 +629,7 @@ pub(crate) fn parse_grid_placement(val: &str) -> Option<GridPlacement> {
         }
     };
 
-    if start.is_none() && matches!(end, GridEnd::Auto) {
+    if start.is_none() && span_from_start.is_none() && matches!(end, GridEnd::Auto) {
         return None;
     }
     Some(GridPlacement {
@@ -649,9 +649,11 @@ fn is_resolvable_grid_line(s: &str) -> bool {
     if s == "auto" {
         return true;
     }
-    match s.strip_prefix("span") {
-        Some(n) => n.trim().parse::<i32>().is_ok(),
-        None => s.parse::<i32>().is_ok(),
+    let tokens: Vec<_> = s.split_whitespace().collect();
+    match tokens.as_slice() {
+        ["span", n] => n.parse::<i32>().is_ok_and(|n| n > 0),
+        [n] => n.parse::<i32>().is_ok_and(|n| n != 0),
+        _ => false,
     }
 }
 

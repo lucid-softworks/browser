@@ -193,6 +193,51 @@ mod tests {
     }
 
     #[test]
+    fn grid_area_auto_span_covers_two_rows_three_columns() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let g = doc.append_element(root, "div");
+        let a = doc.append_element(g, "div");
+        let b = doc.append_element(g, "div");
+        let mut styles = HashMap::new();
+        styles.insert(
+            g,
+            style::ComputedStyle {
+                display: style::Display::Grid,
+                display_block: true,
+                width: Some(300.0),
+                grid_template_columns: vec![style::TrackSize::Px(100.0); 3],
+                grid_template_rows: vec![style::TrackSize::Px(20.0); 3],
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                grid_row: Some(style::GridPlacement {
+                    start: None,
+                    start_span: Some(2),
+                    end: style::GridEnd::Auto,
+                }),
+                grid_column: Some(style::GridPlacement {
+                    start: None,
+                    start_span: Some(3),
+                    end: style::GridEnd::Auto,
+                }),
+                ..Default::default()
+            },
+        );
+        styles.insert(b, block_style(true));
+        let tree = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ar = rect_of(&tree, a);
+        let br = rect_of(&tree, b);
+        assert_eq!(ar.width, 300.0);
+        assert_eq!(ar.height, 40.0);
+        assert_eq!(br.y - ar.y, 40.0);
+    }
+    #[test]
     fn br_splits_text_onto_two_lines() {
         // body > p > "first" <br> "second"
         let mut doc = dom::Document::new();
