@@ -492,7 +492,14 @@ document.getElementById('cancel').addEventListener('click', function(e) {{ e.pre
         assert_eq!(st, 200, "{path}: {response}");
         value(&response)
     };
-    let source_url = format!("file://{}", source.display());
+    let source_url = if cfg!(windows) {
+        format!(
+            "file:///{}",
+            source.display().to_string().replace('\\', "/")
+        )
+    } else {
+        format!("file://{}", source.display())
+    };
     let nav = Json::Obj(
         [("url".into(), Json::Str(source_url.clone()))]
             .into_iter()

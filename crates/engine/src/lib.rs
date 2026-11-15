@@ -263,6 +263,26 @@ pub(crate) use traversal::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_navigation_compares_normalized_urls() {
+        assert!(Engine::is_fragment_navigation(
+            r"file://C:\Users\runneradmin\Temp\page.html",
+            "file:///C:/Users/runneradmin/Temp/page.html#active"
+        ));
+        assert!(Engine::is_fragment_navigation(
+            "http://EXAMPLE.com:80/page#one",
+            "http://example.com/page#two"
+        ));
+        for (from, to) in [
+            ("https://example.com/a#one", "https://example.com/b#two"),
+            ("https://example.com/a?q=1", "https://example.com/a?q=2#two"),
+            ("http://EXAMPLE.com:80/a", "http://example.com/a"),
+            ("invalid", "also invalid"),
+        ] {
+            assert!(!Engine::is_fragment_navigation(from, to), "{from} -> {to}");
+        }
+    }
     #[test]
     fn interleaved_engines_keep_tab_settings_and_scroll_separate() {
         let path =

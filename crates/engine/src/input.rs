@@ -1,6 +1,16 @@
 use crate::*;
 
 impl Engine {
+    /// Whether two URL spellings identify different fragments of the same document.
+    /// Normalize first: Windows file paths and JS URL serialization use different separators.
+    pub fn is_fragment_navigation(from: &str, to: &str) -> bool {
+        let (Ok(from), Ok(to)) = (wurl::Url::parse(from), wurl::Url::parse(to)) else {
+            return false;
+        };
+        let (from, to) = (from.href(), to.href());
+        from != to && from.split('#').next() == to.split('#').next()
+    }
+
     /// Take a navigation requested by page script or an uncancelled link/form activation.
     /// The host owns its history and loads the destination after the event has completed.
     pub fn take_navigation_request(&mut self) -> Option<(String, bool)> {
@@ -11,9 +21,9 @@ impl Engine {
     /// Traverse a fragment history entry in the existing JS realm. Return false when the host
     /// must load another document instead. Preserves application state and notifies hash routers.
     pub fn traverse_same_document_history(&mut self, url: &str) -> bool {
-        if self.session.is_none()
-            || self.current_url().and_then(|url| url.split('#').next()) != url.split('#').next()
-        {
+        // The live realm owns the current fragment; the last fetched URL may predate it.
+        // __traverseFragmentHistory normalizes the target and rejects other documents.
+        if self.session.is_none() {
             return false;
         }
         if self.console_eval(&format!("__traverseFragmentHistory({})", json_str(url))) != "true" {

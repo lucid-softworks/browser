@@ -416,8 +416,7 @@ fn settle_navigation(session: &mut Session) {
         let Some((url, replace)) = session.engine.take_navigation_request() else {
             break;
         };
-        let same_document =
-            url != session.url && url.split('#').next() == session.url.split('#').next();
+        let same_document = engine::Engine::is_fragment_navigation(&session.url, &url);
         if replace {
             session.history[session.history_index] = url.clone();
         } else {

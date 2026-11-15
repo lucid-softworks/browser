@@ -315,9 +315,7 @@ impl Tab {
     fn follow_page_navigation(&mut self) {
         // One request per event-loop turn keeps a redirecting page from starving commands.
         if let Some((url, replace)) = self.engine.take_navigation_request() {
-            if url != self.snapshot.url
-                && url.split('#').next() == self.snapshot.url.split('#').next()
-            {
+            if engine::Engine::is_fragment_navigation(&self.snapshot.url, &url) {
                 if replace {
                     self.history.replace(url.clone());
                 } else {
