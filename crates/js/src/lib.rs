@@ -1,73 +1,45 @@
-//! JavaScript runtime (Phase: scripting).
-//!
-//! Wraps Google's V8 JavaScript engine behind our own small API so the engine could be swapped
-//! later — same pattern as `net`/ureq and `paint`/fontdue. Nothing outside this crate knows V8
-//! exists. V8 gives us full JS speed plus complete language support, including real ES modules
-//! and dynamic `import()`.
-//!
-//! ## V8 integration shape
-//! - V8 is process-global-initialized exactly once (`std::sync::Once`).
-//! - A V8 `Isolate` is single-thread-bound, so every entry point that owns an isolate either runs
-//!   on the calling thread ([`Runtime`]) or creates the isolate on a dedicated worker thread
-//!   ([`eval_batch`]/[`run_with_dom`]/[`run_modules`]).
-//! - Native callbacks in V8 are bare C function pointers and cannot capture Rust state. We share
-//!   the page DOM and console buffer with them through a [`HostState`] stored on the **context
-//!   slot** (`Context::set_slot`/`get_slot`), retrieved inside each callback via
-//!   `scope.get_current_context().get_slot::<HostState>()`. The DOM is only ever touched on the
-//!   isolate's own thread, so `Rc<RefCell<dom::Document>>` is fine (no `Send` needed).
-//!
-//! ## DOM exposure
-//! Rather than port dozens of bespoke per-node wrapper closures, we expose a *small* set of native
-//! primitive functions on `globalThis`, keyed by integer node ids (`dom::NodeId` is a `usize`),
-//! and build the `document`/element objects in JavaScript on top of them (the
-//! `DOCUMENT_BOOTSTRAP`, `TIMERS_BOOTSTRAP`, and `BROWSER_ENV_BOOTSTRAP` strings). All the
-//! framework-compatibility machinery (per-node wrapper cache + expandos, `style`/`classList`/
-//! `dataset` write-through, the DOM interface class hierarchy + `instanceof`, navigator/location/
-//! storage/observers, the timer/event loop) lives in that reused, engine-agnostic JavaScript.
+//! JavaScript and browser bindings backed by Lumen.
 
-#[cfg(feature = "backend-v8")]
+use lumen::{
+    embed::{Ctx, Value},
+    Engine,
+};
+mod embedding;
+mod execution;
+pub(crate) use embedding::*;
+use execution::{controlled_engine, ExecutionControl, EXECUTION_BUDGET, EXECUTION_STOPPED};
+mod realms;
+pub(crate) use realms::*;
+
 mod inner_text;
 
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::cell::Cell;
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::cell::RefCell;
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::collections::HashMap;
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::rc::Rc;
-#[cfg(feature = "backend-v8")]
-pub(crate) use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-#[cfg(feature = "backend-v8")]
+pub(crate) use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) use std::sync::mpsc::{Receiver, Sender};
-#[cfg(feature = "backend-v8")]
 pub(crate) use std::sync::Arc;
-#[cfg(feature = "backend-v8")]
-pub(crate) use std::sync::Once;
 
 /// A completion delivered from a background request thread back to the worker: `(request id,
 /// response-envelope JSON or None on transport error)`. Drained on the worker thread inside
 /// [`drain_event_loop`] to resolve/reject the pending JS `fetch()` promise.
-#[cfg(feature = "backend-v8")]
 type FetchCompletion = (u64, Option<String>);
 
 /// A WebSocket event delivered from a background socket thread to the worker: `(socket id, kind,
 /// payload)`. kind `0`=open, `1`=text, `2`=binary(base64), `3`=close("code:reason"), `4`=error.
 /// Drained opportunistically (non-blocking) inside [`drain_event_loop`] and dispatched to JS via
 /// `__wsDeliver`. A socket is long-lived, so — unlike a fetch — it never touches `in_flight`.
-#[cfg(feature = "backend-v8")]
 type WsEvent = (u64, u8, String);
 
 /// An outgoing WebSocket command from JS to a background socket thread: `(kind, payload)`.
 /// kind `0`=send text, `1`=send binary(base64), `2`=close. Sent over a per-socket channel whose
 /// receiver lives on that socket's `net::ws_run` thread.
-#[cfg(feature = "backend-v8")]
 type WsOut = (u8, String);
 
 /// Host WebSocket connector (built by the engine, mirroring `request_fetcher`): given
 /// `(url, id, ws_evt_tx)` it spawns the socket thread and returns the per-socket outgoing sender,
 /// or `Err` if the thread couldn't start. Crosses the crate boundary with PRIMITIVE tuples only.
-#[cfg(feature = "backend-v8")]
 type WsConnector =
     Arc<dyn Fn(String, u64, Sender<WsEvent>) -> Result<Sender<WsOut>, String> + Send + Sync>;
 
@@ -80,23 +52,11 @@ pub struct EvalOutput {
     pub error: Option<String>,
 }
 
-/// Initialize the V8 platform exactly once for the whole process. Safe to call repeatedly.
-#[cfg(feature = "backend-v8")]
-fn ensure_v8_initialized() {
-    static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        let platform = v8::new_default_platform(0, false).make_shared();
-        v8::V8::initialize_platform(platform);
-        v8::V8::initialize();
-    });
-}
-
 // ---------------------------------------------------------------------------------------------
-// Shared host state (lives on the V8 context slot; retrieved inside native callbacks).
+// Shared host state (lives on the Lumen realm slot; retrieved inside native callbacks).
 // ---------------------------------------------------------------------------------------------
 
 /// A shared, mutable handle to the page's DOM.
-#[cfg(feature = "backend-v8")]
 type SharedDoc = Rc<RefCell<dom::Document>>;
 
 /// A single DOM mutation recorded by the native mutation primitives while at least one
@@ -104,7 +64,6 @@ type SharedDoc = Rc<RefCell<dom::Document>>;
 /// (`__deliverMutations`) drains these as JSON, matches them against the JS-side observer
 /// registry, and builds the spec `MutationRecord` objects. We keep this Rust-side struct (rather
 /// than tracking mutations in JS) because the mutations happen inside the Rust DOM primitives.
-#[cfg(feature = "backend-v8")]
 struct MutationRec {
     /// "childList" | "attributes" | "characterData".
     kind: &'static str,
@@ -120,10 +79,8 @@ struct MutationRec {
     removed: Vec<dom::NodeId>,
 }
 
-/// State shared between Rust and the native primitive callbacks. Stored on the context slot as an
-/// `Rc<HostState>` so any callback can recover it from `scope.get_current_context().get_slot()`.
-/// Interior mutability via `RefCell` since the slot only hands out `&HostState` (well, `Rc`).
-#[cfg(feature = "backend-v8")]
+/// State shared between Rust and native callbacks, registered per realm in Lumen OpState.
+/// Callbacks recover an Rc through host_state; RefCell permits DOM mutation on the session thread.
 struct HostState {
     doc: SharedDoc,
     console: RefCell<Vec<String>>,
@@ -195,6 +152,7 @@ struct HostState {
     /// A geometry read whose `dom_version` is ahead of this re-lays-out the dirty DOM in-Session, so
     /// `getBoundingClientRect` etc. reflect script mutations the blocked engine hasn't rendered yet.
     rects_dom_version: Cell<u64>,
+    style_context_revision: Cell<u64>,
     /// CSSOM *used* inset values per positioned box, keyed by node id, pushed by the engine
     /// alongside `layout_rects`. `(top, right, bottom, left)` in CSS px. Read by `resolved_inset_value`
     /// so `getComputedStyle(el).top` etc. report the used value when the element has a box; absent for
@@ -231,7 +189,6 @@ struct HostState {
     cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
 }
 
-#[cfg(feature = "backend-v8")]
 impl HostState {
     fn new(doc: SharedDoc) -> Rc<Self> {
         // No-DOM paths: dead-end channels (their receivers are dropped immediately) and a connector
@@ -300,6 +257,7 @@ impl HostState {
             computed_cache: RefCell::new(None),
             layout_rects: RefCell::new(HashMap::new()),
             rects_dom_version: Cell::new(0),
+            style_context_revision: Cell::new(0),
             used_insets: RefCell::new(HashMap::new()),
             used_margins: RefCell::new(HashMap::new()),
             image_natural: RefCell::new(HashMap::new()),
@@ -326,75 +284,37 @@ impl HostState {
     }
 }
 
-/// Recover the `Rc<HostState>` from the current context's slot. Panics only if state was never
-/// installed, which is a programming error (every context we run callbacks in installs it).
-#[cfg(feature = "backend-v8")]
-fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
-    let context = scope.get_current_context();
-    context
-        .get_slot::<HostState>()
-        .expect("HostState must be installed on the context")
-}
-
 // ---------------------------------------------------------------------------------------------
 // DOM helpers (engine-agnostic; operate directly on `dom::Document`). Reused from the prior
 // implementation — these are pure Rust and unchanged in behavior.
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(feature = "backend-v8")]
 mod dom_helpers;
-#[cfg(feature = "backend-v8")]
 mod eval_loop;
-#[cfg(feature = "backend-v8")]
 mod forced_layout;
-#[cfg(feature = "backend-v8")]
+mod host_context;
 mod iframe;
-#[cfg(feature = "backend-v8")]
 mod modules;
-#[cfg(feature = "backend-v8")]
 mod primitives;
-#[cfg(feature = "backend-v8")]
 mod runtime;
-#[cfg(feature = "backend-v8")]
 mod selector;
-#[cfg(feature = "backend-v8")]
 mod session;
-#[cfg(feature = "backend-v8")]
 mod style_query;
-#[cfg(feature = "backend-v8")]
 mod worker;
 
-#[cfg(feature = "backend-v8")]
 pub(crate) use dom_helpers::*;
-#[cfg(feature = "backend-v8")]
-pub use eval_loop::*;
-#[cfg(feature = "backend-v8")]
+pub(crate) use eval_loop::*;
+pub use host_context::*;
 pub use iframe::*;
-#[cfg(feature = "backend-v8")]
 pub use modules::*;
-#[cfg(feature = "backend-v8")]
-pub use primitives::*;
-#[cfg(feature = "backend-v8")]
+pub(crate) use primitives::*;
 pub use runtime::*;
-#[cfg(feature = "backend-v8")]
 pub(crate) use selector::*;
-#[cfg(feature = "backend-v8")]
 pub use session::*;
-#[cfg(feature = "backend-v8")]
 pub(crate) use style_query::*;
-#[cfg(feature = "backend-v8")]
 pub use worker::*;
 
-// The from-scratch backend. Implements the language-evaluation slice of the public API
-// (`Runtime`/`eval`/`eval_batch`) on top of `lumen`; the DOM `Session` surface is still V8-only and
-// will grow into lumen in a later milestone. (Named `lumen_backend`, not `lumen`, to avoid clashing
-// with the `lumen` crate.)
-#[cfg(feature = "backend-lumen")]
-mod lumen_backend;
-#[cfg(feature = "backend-lumen")]
-pub use lumen_backend::*;
-
-#[cfg(all(test, feature = "backend-v8"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -532,6 +452,56 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("true|true|true|true"));
+    }
+
+    #[test]
+    fn structured_clone_transfers_and_detaches_array_buffer() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var b = new ArrayBuffer(4); new Uint8Array(b)[0] = 7;
+                    var c = structuredClone(b, { transfer: [b] });
+                    var duplicate = false;
+                    try { structuredClone(c, { transfer: [c, c] }); }
+                    catch (e) { duplicate = e.name === "DataCloneError"; }
+                    b.byteLength + ":" + c.byteLength + ":" + new Uint8Array(c)[0] + ":" + duplicate"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("0:4:7:true"));
+    }
+
+    #[test]
+    fn popover_internals_animations_and_view_transitions_have_state() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var log=[]; var p=document.createElement('div'); p.setAttribute('popover','auto');
+                   document.body.appendChild(p); p.addEventListener('beforetoggle',e=>log.push(e.oldState+'>'+e.newState));
+                   p.addEventListener('toggle',e=>log.push(e.type)); p.showPopover();
+                   var shown=p.togglePopover(true); p.hidePopover();
+                   class FormThing { static formAssociated=true; }
+                   customElements.define('form-thing',FormThing); var f=document.createElement('form'); f.id='f';
+                   var c=document.createElement('form-thing'); f.appendChild(c); document.body.appendChild(f);
+                   var internals=c.attachInternals(); internals.setFormValue('answer');
+                   internals.setValidity({customError:true},'bad');
+                   var invalid=!internals.checkValidity() && internals.form===f && c.__formValue==='answer';
+                   var a=p.animate([{opacity:0},{opacity:1}],100000); var tracked=p.getAnimations()[0]===a && document.getAnimations()[0]===a; a.cancel();
+                   var vt=document.startViewTransition(function(){document.body.setAttribute('data-vt','ran')});
+                   [shown,p.style.display,log.join(','),invalid,tracked,vt.types instanceof Set].join('|')"#
+                    .to_string(),
+                "document.body.getAttribute('data-vt')".to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true|none|closed>open,toggle,open>closed,toggle|true|true|true")
+        );
+        assert_eq!(out[1].value.as_deref(), Some("ran"));
     }
 
     #[test]
@@ -894,7 +864,7 @@ mod tests {
                     r.push("move:" + (div.firstChild === a));
                     div.scrollTo(0, 0); div.scroll(); div.scrollBy(1, 1);
                     r.push("vis:" + div.checkVisibility());
-                    div.showPopover(); div.hidePopover();
+                    div.setAttribute("popover", "auto"); div.showPopover(); div.hidePopover();
                     r.push("toggle:" + div.togglePopover());
                     r.push("exec:" + document.execCommand("bold"));
                     r.push("anims:" + document.getAnimations().length);
@@ -912,7 +882,7 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(
             out[0].value.as_deref(),
-            Some("root:true|same:true:false|move:true|vis:true|toggle:false|exec:false|anims:0|svt:function|sup256:true|supMd5:false|supAes:true|sel:hel")
+            Some("root:true|same:true:false|move:true|vis:true|toggle:true|exec:false|anims:0|svt:function|sup256:true|supMd5:false|supAes:true|sel:hel")
         );
     }
 
@@ -995,6 +965,12 @@ mod tests {
                     sel.extend(t, 8); r.push("e:" + sel.toString());
                     sel.selectAllChildren(p); r.push("a:" + sel.type + ":" + (sel.anchorNode === p));
                     sel.collapseToStart(); r.push("s:" + sel.type);
+                    sel.setBaseAndExtent(t, 8, t, 2);
+                    r.push("b:" + sel.anchorOffset + ":" + sel.focusOffset + ":" + sel.toString());
+                    var detached = document.createTextNode("away");
+                    sel.removeAllRanges(); sel.setBaseAndExtent(detached, 0, detached, 1);
+                    r.push("d:" + sel.rangeCount);
+                    try { sel.setBaseAndExtent(t, 0, t, 99); } catch (e) { r.push("x:" + e.name); }
                     r.join("|")"#
                 .to_string()],
             "https://example.com/",
@@ -1002,7 +978,7 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(
             out[0].value.as_deref(),
-            Some("c:3:Caret|e:lo wo|a:Range:true|s:Caret")
+            Some("c:3:Caret|e:lo wo|a:Range:true|s:Caret|b:8:2:llo wo|d:0|x:IndexSizeError")
         );
     }
 
@@ -1016,6 +992,7 @@ mod tests {
             vec![r#"var r = [];
                     var te = new TextEvent("t"); te.initTextEvent("textInput", true, false, window, "hi");
                     r.push("te:" + te.type + ":" + te.data);
+                    class XY { static formAssociated = true; } customElements.define("x-y", XY);
                     var ai = document.createElement("x-y").attachInternals();
                     ai.setFormValue("v"); r.push("ai:" + ai.checkValidity() + ":" + (typeof ai.states.add));
                     var an = document.body.animate({ opacity: [0, 1] }, 1); an.commitStyles(); an.persist();
@@ -1047,6 +1024,9 @@ mod tests {
                     var ke = new KeyboardEvent("z"); ke.initKeyboardEvent("keydown", true, true, window, "Enter", 0, true, false, false, false);
                     r.push("ke:" + ke.type + ":" + ke.key + ":" + ke.ctrlKey);
                     r.push("doc:" + (document.getRootNode() === document) + ":" + document.isSameNode(document));
+                    var detached = document.implementation.createHTMLDocument("");
+                    var attr = document.createAttribute("data-value");
+                    r.push("identity:" + detached.isSameNode(detached) + ":" + detached.isSameNode(document) + ":" + attr.isSameNode(attr) + ":" + attr.isSameNode(document.createAttribute("data-value")));
                     r.join("|")"#
                 .to_string()],
             "https://example.com/",
@@ -1054,7 +1034,7 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(
             out[0].value.as_deref(),
-            Some("me:click:30:40:true:true|ue:custom:5|ke:keydown:Enter:true|doc:true:true")
+            Some("me:click:30:40:true:true|ue:custom:5|ke:keydown:Enter:true|doc:true:true|identity:true:false:true:false")
         );
     }
 
@@ -1836,6 +1816,29 @@ mod tests {
     }
 
     #[test]
+    fn computed_grid_tracks_serialize_as_expanded_used_pixels() {
+        let (mut doc, body) = doc_with_body("");
+        let grid = doc.append_element(body, "div");
+        if let dom::NodeData::Element(element) = &mut doc.get_mut(grid).data {
+            element.attrs.insert(
+                "style".to_string(),
+                "display:grid;width:300px;height:120px;grid-template-columns:repeat(3,1fr);grid-template-rows:1fr 2fr"
+                    .to_string(),
+            );
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "var s=getComputedStyle(document.querySelector('div')); [s.gridTemplateColumns,s.gridTemplateRows].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("100px 100px 100px|40px 80px"));
+    }
+
+    #[test]
     fn computed_style_inline_color_serializes_rgb() {
         let (mut doc, body) = doc_with_body("");
         let p = doc.append_element(body, "p");
@@ -1919,6 +1922,50 @@ mod tests {
             out[0].value.as_deref(),
             Some(r#"0.5%|-0.1em|0px|url("http://localhost/")"#)
         );
+    }
+
+    #[test]
+    fn webkit_flex_properties_are_true_aliases() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var s = document.querySelectorAll('div')[0].style;
+                s.setProperty('-webkit-flex', 'inherit');
+                var a = [s.getPropertyValue('-webkit-flex'), s.getPropertyValue('flex'), s.cssText];
+                s.cssText = '';
+                s.setProperty('-webkit-flex-grow', 'inherit');
+                a = a.concat([s.getPropertyValue('-webkit-flex-grow'), s.getPropertyValue('flex-grow'), s.cssText]);
+                s.cssText = '';
+                s.setProperty('-webkit-flex', 'var(--v)');
+                a.concat([s.getPropertyValue('flex')]).join('|');
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("inherit|inherit|flex: inherit;|inherit|inherit|flex-grow: inherit;|var(--v)")
+        );
+    }
+
+    #[test]
+    fn css_text_properties_reach_computed_style() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var e = document.querySelectorAll('div')[0];
+                e.style.hyphens = 'auto';
+                [e.getAttribute('style'), getComputedStyle(e).hyphens].join('|');
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("hyphens: auto;|auto"));
     }
 
     #[test]
@@ -2141,14 +2188,14 @@ mod tests {
         let (_d, out) = run_with_dom(
             doc,
             vec![
-                // flex: 0 -> grow 0, shrink 1, basis 0px; cssText collapses to the flex shorthand.
+                // flex: 0 -> grow 0, shrink 1, basis 0%; cssText collapses to the flex shorthand.
                 "var s = document.createElement('div').style; s.cssText = 'flex: 0'; s.cssText"
                     .to_string(),
             ],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("flex: 0 1 0px;"));
+        assert_eq!(out[0].value.as_deref(), Some("flex: 0 1 0%;"));
     }
 
     #[test]
@@ -2156,18 +2203,21 @@ mod tests {
         // Regression for grid-template-columns-crash.html: setting a very long property value must
         // not be O(n²). normalizeCssValue previously indexed the growing result rope per number
         // token (`out[out.length-1]`), forcing repeated flattening, so a ~1.8MB value hung the
-        // engine (V8 GC thrash -> WebDriver "not responding" -> CRASH). Build a large value and
-        // assert the round-trip completes well under the worker budget.
+        // engine (V8 GC thrash -> WebDriver "not responding" -> CRASH). Build the fixture outside
+        // JS so its 40,000 string appends don't consume the worker deadline on slower debug
+        // runners. The same full-size value still goes through the real CSS setter and getter.
+        let value: String = (0..40000)
+            .map(|i| format!(" repeat(1000, {i}px)"))
+            .collect();
         let (doc, _) = doc_with_body("");
         let (_d, out) = run_with_dom(
             doc,
-            vec![
-                "var v=''; for (var i=0;i<40000;i++){ v+=' repeat(1000, '+i+'px)'; } \
+            vec![format!(
+                "var v={value:?}; \
                  var t0=Date.now(); document.body.style.gridTemplateColumns=v; \
                  var ok = document.body.style.gridTemplateColumns.length > 0; \
                  [ok, (Date.now()-t0) < 4000].join(',')"
-                    .to_string(),
-            ],
+            )],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
@@ -2450,6 +2500,234 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("1|DIV|bar|hi"));
     }
 
+    #[test]
+    fn cdata_section_inherits_text_split_text() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var xd = document.implementation.createDocument(null, 'root');
+                   var cdata = xd.createCDATASection('abcd');
+                   xd.documentElement.appendChild(cdata);
+                   var tail = cdata.splitText(2);
+                   [cdata.data, tail.data, tail.nodeType, tail.previousSibling === cdata].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("ab|cd|3|true"));
+    }
+
+    #[test]
+    fn is_equal_node_compares_all_node_wrappers_structurally() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var left = document.createElement('section');
+                   var right = document.createElement('section');
+                   left.setAttribute('data-x', '1'); right.setAttribute('data-x', '1');
+                   left.appendChild(document.createTextNode('same'));
+                   right.appendChild(document.createTextNode('same'));
+                   var equalTrees = left.isEqualNode(right);
+                   var equalText = left.firstChild.isEqualNode(right.firstChild);
+                   right.firstChild.data = 'different';
+                   var differentTrees = left.isEqualNode(right);
+                   var leftAttr = document.createAttribute('data-x'); leftAttr.value = '1';
+                   var rightAttr = document.createAttribute('data-x'); rightAttr.value = '1';
+                   var equalAttrs = leftAttr.isEqualNode(rightAttr);
+                   rightAttr.value = '2';
+                   var differentAttrs = leftAttr.isEqualNode(rightAttr);
+                   var leftDoc = document.implementation.createHTMLDocument('');
+                   var rightDoc = document.implementation.createHTMLDocument('');
+                   var equalDocs = leftDoc.isEqualNode(rightDoc);
+                   rightDoc.body.appendChild(rightDoc.createElement('p'));
+                   var differentDocs = leftDoc.isEqualNode(rightDoc);
+                   var xml = document.implementation.createDocument(null, 'root');
+                   var cdata = xml.createCDATASection('same');
+                   var equalCdata = cdata.isEqualNode(xml.createCDATASection('same'));
+                   [equalTrees, equalText, differentTrees, equalAttrs, differentAttrs,
+                    equalDocs, differentDocs, equalCdata].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true|true|false|true|false|true|false|true")
+        );
+    }
+
+    #[test]
+    fn range_insert_node_splits_text_and_updates_collapsed_end() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var text = document.createTextNode('abcd');
+                   var mark = document.createElement('mark');
+                   p.appendChild(text);
+                   var r = document.createRange();
+                   r.setStart(text, 2); r.setEnd(text, 2);
+                   r.insertNode(mark);
+                   [p.childNodes.length, p.childNodes[0].data,
+                    p.childNodes[1] === mark, p.childNodes[2].data,
+                    r.startContainer === text, r.startOffset,
+                    r.endContainer === p, r.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("3|ab|true|cd|true|2|true|2"));
+    }
+
+    #[test]
+    fn range_insert_node_preserves_offsets_when_moving_boundary_child() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var text = document.createTextNode('text');
+                   p.appendChild(text);
+                   var r = document.createRange();
+                   r.setStart(p, 0); r.setEnd(p, 1);
+                   r.insertNode(text);
+                   [p.childNodes.length, p.firstChild === text,
+                    r.startContainer === p, r.startOffset,
+                    r.endContainer === p, r.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|true|true|0|true|1"));
+    }
+
+    #[test]
+    fn range_insert_node_rejects_moving_existing_document_doctype() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var other = document.implementation.createHTMLDocument('');
+                   var tail = other.createComment('tail'); other.appendChild(tail);
+                   var r = other.createRange(); r.setStart(other, 1); r.setEnd(tail, 2);
+                   var name = ''; try { r.insertNode(other.doctype); } catch (e) { name = e.name; }
+                   [name, other.firstChild === other.doctype,
+                    r.startContainer === other, r.startOffset,
+                    r.endContainer === tail, r.endOffset].join('|')"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("HierarchyRequestError|true|true|1|true|2")
+        );
+    }
+
+    #[test]
+    fn range_insert_node_rejects_parentless_text_boundary() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var text = document.createTextNode('abcd');
+                   var r = document.createRange();
+                   r.setStart(text, 2); r.setEnd(text, 2);
+                   var name = ''; try { r.insertNode(document.createElement('i')); } catch (e) { name = e.name; }
+                   [name, text.data].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("HierarchyRequestError|abcd"));
+    }
+
+    #[test]
+    fn range_surround_contents_wraps_selection_and_selects_parent() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var text = p.appendChild(document.createTextNode('abcd'));
+                   var wrapper = document.createElement('strong');
+                   wrapper.appendChild(document.createTextNode('discarded'));
+                   var r = document.createRange(); r.setStart(text, 1); r.setEnd(text, 3);
+                   r.surroundContents(wrapper);
+                   [p.childNodes.length, p.childNodes[0].data,
+                    p.childNodes[1] === wrapper, wrapper.textContent, p.childNodes[2].data,
+                    r.startContainer === p, r.startOffset,
+                    r.endContainer === p, r.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("3|a|true|bc|d|true|1|true|2"));
+    }
+
+    #[test]
+    fn range_surround_contents_rejects_partial_elements_before_mutating() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var p = document.createElement('p');
+                   var bold = p.appendChild(document.createElement('b'));
+                   var text = bold.appendChild(document.createTextNode('ab'));
+                   p.appendChild(document.createElement('i')).textContent = 'cd';
+                   var r = document.createRange(); r.setStart(text, 1); r.setEnd(p, 1);
+                   var wrapper = document.createElement('span');
+                   var name = ''; try { r.surroundContents(wrapper); } catch (e) { name = e.name; }
+                   [name, p.firstChild === bold, text.data, wrapper.parentNode === null].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("InvalidStateError|true|ab|true")
+        );
+    }
+
+    #[test]
+    fn range_extraction_rejects_contained_doctype_before_mutating() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                r#"var other = document.implementation.createHTMLDocument('');
+                   var originalDoctype = other.doctype;
+                   var originalElement = other.documentElement;
+                   var r = other.createRange(); r.setStart(other, 0); r.setEnd(other, 1);
+                   var name = ''; try { r.extractContents(); } catch (e) { name = e.name; }
+                   [name, other.childNodes.length,
+                    other.firstChild === originalDoctype,
+                    other.lastChild === originalElement,
+                    r.startContainer === other, r.startOffset, r.endOffset].join('|')"#
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("HierarchyRequestError|2|true|true|true|0|1")
+        );
+    }
+
+    #[test]
+    fn document_element_inner_html_preserves_head_and_body() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"document.documentElement.innerHTML = '<head><title>x</title></head><body><p id="marker">inside</p></body>';
+                   [document.head.tagName,
+                    document.body.tagName,
+                    document.body.querySelector('#marker').textContent].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("HEAD|BODY|inside"));
+    }
+
     // --- Timer / event-loop APIs --------------------------------------------------------
 
     #[test]
@@ -2529,12 +2807,31 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("function,true,0"));
+        assert_eq!(out[0].value.as_deref(), Some("function,true,1"));
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
         assert!(
             all.iter().any(|l| l == "finished:finished"),
             "animation finished promise did not resolve: {all:?}"
         );
+    }
+
+    #[test]
+    fn web_animation_exposes_prototypes_effect_and_interpolated_style() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                "var a=document.body.animate([{width:'10px'},{width:'30px'}],{duration:1000}); \
+                 a.pause(); a.currentTime=500; \
+                 [typeof Element.prototype.animate, a instanceof Animation, \
+                  a.effect instanceof KeyframeEffect, a.effect.getKeyframes().length, \
+                  getComputedStyle(document.body).width].join(',')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("function,true,true,2,20px"));
     }
 
     #[test]
@@ -3020,6 +3317,166 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some("a,b,c"));
     }
 
+    #[test]
+    fn element_has_attributes_tracks_attribute_list() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              var values = [el.hasAttributes()];
+              el.setAttribute('data-value', 'yes'); values.push(el.hasAttributes());
+              el.removeAttribute('data-value'); values.push(el.hasAttributes());
+              values.join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("false|true|false"));
+    }
+
+    #[test]
+    fn toggle_attribute_removes_first_same_named_attribute() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              el.setAttributeNS('first', 'attr', 'one');
+              el.setAttributeNS('second', 'attr', 'two');
+              var result = el.toggleAttribute('attr');
+              [result, el.attributes.length, el.attributes[0].name,
+               el.attributes[0].namespaceURI, el.attributes[0].value].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("false|1|attr|second|two"));
+    }
+
+    #[test]
+    fn node_is_connected_tracks_document_membership() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var parent = document.createElement('div');
+              var child = document.createTextNode('value'); parent.appendChild(child);
+              var values = [parent.isConnected, child.isConnected];
+              document.body.appendChild(parent); values.push(parent.isConnected, child.isConnected);
+              parent.remove(); values.push(parent.isConnected, child.isConnected);
+              var detachedDocument = document.implementation.createHTMLDocument('');
+              values.push(detachedDocument.isConnected, detachedDocument.body.isConnected);
+              values.join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("false|false|true|true|false|false|true|true")
+        );
+    }
+
+    #[test]
+    fn node_base_uri_tracks_the_document_base_url() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var el = document.createElement('div');
+              var attr = document.createAttribute('data-value');
+              var before = [el.baseURI, attr.baseURI];
+              var base = document.createElement('base'); base.setAttribute('href', '/assets/');
+              document.head.appendChild(base);
+              before.concat([el.baseURI, document.createTextNode('').baseURI]).join('|')
+            "#
+            .to_string()],
+            "https://example.com/path/page.html",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("https://example.com/path/page.html|https://example.com/path/page.html|https://example.com/assets/|https://example.com/assets/")
+        );
+    }
+
+    #[test]
+    fn node_normalize_merges_text_and_preserves_ranges() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var div = document.createElement('div');
+              var first = div.appendChild(document.createTextNode('a'));
+              var second = div.appendChild(document.createTextNode('bc'));
+              div.appendChild(document.createTextNode(''));
+              var inside = document.createRange(); inside.setStart(second, 1); inside.setEnd(second, 2);
+              var between = document.createRange(); between.setStart(div, 1); between.collapse(true);
+              div.normalize();
+              [div.childNodes.length, first.data,
+               inside.startContainer === first, inside.startOffset, inside.endOffset,
+               between.startContainer === first, between.startOffset].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|abc|true|2|3|true|1"));
+    }
+
+    #[test]
+    fn node_mutations_validate_and_replace_document_children() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var parent = document.createElement('div');
+              var type = ''; try { parent.insertBefore(document.createTextNode('x'), {}); } catch (e) { type = e.name; }
+              var first = parent.appendChild(document.createElement('a'));
+              parent.appendChild(document.createElement('b')); parent.insertBefore(first, first);
+              var d1 = document.implementation.createHTMLDocument('one');
+              var d2 = document.implementation.createHTMLDocument('two');
+              var old = d1.doctype, replacement = d2.doctype;
+              d1.replaceChild(replacement, old);
+              [type, parent.firstChild === first, d1.childNodes.length,
+               d1.firstChild === replacement, d2.childNodes.length,
+               old.parentNode === null, replacement.parentNode === d1].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("TypeError|true|2|true|1|true|true")
+        );
+    }
+
+    #[test]
+    fn replace_child_with_itself_runs_live_range_mutation_steps() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var parent = document.createElement('div');
+                   var child = parent.appendChild(document.createElement('p'));
+                   parent.appendChild(document.createElement('span'));
+                   var inside = document.createRange(); inside.setStart(child, 0); inside.setEnd(child, 0);
+                   var between = document.createRange(); between.setStart(parent, 1); between.setEnd(parent, 2);
+                   var returned = parent.replaceChild(child, child);
+                   [returned === child, parent.firstChild === child,
+                    inside.startContainer === parent, inside.startOffset, inside.endOffset,
+                    between.startOffset, between.endOffset].join('|')"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|true|true|0|0|0|2"));
+    }
+
     // --- Browser environment (`install_browser_env`) ------------------------------------
 
     /// Convenience: run one expression source against a fresh doc+body at the given URL and
@@ -3436,6 +3893,25 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn crypto_random_failure_never_returns_fallback_bytes() {
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+            __cryptoRandom = function () { return null; };
+            var values = new Uint8Array([17, 23]), errors = [];
+            try { crypto.getRandomValues(values); } catch (e) { errors.push(e.name); }
+            try { crypto.randomUUID(); } catch (e) { errors.push(e.name); }
+            errors.join(',') + ':' + values.join(',')
+        "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("OperationError,OperationError:17,23")
+        );
     }
 
     #[test]
@@ -4559,6 +5035,7 @@ mod tests {
         modules.insert(
             entry.clone(),
             r#"console.log(import.meta.url);
+               const globalThis = {}, URL = null, Function = null;
                console.log(import.meta.resolve("./other.css"));"#
                 .to_string(),
         );
@@ -4936,7 +5413,7 @@ mod tests {
 
     #[test]
     fn dedicated_worker_importscripts_shares_top_level_declarations() {
-        // The realm fix: each worker is its own V8 context, so `self === globalThis` and top-level
+        // The realm fix: each worker is its own Lumen realm, so `self === globalThis` and top-level
         // `function`/`var` declarations in an importScripts'd file become worker globals visible to
         // later scripts — exactly what canvas-tests.js et al. rely on (bare `function _assertSame`).
         // Here helper.js declares a bare `function helperFn` and a bare `var helperVar`; the worker
@@ -5304,6 +5781,44 @@ mod tests {
             attr("data-bad").as_deref(),
             Some("undefined"),
             "invalid-host javascript: URL does not execute"
+        );
+    }
+
+    #[test]
+    fn click_dispatch_runs_one_activation_behavior() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+              var events = [];
+              var outer = document.createElement('input'); outer.type = 'checkbox';
+              var inner = document.createElement('input'); inner.type = 'checkbox';
+              outer.appendChild(inner); document.body.appendChild(outer);
+              outer.addEventListener('input', function (event) { if (event.target === outer) events.push('outer'); });
+              inner.addEventListener('input', function () { events.push('inner'); });
+              inner.click();
+
+              var canceled = document.createElement('input'); canceled.type = 'checkbox';
+              var canceledInputs = 0;
+              canceled.addEventListener('click', function (event) { event.preventDefault(); });
+              canceled.addEventListener('input', function () { canceledInputs++; });
+              document.body.appendChild(canceled); canceled.click();
+
+              var blockedOuter = document.createElement('input'); blockedOuter.type = 'checkbox';
+              var label = document.createElement('label');
+              var button = document.createElement('button'); button.type = 'button';
+              label.appendChild(button); blockedOuter.appendChild(label); document.body.appendChild(blockedOuter);
+              button.click();
+              [events.join(','), inner.checked, outer.checked,
+               canceled.checked, canceledInputs, blockedOuter.checked].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("inner|true|false|false|0|false")
         );
     }
 
@@ -5677,9 +6192,9 @@ mod tests {
                 });
                 var f = document.body.appendChild(document.createElement('iframe'));
                 f.onload = function () {
-                  document.body.setAttribute('data-q', f.contentDocument.querySelector('a').search);
+                  document.body.setAttribute('data-denied', String(f.contentDocument === null));
                 };
-                f.src = "data:text/html,<a href='http://h/?q=1'>x</a><script>parent.postMessage('ran','*')<\/script>";
+                f.src = "data:text/html,<a href='http://h/?q=1'>x</a><script>parent.postMessage('ran:' + document.querySelector('a').search,'*')<\/script>";
             "#
             .to_string(),
         );
@@ -5703,13 +6218,13 @@ mod tests {
         };
         assert_eq!(
             attr("data-msg").as_deref(),
-            Some("ran"),
+            Some("ran:?q=1"),
             "data: frame script runs + posts"
         );
         assert_eq!(
-            attr("data-q").as_deref(),
-            Some("?q=1"),
-            "frame anchor decomposition"
+            attr("data-denied").as_deref(),
+            Some("true"),
+            "data URL frame has an opaque origin"
         );
     }
 
@@ -5772,6 +6287,101 @@ mod tests {
             Some("?q=1"),
             "frame anchor search"
         );
+    }
+
+    #[test]
+    fn iframe_document_imports_parent_realm_subtree_on_append() {
+        let (doc, body) = doc_with_body("");
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"
+                var f = document.createElement('iframe');
+                document.body.appendChild(f);
+                var loads = 0;
+                var referenceDoc = document.implementation.createHTMLDocument('');
+                referenceDoc.removeChild(referenceDoc.documentElement);
+                f.onload = function () {
+                  loads++;
+                  var foreignClone = f.contentDocument.documentElement.cloneNode(true);
+                  document.body.setAttribute('data-foreign-has-body', foreignClone.innerHTML.indexOf('<body') >= 0 ? 'yes' : 'no');
+                  referenceDoc.appendChild(foreignClone);
+                  document.body.setAttribute('data-reference-root-before-restore', referenceDoc.documentElement ? referenceDoc.documentElement.tagName : 'null');
+                  document.body.setAttribute('data-reference-body-before-restore', referenceDoc.body ? referenceDoc.body.tagName : 'null');
+                  while (f.contentDocument.firstChild) {
+                    f.contentDocument.removeChild(f.contentDocument.firstChild);
+                  }
+                  f.contentDocument.appendChild(referenceDoc.documentElement.cloneNode(true));
+                  document.body.setAttribute('data-frame-root-after-restore', f.contentDocument.documentElement ? f.contentDocument.documentElement.tagName : 'null');
+                  document.body.setAttribute('data-frame-body-after-restore', f.contentDocument.body ? f.contentDocument.body.tagName : 'null');
+                  f.contentDocument.body.insertBefore(f.contentDocument.createElement('div'), f.contentDocument.body.firstChild);
+                  document.body.setAttribute('data-imported', f.contentWindow.readImported());
+                  document.body.setAttribute('data-exported-range', typeof f.contentWindow.exportedRange);
+                  f.contentWindow.rangeStart = 1;
+                  f.contentWindow.makeRange();
+                  document.body.setAttribute('data-late-range', typeof f.contentWindow.testRange);
+                  document.body.setAttribute('data-frame-global-write', String(f.contentWindow.testRange.startOffset));
+                  document.body.setAttribute('data-loads', String(loads));
+                  document.body.setAttribute('data-reference-root', referenceDoc.documentElement ? referenceDoc.documentElement.tagName : 'null');
+                };
+                f.src = 'frame.html';
+            "#
+            .to_string(),
+        );
+        let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
+            Arc::new(|_m, u, _b, _h| {
+                if u.ends_with("frame.html") {
+                    let frame = r#"<!doctype html><title>Range test iframe</title><body><p id='marker' data-value='copied'>inside</p><script>window.readImported = function () { var n = document.querySelector('#marker'); return n && n.getAttribute('data-value') + ':' + n.textContent; }; window.exportedRange = document.createRange(); window.makeRange = function () { var n = document.querySelector('#marker').firstChild; var r = document.createRange(); r.setStart(n, window.rangeStart); r.setEnd(n, window.rangeStart + 1); window.testRange = r; };</script></body>"#;
+                    Some(format!(
+                        r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/html","body":"{frame}"}}"#
+                    ))
+                } else {
+                    None
+                }
+            });
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![],
+            vec![entry],
+            modules,
+            "https://x/",
+            no_fetch(),
+            request_fetcher,
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        let attr = |name: &str| match &snapshot.get(body).data {
+            dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+            _ => None,
+        };
+        assert_eq!(
+            attr("data-reference-root-before-restore").as_deref(),
+            Some("HTML")
+        );
+        assert_eq!(attr("data-foreign-has-body").as_deref(), Some("yes"));
+        assert_eq!(
+            attr("data-reference-body-before-restore").as_deref(),
+            Some("BODY")
+        );
+        assert_eq!(
+            attr("data-frame-root-after-restore").as_deref(),
+            Some("HTML")
+        );
+        assert_eq!(
+            attr("data-frame-body-after-restore").as_deref(),
+            Some("BODY")
+        );
+        let imported = attr("data-imported");
+        assert_eq!(imported.as_deref(), Some("copied:inside"));
+        assert_eq!(attr("data-exported-range").as_deref(), Some("object"));
+        assert_eq!(attr("data-late-range").as_deref(), Some("object"));
+        assert_eq!(attr("data-frame-global-write").as_deref(), Some("1"));
+        assert_eq!(attr("data-loads").as_deref(), Some("1"));
+        assert_eq!(attr("data-reference-root").as_deref(), Some("HTML"));
     }
 
     #[test]
@@ -6076,10 +6686,8 @@ mod tests {
 
     #[test]
     fn async_fetches_run_concurrently() {
-        // Five fetches each sleeping 100ms in the host fetcher; fired together with Promise.all. If
-        // they were serialized the init drain would take >=500ms; running concurrently (one
-        // background thread per request) it finishes in well under that. We also assert all five
-        // resolved (their bodies collected into a DOM attribute).
+        // All five host requests must enter before any completes. Measure overlap directly:
+        // engine bootstrap and machine load must not affect a network-concurrency assertion.
         let (doc, body) = doc_with_body("");
         let entry = "https://x/app.js".to_string();
         let mut modules = std::collections::HashMap::new();
@@ -6092,16 +6700,29 @@ mod tests {
             "#
             .to_string(),
         );
+        let arrivals = Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        let overlapped = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let arrivals_host = arrivals.clone();
+        let overlapped_host = overlapped.clone();
         let request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync> =
-            Arc::new(|_m, u, _b, _h| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            Arc::new(move |_m, u, _b, _h| {
+                let (lock, ready) = &*arrivals_host;
+                let mut count = lock.lock().unwrap();
+                *count += 1;
+                ready.notify_all();
+                let (count, _) = ready
+                    .wait_timeout_while(count, std::time::Duration::from_secs(2), |n| *n < 5)
+                    .unwrap();
+                if *count < 5 {
+                    overlapped_host.store(false, Ordering::Relaxed);
+                }
+                drop(count);
                 // Echo the last path segment back as the body so we can verify all five resolved.
                 let seg = u.rsplit('/').next().unwrap_or("");
                 Some(format!(
                     r#"{{"ok":true,"status":200,"statusText":"OK","url":"{u}","contentType":"text/plain","body":"{seg}"}}"#
                 ))
             });
-        let start = std::time::Instant::now();
         let (_session, snapshot, out) = Session::new(
             doc,
             vec![],
@@ -6115,7 +6736,6 @@ mod tests {
             noop_cookie_set(),
             None,
         );
-        let elapsed = start.elapsed();
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         let got = match &snapshot.get(body).data {
             dom::NodeData::Element(e) => e.attrs.get("data-all").cloned(),
@@ -6126,10 +6746,9 @@ mod tests {
             Some("a,b,c,d,e"),
             "all five fetches should resolve"
         );
-        // Concurrent: 5x100ms serialized would be >=500ms; concurrently it is ~100ms + overhead.
         assert!(
-            elapsed < std::time::Duration::from_millis(400),
-            "fetches should run concurrently, took {elapsed:?}"
+            overlapped.load(Ordering::Relaxed),
+            "all five host fetches must overlap"
         );
     }
 
@@ -6663,6 +7282,55 @@ mod tests {
             out.value.as_deref(),
             Some("svg:path|true|path|function|true")
         );
+    }
+
+    #[test]
+    fn concurrent_sessions_keep_host_context_isolated() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [false, true].into_iter().map(|dark| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let context = HostContext::default();
+                let _host = context.enter();
+                let width = if dark { 640 } else { 320 };
+                let bytes = if dark { 2200 } else { 1100 };
+                set_device_metrics(width, 400, if dark { 2.0 } else { 1.0 });
+                set_color_scheme_dark(dark);
+                set_cross_origin_isolated(dark);
+                set_response_body_size(bytes);
+                // Both tabs have installed their settings before either JS worker starts.
+                barrier.wait();
+                let (session, _, outputs) = Session::new(
+                    html::parse("<style>#box{width:50vw;color:rgb(1,2,3)}@media(prefers-color-scheme:dark){#box{color:rgb(4,5,6)}}</style><div id=box>text</div>"),
+                    vec!["window.ready = true".to_string()], Vec::new(), HashMap::new(),
+                    "https://example.com/", no_fetch(), no_request(), no_ws(),
+                    noop_cookie_get(), noop_cookie_set(), None,
+                );
+                assert!(outputs[0].error.is_none(), "{:?}", outputs[0]);
+                let (metrics,_,_) = session.repl_eval("[innerWidth,innerHeight,devicePixelRatio,crossOriginIsolated,performance.getEntriesByType('navigation')[0].encodedBodySize].join(',')");
+                assert_eq!(metrics,format!("{width},400,{},{dark},{bytes}",if dark {2} else {1}));
+                let (initial,_,_) = session.repl_eval("getComputedStyle(document.getElementById('box')).width");
+                assert_eq!(initial,format!("{}px",width/2));
+                let marker = if dark { 7 } else { 3 };
+                let script = format!("__commitSelection({marker},1,{marker},4); __clearHighlights(); __addHighlight('tab{marker}',{marker}); window.scrollTo(0,{});",width/2);
+                session.repl_eval(&script);
+                barrier.wait();
+                assert_eq!(active_selection(),Some((marker,1,marker,4)));
+                assert_eq!(active_highlights(),vec![(marker,format!("tab{marker}"))]);
+                assert_eq!(take_pending_scroll(),Some((width/2) as f32));
+                assert_eq!(take_pending_scroll(),None);
+                // Live host changes must reach the already-running session and invalidate its
+                // CSS cache even when its DOM version remains unchanged.
+                set_device_metrics(width+100,400,1.0);
+                set_color_scheme_dark(!dark);
+                barrier.wait();
+                let (live,_,_) = session.repl_eval("[matchMedia('(prefers-color-scheme: dark)').matches,getComputedStyle(document.getElementById('box')).width,getComputedStyle(document.getElementById('box')).color].join('|')");
+                assert_eq!(live,format!("{}|{}px|{}",!dark,(width+100)/2,if dark {"rgb(1, 2, 3)"} else {"rgb(4, 5, 6)"}));
+            })
+        }).collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 
     // --- persistent Session ------------------------------------------------------------------

@@ -1,0 +1,106 @@
+name: Desktop
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Keep dependency artifacts and cache unchanged workspace compilation on every platform.
+  # sccache cannot cache incremental builds; final binary linking still runs normally.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            binary: browser
+          - os: windows-latest
+            platform: windows
+            binary: browser.exe
+          - os: macos-15
+            platform: macos-arm64
+            arch: arm64
+            binary: browser
+          - os: macos-15-intel
+            platform: macos-x86_64
+            arch: x86_64
+            binary: browser
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.1'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-${{ matrix.platform }}
+          # A failed test or packaging check must not discard a successful dependency build.
+          cache-on-failure: true
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install Linux libraries and fonts
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxkbcommon-x11-0 mesa-vulkan-drivers fonts-dejavu-core
+      - name: Check desktop targets
+        run: cargo check --locked -p browser-desktop --all-targets
+      - name: Test engine and desktop integration
+        run: cargo test --locked --workspace
+      - name: Build desktop executable
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: cargo build --locked --release -p browser-desktop
+      - name: Stage executable and licenses
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mkdir -p "dist/browser-${{ matrix.platform }}"
+          cp "target/release/${{ matrix.binary }}" LICENSE crates/desktop/assets/Inter-LICENSE.txt "dist/browser-${{ matrix.platform }}/"
+      - name: Package macOS app and disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dmg-tools"
+          "$RUNNER_TEMP/dmg-tools/bin/python" -m pip install -r scripts/macos-dmg-requirements.txt
+          export DMG_LAYOUT_PYTHON="$RUNNER_TEMP/dmg-tools/bin/python"
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "browser-desktop"))')"
+          scripts/package-macos.sh target/release/browser "dist/browser-${{ matrix.platform }}" "$version" "$PACKAGE_ARCH" "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        id: package
+        with:
+          name: browser-${{ matrix.platform }}
+          path: dist/browser-${{ matrix.platform }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Link downloadable build
+        shell: bash
+        env:
+          ARTIFACT_URL: ${{ steps.package.outputs.artifact-url }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "### Browser for $PLATFORM" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Download this build]($ARTIFACT_URL) — commit $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            echo 'Extract the downloaded ZIP, open the DMG, and drag Browser into Applications. These test builds are ad-hoc signed, not Apple-notarized.' >> "$GITHUB_STEP_SUMMARY"
+          fi

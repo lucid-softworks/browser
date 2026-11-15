@@ -307,6 +307,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
             || !cs.box_shadows.is_empty()
             || cs.transform.is_some()
             || cs.border_radius != 0.0
+            || cs.border_radius_pct.is_some()
             || cs.mask_image.is_some()
             || cs.background_image_url.is_some()
         {
@@ -316,6 +317,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
                 transform: cs.transform,
                 transform_origin: cs.transform_origin,
                 border_radius: cs.border_radius,
+                border_radius_pct: cs.border_radius_pct,
                 mask_image: cs.mask_image.clone(),
                 background_image: cs.background_image_url.as_ref().map(|url| style::BgImage {
                     url: url.clone(),
@@ -481,14 +483,75 @@ pub(crate) fn build_replaced_or_control(
                 .attrs
                 .get("height")
                 .and_then(|v| v.trim().parse::<f32>().ok());
-            if css_w.is_none() {
+            if css_w.is_none() && !cs.width_authored {
                 css_w = aw;
             }
-            if css_h.is_none() {
+            if css_h.is_none() && !cs.height_authored {
                 css_h = ah;
             }
         }
-        let (cw, ch) = image_content_size(css_w, css_h, intrinsic);
+        let horizontal_edges =
+            cs.padding.left + cs.padding.right + cs.border.left + cs.border.right;
+        let vertical_edges = cs.padding.top + cs.padding.bottom + cs.border.top + cs.border.bottom;
+        let border_box = cs.box_sizing == style::BoxSizing::BorderBox;
+        let content_w = css_w.map(|width| {
+            if border_box {
+                (width - horizontal_edges).max(0.0)
+            } else {
+                width
+            }
+        });
+        let content_h = css_h.map(|height| {
+            if border_box {
+                (height - vertical_edges).max(0.0)
+            } else {
+                height
+            }
+        });
+        let (cw, ch) = match (css_w, css_h, cs.aspect_ratio, cs.aspect_ratio_auto) {
+            (Some(width), None, Some(ratio), false) if ratio > 0.0 => {
+                if border_box {
+                    (
+                        (width - horizontal_edges).max(0.0),
+                        (width / ratio - vertical_edges).max(0.0),
+                    )
+                } else {
+                    (width.max(0.0), (width / ratio).max(0.0))
+                }
+            }
+            (None, Some(height), Some(ratio), false) if ratio > 0.0 => {
+                if border_box {
+                    (
+                        (height * ratio - horizontal_edges).max(0.0),
+                        (height - vertical_edges).max(0.0),
+                    )
+                } else {
+                    ((height * ratio).max(0.0), height.max(0.0))
+                }
+            }
+            _ => {
+                let attribute_intrinsic = if is_img {
+                    el.attrs
+                        .get("width")
+                        .and_then(|width| width.trim().parse::<f32>().ok())
+                        .zip(
+                            el.attrs
+                                .get("height")
+                                .and_then(|height| height.trim().parse::<f32>().ok()),
+                        )
+                } else {
+                    None
+                };
+                let natural = if cs.aspect_ratio_auto {
+                    intrinsic
+                        .or(attribute_intrinsic)
+                        .or_else(|| cs.aspect_ratio.map(|ratio| (ratio, 1.0)))
+                } else {
+                    intrinsic.or(attribute_intrinsic)
+                };
+                image_content_size(content_w, content_h, natural)
+            }
+        };
         if cw <= 0.0 || ch <= 0.0 {
             // No drawable bitmap and no explicit size. For <img> with alt text, lay out a small
             // box containing the alt string so a broken image isn't a 0×0 nothing.

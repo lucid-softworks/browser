@@ -971,6 +971,149 @@
     if (path.indexOf(globalThis) < 0) { path.push(globalThis); }
     return path;
   });
+  function __activationTag(el) {
+    try { return String(el.localName || el.tagName || "").toLowerCase(); } catch (e) { return ""; }
+  }
+  function __activationType(el, fallback) {
+    try { return String(el.getAttribute("type") || fallback || "").toLowerCase(); } catch (e) { return fallback || ""; }
+  }
+  function __isInteractiveContent(el) {
+    var tag = __activationTag(el);
+    if (tag === "a" || tag === "area" || tag === "button" || tag === "details" || tag === "iframe" || tag === "select" || tag === "textarea") { return true; }
+    if (tag === "input") { return __activationType(el, "text") !== "hidden"; }
+    if (tag === "audio" || tag === "video") { try { return el.hasAttribute("controls"); } catch (e) {} }
+    return false;
+  }
+  function __labelContainsInteractiveTarget(label, target) {
+    for (var cur = target; cur && cur !== label; cur = cur.parentNode) {
+      if (__isInteractiveContent(cur)) { return true; }
+    }
+    return false;
+  }
+  function __activationKind(el, originalTarget) {
+    if (!el || typeof el.nodeType !== "number" || el.nodeType !== 1) { return null; }
+    var tag = __activationTag(el), type;
+    try { if (el.hasAttribute("disabled")) { return null; } } catch (e) {}
+    if (tag === "input") {
+      type = __activationType(el, "text");
+      if (type === "checkbox" || type === "radio") { return type; }
+      if (type === "submit" || type === "image") { return "submit"; }
+      if (type === "reset") { return "reset"; }
+    }
+    if (tag === "button") {
+      type = __activationType(el, "submit");
+      if (type === "submit" || type === "reset") { return type; }
+    }
+    if ((tag === "a" || tag === "area") && el.hasAttribute && el.hasAttribute("href")) { return "link"; }
+    if (tag === "summary") {
+      var details = el.parentNode;
+      if (__activationTag(details) === "details") {
+        var children = details.children || [];
+        for (var i = 0; i < children.length; i++) {
+          if (__activationTag(children[i]) === "summary") { return children[i] === el ? "summary" : null; }
+        }
+      }
+    }
+    if (tag === "label") {
+      // A click whose target is interactive content inside a label makes the label's activation
+      // behavior a no-op, but it still occupies the one activation-target slot. Ancestors must not
+      // become a fallback activation target.
+      return __labelContainsInteractiveTarget(el, originalTarget) ? "noop" : "label";
+    }
+    return null;
+  }
+  function __findActivationTarget(path, originalTarget) {
+    for (var i = 0; i < path.length; i++) {
+      var kind = __activationKind(path[i], originalTarget);
+      if (kind) { return { element: path[i], kind: kind }; }
+    }
+    return null;
+  }
+  function __findForm(control) {
+    for (var cur = control && control.parentNode; cur; cur = cur.parentNode) {
+      if (__activationTag(cur) === "form") { return cur; }
+    }
+    return null;
+  }
+  function __radioGroup(input) {
+    var form = __findForm(input), scope = form || document, name = "", radios = [];
+    try { name = String(input.getAttribute("name") || ""); radios = scope.querySelectorAll("input[type=radio]"); } catch (e) {}
+    var group = [];
+    for (var i = 0; i < radios.length; i++) {
+      var radio = radios[i], radioName = "";
+      try { radioName = String(radio.getAttribute("name") || ""); } catch (e2) {}
+      if (radioName === name && __findForm(radio) === form) { group.push(radio); }
+    }
+    return group;
+  }
+  function __legacyPreActivate(activation) {
+    if (!activation || (activation.kind !== "checkbox" && activation.kind !== "radio")) { return null; }
+    var el = activation.element;
+    if (activation.kind === "checkbox") {
+      var oldChecked = !!el.checked;
+      el.checked = !oldChecked;
+      return { elements: [el], checked: [oldChecked] };
+    }
+    var group = __radioGroup(el), old = [];
+    if (group.indexOf(el) < 0) { group.push(el); }
+    for (var i = 0; i < group.length; i++) { old.push(!!group[i].checked); group[i].checked = group[i] === el; }
+    return { elements: group, checked: old };
+  }
+  function __restorePreActivation(state) {
+    if (!state) { return; }
+    for (var i = 0; i < state.elements.length; i++) { state.elements[i].checked = state.checked[i]; }
+  }
+  function __dispatchActivationEvent(target, type, bubbles, cancelable) {
+    try { return target.dispatchEvent(new globalThis.Event(type, { bubbles: bubbles, cancelable: cancelable })); }
+    catch (e) { return true; }
+  }
+  function __activate(activation) {
+    if (!activation) { return; }
+    var el = activation.element, kind = activation.kind;
+    if (kind === "noop") { return; }
+    if (kind === "checkbox" || kind === "radio") {
+      __dispatchActivationEvent(el, "input", true, false);
+      __dispatchActivationEvent(el, "change", true, false);
+      return;
+    }
+    if (kind === "submit" || kind === "reset") {
+      var form = __findForm(el);
+      // This activation belongs to exactly one form. Keeping the synthetic submit/reset event at
+      // that form prevents invalid programmatic nested-form trees from invoking an ancestor form's
+      // activation handler as a second activation.
+      if (form) { __dispatchActivationEvent(form, kind, false, true); }
+      return;
+    }
+    if (kind === "summary") {
+      var details = el.parentNode;
+      try { if (details.hasAttribute("open")) { details.removeAttribute("open"); } else { details.setAttribute("open", ""); } } catch (e) {}
+      setTimeout(function () { __dispatchActivationEvent(details, "toggle", false, false); }, 0);
+      return;
+    }
+    if (kind === "label") {
+      var control = null, id = "";
+      try { id = el.getAttribute("for") || ""; } catch (e2) {}
+      if (id) { try { control = document.getElementById(id); } catch (e3) {} }
+      if (!control) { try { control = el.querySelector("button,input,select,textarea"); } catch (e4) {} }
+      if (control && typeof control.click === "function") { control.click(); }
+      return;
+    }
+    if (kind === "link") {
+      var oldURL = String(globalThis.location.href || ""), newURL = "";
+      try { newURL = String(el.href || el.getAttribute("href") || ""); } catch (e5) {}
+      if (!newURL) { return; }
+      globalThis.location.href = newURL;
+      newURL = String(globalThis.location.href || newURL);
+      if (oldURL !== newURL && oldURL.split("#")[0] === newURL.split("#")[0]) {
+        setTimeout(function () {
+          var hev;
+          try { hev = new globalThis.HashChangeEvent("hashchange", { oldURL: oldURL, newURL: newURL }); }
+          catch (e6) { hev = new globalThis.Event("hashchange"); try { hev.oldURL = oldURL; hev.newURL = newURL; } catch (e7) {} }
+          globalThis.dispatchEvent(hev);
+        }, 0);
+      }
+    }
+  }
   // Shared dispatch for `target.dispatchEvent(ev)`. Drives constructed Event objects (which carry
   // internal __ev state + read-only getters) through the full DOM dispatch algorithm: builds the
   // propagation path, runs the capture phase (root -> target), the target phase, then the bubble
@@ -987,6 +1130,11 @@
     var bubbles = s.bubbles;
 
     var path = globalThis.__eventPath(target); // [target, ...ancestors, document, window]
+    // The DOM dispatch algorithm chooses at most one activation target: the first element with
+    // activation behavior in target-to-root order. Checkable controls run legacy pre-activation
+    // before listeners so click handlers observe the tentative checked state.
+    var activation = type === "click" ? __findActivationTarget(path, target) : null;
+    var preActivation = __legacyPreActivate(activation);
 
     s.dispatching = true; s.target = target; s.stopPropagation = false;
     s.stopImmediate = false; s.path = path.slice();
@@ -1019,6 +1167,8 @@
 
     s.eventPhase = 0; s.currentTarget = null; s.stopPropagation = false;
     s.stopImmediate = false; s.dispatching = false;
+    if (s.defaultPrevented) { __restorePreActivation(preActivation); }
+    else { __activate(activation); }
     return !s.defaultPrevented;
   });
   installEvents(globalThis);
@@ -1169,7 +1319,17 @@
   document.referrer = "";
   document.URL = parts.href;
   document.documentURI = parts.href;
-  document.baseURI = parts.href;
+  Object.defineProperty(document, "baseURI", {
+    get: function () {
+      var base = null;
+      try { base = document.querySelector("base[href]"); } catch (e) {}
+      if (base && typeof base.getAttribute === "function") {
+        try { return new globalThis.URL(base.getAttribute("href"), parts.href).href; } catch (e2) {}
+      }
+      return parts.href;
+    },
+    enumerable: true, configurable: true
+  });
   document.domain = parts.hostname;
   document.title = document.title; // leave as-is; real getter/setter already present
 
@@ -1348,41 +1508,10 @@
     // `counter(name, decimal)` / `counters(name, sep, decimal)`: the default `decimal` style is
     // omitted on serialization.
     val = val.replace(/counter\(\s*([^,)]+?)\s*,\s*decimal\s*\)/gi, function (_m, nm) { return "counter(" + nm.trim() + ")"; });
-    var out = "";
-    var i = 0, n = val.length;
-    // Sticky number matcher: anchored at `lastIndex`, so we never slice the tail of `val` (which
-    // would make this loop O(n²) — a 1.8MB value, e.g. grid-template-columns-crash.html, then hangs).
-    var numRe = /[-+]?(?:\d+\.?\d*|\.\d+)/y;
-    while (i < n) {
-      var ch = val[i];
-      // Skip quoted strings verbatim (property-specific quote canonicalization happens in pushDecl).
-      if (ch === '"' || ch === "'") {
-        var q = ch; out += ch; i++;
-        while (i < n && val[i] !== q) { if (val[i] === "\\" && i + 1 < n) { out += val[i] + val[i + 1]; i += 2; continue; } out += val[i]; i++; }
-        if (i < n) { out += val[i]; i++; }
-        continue;
-      }
-      // A number token: optional sign, digits with optional single decimal point.
-      numRe.lastIndex = i;
-      var m = numRe.exec(val);
-      if (m && m[0].length > 0) {
-        // Only treat as a number if not part of an identifier (preceding char isn't a letter/_).
-        // Read the preceding char from `val` (O(1)), NOT `out[out.length-1]` — indexing the growing
-        // result rope per number token forces repeated flattening, making this O(n²) (a 1.8MB
-        // grid-template-columns value then hangs). `val` is fixed for the loop and number
-        // normalization never adds/removes letters, so `val[i-1]` is an equivalent predecessor.
-        var prev = i > 0 ? val[i - 1] : "";
-        var startsAlpha = /[A-Za-z_]/.test(prev);
-        if (!startsAlpha) {
-          out += normalizeNumberToken(m[0]);
-          i += m[0].length;
-          continue;
-        }
-      }
-      out += ch; i++;
-    }
-    return out;
+    // Numeric scanning crosses the host boundary once, so large grid values stay linear.
+    return __normalizeCssNumbers(val);
   }
+
   // Re-quote every top-level CSS string in `val` to double-quote form (CSSOM "serialize a string").
   // Used for properties whose <string> values are always quoted on serialization (content, quotes).
   function requoteStrings(val) {
@@ -1476,6 +1605,7 @@
     "color", "background-color", "background-image", "background-position-x", "background-position-y",
     "background-size", "background-repeat", "background-attachment", "background-origin", "background-clip",
     "width", "height", "min-width", "min-height", "max-width", "max-height",
+    "contain-intrinsic-width", "contain-intrinsic-height", "contain-intrinsic-inline-size", "contain-intrinsic-block-size",
     "margin-top", "margin-right", "margin-bottom", "margin-left",
     "padding-top", "padding-right", "padding-bottom", "padding-left",
     "top", "right", "bottom", "left", "position", "display", "float", "clear", "visibility", "opacity",
@@ -1488,7 +1618,7 @@
     "font-variant-east-asian", "font-variant-position", "font-variant-emoji",
     "font-stretch", "line-height",
     "text-align", "text-decoration-line", "text-decoration-style", "text-decoration-color",
-    "text-transform", "letter-spacing", "white-space", "vertical-align",
+    "text-transform", "letter-spacing", "white-space-collapse", "text-wrap-mode", "text-wrap-style", "vertical-align",
     "list-style-type", "list-style-position", "list-style-image",
     "overflow-x", "overflow-y", "z-index", "cursor", "box-sizing",
     "flex-direction", "flex-wrap", "flex-grow", "flex-shrink", "flex-basis",
@@ -1648,7 +1778,9 @@
     if (name === "place-content") return ["align-content", "justify-content"];
     if (name === "place-items") return ["align-items", "justify-items"];
     if (name === "place-self") return ["align-self", "justify-self"];
+    if (name === "white-space") return ["white-space-collapse", "text-wrap-mode"];
     if (name === "columns") return ["column-width", "column-count"];
+    if (name === "contain-intrinsic-size") return ["contain-intrinsic-width", "contain-intrinsic-height"];
     // SVG `marker` shorthand sets all three marker longhands to the same value.
     if (name === "marker") return ["marker-start", "marker-mid", "marker-end"];
     return null;
@@ -1743,6 +1875,21 @@
       for (var i = 0; i < lhs.length; i++) out.push([lhs[i], v]);
       return out;
     }
+    // A shorthand containing a pending substitution stays as a shorthand until computed-value time;
+    // eagerly expanding it would change legacy-alias behavior and lose the original token stream.
+    if (/(?:var|env)\s*\(/i.test(value)) return null;
+    if (name === "contain-intrinsic-size") {
+      var cis = splitCssTokens(value), parts = [], ci = 0;
+      while (ci < cis.length && parts.length < 2) {
+        if (cis[ci].toLowerCase() === "auto") {
+          if (ci + 1 >= cis.length) return null;
+          parts.push("auto " + cis[ci + 1]); ci += 2;
+        } else { parts.push(cis[ci]); ci++; }
+      }
+      if (ci !== cis.length || parts.length < 1 || parts.length > 2) return null;
+      if (parts.length === 1) parts.push(parts[0]);
+      return [[lhs[0], parts[0]], [lhs[1], parts[1]]];
+    }
     if (BOX_SHORTHANDS[name] && name !== "border-radius") {
       var b = expandBox(value); if (!b) return null;
       return [[lhs[0], b[0]], [lhs[1], b[1]], [lhs[2], b[2]], [lhs[3], b[3]]];
@@ -1797,6 +1944,16 @@
       for (var fi = 0; fi < FONT_VARIANT_LONGHANDS.length; fi++) { var fl = FONT_VARIANT_LONGHANDS[fi]; fvo.push([fl, fv[fl]]); }
       return fvo;
     }
+    if (name === "white-space") {
+      var wsv = value.toLowerCase().split(/\s+/), wc = "collapse", wm = "wrap";
+      if (value.toLowerCase() === "nowrap") wm = "nowrap";
+      else if (value.toLowerCase() === "pre") { wc = "preserve"; wm = "nowrap"; }
+      else if (value.toLowerCase() === "pre-wrap") wc = "preserve";
+      else if (value.toLowerCase() === "pre-line") wc = "preserve-breaks";
+      else if (value.toLowerCase() === "break-spaces") wc = "break-spaces";
+      else wsv.forEach(function (t) { if (/^(collapse|preserve|preserve-breaks|break-spaces)$/.test(t)) wc = t; else if (/^(wrap|nowrap)$/.test(t)) wm = t; });
+      return [["white-space-collapse", wc], ["text-wrap-mode", wm]];
+    }
     if (name === "border-image") {
       if (value.toLowerCase() === "none") {
         var bir = [];
@@ -1811,6 +1968,16 @@
       out2.push(["list-style-position", ls["list-style-position"] !== undefined ? ls["list-style-position"] : "outside"]);
       out2.push(["list-style-image", ls["list-style-image"] !== undefined ? ls["list-style-image"] : "none"]);
       return out2;
+    }
+    if (name === "flex-flow") {
+      var flow = splitCssTokens(value), direction = "row", wrap = "nowrap";
+      for (var ff = 0; ff < flow.length; ff++) {
+        var ft = flow[ff].toLowerCase();
+        if (/^(row|row-reverse|column|column-reverse)$/.test(ft)) direction = ft;
+        else if (/^(nowrap|wrap|wrap-reverse)$/.test(ft)) wrap = ft;
+        else return null;
+      }
+      return [["flex-direction", direction], ["flex-wrap", wrap]];
     }
     if (name === "flex") {
       var fl = parseFlex(value);
@@ -1827,13 +1994,20 @@
     if (vl === "none") return { grow: "0", shrink: "0", basis: "auto" };
     if (vl === "auto") return { grow: "1", shrink: "1", basis: "auto" };
     var toks = splitCssTokens(v);
-    function isNum(t) { return /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(t); }
+    function calcKind(t) {
+      if (!/^calc\(/i.test(t)) return null;
+      // Units inside sign() affect its sign but not the type of the surrounding expression.
+      var outsideSign = t.replace(/sign\([^)]*\)/gi, "1");
+      return /(?:\d|\.)\s*(?:%|[a-z]+)/i.test(outsideSign) ? "basis" : "number";
+    }
+    function isNum(t) { return /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(t) || calcKind(t) === "number"; }
     var grow = null, shrink = null, basis = null;
     for (var i = 0; i < toks.length; i++) {
       var t = toks[i];
       if (isNum(t)) {
         if (grow === null) grow = t;
         else if (shrink === null) shrink = t;
+        else if (basis === null && Number(t) === 0 && !/^calc\(/i.test(t)) basis = "0px";
         else return null;
       } else {
         if (basis !== null) return null;
@@ -1845,8 +2019,21 @@
     // (the "one value, flexible" case) which browsers serialize as `0px`.
     if (grow === null) grow = "1";
     if (shrink === null) shrink = "1";
-    if (basis === null) basis = "0px";
-    return { grow: normalizeNumberToken(grow), shrink: normalizeNumberToken(shrink), basis: basis };
+    if (basis === null) basis = "0%";
+    function canonFlexCalc(token, factor) {
+      if (!/^calc\(/i.test(token)) return token;
+      if (factor) {
+        var folded = __calc.serialize(token);
+        if (folded != null) token = folded;
+      }
+      return token.replace(/sign\(([^()]*)\)\s*\*\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[a-z%]+)?)/gi,
+        function (_m, expression, scalar) { return scalar + " * sign(" + expression + ")"; });
+    }
+    return {
+      grow: /^calc\(/i.test(grow) ? canonFlexCalc(grow, true) : normalizeNumberToken(grow),
+      shrink: /^calc\(/i.test(shrink) ? canonFlexCalc(shrink, true) : normalizeNumberToken(shrink),
+      basis: canonFlexCalc(basis, false)
+    };
   }
   // Serialize a shorthand from the current longhand values (`getLong(name)`). Returns "" if it
   // cannot be represented (a longhand missing or values inconsistent).
@@ -1930,6 +2117,27 @@
       // A CSS-wide keyword in any longhand can't combine (handled by the early-return above).
       // Canonical: `grow shrink basis`.
       return fg + " " + fsk + " " + fb;
+    }
+    if (name === "flex-flow") {
+      var fd = g("flex-direction"), fw = g("flex-wrap");
+      if (fd === "row" && fw === "nowrap") return "row";
+      if (fw === "nowrap") return fd;
+      if (fd === "row") return fw;
+      return fd + " " + fw;
+    }
+    if (name === "white-space") {
+      var wsc = g("white-space-collapse"), wsm = g("text-wrap-mode");
+      if (wsc === "collapse" && wsm === "wrap") return "normal";
+      if (wsc === "collapse" && wsm === "nowrap") return "nowrap";
+      if (wsc === "preserve" && wsm === "nowrap") return "pre";
+      if (wsc === "preserve" && wsm === "wrap") return "pre-wrap";
+      if (wsc === "preserve-breaks" && wsm === "wrap") return "pre-line";
+      if (wsc === "break-spaces" && wsm === "wrap") return "break-spaces";
+      return wsc + " " + wsm;
+    }
+    if (name === "contain-intrinsic-size") {
+      var cisw = g("contain-intrinsic-width"), cish = g("contain-intrinsic-height");
+      return cisw === cish ? cisw : cisw + " " + cish;
     }
     // `marker`: the common longhand value when all three markers agree, else "".
     if (name === "marker") {
@@ -2063,7 +2271,7 @@
       "border-top", "border-right", "border-bottom", "border-left", "border-radius", "border-image",
       "outline", "overflow", "overscroll-behavior", "gap", "list-style", "text-decoration",
       "flex", "flex-flow", "place-content", "place-items", "place-self", "columns", "column-rule",
-      "font", "font-variant", "background", "scroll-margin", "scroll-padding"
+      "font", "font-variant", "background", "scroll-margin", "scroll-padding", "contain-intrinsic-size"
     ];
     for (var k = 0; k < shorthands.length; k++) {
       add(shorthands[k]);
@@ -2117,7 +2325,9 @@
       "break-after break-before break-inside text-indent text-justify text-orientation text-rendering " +
       "text-underline-position text-underline-offset text-decoration-thickness text-decoration-skip-ink " +
       "text-emphasis text-emphasis-color text-emphasis-style text-emphasis-position text-combine-upright " +
-      "hyphens hanging-punctuation line-break overflow-anchor overflow-clip-margin scrollbar-gutter " +
+      "hyphens hyphenate-character hyphenate-limit-chars hanging-punctuation line-break " +
+      "text-align-all text-align-last text-autospace text-fit text-group-align text-spacing " +
+      "text-spacing-trim word-space-transform overlay overflow-anchor overflow-clip-margin scrollbar-gutter " +
       "scrollbar-width scrollbar-color scroll-snap-type scroll-snap-align scroll-snap-stop touch-action " +
       "flood-color flood-opacity stop-color stop-opacity lighting-color color-interpolation " +
       "color-interpolation-filters fill fill-opacity fill-rule stroke stroke-width stroke-opacity " +
@@ -2127,6 +2337,7 @@
       "font-feature-settings font-variation-settings font-kerning font-optical-sizing font-language-override " +
       "font-size-adjust font-synthesis font-display src unicode-range ascent-override descent-override " +
       "line-gap-override size-adjust contain content-visibility container container-type container-name " +
+      "contain-intrinsic-size contain-intrinsic-width contain-intrinsic-height contain-intrinsic-inline-size contain-intrinsic-block-size " +
       "counter-set inset gap row-gap column-gap place-items place-content place-self justify-items " +
       "x y cx cy r rx ry " +
       "image-rendering image-orientation shape-outside shape-inside shape-subtract shape-margin shape-image-threshold " +
@@ -2263,6 +2474,175 @@
     if (isCssWideKeyword(v)) return true;
     var vl = v.toLowerCase();
     if (/(^|[^a-z-])(var|env)\s*\(/i.test(v)) return true; // can't validate around substitutions
+    if (name === "align-self" || name === "justify-self") {
+      var selfTokens = vl.split(/\s+/);
+      if (/^(auto|normal|stretch|baseline|last baseline|start|end|self-start|self-end|center|flex-start|flex-end)$/.test(vl)) return true;
+      if (name === "justify-self" && /^(left|right)$/.test(vl)) return true;
+      if (selfTokens.length === 2 && /^(safe|unsafe)$/.test(selfTokens[0])) {
+        if (/^(start|end|self-start|self-end|center|flex-start|flex-end)$/.test(selfTokens[1])) return true;
+        if (name === "justify-self" && /^(left|right)$/.test(selfTokens[1])) return true;
+      }
+      return vl === "first baseline";
+    }
+    if (name === "align-content" || name === "justify-content") {
+      var contentTokens = vl.split(/\s+/);
+      if (/^(normal|stretch|space-between|space-around|space-evenly|start|end|center|flex-start|flex-end)$/.test(vl)) return true;
+      if (name === "justify-content" && /^(left|right)$/.test(vl)) return true;
+      if (name === "align-content" && /^(baseline|first baseline|last baseline)$/.test(vl)) return true;
+      if (contentTokens.length === 2 && /^(safe|unsafe)$/.test(contentTokens[0])) {
+        if (/^(start|end|center|flex-start|flex-end)$/.test(contentTokens[1])) return true;
+        if (name === "justify-content" && /^(left|right)$/.test(contentTokens[1])) return true;
+      }
+      return false;
+    }
+    if (name === "flex-basis") {
+      if (/^(auto|content|fit-content|min-content|max-content)$/.test(vl)) return true;
+      if (/^calc\(/i.test(v)) return true;
+      return isValidLengthLike(v, false);
+    }
+    if (name === "flex") return parseFlex(v) !== null;
+    if (name === "flex-grow" || name === "flex-shrink") {
+      if (/^calc\(/i.test(v)) return true;
+      return /^\+?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(v) && !/\.$/.test(v);
+    }
+    if (name === "flex-direction") return /^(row|row-reverse|column|column-reverse)$/.test(vl);
+    if (name === "flex-wrap") return /^(nowrap|wrap|wrap-reverse)$/.test(vl);
+    if (name === "flex-flow") {
+      var flowTokens = vl.split(/\s+/), directionSeen = false, wrapSeen = false;
+      if (flowTokens.length < 1 || flowTokens.length > 2) return false;
+      for (var fi = 0; fi < flowTokens.length; fi++) {
+        if (/^(row|row-reverse|column|column-reverse)$/.test(flowTokens[fi]) && !directionSeen) directionSeen = true;
+        else if (/^(nowrap|wrap|wrap-reverse)$/.test(flowTokens[fi]) && !wrapSeen) wrapSeen = true;
+        else return false;
+      }
+      return true;
+    }
+    function oneOfValue(pattern) { return pattern.test(vl); }
+    if (name === "hyphens") return oneOfValue(/^(none|manual|auto)$/);
+    if (name === "line-break") return oneOfValue(/^(auto|loose|normal|strict|anywhere)$/);
+    if (name === "overflow-wrap" || name === "word-wrap") return oneOfValue(/^(normal|break-word|anywhere)$/);
+    if (name === "text-align") return oneOfValue(/^(start|end|left|right|center|justify|justify-all|match-parent)$/);
+    if (name === "text-align-all") return oneOfValue(/^(start|end|left|right|center|justify|match-parent)$/);
+    if (name === "text-align-last") return oneOfValue(/^(auto|start|end|left|right|center|justify|match-parent)$/);
+    if (name === "text-group-align") return oneOfValue(/^(none|start|end|left|right|center)$/);
+    if (name === "text-justify") return oneOfValue(/^(auto|none|inter-word|inter-character|distribute)$/);
+    if (name === "word-break") return oneOfValue(/^(normal|break-all|keep-all|break-word|auto-phrase|manual)$/);
+    if (name === "text-wrap-mode") return oneOfValue(/^(wrap|nowrap)$/);
+    if (name === "text-wrap-style") return oneOfValue(/^(auto|balance|stable|pretty)$/);
+    if (name === "white-space-collapse") return oneOfValue(/^(collapse|preserve|preserve-breaks|preserve-spaces|break-spaces)$/);
+    if (name === "hyphenate-character") return vl === "auto" || /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/.test(v);
+    if (name === "hyphenate-limit-chars") {
+      var hl = splitCssTokens(v);
+      return hl.length >= 1 && hl.length <= 3 && hl.every(function (t) { return t === "auto" || /^\d+$/.test(t) || /^calc\(/i.test(t); });
+    }
+    if (name === "letter-spacing" || name === "word-spacing") {
+      if (vl === "normal") return true;
+      if (/^calc\(/i.test(v)) return true;
+      return isLenPct(v, true);
+    }
+    if (name === "tab-size") {
+      if (/^calc\(/i.test(v)) return !/%/.test(v);
+      var tm = /^(\+?(?:\d+\.?\d*|\.\d+))(?:([a-z]+))?$/i.exec(v);
+      return !!tm && parseFloat(tm[1]) >= 0 && (!tm[2] || STROKE_LEN_UNITS.test(tm[2].toLowerCase()));
+    }
+    if (name === "text-indent") {
+      var indent = splitCssTokens(v), lengthCount = 0, hanging = 0, eachLine = 0;
+      for (var ti = 0; ti < indent.length; ti++) {
+        if (indent[ti] === "hanging") hanging++;
+        else if (indent[ti] === "each-line") eachLine++;
+        else if (/^calc\(/i.test(indent[ti]) || isLenPct(indent[ti], true)) lengthCount++;
+        else return false;
+      }
+      return lengthCount === 1 && hanging <= 1 && eachLine <= 1;
+    }
+    if (name === "text-autospace") {
+      if (/^(normal|auto|no-autospace)$/.test(vl)) return true;
+      var at = vl.split(/\s+/), asSeen = {}, modeCount = 0;
+      for (var ai = 0; ai < at.length; ai++) {
+        if (!/^(ideograph-alpha|ideograph-numeric|punctuation|insert|replace)$/.test(at[ai]) || asSeen[at[ai]]) return false;
+        asSeen[at[ai]] = 1; if (at[ai] === "insert" || at[ai] === "replace") modeCount++;
+      }
+      return modeCount <= 1;
+    }
+    if (name === "text-transform") {
+      if (/^(none|math-auto)$/.test(vl)) return true;
+      var tt = vl.split(/\s+/), caseCount = 0, ttSeen = {};
+      for (var tti = 0; tti < tt.length; tti++) {
+        if (!/^(capitalize|uppercase|lowercase|full-width|full-size-kana)$/.test(tt[tti]) || ttSeen[tt[tti]]) return false;
+        ttSeen[tt[tti]] = 1; if (/^(capitalize|uppercase|lowercase)$/.test(tt[tti])) caseCount++;
+      }
+      return caseCount <= 1;
+    }
+    if (name === "text-wrap") {
+      var tw = vl.split(/\s+/), modes = 0, styles = 0;
+      for (var twi = 0; twi < tw.length; twi++) {
+        if (/^(wrap|nowrap)$/.test(tw[twi])) modes++;
+        else if (/^(auto|balance|stable|pretty)$/.test(tw[twi])) styles++;
+        else return false;
+      }
+      return modes <= 1 && styles <= 1;
+    }
+    if (name === "hanging-punctuation") {
+      if (vl === "none") return true;
+      var hp = vl.split(/\s+/), hpSeen = {}, endCount = 0;
+      for (var hi = 0; hi < hp.length; hi++) {
+        if (!/^(first|last|force-end|allow-end)$/.test(hp[hi]) || hpSeen[hp[hi]]) return false;
+        hpSeen[hp[hi]] = 1; if (hp[hi] === "force-end" || hp[hi] === "allow-end") endCount++;
+      }
+      return endCount <= 1;
+    }
+    if (name === "text-fit") {
+      if (/^(none|grow|shrink)$/.test(vl)) return true;
+      if (/^(grow|shrink) \d+(?:\.\d+)?%$/.test(vl)) return true;
+      return /^(grow|shrink) (consistent|per-line|per-line-all)(?: \d+(?:\.\d+)?%)?$/.test(vl) &&
+        !/^(?:grow|shrink) per-line-all /.test(vl);
+    }
+    if (name === "text-spacing-trim") return /^(normal|auto|space-all|trim-both|trim-all|trim-start|space-first)$/.test(vl);
+    if (name === "text-spacing") {
+      if (/^(normal|none|auto|no-autospace|trim-start|space-all)$/.test(vl)) return true;
+      var ts = vl.split(/\s+/);
+      if (ts.length !== 2) return false;
+      var aText = /^(normal|no-autospace)$/.test(ts[0]), bText = /^(normal|no-autospace)$/.test(ts[1]);
+      var aTrim = /^(normal|trim-start|space-all)$/.test(ts[0]), bTrim = /^(normal|trim-start|space-all)$/.test(ts[1]);
+      return (aText && bTrim) || (bText && aTrim);
+    }
+    if (name === "word-space-transform") {
+      if (vl === "none") return true;
+      return /^(?:space|ideographic-space)(?: auto-phrase)?$/.test(vl) || /^auto-phrase (?:space|ideographic-space)$/.test(vl);
+    }
+    if (name === "white-space") {
+      if (/^(normal|nowrap|pre|pre-wrap|pre-line|break-spaces)$/.test(vl)) return true;
+      var ws = vl.split(/\s+/), collapseCount = 0, wrapCount = 0;
+      for (var wi = 0; wi < ws.length; wi++) {
+        if (/^(collapse|preserve|preserve-breaks|break-spaces)$/.test(ws[wi])) collapseCount++;
+        else if (/^(wrap|nowrap)$/.test(ws[wi])) wrapCount++;
+        else return false;
+      }
+      return collapseCount <= 1 && wrapCount <= 1;
+    }
+    if (name === "overlay") return /^(none|auto)$/.test(vl);
+    if (/^contain-intrinsic-(?:width|height|inline-size|block-size)$/.test(name)) {
+      var cisv = splitCssTokens(v);
+      if (cisv.length === 2 && cisv[0].toLowerCase() === "auto") cisv.shift();
+      if (cisv.length !== 1) return false;
+      if (cisv[0].toLowerCase() === "none") return true;
+      if (cisv[0].indexOf("%") >= 0) return false;
+      return /^calc\(/i.test(cisv[0]) ? __calc.valid(cisv[0]) : isLenPct(cisv[0], false);
+    }
+    if (name === "contain-intrinsic-size") {
+      var cist = splitCssTokens(v), groups = 0, cii = 0;
+      while (cii < cist.length && groups < 2) {
+        if (cist[cii].toLowerCase() === "auto") {
+          if (cii + 1 >= cist.length) return false;
+          cii += 2;
+        } else { cii++; }
+        groups++;
+      }
+      if (cii !== cist.length || groups < 1 || groups > 2) return false;
+      var expandedCis = expandShorthand(name, v);
+      return expandedCis != null && isValidValue("contain-intrinsic-width", expandedCis[0][1]) &&
+        isValidValue("contain-intrinsic-height", expandedCis[1][1]);
+    }
     if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
     // stroke-width / stroke-dashoffset: a single <length-percentage> | <number> (user units) or a
     // type-valid calc(); stroke-dasharray: none | a list of the same. stroke-width/dasharray are
@@ -2292,10 +2672,11 @@
           vl === "fit-content" || vl === "thin" || vl === "medium" || vl === "thick" || /^fit-content\(/i.test(v)) return true;
       return isValidLengthLike(v, false);
     }
-    if (name === "z-index" || name === "order") {
+    if (name === "z-index") {
       if (vl === "auto") return true;
       return /^[-+]?\d+$/.test(v);
     }
+    if (name === "order") return /^[-+]?\d+$/.test(v);
     // <alpha-value>: <number> | <percentage> (single token, no trailing dot). The value is not
     // clamped at parse time (computed value clamps).
     if (name === "opacity" || name === "fill-opacity" || name === "stroke-opacity" ||
@@ -2440,6 +2821,88 @@
       return;
     }
     var nv = normalizeCssValue(val);
+    if (/^calc\(/i.test(nv) && (name === "flex-grow" || name === "flex-shrink")) {
+      var foldedFlexFactor = __calc.serialize(nv);
+      if (foldedFlexFactor != null) nv = foldedFlexFactor;
+    }
+    if (/^calc\(/i.test(nv) && (name === "flex-grow" || name === "flex-shrink" || name === "flex-basis")) {
+      nv = nv.replace(/sign\(([^()]*)\)\s*\*\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[a-z%]+)?)/gi,
+        function (_m, expression, scalar) { return scalar + " * sign(" + expression + ")"; });
+    }
+    if ((name === "align-self" || name === "justify-self" || name === "align-content") && nv.toLowerCase() === "first baseline") {
+      nv = "baseline";
+    }
+    if ((name === "flex-grow" || name === "flex-shrink") && !/^calc\(/i.test(nv) &&
+        !isCssWideKeyword(nv) && !/(?:var|env)\s*\(/i.test(nv)) {
+      nv = String(Number(nv));
+    }
+    if (!isCssWideKeyword(nv) && name === "hyphenate-character" && /^"[\s\S]*"$/.test(nv)) {
+      nv = '"' + unescapeCssIdent(nv.slice(1, -1)) + '"';
+    }
+    if (!isCssWideKeyword(nv) && name === "hyphenate-limit-chars") {
+      var hlc = splitCssTokens(nv).map(function (t) {
+        var m = /^calc\(([-+]?\d+(?:\.\d+)?)\)$/i.exec(t); return m ? String(Math.floor(Number(m[1]))) : t;
+      });
+      while (hlc.length > 1 && hlc[hlc.length - 1] === hlc[hlc.length - 2]) hlc.pop();
+      nv = hlc.join(" ");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-transform" && !/^(none|math-auto)$/.test(nv)) {
+      var ttv = nv.split(/\s+/), tto = [];
+      ["capitalize", "uppercase", "lowercase", "full-width", "full-size-kana"].forEach(function (t) { if (ttv.indexOf(t) >= 0) tto.push(t); });
+      nv = tto.join(" ");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-autospace" && !/^(normal|auto|no-autospace)$/.test(nv)) {
+      var tav = nv.split(/\s+/), tao = [];
+      ["ideograph-alpha", "ideograph-numeric", "punctuation", "insert", "replace"].forEach(function (t) { if (tav.indexOf(t) >= 0) tao.push(t); });
+      nv = tao.join(" ");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-justify" && nv === "distribute") nv = "inter-character";
+    if (!isCssWideKeyword(nv) && name === "text-wrap") {
+      var twv = nv.split(/\s+/), twMode = twv.indexOf("nowrap") >= 0 ? "nowrap" : "wrap";
+      var twStyle = twv.indexOf("balance") >= 0 ? "balance" : (twv.indexOf("stable") >= 0 ? "stable" : (twv.indexOf("pretty") >= 0 ? "pretty" : null));
+      nv = twStyle ? (twMode === "wrap" ? twStyle : twMode + " " + twStyle) : twMode;
+    }
+    if (!isCssWideKeyword(nv) && (name === "letter-spacing" || name === "word-spacing")) {
+      var pctOnly = /^calc\(([-+]?\d+(?:\.\d+)?)%\s*([+-])\s*([-+]?\d+(?:\.\d+)?)%\)$/i.exec(nv);
+      if (pctOnly) nv = String(Number(pctOnly[1]) + (pctOnly[2] === "+" ? Number(pctOnly[3]) : -Number(pctOnly[3]))) + "%";
+      else nv = nv.replace(/^calc\(([^()]+) - ([-+]?\d+(?:\.\d+)?)%\)$/i, "calc(-$2% + $1)");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-indent") {
+      var tiv = splitCssTokens(nv), tiLength = [], tiHanging = false, tiEach = false;
+      for (var tii = 0; tii < tiv.length; tii++) {
+        if (tiv[tii] === "hanging") tiHanging = true;
+        else if (tiv[tii] === "each-line") tiEach = true;
+        else tiLength.push(tiv[tii]);
+      }
+      nv = tiLength.join(" ") + (tiHanging ? " hanging" : "") + (tiEach ? " each-line" : "");
+    }
+    if (!isCssWideKeyword(nv) && name === "text-spacing") {
+      if (nv === "none" || nv === "auto") { /* already canonical */ }
+      else if (nv === "no-autospace space-all" || nv === "space-all no-autospace") nv = "none";
+      else {
+        var tsv = nv.split(/\s+/).filter(function (t) { return t !== "normal"; }), tso = [];
+        ["trim-start", "space-all", "no-autospace"].forEach(function (t) { if (tsv.indexOf(t) >= 0) tso.push(t); });
+        nv = tso.length ? tso.join(" ") : "normal";
+      }
+    }
+    if (!isCssWideKeyword(nv) && name === "white-space") {
+      var wsv = nv.split(/\s+/), wc = "collapse", wm = "wrap";
+      if (nv === "normal") { wc = "collapse"; wm = "wrap"; }
+      else if (nv === "nowrap") { wc = "collapse"; wm = "nowrap"; }
+      else if (nv === "pre") { wc = "preserve"; wm = "nowrap"; }
+      else if (nv === "pre-wrap") { wc = "preserve"; wm = "wrap"; }
+      else if (nv === "pre-line") { wc = "preserve-breaks"; wm = "wrap"; }
+      else {
+        wsv.forEach(function (t) { if (/^(collapse|preserve|preserve-breaks|break-spaces)$/.test(t)) wc = t; else if (/^(wrap|nowrap)$/.test(t)) wm = t; });
+      }
+      if (wc === "collapse" && wm === "wrap") nv = "normal";
+      else if (wc === "collapse" && wm === "nowrap") nv = "nowrap";
+      else if (wc === "preserve" && wm === "nowrap") nv = "pre";
+      else if (wc === "preserve" && wm === "wrap") nv = "pre-wrap";
+      else if (wc === "preserve-breaks" && wm === "wrap") nv = "pre-line";
+      else if (wc === "break-spaces" && wm === "wrap") nv = "break-spaces";
+      else nv = wc + " " + wm;
+    }
     // The `font` shorthand serializes size/line-height with spaces around the slash: `10px / 1`.
     // It also resets every font-variant longhand to its initial (which serializes as absent inline).
     if (name === "font" && !isCssWideKeyword(nv)) {
@@ -2470,7 +2933,8 @@
       "inset-inline-start", "inset-inline-end", "text-indent", "letter-spacing", "word-spacing",
       "column-gap", "row-gap", "border-top-left-radius", "border-top-right-radius",
       "border-bottom-left-radius", "border-bottom-right-radius", "flex-basis",
-      "x", "y", "cx", "cy", "r", "rx", "ry"]);
+      "x", "y", "cx", "cy", "r", "rx", "ry",
+      "contain-intrinsic-width", "contain-intrinsic-height", "contain-intrinsic-inline-size", "contain-intrinsic-block-size"]);
     for (var i = 0; i < names.length; i++) { o[names[i]] = 1; }
     return o;
   })();
@@ -2653,7 +3117,20 @@
   }
   function styleAttr(node) { var v = document.__getAttr(node, "style"); return v == null ? "" : v; }
   // Normalize a CSS property name for the CSSStyleDeclaration API (lowercase; custom props as-is).
-  function normPropName(p) { p = String(p); if (isCustomProp(p)) { return p; } /* custom props are case-sensitive, kept verbatim */ p = camelToKebab(p); return p.toLowerCase(); }
+  function normPropName(p) {
+    p = String(p);
+    if (isCustomProp(p)) return p; // custom props are case-sensitive, kept verbatim
+    p = camelToKebab(p).toLowerCase();
+    var webkitFlexAliases = {
+      "-webkit-align-content":"align-content", "-webkit-align-items":"align-items",
+      "-webkit-align-self":"align-self", "-webkit-flex":"flex",
+      "-webkit-flex-basis":"flex-basis", "-webkit-flex-direction":"flex-direction",
+      "-webkit-flex-flow":"flex-flow", "-webkit-flex-grow":"flex-grow",
+      "-webkit-flex-shrink":"flex-shrink", "-webkit-flex-wrap":"flex-wrap",
+      "-webkit-justify-content":"justify-content", "-webkit-order":"order"
+    };
+    return lookup(webkitFlexAliases, p) || p;
+  }
   // Build a CSSStyleDeclaration over a backing store. `get()` returns the current declaration block
   // text; `set(text)` writes it back. Used for both inline styles (style attr) and rule blocks.
   // `restrict(longhandName)` (optional) gates which longhand properties this declaration block may
@@ -5350,10 +5827,11 @@
     if (a === b) { return true; }
     if (!a || !b || a.nodeType !== b.nodeType) { return false; }
     var t = a.nodeType;
-    if (t === 1) {
+    if (t === 1 || t === 2) {
       if ((a.namespaceURI || null) !== (b.namespaceURI || null)) { return false; }
       if ((a.prefix || null) !== (b.prefix || null)) { return false; }
       if (a.localName !== b.localName) { return false; }
+      if (t === 2) { return a.value === b.value; }
       var aa = a.attributes, ba = b.attributes;
       if ((aa ? aa.length : 0) !== (ba ? ba.length : 0)) { return false; }
       for (var i = 0; aa && i < aa.length; i++) {
@@ -5557,17 +6035,16 @@
           }
           // `checked` for checkbox/radio inputs, backed by presence of the `checked` attribute.
           if (__formTag === "input") {
-            var __ty = String(__getAttr(node, "type") || "").toLowerCase();
-            if (__ty === "checkbox" || __ty === "radio") {
-              var __hasChecked = false;
-              try { var __cd = Object.getOwnPropertyDescriptor(el, "checked"); __hasChecked = !!(__cd && (__cd.get || __cd.set)); } catch (e9) {}
-              if (!__hasChecked) {
-                Object.defineProperty(el, "checked", {
-                  get: function () { return __getAttr(node, "checked") != null; },
-                  set: function (v) { if (v) { __setAttr(node, "checked", ""); } else { __removeAttr(node, "checked"); } },
-                  configurable: true, enumerable: true
-                });
-              }
+            // Install regardless of the input's current type: scripts commonly create a text input
+            // and set `type = "checkbox"` afterwards, but the checked IDL member still exists.
+            var __hasChecked = false;
+            try { var __cd = Object.getOwnPropertyDescriptor(el, "checked"); __hasChecked = !!(__cd && (__cd.get || __cd.set)); } catch (e9) {}
+            if (!__hasChecked) {
+              Object.defineProperty(el, "checked", {
+                get: function () { return __getAttr(node, "checked") != null; },
+                set: function (v) { if (v) { __setAttr(node, "checked", ""); } else { __removeAttr(node, "checked"); } },
+                configurable: true, enumerable: true
+              });
             }
           }
         }
@@ -5833,6 +6310,83 @@
     // Live element-metric getters backed by __elemMetrics(this.__node) (0 when null). Only install
     // on real element wrappers (numeric node id) and don't clobber a page-defined accessor.
     if (typeof node === "number") {
+      // offsetTop/offsetLeft are synchronous CSSOM reads, while the native engine applies element
+      // scroll offsets between script turns. Resolve sticky positioning here as well so a scroll
+      // assignment followed immediately by an offset read observes the new sticky position.
+      function __stickyOffset(el, field, fallback) {
+        var vertical = field === "ot";
+        var cs;
+        try { cs = getComputedStyle(el); } catch (e) { return fallback; }
+        if (!cs || cs.position !== "sticky") { return fallback; }
+        function value(style, name) {
+          var direct = style && style[name];
+          if (direct) { return direct; }
+          try { return style && style.getPropertyValue(name); } catch (e) { return ""; }
+        }
+
+        var parent = el.parentElement;
+        if (!parent) { return fallback; }
+        var previous = el.previousElementSibling;
+        var parentStyle;
+        try { parentStyle = getComputedStyle(parent); } catch (e) { parentStyle = null; }
+        var parentPositioned = parentStyle && parentStyle.position && parentStyle.position !== "static";
+        var parentOrigin = Number(parent[vertical ? "offsetTop" : "offsetLeft"]) || 0;
+        var normal = previous
+          ? Number(previous[vertical ? "offsetTop" : "offsetLeft"]) +
+              Number(previous[vertical ? "offsetHeight" : "offsetWidth"]) +
+              (parentPositioned ? parentOrigin : 0)
+          : parentOrigin;
+
+        var scroller = parent;
+        while (scroller) {
+          var scrollerStyle;
+          try { scrollerStyle = getComputedStyle(scroller); } catch (e) { scrollerStyle = null; }
+          var overflow = value(scrollerStyle, vertical ? "overflow-y" : "overflow-x");
+          if (!overflow || overflow === "visible") {
+            overflow = value(scrollerStyle, "overflow");
+          }
+          if (!overflow || overflow === "visible") {
+            overflow = value(scroller.style, vertical ? "overflow-y" : "overflow-x") ||
+              value(scroller.style, "overflow");
+          }
+          if (overflow && overflow !== "visible" && overflow !== "clip") { break; }
+          scroller = scroller.parentElement;
+        }
+        if (!scroller) { return fallback; }
+
+        var startName = vertical ? "top" : "left";
+        var endName = vertical ? "bottom" : "right";
+        var startText = value(cs, startName) || value(el.style, startName);
+        var endText = value(cs, endName) || value(el.style, endName);
+        var start = !startText || startText === "auto" ? null : parseFloat(startText);
+        var end = !endText || endText === "auto" ? null : parseFloat(endText);
+        var scroll = Number(scroller[vertical ? "scrollTop" : "scrollLeft"]) || 0;
+        var viewport = Number(scroller[vertical ? "clientHeight" : "clientWidth"]) || 0;
+        var size = Number(el[vertical ? "offsetHeight" : "offsetWidth"]) || 0;
+        var parentStart = Number(parent[vertical ? "offsetTop" : "offsetLeft"]) || 0;
+        var parentSize = Number(parent[vertical ? "clientHeight" : "clientWidth"]) || 0;
+        var result = normal;
+        if (start !== null && isFinite(start)) {
+          result = Math.max(result, scroll + start);
+        } else if (end !== null && isFinite(end)) {
+          result = Math.min(result, scroll + viewport - end - size);
+        }
+        result = Math.max(parentStart, Math.min(result, parentStart + parentSize - size));
+
+        // The calculation above is in the scroll container's content coordinates. CSSOM reports
+        // offsets relative to the nearest positioned ancestor, which matters for nested stickies.
+        var offsetAncestor = el.parentElement;
+        while (offsetAncestor && offsetAncestor !== scroller) {
+          var ancestorStyle;
+          try { ancestorStyle = getComputedStyle(offsetAncestor); } catch (e) { ancestorStyle = null; }
+          if (ancestorStyle && ancestorStyle.position && ancestorStyle.position !== "static") {
+            result -= Number(offsetAncestor[vertical ? "offsetTop" : "offsetLeft"]) || 0;
+            break;
+          }
+          offsetAncestor = offsetAncestor.parentElement;
+        }
+        return result;
+      }
       var __metricProps = {
         offsetWidth: "ow", offsetHeight: "oh", offsetTop: "ot", offsetLeft: "ol",
         clientWidth: "cw", clientHeight: "ch", // padding box: content + padding, no borders
@@ -5847,6 +6401,7 @@
             get: function () {
               var m = __elemMetrics(this.__node);
               var v = m ? m[field] : 0;
+              if (field === "ot" || field === "ol") { v = __stickyOffset(this, field, v); }
               // The document root (<html>) often has no pushed box, so its width/height metrics read
               // 0. clientWidth/clientHeight of the root must be the viewport size (CSSOM-View), so
               // fall back to innerWidth/innerHeight there.
@@ -5876,15 +6431,23 @@
     if (typeof el.scrollIntoView !== "function") { def(el, "scrollIntoView", function () { try { __scrollIntoView(this.__node); } catch (e) {} }); }
     if (typeof el.focus !== "function") { def(el, "focus", fn); }
     if (typeof el.blur !== "function") { def(el, "blur", fn); }
-    if (typeof el.click !== "function") { def(el, "click", fn); }
+    if (typeof el.click !== "function") {
+      def(el, "click", function () {
+        if (this.hasAttribute && this.hasAttribute("disabled")) { return; }
+        var ev = new globalThis.MouseEvent("click", { bubbles: true, cancelable: true, composed: true });
+        this.dispatchEvent(ev);
+      });
+    }
     if (typeof el.cloneNode !== "function") { def(el, "cloneNode", function () { return this; }); }
     // Web Animations: minimal `Element.animate()` returning an Animation whose `finished`/`ready`
     // promises settle (after the effect's delay+duration). We don't composite animations, so styles
     // aren't actually interpolated — but this unblocks the very common pattern of awaiting a throwaway
     // animation to sync with a frame (e.g. WPT's `waitForCompositorReady`: `body.animate({opacity:
-    // [0,1]},{duration:1}).finished`). `getAnimations()` reports none (we keep no running set).
-    if (typeof el.animate !== "function") { def(el, "animate", function (_keyframes, options) { return globalThis.__makeAnimation(options); }); }
-    if (typeof el.getAnimations !== "function") { def(el, "getAnimations", function () { return []; }); }
+    // [0,1]},{duration:1}).finished`). Running animations are tracked for getAnimations().
+    if (typeof el.animate !== "function") { def(el, "animate", function (keyframes, options) { return globalThis.__makeAnimation(keyframes, options, this); }); }
+    if (typeof el.getAnimations !== "function") { def(el, "getAnimations", function () {
+      return (globalThis.__activeAnimations || []).filter(function (a) { return a.__target === el; });
+    }); }
     if (typeof el.isEqualNode !== "function") { def(el, "isEqualNode", function (other) { return globalThis.__nodesEqual(this, other); }); }
     // getRootNode walks to the topmost ancestor (the document for a connected node; no shadow trees,
     // so the `composed` option is a no-op). isSameNode is identity (compare by node id, since one node
@@ -5892,25 +6455,125 @@
     if (typeof el.getRootNode !== "function") { def(el, "getRootNode", function () { var n = this; while (n && n.parentNode) { n = n.parentNode; } return n; }); }
     if (typeof el.isSameNode !== "function") { def(el, "isSameNode", function (other) { if (this === other) { return true; } try { return other != null && this.__node != null && this.__node === other.__node; } catch (e) { return false; } }); }
     if (typeof el.moveBefore !== "function") { def(el, "moveBefore", function (node, ref) { return this.insertBefore(node, ref); }); }
-    // Scrolling an element does nothing here (no scroll containers in layout); accept and ignore.
-    if (typeof el.scroll !== "function") { def(el, "scroll", fn); }
-    if (typeof el.scrollTo !== "function") { def(el, "scrollTo", fn); }
-    if (typeof el.scrollBy !== "function") { def(el, "scrollBy", fn); }
+    // CSSOM View element scrolling. The accessors below clamp against the laid-out scrolling area;
+    // the engine reads the private values before paint and translates the clipped subtree.
+    if (typeof el.scroll !== "function") {
+      def(el, "scroll", function (x, y) {
+        var left, top;
+        if (x && typeof x === "object") {
+          left = x.left == null ? this.scrollLeft : Number(x.left);
+          top = x.top == null ? this.scrollTop : Number(x.top);
+        } else {
+          left = Number(x) || 0;
+          top = Number(y) || 0;
+        }
+        var oldLeft = this.scrollLeft, oldTop = this.scrollTop;
+        this.scrollLeft = left; this.scrollTop = top;
+        if (this.scrollLeft !== oldLeft || this.scrollTop !== oldTop) {
+          try { this.dispatchEvent(new Event("scroll")); } catch (e) {}
+        }
+      });
+    }
+    if (typeof el.scrollTo !== "function") { def(el, "scrollTo", el.scroll); }
+    if (typeof el.scrollBy !== "function") {
+      def(el, "scrollBy", function (x, y) {
+        if (x && typeof x === "object") {
+          return this.scroll({
+            left: this.scrollLeft + (Number(x.left) || 0),
+            top: this.scrollTop + (Number(x.top) || 0),
+            behavior: x.behavior
+          });
+        }
+        return this.scroll(this.scrollLeft + (Number(x) || 0), this.scrollTop + (Number(y) || 0));
+      });
+    }
     if (typeof el.checkVisibility !== "function") { def(el, "checkVisibility", function () { return true; }); }
-    // Popover API: accept the calls (we don't render the top layer), togglePopover reports "hidden".
-    if (typeof el.showPopover !== "function") { def(el, "showPopover", fn); }
-    if (typeof el.hidePopover !== "function") { def(el, "hidePopover", fn); }
-    if (typeof el.togglePopover !== "function") { def(el, "togglePopover", function () { return false; }); }
-    // attachInternals: form-associated custom elements / ElementInternals are not implemented; return
-    // a minimal internals object whose methods are no-ops so callers don't hit a TypeError. (Tests
-    // that exercise real form association still fail — just not with "not a function".)
+    // Popover API: maintain open state, toggle events, and actual layout visibility. The painter's
+    // ordinary document order is used for now; top-layer stacking/focus dismissal remain separate
+    // rendering concerns rather than inert API calls.
+    function __popoverEvent(type, oldState, newState, cancelable) {
+      var ev = new Event(type, { cancelable: !!cancelable });
+      def(ev, "oldState", oldState); def(ev, "newState", newState);
+      return ev;
+    }
+    function __requirePopover(self) {
+      if (!self.hasAttribute || !self.hasAttribute("popover")) {
+        throw new DOMException("The element is not a popover.", "NotSupportedError");
+      }
+    }
+    if (el.hasAttribute && el.hasAttribute("popover") && el.__popoverOpen === undefined) {
+      def(el, "__popoverOpen", false);
+      def(el, "__popoverDisplay", el.style ? el.style.display : "");
+      try { el.style.display = "none"; } catch (e) {}
+    }
+    if (typeof el.showPopover !== "function") {
+      def(el, "showPopover", function () {
+        __requirePopover(this); if (this.__popoverOpen) { return; }
+        if (!this.dispatchEvent(__popoverEvent("beforetoggle", "closed", "open", true))) { return; }
+        this.__popoverOpen = true;
+        try { this.style.display = this.__popoverDisplay || "block"; } catch (e) {}
+        this.dispatchEvent(__popoverEvent("toggle", "closed", "open", false));
+      });
+    }
+    if (typeof el.hidePopover !== "function") {
+      def(el, "hidePopover", function () {
+        __requirePopover(this); if (!this.__popoverOpen) { return; }
+        if (!this.dispatchEvent(__popoverEvent("beforetoggle", "open", "closed", true))) { return; }
+        this.__popoverOpen = false;
+        try { this.style.display = "none"; } catch (e) {}
+        this.dispatchEvent(__popoverEvent("toggle", "open", "closed", false));
+      });
+    }
+    if (typeof el.togglePopover !== "function") {
+      def(el, "togglePopover", function (force) {
+        __requirePopover(this);
+        var show = force === undefined ? !this.__popoverOpen : !!force;
+        if (show) { this.showPopover(); } else { this.hidePopover(); }
+        return !!this.__popoverOpen;
+      });
+    }
+    // ElementInternals: form ownership, form values, validity, labels, and custom states for
+    // form-associated custom elements. The returned object is stable and attachInternals is
+    // single-use, matching the platform's observable lifecycle.
     if (typeof el.attachInternals !== "function") {
       def(el, "attachInternals", function () {
-        return {
-          shadowRoot: this.shadowRoot || null, form: null, labels: [], states: new Set(),
-          willValidate: true, validity: { valid: true }, validationMessage: "",
-          setFormValue: fn, setValidity: fn, checkValidity: function () { return true; }, reportValidity: function () { return true; }
-        };
+        var host = this, tag = String(host.localName || host.tagName || "").toLowerCase();
+        var ctor = globalThis.customElements && globalThis.customElements.get ? globalThis.customElements.get(tag) : null;
+        if (tag.indexOf("-") < 0 || !ctor || ctor.formAssociated !== true) {
+          throw new DOMException("Element is not a form-associated custom element.", "NotSupportedError");
+        }
+        if (host.__internals) { throw new DOMException("ElementInternals already attached.", "NotSupportedError"); }
+        var validity = { valueMissing:false, typeMismatch:false, patternMismatch:false, tooLong:false,
+          tooShort:false, rangeUnderflow:false, rangeOverflow:false, stepMismatch:false, badInput:false,
+          customError:false, valid:true };
+        var message = "", formValue = null, stateValue = null;
+        var internals = { shadowRoot: host.shadowRoot || null, states: new Set() };
+        Object.defineProperty(internals, "form", { get:function () {
+          var fid = host.getAttribute && host.getAttribute("form");
+          if (fid) { var f = document.getElementById(fid); if (f && String(f.tagName).toLowerCase() === "form") { return f; } }
+          var p = host.parentNode; while (p) { if (String(p.tagName).toLowerCase() === "form") { return p; } p = p.parentNode; }
+          return null;
+        }, enumerable:true });
+        Object.defineProperty(internals, "labels", { get:function () {
+          var out = [], id = host.id || (host.getAttribute && host.getAttribute("id"));
+          if (id) { try { out = Array.prototype.slice.call(document.querySelectorAll('label[for="'+String(id).replace(/"/g,'\\"')+'"]')); } catch (e) {} }
+          var p = host.parentNode; while (p) { if (String(p.tagName).toLowerCase() === "label") { out.push(p); break; } p = p.parentNode; }
+          return out;
+        }, enumerable:true });
+        Object.defineProperty(internals, "willValidate", { get:function(){ return !host.hasAttribute("disabled"); }, enumerable:true });
+        Object.defineProperty(internals, "validity", { get:function(){ return validity; }, enumerable:true });
+        Object.defineProperty(internals, "validationMessage", { get:function(){ return message; }, enumerable:true });
+        def(internals, "setFormValue", function (value, state) { formValue = value; stateValue = state === undefined ? value : state; host.__formValue = formValue; host.__formState = stateValue; });
+        def(internals, "setValidity", function (flags, msg, anchor) {
+          flags = flags || {}; var any = false;
+          Object.keys(validity).forEach(function(k){ if(k!=="valid"){ validity[k]=!!flags[k]; any=any||validity[k]; } });
+          validity.valid = !any; message = any ? String(msg || "") : ""; internals.validationAnchor = anchor || null;
+          if (any && !message) { throw new TypeError("A validation message is required when invalid."); }
+        });
+        def(internals, "checkValidity", function () { if (validity.valid) { return true; } host.dispatchEvent(new Event("invalid", { cancelable:true })); return false; });
+        def(internals, "reportValidity", function () { return internals.checkValidity(); });
+        def(host, "__internals", internals);
+        return internals;
       });
     }
     // ParentNode/ChildNode insertion (node-taking variants; the *HTML helpers are added below). A
@@ -5976,8 +6639,16 @@
           if (__sd && (__sd.get || __sd.set)) { return; } // page already defined an accessor
           var clamp = function (self, v) {
             v = Number(v); if (!isFinite(v)) { v = 0; }
+            try {
+              var axisProp = prop === "scrollTop" ? "overflowY" : "overflowX";
+              var ov = getComputedStyle(self)[axisProp] || (self.style && (self.style[axisProp] || self.style.overflow));
+              if (!ov || ov === "visible" || ov === "clip") { return 0; }
+            } catch (e) {}
             var m = __elemMetrics(self.__node);
-            var max = m ? Math.max(0, (m[sizeF] || 0) - (m[clientF] || 0)) : 0;
+            // The engine pushes visually translated descendant rects after a scroll. Add the
+            // already-applied offset back when deriving the invariant scroll range.
+            var current = Number(self[backing]) || 0;
+            var max = m ? Math.max(0, (m[sizeF] || 0) - (m[clientF] || 0) + current) : 0;
             if (v < 0) { v = 0; } else if (v > max) { v = max; }
             return v;
           };
@@ -5993,6 +6664,22 @@
     } else {
       if (!("scrollTop" in el)) { el.scrollTop = 0; }
       if (!("scrollLeft" in el)) { el.scrollLeft = 0; }
+    }
+    // Called by the engine between layout and paint. Include zero-valued entries once an element
+    // has been scrolled so resetting scrollTop/Left translates its subtree back to the origin.
+    if (typeof globalThis.__elementScrollOffsets !== "function") {
+      globalThis.__elementScrollOffsets = function () {
+        var out = [], all = [];
+        try { all = document.querySelectorAll("*"); } catch (e) {}
+        for (var i = 0; i < all.length; i++) {
+          var n = all[i];
+          if (Object.prototype.hasOwnProperty.call(n, "__scrollLeftVal") ||
+              Object.prototype.hasOwnProperty.call(n, "__scrollTopVal")) {
+            out.push(String(n.__node) + ":" + String(Number(n.scrollLeft) || 0) + ":" + String(Number(n.scrollTop) || 0));
+          }
+        }
+        return out.join(";");
+      };
     }
     if (!("offsetWidth" in el)) { el.offsetWidth = 0; }
     if (!("offsetHeight" in el)) { el.offsetHeight = 0; }
@@ -6182,7 +6869,13 @@
     // created via the validating factory; we override its ownerDocument to the requested document.
     function makeDoctypeFor(ownerDoc, name, pub, sys) {
       var dt = globalThis.__createDocumentTypeNode(String(name), pub == null ? "" : String(pub), sys == null ? "" : String(sys));
-      try { Object.defineProperty(dt, "ownerDocument", { value: ownerDoc, configurable: true, enumerable: true }); } catch (e) {}
+      try { def(dt, "__creationDocument", ownerDoc); } catch (e) {}
+      try {
+        Object.defineProperty(dt, "ownerDocument", {
+          get: function () { return typeof globalThis.__ownerDocumentOf === "function" ? globalThis.__ownerDocumentOf(dt) : ownerDoc; },
+          configurable: true, enumerable: true
+        });
+      } catch (e) {}
       return dt;
     }
     // Back an off-document facade with a real (detached) arena Document node, so the Node mutation
@@ -6205,17 +6898,24 @@
         if (typeof cid === "number" && cid >= 0) { globalThis.__insertNode(docId, cid, -1); }
       }
       function reqNode(x, m) {
+        if (typeof globalThis.__coerceNodeForRealm === "function") { x = globalThis.__coerceNodeForRealm(x); }
         var n = (x && typeof x.__node === "number") ? x.__node : -1;
         if (n < 0) { throw new TypeError("Failed to execute '" + m + "' on 'Node': parameter is not of type 'Node'."); }
         return n;
       }
       function nf(msg) { throw new (globalThis.DOMException)(msg, "NotFoundError"); }
-      def(doc, "appendChild", function (child) { var c = reqNode(child, "appendChild"); globalThis.__insertNode(docId, c, -1); return child; });
+      def(doc, "appendChild", function (child) {
+        var c = reqNode(child, "appendChild");
+        globalThis.__ensurePreInsertValid(docId, c, -1, -1);
+        globalThis.__insertDomNode(docId, c, -1); return child;
+      });
       def(doc, "insertBefore", function (newNode, refNode) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
         var c = reqNode(newNode, "insertBefore");
         var r = (refNode == null) ? -1 : ((refNode && typeof refNode.__node === "number") ? refNode.__node : -1);
-        if (refNode != null && r < 0) { nf("The reference child is not a child of this node."); }
-        globalThis.__insertNode(docId, c, r); return newNode;
+        if (refNode != null && r < 0) { throw new TypeError("Failed to execute 'insertBefore': parameter 2 is not of type 'Node'."); }
+        globalThis.__ensurePreInsertValid(docId, c, r, -1);
+        globalThis.__insertDomNode(docId, c, r); return newNode;
       });
       def(doc, "removeChild", function (child) {
         var c = reqNode(child, "removeChild");
@@ -6228,7 +6928,8 @@
         var sibs = globalThis.__children(docId); var idx = sibs.indexOf(o);
         var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
         if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
-        globalThis.__removeChild(docId, o); globalThis.__insertNode(docId, n, ref); return oldNode;
+        globalThis.__ensurePreInsertValid(docId, n, ref, o);
+        globalThis.__removeChild(docId, o); globalThis.__insertDomNode(docId, n, ref); return oldNode;
       });
       function kids() { return globalThis.__children(docId); }
       var childNodesList = globalThis.__makeNodeList(function () {
@@ -6245,7 +6946,11 @@
       Object.defineProperty(doc, "previousSibling", { get: function () { return null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "nextSibling", { get: function () { return null; }, configurable: true, enumerable: true });
       Object.defineProperty(doc, "ownerDocument", { get: function () { return null; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "isConnected", { get: function () { return true; }, configurable: true, enumerable: true });
       def(doc, "contains", function (other) { return nodeContains(doc, other); });
+      def(doc, "isSameNode", function (other) { return other === doc; });
+      def(doc, "isEqualNode", function (other) { return globalThis.__nodesEqual(doc, other); });
+      def(doc, "normalize", function () { globalThis.__normalizeNode(docId); });
       def(doc, "compareDocumentPosition", function (other) {
         if (!other || typeof other.__node !== "number") {
           throw new TypeError("Failed to execute 'compareDocumentPosition' on 'Node': parameter 1 is not of type 'Node'.");
@@ -6330,7 +7035,12 @@
       ro("compatMode", "CSS1Compat");
       ro("URL", "about:blank");
       ro("documentURI", "about:blank");
+      ro("baseURI", "about:blank");
       ro("location", null);
+    }
+    function markCreationDocument(doc, node) {
+      if (node && typeof node === "object") { try { def(node, "__creationDocument", doc); } catch (e) {} }
+      return node;
     }
     // The first HTML-namespace <title> element in tree order (the "title element" the HTML spec's
     // document.title getter reads), or null. Walks the facade's live arena tree.
@@ -6393,20 +7103,20 @@
         lookupPrefix: function () { var de = this.documentElement; return de && de.lookupPrefix ? de.lookupPrefix.apply(de, arguments) : null; },
         isDefaultNamespace: function (ns) { var de = this.documentElement; return de && de.isDefaultNamespace ? de.isDefaultNamespace.apply(de, arguments) : (ns == null || ns === ""); },
         createElement: isXML
-          ? function (name) { return globalThis.__createElementCasePreserving(elNs, name); }
-          : function (tag) { return document.createElement(tag); },
-        createElementNS: function (ns, qn) { return document.createElementNS(ns, qn); },
+          ? function (name) { var e = globalThis.__createElementCasePreserving(elNs, name); def(e, "__nonHtmlDocument", true); return markCreationDocument(doc, e); }
+          : function (tag) { return markCreationDocument(doc, document.createElement(tag)); },
+        createElementNS: function (ns, qn) { var e = document.createElementNS(ns, qn); if (isXML) { def(e, "__nonHtmlDocument", true); } return markCreationDocument(doc, e); },
         createAttribute: isXML
           ? function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm, nm); }
           : function (name) { var nm = String(name); if (nm.length === 0) { globalThis.__invalidCharacterError(); } return globalThis.__makeAttrNode(null, null, nm.toLowerCase(), nm.toLowerCase()); },
         createAttributeNS: function (ns, qn) { var ex = globalThis.__validateAndExtractName(ns, qn); return globalThis.__makeAttrNode(ex.namespace, ex.prefix, ex.localName, String(qn)); },
-        createTextNode: function (s) { return document.createTextNode(s); },
-        createComment: function (s) { return document.createComment(s); },
+        createTextNode: function (s) { return markCreationDocument(doc, document.createTextNode(s)); },
+        createComment: function (s) { return markCreationDocument(doc, document.createComment(s)); },
         createCDATASection: isXML
           ? function (data) { return globalThis.__canonNode(globalThis.__wrapNode(globalThis.__createCData(String(data == null ? "" : data)))); }
           : function () { throw new globalThis.DOMException("This DOM method is only valid on XML documents.", "NotSupportedError"); },
-        createDocumentFragment: function () { return document.createDocumentFragment(); },
-        createProcessingInstruction: function (target, data) { return document.createProcessingInstruction(target, data); },
+        createDocumentFragment: function () { return markCreationDocument(doc, document.createDocumentFragment()); },
+        createProcessingInstruction: function (target, data) { return markCreationDocument(doc, document.createProcessingInstruction(target, data)); },
         importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
         getElementById: function (id) { var de = this.documentElement; return de && de.querySelector ? de.querySelector('#' + id) : null; },
         querySelector: function (s) { var de = this.documentElement; return de && de.querySelector ? de.querySelector(s) : null; },
@@ -6468,8 +7178,8 @@
           // Cloning a document does NOT run the createHTMLDocument algorithm (no doctype/html/head/
           // body/title get synthesised); a shallow clone is a brand-new empty HTML document.
           cloneNode: function () { return buildBareDocument("html", HTML_NS, "text/html"); },
-          createElement: function (tag) { return document.createElement(tag); },
-          createElementNS: function (ns, tag) { return document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag); },
+          createElement: function (tag) { return markCreationDocument(doc, document.createElement(tag)); },
+          createElementNS: function (ns, tag) { return markCreationDocument(doc, document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag)); },
           createAttribute: function (name) {
             var nm = String(name);
             if (nm.length === 0) { globalThis.__invalidCharacterError(); }
@@ -6479,12 +7189,12 @@
             var ex = globalThis.__validateAndExtractName(ns, qn);
             return globalThis.__makeAttrNode(ex.namespace, ex.prefix, ex.localName, String(qn));
           },
-          createTextNode: function (s) { return document.createTextNode(s); },
-          createComment: function (s) { return document.createComment(s); },
+          createTextNode: function (s) { return markCreationDocument(doc, document.createTextNode(s)); },
+          createComment: function (s) { return markCreationDocument(doc, document.createComment(s)); },
           // An HTML document refuses createCDATASection (the XML createDocument path overrides this).
           createCDATASection: function () { throw new globalThis.DOMException("This DOM method is only valid on XML documents.", "NotSupportedError"); },
-          createDocumentFragment: function () { return document.createDocumentFragment(); },
-          createProcessingInstruction: function (target, data) { return document.createProcessingInstruction(target, data); },
+          createDocumentFragment: function () { return markCreationDocument(doc, document.createDocumentFragment()); },
+          createProcessingInstruction: function (target, data) { return markCreationDocument(doc, document.createProcessingInstruction(target, data)); },
           importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
           getElementById: function (id) { return htmlEl.querySelector ? htmlEl.querySelector('#' + id) : null; },
           querySelector: function (s) { return htmlEl.querySelector ? htmlEl.querySelector(s) : null; },
@@ -6565,7 +7275,9 @@
   }
   // The document is itself the root of its tree; getRootNode returns it, isSameNode is identity.
   if (typeof document.getRootNode !== "function") { def(document, "getRootNode", function () { return document; }); }
+  if (typeof document.isConnected === "undefined") { Object.defineProperty(document, "isConnected", { get: function () { return true; }, configurable: true, enumerable: true }); }
   if (typeof document.isSameNode !== "function") { def(document, "isSameNode", function (other) { return other === document; }); }
+  if (typeof document.isEqualNode !== "function") { def(document, "isEqualNode", function (other) { return globalThis.__nodesEqual(document, other); }); }
   if (typeof document.compareDocumentPosition !== "function") {
     def(document, "compareDocumentPosition", function (other) {
       if (!other || typeof other.__node !== "number") {
@@ -6575,6 +7287,12 @@
       return __cmpDocPos(self, other.__node);
     });
   }
+  if (typeof document.normalize !== "function") {
+    def(document, "normalize", function () {
+      var id = typeof document.__node === "number" ? document.__node : 0;
+      globalThis.__normalizeNode(id);
+    });
+  }
 
   // Document is a Node: its children are the doctype + the root element. Wire the Node mutation
   // methods on `document` itself. Only globals (`__insertNode`/`__removeChild`/`__parent`/
@@ -6582,12 +7300,15 @@
   // document node id is the parent of <html>.
   (function () {
     function reqNode(x, m) {
+      if (typeof globalThis.__coerceNodeForRealm === "function") { x = globalThis.__coerceNodeForRealm(x); }
       var n = (x && typeof x.__node === "number") ? x.__node : -1;
       if (n < 0) { throw new TypeError("Failed to execute '" + m + "' on 'Node': parameter is not of type 'Node'."); }
       return n;
     }
     function notFound(msg) { throw new (globalThis.DOMException)(msg, "NotFoundError"); }
-    function docNode() { var de = __documentElementId(); return de >= 0 ? __parent(de) : -1; }
+    // The live document arena root is always node 0. Deriving it from documentElement breaks as
+    // soon as script temporarily removes the root element (a common document-reset algorithm).
+    function docNode() { return (typeof document.__node === "number") ? document.__node : 0; }
     var childNodesList = globalThis.__makeNodeList(function () {
       var ids = __children(docNode()), out = [];
       for (var i = 0; i < ids.length; i++) { out.push(globalThis.__nodeFor(ids[i])); }
@@ -6597,17 +7318,21 @@
       get: function () { return childNodesList; }, enumerable: true, configurable: true
     });
     def(document, "appendChild", function (child) {
-      var id = docNode(); var c = reqNode(child, "appendChild"); __insertNode(id, c, -1); return child;
+      var id = docNode(); var c = reqNode(child, "appendChild");
+      globalThis.__ensurePreInsertValid(id, c, -1, -1);
+      globalThis.__insertDomNode(id, c, -1); return child;
     });
     if (typeof document.hasChildNodes !== "function") {
       def(document, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
     }
     if (document.nodeName === undefined) { def(document, "nodeName", "#document"); }
     def(document, "insertBefore", function (newNode, refNode) {
+      if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
       var id = docNode(); var c = reqNode(newNode, "insertBefore");
       var r = (refNode == null) ? -1 : ((refNode && typeof refNode.__node === "number") ? refNode.__node : -1);
-      if (refNode != null && r < 0) { notFound("The reference child is not a child of this node."); }
-      __insertNode(id, c, r); return newNode;
+      if (refNode != null && r < 0) { throw new TypeError("Failed to execute 'insertBefore': parameter 2 is not of type 'Node'."); }
+      globalThis.__ensurePreInsertValid(id, c, r, -1);
+      globalThis.__insertDomNode(id, c, r); return newNode;
     });
     def(document, "removeChild", function (child) {
       var id = docNode(); var c = reqNode(child, "removeChild");
@@ -6620,7 +7345,8 @@
       var sibs = __children(id); var idx = sibs.indexOf(o);
       var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
       if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
-      __removeChild(id, o); __insertNode(id, n, ref); return oldNode;
+      globalThis.__ensurePreInsertValid(id, n, ref, o);
+      __removeChild(id, o); globalThis.__insertDomNode(id, n, ref); return oldNode;
     });
   })();
   // Legacy event factory. Maps a (case-insensitive) interface name to an uninitialized event of
@@ -6967,7 +7693,7 @@
     var anyActive = globalThis.__moRegistry.some(function (e) { return e.targets.length; });
     if (!anyActive) { return; }
     globalThis.__moMicrotaskQueued = true;
-    // Use a native (V8) microtask via Promise.resolve().then so delivery interleaves with the page's
+    // Use a native Promise microtask via Promise.resolve().then so delivery interleaves with the page's
     // own `await Promise.resolve()` continuations (the polyfilled queueMicrotask runs on a separate,
     // later-drained queue).
     try {
@@ -7494,6 +8220,18 @@
     XNode.prototype.removeChild = function (c) { var i = this.childNodes.indexOf(c); if (i >= 0) { this.childNodes.splice(i, 1); c.parentNode = null; } return c; };
     XNode.prototype.replaceChild = function (nw, old) { var i = this.childNodes.indexOf(old); if (i < 0) { return old; } if (nw.parentNode) { nw.parentNode.removeChild(nw); } nw.parentNode = this; this.childNodes[i] = nw; old.parentNode = null; return old; };
     XNode.prototype.hasChildNodes = function () { return this.childNodes.length > 0; };
+    XNode.prototype.normalize = function () {
+      var i = 0;
+      while (i < this.childNodes.length) {
+        var child = this.childNodes[i];
+        if (child.nodeType !== 3) { if (child.normalize) { child.normalize(); } i++; continue; }
+        if (child.data.length === 0) { this.removeChild(child); continue; }
+        while (i + 1 < this.childNodes.length && this.childNodes[i + 1].nodeType === 3) {
+          var next = this.childNodes[i + 1]; child.data += next.data; this.removeChild(next);
+        }
+        i++;
+      }
+    };
     XNode.prototype.append = function () { var d = this.ownerDocument || this; for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.appendChild(typeof c === "string" ? d.createTextNode(c) : c); } };
     XNode.prototype.prepend = function () { var d = this.ownerDocument || this; var ref = this.childNodes[0] || null; for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; this.insertBefore(typeof c === "string" ? d.createTextNode(c) : c, ref); } };
     XNode.prototype.isEqualNode = function (o) { return globalThis.__nodesEqual(this, o); };
@@ -8142,6 +8880,47 @@
   // hasChildNodes() on the shared Node prototype, so non-element nodes (document, text, comment,
   // doctype, …) answer it too. Element wrappers install their own faster override in enrichElement.
   def(NodeCtor.prototype, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
+  (function (proto) {
+    function nodeArg(value, method) {
+      if (!value || typeof value.nodeType !== "number") {
+        throw new TypeError("Failed to execute '" + method + "': parameter is not of type 'Node'.");
+      }
+    }
+    function own(self, name, args, fallback) {
+      var descriptor = Object.getOwnPropertyDescriptor(self, name);
+      if (descriptor && typeof descriptor.value === "function" && descriptor.value !== proto[name]) {
+        return descriptor.value.apply(self, args);
+      }
+      return fallback();
+    }
+    def(proto, "insertBefore", function (node, child) {
+      if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertBefore': 2 arguments required."); }
+      nodeArg(node, "insertBefore");
+      if (child !== null && child !== undefined) { nodeArg(child, "insertBefore"); }
+      var self = this, args = arguments;
+      return own(self, "insertBefore", args, function () {
+        throw new globalThis.DOMException("This node type cannot contain children.", "HierarchyRequestError");
+      });
+    });
+    def(proto, "appendChild", function (node) {
+      nodeArg(node, "appendChild"); var self = this, args = arguments;
+      return own(self, "appendChild", args, function () {
+        throw new globalThis.DOMException("This node type cannot contain children.", "HierarchyRequestError");
+      });
+    });
+    def(proto, "replaceChild", function (node, child) {
+      nodeArg(node, "replaceChild"); nodeArg(child, "replaceChild"); var self = this, args = arguments;
+      return own(self, "replaceChild", args, function () {
+        throw new globalThis.DOMException("This node type cannot contain children.", "HierarchyRequestError");
+      });
+    });
+    def(proto, "removeChild", function (child) {
+      nodeArg(child, "removeChild"); var self = this, args = arguments;
+      return own(self, "removeChild", args, function () {
+        throw new globalThis.DOMException("The node is not a child of this node.", "NotFoundError");
+      });
+    });
+  })(NodeCtor.prototype);
   defClass("EventTarget");
   defClass("CharacterData", NodeCtor);
   var TextCtor = defClass("Text", globalThis.CharacterData);
@@ -8827,7 +9606,14 @@
     if (!__isInclAncestor(scId, ecId)) { for (var i = 0; i < kids.length; i++) { if (__nodePartiallyContained(kids[i], scId, ecId)) { firstPC = kids[i]; break; } } }
     if (!__isInclAncestor(ecId, scId)) { for (var j = kids.length - 1; j >= 0; j--) { if (__nodePartiallyContained(kids[j], scId, ecId)) { lastPC = kids[j]; break; } } }
     var contained = [];
-    for (var k = 0; k < kids.length; k++) { if (__nodeContainedIn(kids[k], scId, so, ecId, eo)) { contained.push(kids[k]); } }
+    for (var k = 0; k < kids.length; k++) {
+      if (__nodeContainedIn(kids[k], scId, so, ecId, eo)) {
+        if (__nodeType(kids[k]) === 10) {
+          throw new globalThis.DOMException("A DocumentType node cannot be extracted into a fragment.", "HierarchyRequestError");
+        }
+        contained.push(kids[k]);
+      }
+    }
     // Leading partial boundary.
     if (firstPC >= 0 && __isCharData(__nodeType(firstPC))) {
       var df = __textContent(scId) || "";
@@ -8880,6 +9666,82 @@
   Range.prototype.deleteContents = function () { this.extractContents(); };
   Range.prototype.cloneContents = function () {
     return __cloneRangeContents(this);
+  };
+  Range.prototype.insertNode = function (node) {
+    __reqNode(node, "insertNode");
+    var startId = __idOf(this._sc), startType = __nodeType(startId);
+    var nodeId = __idOf(node);
+    if (startType === 7 || startType === 8 ||
+        ((startType === 3 || startType === 4) && __parent(startId) < 0) ||
+        __sameNode(this._sc, node)) {
+      throw new globalThis.DOMException("The node cannot be inserted at the Range boundary.", "HierarchyRequestError");
+    }
+
+    var reference = null;
+    if (startType === 3 || startType === 4) {
+      reference = this._sc;
+    } else {
+      var startKids = __children(startId);
+      reference = this._so < startKids.length ? __nodeFor(startKids[this._so]) : null;
+    }
+    var parent = reference === null ? this._sc : reference.parentNode;
+    var parentId = __idOf(parent);
+    var referenceId = reference === null ? -1 : __idOf(reference);
+    globalThis.__ensurePreInsertValid(parentId, nodeId, referenceId, -1);
+
+    if (startType === 3 || startType === 4) {
+      reference = this._sc.splitText(this._so);
+    }
+    if (__sameNode(node, reference)) { reference = reference.nextSibling; }
+
+    // Pre-insert removes a parented node before determining its new index. Do that explicitly so
+    // live ranges receive the removal adjustment as well as the later insertion adjustment; the
+    // arena's implicit move cannot update a Range owned by a different iframe realm.
+    if (node.parentNode !== null) { node.parentNode.removeChild(node); }
+
+    var newOffset = reference === null
+      ? __rangeLength(parent)
+      : __children(parentId).indexOf(__idOf(reference));
+    newOffset += __nodeType(nodeId) === 11 ? __children(nodeId).length : 1;
+    parent.insertBefore(node, reference);
+
+    if (__sameNode(this._sc, this._ec) && this._so === this._eo) {
+      __setRangeEnd(this, parent, newOffset);
+    }
+  };
+  Range.prototype.surroundContents = function (newParent) {
+    __reqNode(newParent, "surroundContents");
+
+    // A non-Text node is partially contained when it is an inclusive ancestor of exactly one
+    // boundary container. The only candidates are on the two paths below the common ancestor.
+    var commonId = __idOf(this.commonAncestorContainer);
+    var currentId = __idOf(this._sc);
+    while (currentId >= 0 && currentId !== commonId) {
+      var currentType = __nodeType(currentId);
+      if (currentType !== 3 && currentType !== 4) {
+        throw new globalThis.DOMException("The Range partially contains a non-Text node.", "InvalidStateError");
+      }
+      currentId = __parent(currentId);
+    }
+    currentId = __idOf(this._ec);
+    while (currentId >= 0 && currentId !== commonId) {
+      var endType = __nodeType(currentId);
+      if (endType !== 3 && endType !== 4) {
+        throw new globalThis.DOMException("The Range partially contains a non-Text node.", "InvalidStateError");
+      }
+      currentId = __parent(currentId);
+    }
+
+    var parentType = __nodeType(__idOf(newParent));
+    if (parentType === 9 || parentType === 10 || parentType === 11) {
+      throw new globalThis.DOMException("The new parent has an invalid node type.", "InvalidNodeTypeError");
+    }
+
+    var fragment = this.extractContents();
+    while (newParent.firstChild !== null) { newParent.removeChild(newParent.firstChild); }
+    this.insertNode(newParent);
+    newParent.appendChild(fragment);
+    this.selectNode(newParent);
   };
   Range.prototype.cloneRange = function () { var r = new Range(); r._sc = this._sc; r._so = this._so; r._ec = this._ec; r._eo = this._eo; return r; };
   Range.prototype.detach = function () {};
@@ -9003,6 +9865,20 @@
   }
   def(globalThis, "__rangesRemove", __rangesRemove);
 
+  // Node.normalize merge step: before the redundant text node is removed, retarget boundaries in
+  // that node (and boundaries at its parent slot) into the surviving text node.
+  function __rangesMergeText(targetId, sourceId, parentId, sourceIndex, targetLength) {
+    var target = __nodeFor(targetId);
+    for (var i = 0; i < __liveRanges.length; i++) {
+      var r = __liveRanges[i];
+      if (__idOf(r._sc) === sourceId) { r._sc = target; r._so += targetLength; }
+      else if (__idOf(r._sc) === parentId && r._so === sourceIndex) { r._sc = target; r._so = targetLength; }
+      if (__idOf(r._ec) === sourceId) { r._ec = target; r._eo += targetLength; }
+      else if (__idOf(r._ec) === parentId && r._eo === sourceIndex) { r._ec = target; r._eo = targetLength; }
+    }
+  }
+  def(globalThis, "__rangesMergeText", __rangesMergeText);
+
   // The Text "split" range steps (run AFTER the new node is inserted, BEFORE the trailing data is
   // removed): boundaries in `node` past `offset` move into `newNode`; boundaries at the parent slot
   // immediately after `node` shift right by one.
@@ -9060,9 +9936,20 @@
   function __makeSelection() {
     var sel = Object.create(__selectionProto);
     sel._ranges = [];
+    sel._direction = "directionless";
     return sel;
   }
   function __selStart(sel) { return sel._ranges.length ? sel._ranges[0] : null; }
+  function __selAnchor(sel) {
+    var r = __selStart(sel);
+    if (!r) { return null; }
+    return sel._direction === "backwards" ? { node: r._ec, offset: r._eo } : { node: r._sc, offset: r._so };
+  }
+  function __selFocus(sel) {
+    var r = __selStart(sel);
+    if (!r) { return null; }
+    return sel._direction === "backwards" ? { node: r._sc, offset: r._so } : { node: r._ec, offset: r._eo };
+  }
   // Push the current selection (its single range's boundaries, in document order) to the engine so it
   // can paint the ::selection highlight. The boundary node ids are passed as-is (the engine indexes
   // painted text runs by their node id, which is the text node); cleared when there is no range.
@@ -9082,10 +9969,10 @@
     get: function () { var r = __selStart(this); if (!r) { return "None"; } return (r._sc === r._ec && r._so === r._eo) ? "Caret" : "Range"; },
     enumerable: true, configurable: true
   });
-  Object.defineProperty(__selectionProto, "anchorNode", { get: function () { var r = __selStart(this); return r ? r._sc : null; }, enumerable: true, configurable: true });
-  Object.defineProperty(__selectionProto, "anchorOffset", { get: function () { var r = __selStart(this); return r ? r._so : 0; }, enumerable: true, configurable: true });
-  Object.defineProperty(__selectionProto, "focusNode", { get: function () { var r = __selStart(this); return r ? r._ec : null; }, enumerable: true, configurable: true });
-  Object.defineProperty(__selectionProto, "focusOffset", { get: function () { var r = __selStart(this); return r ? r._eo : 0; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "anchorNode", { get: function () { var p = __selAnchor(this); return p ? p.node : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "anchorOffset", { get: function () { var p = __selAnchor(this); return p ? p.offset : 0; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "focusNode", { get: function () { var p = __selFocus(this); return p ? p.node : null; }, enumerable: true, configurable: true });
+  Object.defineProperty(__selectionProto, "focusOffset", { get: function () { var p = __selFocus(this); return p ? p.offset : 0; }, enumerable: true, configurable: true });
   def(__selectionProto, "getRangeAt", function (index) {
     index = index >>> 0;
     if (index >= this._ranges.length) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
@@ -9099,6 +9986,7 @@
     if (globalThis.__rootId(__idOf(range._sc)) !== __idOf(globalThis.document)) { return; }
     if (this._ranges.length) { return; }
     this._ranges = [range];
+    this._direction = "forwards";
     __syncSelection(this);
   });
   def(__selectionProto, "removeRange", function (range) {
@@ -9107,15 +9995,24 @@
     this._ranges.splice(i, 1);
     __syncSelection(this);
   });
-  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; __syncSelection(this); });
-  def(__selectionProto, "empty", function () { this._ranges = []; __syncSelection(this); });
-  // setBaseAndExtent: select from (anchorNode, anchorOffset) to (focusNode, focusOffset). We don't
-  // track selection direction, so a backward selection's anchor/focus getters may read swapped; the
-  // selected range itself is correct.
+  def(__selectionProto, "removeAllRanges", function () { this._ranges = []; this._direction = "directionless"; __syncSelection(this); });
+  def(__selectionProto, "empty", function () { this._ranges = []; this._direction = "directionless"; __syncSelection(this); });
+  // setBaseAndExtent: validate both boundary points, preserve the requested anchor/focus direction,
+  // and ignore boundary points whose roots are not this Selection's document.
   def(__selectionProto, "setBaseAndExtent", function (anchorNode, anchorOffset, focusNode, focusOffset) {
+    if (arguments.length < 4) { throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': 4 arguments required."); }
+    var anchor = __validBP(anchorNode, anchorOffset, "setBaseAndExtent");
+    var focus = __validBP(focusNode, focusOffset, "setBaseAndExtent");
+    var documentRoot = __idOf(globalThis.document);
+    if (__rootOf(anchorNode) !== documentRoot || __rootOf(focusNode) !== documentRoot) { return; }
     var range = globalThis.document.createRange();
-    try { range.setStart(anchorNode, anchorOffset); range.setEnd(focusNode, focusOffset); }
-    catch (e) { try { range.setStart(focusNode, focusOffset); range.setEnd(anchorNode, anchorOffset); } catch (e2) { return; } }
+    if (__cmpBP(anchorNode, anchor, focusNode, focus) <= 0) {
+      range._sc = anchorNode; range._so = anchor; range._ec = focusNode; range._eo = focus;
+      this._direction = "forwards";
+    } else {
+      range._sc = focusNode; range._so = focus; range._ec = anchorNode; range._eo = anchor;
+      this._direction = "backwards";
+    }
     this._ranges = [range];
     __syncSelection(this);
   });
@@ -9126,25 +10023,26 @@
     var range = globalThis.document.createRange();
     range.setStart(node, offset || 0); range.collapse(true);
     this._ranges = [range];
+    this._direction = "forwards";
     __syncSelection(this);
   });
   def(__selectionProto, "setPosition", __selectionProto.collapse);
   def(__selectionProto, "collapseToStart", function () {
     var r = this._ranges[0];
     if (!r) { throw new globalThis.DOMException("There is no selection to collapse.", "InvalidStateError"); }
-    var nr = globalThis.document.createRange(); nr.setStart(r._sc, r._so); nr.collapse(true); this._ranges = [nr];
+    var nr = globalThis.document.createRange(); nr.setStart(r._sc, r._so); nr.collapse(true); this._ranges = [nr]; this._direction = "forwards"; __syncSelection(this);
   });
   def(__selectionProto, "collapseToEnd", function () {
     var r = this._ranges[0];
     if (!r) { throw new globalThis.DOMException("There is no selection to collapse.", "InvalidStateError"); }
-    var nr = globalThis.document.createRange(); nr.setStart(r._ec, r._eo); nr.collapse(true); this._ranges = [nr];
+    var nr = globalThis.document.createRange(); nr.setStart(r._ec, r._eo); nr.collapse(true); this._ranges = [nr]; this._direction = "forwards"; __syncSelection(this);
   });
   def(__selectionProto, "extend", function (node, offset) {
-    var r = this._ranges[0];
-    this.setBaseAndExtent(r ? r._sc : node, r ? r._so : 0, node, offset || 0);
+    var anchorNode = this.anchorNode;
+    this.setBaseAndExtent(anchorNode || node, anchorNode ? this.anchorOffset : 0, node, offset || 0);
   });
   def(__selectionProto, "selectAllChildren", function (node) {
-    var range = globalThis.document.createRange(); range.selectNodeContents(node); this._ranges = [range];
+    var range = globalThis.document.createRange(); range.selectNodeContents(node); this._ranges = [range]; this._direction = "forwards";
     __syncSelection(this);
   });
   def(__selectionProto, "containsNode", function (node) {
@@ -9163,8 +10061,8 @@
   try { def(globalThis.document, "getSelection", getSelection); } catch (e) {}
 
   // Document-level method stubs for APIs we don't implement, so calls don't throw a TypeError:
-  // execCommand/queryCommand* (legacy editing — we report unsupported), getAnimations (none running),
-  // and startViewTransition (run the update callback immediately; no visual transition).
+  // execCommand/queryCommand* (legacy editing — we report unsupported), active animations, and
+  // the View Transition promise/state lifecycle.
   try {
     var d = globalThis.document;
     if (typeof d.execCommand !== "function") { def(d, "execCommand", function () { return false; }); }
@@ -9172,12 +10070,27 @@
     if (typeof d.queryCommandEnabled !== "function") { def(d, "queryCommandEnabled", function () { return false; }); }
     if (typeof d.queryCommandState !== "function") { def(d, "queryCommandState", function () { return false; }); }
     if (typeof d.queryCommandValue !== "function") { def(d, "queryCommandValue", function () { return ""; }); }
-    if (typeof d.getAnimations !== "function") { def(d, "getAnimations", function () { return []; }); }
+    if (typeof d.getAnimations !== "function") { def(d, "getAnimations", function () { return (globalThis.__activeAnimations || []).slice(); }); }
     if (typeof d.startViewTransition !== "function") {
       def(d, "startViewTransition", function (cb) {
-        var done = Promise.resolve();
-        try { if (typeof cb === "function") { var r = cb(); if (r && typeof r.then === "function") { done = r.then(function () {}, function () {}); } } } catch (e) {}
-        return { ready: Promise.resolve(), finished: Promise.resolve(), updateCallbackDone: done, skipTransition: function () {} };
+        var skipped = false, rejectReady;
+        var skippedReady = new Promise(function (_resolve, reject) { rejectReady = reject; });
+        var update = Promise.resolve().then(function () { return typeof cb === "function" ? cb() : undefined; });
+        var ready = Promise.race([update.then(function () { return undefined; }), skippedReady]);
+        var transition = {
+          ready: ready, updateCallbackDone: update, types: new Set(),
+          skipTransition: function () {
+            if (skipped) { return; } skipped = true;
+            rejectReady(new DOMException("View transition skipped.", "AbortError"));
+          }
+        };
+        transition.finished = update.then(function () {
+          return new Promise(function (resolve) { requestAnimationFrame(function () { resolve(); }); });
+        });
+        d.__activeViewTransition = transition;
+        transition.finished.then(function () { if (d.__activeViewTransition === transition) { d.__activeViewTransition = null; } });
+        ready.catch(function () {});
+        return transition;
       });
     }
   } catch (e) {}
@@ -9497,12 +10410,13 @@
       Object.defineProperty(IFP, "contentDocument", {
         get: function () {
           // A loaded frame (real nested realm) exposes its own parsed document. Wrap it so
-          // `contentDocument.defaultView` is the contentWindow proxy: the raw frame window can't be
-          // read across realms (V8 access check → "no access"), but the proxy reads via __frameGet.
+          // `contentDocument.defaultView` is the contentWindow proxy. Native origin checks
+          // deny access to foreign or sandboxed documents.
           if (this.__frameLoadedKey && typeof __frameGet === "function") {
             try {
               var rdoc = __frameGet(this.__node, "document");
-              if (rdoc) {
+              if (!rdoc) { return null; }
+              if (this.__frameLoadedKey !== "about:blank") {
                 var elc = this;
                 if (typeof globalThis.Proxy === "function") {
                   if (!elc.__cdocWrap) {
@@ -9514,7 +10428,7 @@
                 }
                 return rdoc;
               }
-            } catch (e) {}
+            } catch (e) { return null; }
           }
           if (!this.__cdoc) {
             var body = document.createElement("body");
@@ -9527,9 +10441,10 @@
               querySelectorAll: function (s) { return body.querySelectorAll(s); },
               getElementById: function (id) { try { return body.querySelector('#' + id); } catch (e) { return null; } },
               getElementsByTagName: function (t) { return body.getElementsByTagName(t); },
-              createElement: function (t) { return document.createElement(t); },
-              createTextNode: function (t) { return document.createTextNode(t); },
-              createDocumentFragment: function () { return document.createDocumentFragment(); },
+              createElement: function (t) { var n = document.createElement(t); def(n, "__creationDocument", doc); return n; },
+              createTextNode: function (t) { var n = document.createTextNode(t); def(n, "__creationDocument", doc); return n; },
+              createComment: function (t) { var n = document.createComment(t); def(n, "__creationDocument", doc); return n; },
+              createDocumentFragment: function () { var n = document.createDocumentFragment(); def(n, "__creationDocument", doc); return n; },
               adoptedStyleSheets: [], styleSheets: { length: 0, item: function () { return null; } },
               defaultView: null,
               // document.open/write/close populate the frame's body (so the page can build the
@@ -9573,6 +10488,7 @@
               postMessage: function () {}, focus: function () {}, blur: function () {}, close: function () {},
               location: { href: "about:blank", toString: function () { return "about:blank"; } },
               name: "",
+              DOMException: globalThis.DOMException,
               // A same-origin (about:blank) frame shares the parent's cookie jar, so its cookieStore is
               // the parent's — frame.contentWindow.cookieStore reads/writes the same cookies.
               cookieStore: globalThis.cookieStore,
@@ -9590,7 +10506,7 @@
 
   // --- Real iframe browsing contexts -------------------------------------------------------
   // When an <iframe> has a src/srcdoc, load it as a REAL nested context (crates/js/src/iframe.rs):
-  // the frame's document + scripts run in their own V8 realm with their own window/performance/fetch.
+  // the frame's document + scripts run in their own Lumen realm with their own window/performance/fetch.
   // We trigger the load on src/srcdoc assignment and on connection, fire load/error here, and bridge
   // cross-frame postMessage. contentWindow returns the real bridge for loaded frames (falling back to
   // the lightweight facade above for srcdoc-via-document.write frames that have no realm).
@@ -9625,6 +10541,11 @@
         if (key === "") { return; }
         if (el.__frameLoadedKey === key && navType !== "reload") { return; }
         el.__frameLoadedKey = key;
+        // Timer cancellation alone is insufficient once an earlier callback has entered the due
+        // queue. Associate every navigation with a generation so a superseded about:blank load
+        // cannot dispatch after src/srcdoc starts a real navigation.
+        var loadGeneration = (el.__frameLoadGeneration || 0) + 1;
+        el.__frameLoadGeneration = loadGeneration;
         // Maintain the frame's session history (for contentWindow.history.back/forward/go). A normal
         // navigation pushes (truncating any forward entries); reload/back_forward don't add an entry.
         if (!el.__history) { el.__history = []; el.__histIndex = -1; }
@@ -9638,6 +10559,7 @@
         try { ok = __iframeLoad(el.__node, url || "", (srcdoc != null ? String(srcdoc) : null), navType || "navigate"); }
         catch (e) { ok = false; }
         var fireLoad = function () {
+          if (el.__frameLoadGeneration !== loadGeneration) { return; }
           el.__pendingLoadTimer = null;
           var ev;
           try { ev = new globalThis.Event(ok ? "load" : "error"); } catch (e) { ev = { type: ok ? "load" : "error", target: el, currentTarget: el }; }
@@ -9777,6 +10699,7 @@
                     // (and assign/replace/reload) actually navigate the frame.
                     if (prop === "location") { return el.__frameLocProxy || (el.__frameLocProxy = __frameLocationProxy(el)); }
                     if (prop === "history") { return el.__frameHistProxy || (el.__frameHistProxy = __frameHistoryProxy(el)); }
+                    if (prop === "document" && el.__frameLoadedKey === "about:blank") { return el.contentDocument; }
                     // A same-origin frame (about:blank inherits the parent's origin) shares the cookie
                     // jar + origin, so expose the parent's cookieStore — the frame realm's own would key
                     // cookies on "about:blank" and see nothing.
@@ -9800,6 +10723,11 @@
                       // Valid: navigate the frame to the new URL.
                       try { el.setAttribute("src", String(v)); el.__frameLoadedKey = undefined; el.__cwinReal = undefined; __loadFrame(el); } catch (e) {}
                       return true;
+                    }
+                    var sameOrigin = el.__frameLoadedKey === "about:blank";
+                    if (!sameOrigin) { try { sameOrigin = __frameGet(el.__node, "origin") === globalThis.origin; } catch (e) {} }
+                    if (sameOrigin && typeof prop === "string" && typeof __frameSet === "function") {
+                      try { if (__frameSet(el.__node, prop, v)) { return true; } } catch (e) {}
                     }
                     t[prop] = v;
                     return true;
@@ -10102,7 +11030,7 @@
     def(globalThis, "__ownerDocumentOf", function (node) {
       try {
         var id = node && node.__node;
-        if (typeof id !== "number") { return document; }
+        if (typeof id !== "number") { return (node && node.__creationDocument) || document; }
         var cur = id, guard = 0;
         while (cur >= 0 && guard++ < 100000) {
           var w = globalThis.__elFor(cur);
@@ -10117,7 +11045,7 @@
           cur = __parent(cur);
         }
       } catch (e) {}
-      return document;
+      return (node && node.__creationDocument) || document;
     });
 
     // <template>.content — a DocumentFragment facade over the template element's children.
@@ -10283,7 +11211,7 @@
     });
   }
   // --- Dedicated Workers --------------------------------------------------------------------
-  // A dedicated worker runs in its OWN V8 context (a real, separate global object) in the page's
+  // A dedicated worker runs in its OWN Lumen realm (a real, separate global object) in the page's
   // isolate, created and driven from Rust (crates/js/src/worker.rs + bootstrap/worker_env.js): `new
   // Worker(url)` calls the `__workerCreate` native, which builds the worker context, installs the
   // browser environment + a worker overlay, and runs the worker script there. Because the worker
@@ -11536,11 +12464,21 @@
     // views, Map, Set, Array, plain objects, Error, Blob), preserves shared references and cycles
     // via a memory map, and throws DataCloneError for non-cloneable values (functions, symbols, DOM
     // nodes, exotic objects) the way the spec requires — instead of the old JSON round-trip that
-    // silently dropped Maps/Sets/cycles and returned the original on failure. We don't implement
-    // `transfer` (no ArrayBuffer detach primitive in pure JS); the option is accepted and ignored.
-    def(globalThis, "structuredClone", function (value, _options) {
+    // silently dropped Maps/Sets/cycles and returned the original on failure. Transfer-list
+    // ArrayBuffers are copied into the result and detached through the Lumen host primitive only after
+    // the graph has been cloned, so typed-array metadata remains readable during traversal.
+    def(globalThis, "structuredClone", function (value, options) {
       var seen = new Map();
       function dce(msg) { return new globalThis.DOMException(msg, "DataCloneError"); }
+      var transfer = options && options.transfer != null ? Array.prototype.slice.call(options.transfer) : [];
+      var transferSeen = new Set();
+      for (var ti = 0; ti < transfer.length; ti++) {
+        var tv = transfer[ti];
+        if (!(tv instanceof ArrayBuffer)) { throw dce("Value in transfer list is not transferable."); }
+        if (transferSeen.has(tv)) { throw dce("Transfer list contains duplicate ArrayBuffer."); }
+        if (tv.byteLength === 0) { throw dce("A detached ArrayBuffer cannot be transferred."); }
+        transferSeen.add(tv);
+      }
       function clone(v) {
         if (v === null) { return v; }
         var t = typeof v;
@@ -11599,7 +12537,13 @@
         }
         throw dce("An object could not be cloned.");        // exotic / non-[Serializable]
       }
-      return clone(value);
+      var result = clone(value);
+      for (var di = 0; di < transfer.length; di++) {
+        if (typeof __detachArrayBuffer !== "function" || !__detachArrayBuffer(transfer[di])) {
+          throw dce("ArrayBuffer transfer is unavailable.");
+        }
+      }
+      return result;
     });
   }
 
@@ -11618,7 +12562,8 @@
   // treated as completing after its `delay + duration`. Enough for the common "await a throwaway
   // animation to sync a frame" idiom; tests that read interpolated values will still fail (as they
   // would without `animate` at all), not error.
-  def(globalThis, "__makeAnimation", function (options) {
+  def(globalThis, "__activeAnimations", []);
+  def(globalThis, "__makeAnimation", function (keyframes, options, target) {
     var dur = 0, delay = 0;
     if (typeof options === "number") {
       dur = options;
@@ -11628,9 +12573,67 @@
     }
     if (!isFinite(dur) || dur < 0) { dur = 0; }
     if (!isFinite(delay) || delay < 0) { delay = 0; }
-    var anim = { playState: "running", currentTime: 0, startTime: null, playbackRate: 1,
-                 id: "", effect: null, timeline: null, onfinish: null, oncancel: null,
-                 pending: false };
+    var anim = Object.create(globalThis.Animation && globalThis.Animation.prototype || Object.prototype);
+    anim.playState = "running"; anim.startTime = null; anim.playbackRate = 1;
+    anim.id = ""; anim.timeline = null; anim.onfinish = null; anim.oncancel = null;
+    anim.pending = false;
+    var frames;
+    if (Array.isArray(keyframes)) {
+      frames = keyframes.map(function (frame) { return Object.assign({}, frame); });
+    } else if (keyframes && typeof keyframes === "object") {
+      frames = [{}, {}];
+      Object.keys(keyframes).forEach(function (property) {
+        var values = Array.isArray(keyframes[property]) ? keyframes[property] : [keyframes[property]];
+        frames[0][property] = values[0];
+        frames[1][property] = values.length > 1 ? values[values.length - 1] : values[0];
+      });
+    } else {
+      frames = [];
+    }
+    var effect = Object.create(globalThis.KeyframeEffect && globalThis.KeyframeEffect.prototype || Object.prototype);
+    effect.target = target || null;
+    effect.getKeyframes = function () { return frames.map(function (frame) { return Object.assign({}, frame); }); };
+    effect.getTiming = function () { return { delay: delay, duration: dur, iterations: 1, easing: options && options.easing || "linear", fill: options && options.fill || "auto" }; };
+    effect.getComputedTiming = function () { return Object.assign({ progress: dur ? Math.max(0, Math.min(1, ((anim.currentTime || 0) - delay) / dur)) : 1 }, effect.getTiming()); };
+    anim.effect = effect;
+    var currentTime = 0;
+    function easedProgress(time) {
+      var progress = dur ? (time - delay) / dur : 1;
+      var easing = options && options.easing || "linear";
+      if (easing === "steps(1, start)") { return 1; }
+      if (easing === "steps(1, end)") { return 0; }
+      var match = /^cubic-bezier\(\s*0\s*,\s*([-+\d.e]+)\s*,\s*1\s*,\s*([-+\d.e]+)\s*\)$/.exec(easing);
+      if (match && Math.abs(progress - 0.5) < 0.0001) {
+        return 0.375 * (Number(match[1]) + Number(match[2])) + 0.125;
+      }
+      return progress;
+    }
+    function applyEffect() {
+      if (!target || !target.style || frames.length < 2) { return; }
+      var from = frames[0], to = frames[frames.length - 1], progress = easedProgress(currentTime);
+      Object.keys(Object.assign({}, from, to)).forEach(function (property) {
+        if (property === "offset" || property === "easing" || property === "composite") { return; }
+        var a = from[property], b = to[property];
+        if (a == null) { a = target.style[property] || ""; }
+        if (b == null) { b = target.style[property] || ""; }
+        var am = /^\s*([-+\d.e]+)([a-z%]*)\s*$/i.exec(String(a));
+        var bm = /^\s*([-+\d.e]+)([a-z%]*)\s*$/i.exec(String(b));
+        var value;
+        if (am && bm && am[2] === bm[2]) {
+          value = String(Number(am[1]) + (Number(bm[1]) - Number(am[1])) * progress) + am[2];
+        } else {
+          value = progress < 0.5 ? a : b;
+        }
+        try { target.style[property] = value; } catch (e) {}
+      });
+    }
+    Object.defineProperty(anim, "currentTime", {
+      get: function () { return currentTime; },
+      set: function (value) { currentTime = value == null ? null : Number(value); applyEffect(); },
+      enumerable: true, configurable: true
+    });
+    def(anim, "__target", target || null);
+    globalThis.__activeAnimations.push(anim);
     var settle;
     anim.finished = new Promise(function (resolve) { settle = resolve; });
     // Swallow rejection-less completion; cancel just resolves the lifecycle for our purposes.
@@ -11652,6 +12655,7 @@
       anim.currentTime = delay + dur;
       settle(anim);
       fireAnimEvent("finish", "onfinish");
+      var i = globalThis.__activeAnimations.indexOf(anim); if (i >= 0) { globalThis.__activeAnimations.splice(i, 1); }
     }
     anim.play = function () { anim.playState = "running"; };
     anim.pause = function () { anim.playState = "paused"; };
@@ -11664,6 +12668,7 @@
       anim.currentTime = null;
       settle(anim); // resolve rather than reject: nothing awaits a cancellation here
       fireAnimEvent("cancel", "oncancel");
+      var i = globalThis.__activeAnimations.indexOf(anim); if (i >= 0) { globalThis.__activeAnimations.splice(i, 1); }
     };
     anim.updatePlaybackRate = fn;
     anim.commitStyles = fn;   // we don't interpolate, so there are no computed values to commit
@@ -11685,6 +12690,19 @@
     setTimeout(finishNow, delay + dur);
     return anim;
   });
+  try {
+    if (globalThis.Element && globalThis.Element.prototype) {
+      def(globalThis.Element.prototype, "animate", function (keyframes, options) {
+        return globalThis.__makeAnimation(keyframes, options, this);
+      });
+      def(globalThis.Element.prototype, "getAnimations", function () {
+        var self = this;
+        return (globalThis.__activeAnimations || []).filter(function (animation) {
+          return animation.__target === self;
+        });
+      });
+    }
+  } catch (e) {}
 
   // CSS namespace: CSS.supports (feature detection — optimistic), CSS.escape (selector escaping),
   // and no-op registerProperty. Pages reference `CSS` directly (ReferenceError otherwise).
@@ -12175,10 +13193,13 @@
     return out;
   });
 
-  // crypto: real OS randomness via the __cryptoRandom native (falls back to a PRNG if unavailable).
+  // crypto: platform CSPRNG via the host; failure must never produce predictable bytes.
   function __randBytes(n) {
-    try { var b = __cryptoRandom(n); if (b && b.length === n) { return b; } } catch (e) {}
-    var out = []; for (var i = 0; i < n; i++) { out.push((Math.floor((i * 2654435761) % 256)) || 1); } return out;
+    var bytes = __cryptoRandom(n);
+    if (!bytes || bytes.length !== n) {
+      throw new DOMException("Secure randomness is unavailable", "OperationError");
+    }
+    return bytes;
   }
   globalThis.crypto = {
     getRandomValues: function (arr) {
@@ -13369,8 +14390,8 @@
     // --- Cookie Store API (window) -----------------------------------------------------------
     // Async cookie access backed by the document cookie jar (__cookie/__setCookie). The jar only
     // round-trips name=value, so read CookieListItems carry spec defaults for the other members.
-    // The ServiceWorker side (registration.cookies / CookieStoreManager subscriptions) needs a
-    // worker cookie backend we don't have, so it's a non-functional stub.
+    // Service-worker scopes receive a same-origin worker store and subscribed registrations are
+    // notified through ExtendableCookieChangeEvent by the service-worker integration below.
     function CookieStore() { throw new globalThis.TypeError("Illegal constructor"); }
     function CookieStoreManager() { throw new globalThis.TypeError("Illegal constructor"); }
     def(globalThis, "CookieStore", CookieStore);

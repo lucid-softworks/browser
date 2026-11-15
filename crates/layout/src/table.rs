@@ -229,6 +229,21 @@ pub(crate) fn cell_min_content_width(boxx: &LayoutBox, measurer: &dyn TextMeasur
     max_word + p.left + p.right + b.left + b.right
 }
 
+/// Maximum intrinsic width contributed anywhere in a caption subtree. Caption contents commonly
+/// sit inside an anonymous inline wrapper, so looking only at the caption's direct intrinsic width
+/// can miss an explicit-width inline-block descendant.
+fn caption_subtree_width(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    measurer: &dyn TextMeasurer,
+) -> f32 {
+    boxx.children
+        .iter()
+        .fold(intrinsic_width(boxx, styles, measurer), |width, child| {
+            width.max(caption_subtree_width(child, styles, measurer))
+        })
+}
+
 /// Lay out a `display: table` box as a grid of cells. The box's content rect (x/y/width) is already
 /// positioned by `layout_block`; this fills in cell geometry and returns the table's content height.
 ///
@@ -254,7 +269,7 @@ pub(crate) fn layout_table(
     // caller. Instead, we pull them from the cell box's node via the global doc passed through the
     // ctx-free path: we stored spans on build. To keep this self-contained, read them here from the
     // styles-independent attribute snapshot captured at build time (see `TABLE_SPANS`).
-    let content = boxx.dimensions.content;
+    let mut content = boxx.dimensions.content;
     let table_cs = style_of(boxx, styles).cloned().unwrap_or_default();
 
     // Border model. In the SEPARATE model, `border-spacing` opens a gap between adjacent cells (and
@@ -282,6 +297,20 @@ pub(crate) fn layout_table(
             }
         }
         boxx.children = kept;
+    }
+    // A caption's min-content width contributes to the table wrapper's minimum width. Table width
+    // is special: this constraint applies to the outer table box, so subtract the table's own
+    // padding and borders before storing the enlarged content width.
+    let caption_min = captions
+        .iter()
+        .map(|caption| caption_subtree_width(caption, styles, measurer))
+        .fold(0.0f32, f32::max);
+    if caption_min > 0.0 {
+        let padding = boxx.dimensions.padding;
+        let border = boxx.dimensions.border;
+        let horizontal_edges = padding.left + padding.right + border.left + border.right;
+        content.width = content.width.max((caption_min - horizontal_edges).max(0.0));
+        boxx.dimensions.content.width = content.width;
     }
     // Explicit column widths from `<colgroup>`/`<col>` (read before the children are drained).
     let col_attr_widths = collect_col_widths(boxx, styles);
@@ -360,11 +389,11 @@ pub(crate) fn layout_table(
             }
         }
     }
-    // Apply explicit `<col>`/`<colgroup>` widths: a column with a declared width is pinned to it as
-    // its preferred width (and at least its min-content, so content never overflows the column).
+    // Apply explicit `<col>`/`<colgroup>` widths as another minimum contribution. A cell's own
+    // specified width can be larger and must not be overwritten by a narrower column declaration.
     for c in 0..col_count {
         if let Some(Some(w)) = col_attr_widths.get(c) {
-            col_pref[c] = w.max(col_min[c]);
+            col_pref[c] = col_pref[c].max(*w).max(col_min[c]);
         }
     }
 
@@ -431,7 +460,7 @@ pub(crate) fn layout_table(
     }
     col_x[col_count] = x; // right edge incl. trailing spacing
     let cols_only: f32 = col_w.iter().sum();
-    let table_width: f32 = cols_only + h_spacing_total;
+    let table_width: f32 = (cols_only + h_spacing_total).max(content.width);
 
     // --- Captions: `caption-side: bottom` ones go below the grid, the rest above. ---
     let (mut bottom_captions, mut top_captions): (Vec<LayoutBox>, Vec<LayoutBox>) =
