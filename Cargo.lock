@@ -2100,6 +2100,7 @@ dependencies = [
  "dom",
  "stacker",
  "style",
+ "unicode-segmentation",
 ]
 
 [[package]]

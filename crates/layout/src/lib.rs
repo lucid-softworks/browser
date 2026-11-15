@@ -17,6 +17,7 @@ mod intrinsic;
 mod linebreak;
 mod sizing;
 mod table;
+mod text_units;
 mod types;
 
 pub(crate) use block::*;

@@ -18,15 +18,12 @@
 //! removes the letter-to-letter ones so a run wraps only at spaces. The pair prohibitions apply to
 //! all three — no value of `word-break` may strand a full stop at the start of a line.
 //!
-//! Hangul is deliberately excluded from the ideographic set: Korean is written with spaces and
-//! UAX #14 only permits breaking between syllables under an explicit `line-break` value, so
-//! treating it like Han here would wrap Korean mid-word.
-
-/// Characters we apply ideographic breaking to: Han, kana, CJK punctuation and the fullwidth
-/// forms. Deliberately excludes Hangul (see the module note).
+//! Normal permits Hangul syllable breaks; keep-all suppresses them.
+/// Han, kana, Hangul and CJK punctuation.
 fn is_ideographic(c: char) -> bool {
     matches!(c as u32,
-        0x2E80..=0x2EFF    // CJK radicals supplement
+        0x1100..=0x11FF | 0xAC00..=0xD7AF | 0xA960..=0xA97F | 0xD7B0..=0xD7FF
+        | 0x2E80..=0x2EFF    // CJK radicals supplement
         | 0x3000..=0x303F  // CJK symbols and punctuation
         | 0x3040..=0x309F  // hiragana
         | 0x30A0..=0x30FF  // katakana
@@ -85,7 +82,11 @@ fn forbidden_at_line_end(c: char) -> bool {
 /// The pair prohibitions are checked first because they hold regardless of `word-break`: even
 /// `break-all` must not strand a closing bracket or a full stop at the start of a line.
 fn can_break_between(prev: char, next: char, mode: style::WordBreak) -> bool {
-    if forbidden_at_line_start(next) || forbidden_at_line_end(prev) {
+    if matches!(prev, '\u{a0}' | '\u{202f}' | '\u{2060}' | '\u{feff}')
+        || matches!(next, '\u{a0}' | '\u{202f}' | '\u{2060}' | '\u{feff}')
+        || forbidden_at_line_start(next)
+        || forbidden_at_line_end(prev)
+    {
         return false;
     }
     // U+3000 IDEOGRAPHIC SPACE is a space, not a typographic letter unit, despite sitting in the CJK
@@ -127,7 +128,8 @@ pub(crate) fn segments(run: &str, mode: style::WordBreak) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut prev: Option<char> = None;
-    for (i, c) in run.char_indices() {
+    for (i, cluster) in crate::text_units::grapheme_indices(run) {
+        let c = cluster.chars().next().expect("nonempty grapheme");
         if let Some(p) = prev {
             if can_break_between(p, c, mode) {
                 out.push(&run[start..i]);
@@ -176,9 +178,13 @@ mod tests {
     }
 
     #[test]
-    fn hangul_is_left_alone() {
-        // Korean is space-separated; breaking between syllables needs an explicit word-break.
-        assert_eq!(seg("한국어"), vec!["한국어"]);
+    fn hangul_normal_and_keep_all() {
+        // Normal permits syllable boundaries.
+        assert_eq!(seg("한국어"), vec!["한", "국", "어"]);
+        assert_eq!(
+            segments("한국漢字", style::WordBreak::KeepAll),
+            vec!["한국漢字"]
+        );
     }
 
     #[test]
@@ -206,6 +212,19 @@ mod tests {
             segments("字字\u{3000}字字", style::WordBreak::KeepAll),
             vec!["字字\u{3000}", "字字"]
         );
+    }
+
+    #[test]
+    fn graphemes_and_nonbreaking_controls() {
+        assert_eq!(seg("か\u{3099}き"), vec!["か\u{3099}", "き"]);
+        for text in ["a\u{a0}b", "a\u{2060}b", "a\u{202f}b"] {
+            assert_eq!(segments(text, style::WordBreak::BreakAll), vec![text]);
+        }
+        assert_eq!(
+            segments("e\u{301}x", style::WordBreak::BreakAll),
+            vec!["e\u{301}", "x"]
+        );
+        assert_eq!(segments("👩‍👩‍👧‍👦x", style::WordBreak::BreakAll), vec!["👩‍👩‍👧‍👦", "x"]);
     }
 
     #[test]
