@@ -79,6 +79,9 @@ jobs:
           name: webdriver-bin
           path: target/release/webdriver
           retention-days: 1
+      - name: Stop cache writer before archiving
+        if: ${{ always() && env.KACHE_CACHE_DIR != '' }}
+        run: kache daemon stop
 
   wpt:
     needs: [scope, webdriver]

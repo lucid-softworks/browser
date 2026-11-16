@@ -52,6 +52,9 @@ jobs:
           path: target/cargo-timings/
           if-no-files-found: ignore
           retention-days: 7
+      - name: Stop cache writer before archiving
+        if: ${{ always() && env.KACHE_CACHE_DIR != '' }}
+        run: kache daemon stop
 
   # The Rust engine + all unit tests build and pass on Linux. Runs on PRs and main as a per-push
   # gate so test regressions surface before merge. Desktop builds also run on Windows and macOS
@@ -98,3 +101,6 @@ jobs:
           path: target/cargo-timings/
           if-no-files-found: ignore
           retention-days: 7
+      - name: Stop cache writer before archiving
+        if: ${{ always() && env.KACHE_CACHE_DIR != '' }}
+        run: kache daemon stop

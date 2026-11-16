@@ -110,3 +110,7 @@ jobs:
           if [[ "$RUNNER_OS" == macOS ]]; then
             echo 'Extract the downloaded ZIP, open the DMG, and drag Browser into Applications. These test builds are ad-hoc signed, not Apple-notarized.' >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Stop cache writer before archiving
+        if: ${{ always() && env.KACHE_CACHE_DIR != '' }}
+        shell: bash
+        run: kache daemon stop
