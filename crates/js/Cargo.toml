@@ -28,7 +28,7 @@ layout = { path = "../layout" }
 # text with the same system fonts the engine paints with.
 fontdue = "0.9"
 # OS cryptographic randomness on Windows, Linux, and macOS, behind our host primitive.
-getrandom = "0.3"
+getrandom = "0.4"
 # HTML parsing, so the `innerHTML` setter can build real child nodes from markup.
 html = { path = "../html" }
 # The software canvas 2D rasterizer (a leaf crate, no internal deps), so OffscreenCanvas can
