@@ -29,8 +29,6 @@ env:
   WPT_REVISION: c0f2b11f490d5849bf4d48c276b68681e894b1fb
   CARGO_INCREMENTAL: 0
   CARGO_BUILD_JOBS: 2
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   run:
@@ -54,13 +52,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.99.1'
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust compilations
+        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
         with:
-          workspaces: engine-source -> target
-          # This checkout has a different target path from the root CI/nightly builds.
-          shared-key: wpt-smoke-${{ matrix.engine }}
-          cache-on-failure: true
-      - uses: mozilla-actions/sccache-action@v0.0.9
+          version: '2.1.1'
+          cache-key-prefix: kache-wpt-smoke-${{ matrix.engine }}
+          max-size: '2GiB'
+          pr-comment: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
