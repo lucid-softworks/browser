@@ -36,16 +36,22 @@ jobs:
           toolchain: '1.99.1'
           components: rustfmt, clippy
       - name: Cache Rust compilations
-        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        uses: ./.github/actions/rust-cache
         with:
-          version: '2.1.1'
-          cache-key-prefix: kache-lint
+          prefix: kache-lint
           max-size: '2GiB'
-          pr-comment: false
       - name: Install desktop build libraries
         run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --timings -- -D warnings
+      - name: Upload compilation timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-lint
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # The Rust engine + all unit tests build and pass on Linux. Runs on PRs and main as a per-push
   # gate so test regressions surface before merge. Desktop builds also run on Windows and macOS
@@ -60,21 +66,21 @@ jobs:
           toolchain: '1.99.1'
       # Share eligible release compiler outputs with the nightly WebDriver build.
       - name: Cache Rust compilations
-        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        uses: ./.github/actions/rust-cache
         with:
-          version: '2.1.1'
-          cache-key-prefix: kache-release
-          max-size: '2GiB'
-          pr-comment: false
+          prefix: kache-release
+          max-size: '4GiB'
       # Rune links Wayland/XKB; engine-only tests still exercise system-font discovery.
       - name: Install desktop libraries and test fonts
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libxkbcommon-x11-0 mesa-vulkan-drivers fonts-dejavu-core fonts-liberation
-      - name: Build + test
-        run: |
-          cargo build --workspace --release
-          cargo test --workspace --release
+      - name: Build release targets
+        run: cargo build --workspace --release --timings
+      - name: Compile release tests
+        run: cargo test --workspace --release --no-run --timings
+      - name: Run release tests
+        run: cargo test --workspace --release
       - name: Test Lumen property-cache regressions
         run: |
           # Upstream's unit-test module includes these benchmark fixtures at compile time.
@@ -83,4 +89,12 @@ jobs:
           fixture_source="https://raw.githubusercontent.com/mozilla/arewefastyet/0e2160885d0ca693577d54f1bbbe572f052282c6/benchmarks/v8-v7"
           curl -fL --retry 3 "$fixture_source/base.js" -o v8-v7/base.js
           curl -fL --retry 3 "$fixture_source/richards.js" -o v8-v7/richards.js
-          cargo test --locked -p lumen --lib stub_cache_
+          cargo test --locked -p lumen --lib --timings stub_cache_
+      - name: Upload compilation timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-release-tests
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 7
