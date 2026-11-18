@@ -13,8 +13,10 @@ pub(crate) fn is_non_rendered_tag(tag: &str) -> bool {
     )
 }
 
-/// The default value of a `<textarea>`: its descendant text content, with a single leading newline
-/// stripped (per the HTML textarea parsing rule). Used when no live `value` has been set.
+/// The default value of a `<textarea>`: its descendant text content. The HTML parser already
+/// discards a single leading LF after the start tag; here we additionally strip a leading CRLF,
+/// which the byte-level parser cannot recognize as one newline (the spec normalizes CRLF→LF in
+/// the input stream before the skip applies). Used when no live `value` has been set.
 pub(crate) fn textarea_text_content(doc: &dom::Document, id: dom::NodeId) -> String {
     fn gather(doc: &dom::Document, id: dom::NodeId, s: &mut String) {
         for &child in &doc.get(id).children {
@@ -30,10 +32,7 @@ pub(crate) fn textarea_text_content(doc: &dom::Document, id: dom::NodeId) -> Str
     }
     let mut s = String::new();
     gather(doc, id, &mut s);
-    s.strip_prefix("\r\n")
-        .or_else(|| s.strip_prefix('\n'))
-        .map(str::to_string)
-        .unwrap_or(s)
+    s.strip_prefix("\r\n").map(str::to_string).unwrap_or(s)
 }
 
 /// The text a form control (`<input>` / `<textarea>`) should render inside its box, or `None`
