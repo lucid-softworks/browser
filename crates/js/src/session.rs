@@ -159,6 +159,46 @@ impl Session {
             f32,
         )>,
     ) -> (Session, dom::Document, Vec<EvalOutput>) {
+        Self::new_with_script_nodes(
+            doc,
+            scripts.into_iter().map(|source| (None, source)).collect(),
+            entries,
+            modules,
+            url,
+            fetcher,
+            request_fetcher,
+            ws_connector,
+            cookie_getter,
+            cookie_setter,
+            initial_rects,
+        )
+    }
+
+    /// As `new`, retaining parser script nodes for currentScript and document.write.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    pub fn new_with_script_nodes(
+        doc: dom::Document,
+        scripts: Vec<(Option<usize>, String)>,
+        entries: Vec<String>,
+        modules: HashMap<String, String>,
+        url: &str,
+        fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send>,
+        request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
+        ws_connector: WsConnector,
+        cookie_getter: Arc<dyn Fn(&str) -> String + Send + Sync>,
+        cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
+        // Layout rects to seed into HostState BEFORE the page's scripts run, so synchronous
+        // layout-dependent reads during load see real geometry. `(rects, naturals, insets,
+        // margins, scroll_y_css, doc_height_css)` (CSS px). `None` to seed nothing.
+        initial_rects: Option<(
+            Vec<(usize, f32, f32, f32, f32)>,
+            Vec<(usize, f32, f32)>,
+            Vec<(usize, f32, f32, f32, f32)>,
+            Vec<(usize, f32, f32, f32, f32)>,
+            f32,
+            f32,
+        )>,
+    ) -> (Session, dom::Document, Vec<EvalOutput>) {
         let url = url.to_string();
         let fallback = doc.clone();
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<SessionCmd>();
@@ -520,7 +560,7 @@ impl Drop for Session {
 /// Own the Lumen engine and its persistent page realm on the session thread.
 pub(crate) fn session_thread_main(
     doc: dom::Document,
-    scripts: Vec<String>,
+    scripts: Vec<(Option<usize>, String)>,
     entries: Vec<String>,
     modules: HashMap<String, String>,
     url: String,
@@ -632,9 +672,19 @@ pub(crate) fn session_thread_main(
 
         // Run initial classic scripts in order, then the module graph, exactly as the load path.
         let mut results: Vec<EvalOutput> = Vec::with_capacity(scripts.len() + entries.len());
-        for source in &scripts {
+        if scripts.iter().any(|(node, _)| node.is_some()) {
+            eval_internal(scope, "__scriptPrepareParser()", "<parser-scripts>");
+        }
+        for (node, source) in &scripts {
+            let current = node.map_or_else(|| "null".into(), |id| id.to_string());
+            eval_internal(
+                scope,
+                &format!("__scriptSetCurrent({current})"),
+                "<script-start>",
+            );
             results.push(eval_source(scope, source, "<script>"));
         }
+        eval_internal(scope, "__scriptFinishParsing()", "<parser-end>");
         for entry in &entries {
             results.push(run_one_entry(&mut engine, &registry, entry));
         }
@@ -694,13 +744,24 @@ pub(crate) fn session_thread_main(
                 reply,
             } => {
                 let scope = engine.ctx();
-                let source = format!(
-                    "__handleKeyInput({}, {}, {})",
-                    node_id,
-                    js_string_literal(&key),
-                    js_string_literal(&code),
-                );
-                let mut results = vec![eval_source(scope, &source, "<key>")];
+                // Native event dispatch returns to the host between keyboard events.
+                // Each eval performs a microtask checkpoint, so e.g. a framework's
+                // keydown update is visible to keypress and the default action.
+                let mut results = Vec::new();
+                let mut allowed = true;
+                for phase in ["keydown", "keypress", "default", "keyup"] {
+                    let source = format!(
+                        "__handleKeyInput({}, {}, {}, {}, {})",
+                        node_id,
+                        js_string_literal(&key),
+                        js_string_literal(&code),
+                        js_string_literal(phase),
+                        allowed,
+                    );
+                    let result = eval_source(scope, &source, "<key>");
+                    allowed = result.value.as_deref() == Some("true");
+                    results.push(result);
+                }
                 drain_runtime(&mut engine, &mut results, Some(&fetch_rx), Some(&ws_evt_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));

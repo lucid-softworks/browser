@@ -536,6 +536,9 @@ impl Engine {
         };
         let (mut snapshot, console) = session.dispatch_key(node.0, key, code);
         snapshot.prune_invalid();
+        if key == "Enter" {
+            self.focus_value = node_value(&snapshot, node);
+        }
 
         if let LoadState::Loaded {
             doc, console: c, ..

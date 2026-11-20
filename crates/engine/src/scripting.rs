@@ -15,6 +15,13 @@ pub enum ScriptSource {
 /// [`collect_module_entries`] and run (deferred) via [`run_modules`]. Pure: unit-testable
 /// without network.
 pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSource> {
+    collect_script_slots(doc, base)
+        .into_iter()
+        .map(|(_, source)| source)
+        .collect()
+}
+
+fn collect_script_slots(doc: &dom::Document, base: &str) -> Vec<(dom::NodeId, ScriptSource)> {
     fn is_js_type(ty: Option<&str>) -> bool {
         match ty {
             None => true,
@@ -28,7 +35,12 @@ pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSour
             }
         }
     }
-    fn walk(doc: &dom::Document, id: dom::NodeId, base: &str, out: &mut Vec<ScriptSource>) {
+    fn walk(
+        doc: &dom::Document,
+        id: dom::NodeId,
+        base: &str,
+        out: &mut Vec<(dom::NodeId, ScriptSource)>,
+    ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag == "script" {
                 if is_js_type(e.attrs.get("type").map(String::as_str)) {
@@ -40,7 +52,7 @@ pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSour
                         .or_else(|| e.attrs.get("xlink:href"));
                     if let Some(src) = ext {
                         if let Some(abs) = resolve_url(base, src) {
-                            out.push(ScriptSource::External(abs));
+                            out.push((id, ScriptSource::External(abs)));
                         }
                     } else {
                         // The script body is text (HTML) or a CDATA section (XML/SVG).
@@ -53,7 +65,7 @@ pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSour
                                 _ => {}
                             }
                         }
-                        out.push(ScriptSource::Inline(source));
+                        out.push((id, ScriptSource::Inline(source)));
                     }
                 }
                 // Don't descend into a script's children (its text body isn't markup).
@@ -685,15 +697,15 @@ pub(crate) fn start_session(
     let mut notes: Vec<String> = Vec::new();
 
     // Classic scripts, in document order.
-    let mut classic: Vec<String> = Vec::new();
+    let mut classic: Vec<(Option<usize>, String)> = Vec::new();
     let mut fetched = 0usize;
-    for item in collect_script_sources(&doc, base) {
+    for (node, item) in collect_script_slots(&doc, base) {
         match item {
             ScriptSource::Inline(src) => {
                 if src.len() > MAX_SCRIPT_BYTES {
                     notes.push(format!("[skipped large script: {} bytes]", src.len()));
                 } else {
-                    classic.push(src);
+                    classic.push((Some(node.0), src));
                 }
             }
             ScriptSource::External(url) => {
@@ -710,7 +722,10 @@ pub(crate) fn start_session(
                         url,
                         resp.body.len()
                     )),
-                    Ok(resp) => classic.push(String::from_utf8_lossy(&resp.body).into_owned()),
+                    Ok(resp) => classic.push((
+                        Some(node.0),
+                        String::from_utf8_lossy(&resp.body).into_owned(),
+                    )),
                     Err(e) => notes.push(format!("[failed to load script: {url} — {e}]")),
                 }
             }
@@ -739,7 +754,7 @@ pub(crate) fn start_session(
     let ws_connector = build_ws_connector();
     let cookie_getter = build_cookie_getter();
     let cookie_setter = build_cookie_setter();
-    let (session, snapshot, results) = js::Session::new(
+    let (session, snapshot, results) = js::Session::new_with_script_nodes(
         doc,
         classic,
         entries,

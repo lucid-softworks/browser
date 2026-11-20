@@ -53,6 +53,7 @@ pub(crate) fn install_browser_environment(scope: &mut Ctx, url: &str) {
         .ok()
         .expect("set isolation");
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
+    eval_internal(scope, include_str!("bootstrap/scripts.js"), "<scripts>");
     // IndexedDB (in-memory) — depends on structuredClone + queueMicrotask from the prior bootstraps.
     eval_internal(scope, INDEXEDDB_BOOTSTRAP, "<indexeddb>");
     // Web Crypto SubtleCrypto (digest + HMAC) — depends on `crypto` from browser-env.
@@ -114,9 +115,12 @@ pub(crate) const SVG_BOOTSTRAP: &str = include_str!("bootstrap/svg.js");
 pub(crate) const EVENT_LOOP_CAP: usize = 10_000;
 
 /// Evaluate in the persistent realm, capturing thrown values and console output.
-pub(crate) fn eval_source(scope: &mut Ctx, source: &str, _name: &str) -> EvalOutput {
+pub(crate) fn eval_source(scope: &mut Ctx, source: &str, name: &str) -> EvalOutput {
     host_state(scope).console.borrow_mut().clear();
     let result = eval_value(scope, source);
+    if name == "<script>" {
+        eval_internal(scope, "__scriptSetCurrent(null)", "<script-end>");
+    }
     scope.drain_microtasks_for_host();
     let (value, error) = if scope.execution_cancelled() {
         (None, Some(EXECUTION_STOPPED.to_string()))

@@ -1206,8 +1206,12 @@ fn element_click(id: &str, eid: &str, sessions: &Mutex<Sessions>) -> WdResult {
         let v = parse(&raw).ok_or_else(|| WdError::javascript_error("bad rect"))?;
         let cx = v.get("x").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
         let cy = v.get("y").and_then(|y| y.as_f64()).unwrap_or(0.0) as f32;
-        // Build layout AFTER the rect eval (console_eval invalidates layout_cache) so dispatch_click
-        // can hit-test against a fresh box tree.
+        // Element Click includes the pointer's down/up sequence. Controls such as
+        // Closure's widgets arm on mousedown before handling the click.
+        for kind in ["mousemove", "mousedown", "mouseup"] {
+            let _ = s.engine.render();
+            s.engine.dispatch_mouse(kind, cx * s.scale, cy * s.scale);
+        }
         let _ = s.engine.render();
         // dispatch_click takes device px; rect is CSS px, so multiply by scale.
         s.engine.dispatch_click(cx * s.scale, cy * s.scale);

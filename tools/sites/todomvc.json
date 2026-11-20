@@ -1,0 +1,186 @@
+[
+  {
+    "name": "React 19",
+    "url": "https://todomvc.com/examples/react/dist/"
+  },
+  {
+    "name": "React Redux 9",
+    "url": "https://todomvc.com/examples/react-redux/dist/"
+  },
+  {
+    "name": "Vue 3.5",
+    "url": "https://todomvc.com/examples/vue/dist/"
+  },
+  {
+    "name": "Preact 10.29",
+    "url": "https://todomvc.com/examples/preact/dist/"
+  },
+  {
+    "name": "Backbone.js",
+    "url": "https://todomvc.com/examples/backbone/dist/"
+  },
+  {
+    "name": "Angular 21",
+    "url": "https://todomvc.com/examples/angular/dist/browser/"
+  },
+  {
+    "name": "Ember.js",
+    "url": "https://todomvc.com/examples/emberjs/todomvc/dist/"
+  },
+  {
+    "name": "Lit 3.3",
+    "url": "https://todomvc.com/examples/lit/dist/"
+  },
+  {
+    "name": "KnockoutJS",
+    "url": "https://todomvc.com/examples/knockoutjs/"
+  },
+  {
+    "name": "Dojo",
+    "url": "https://todomvc.com/examples/dojo/"
+  },
+  {
+    "name": "Knockback.js",
+    "url": "https://todomvc.com/examples/knockback/"
+  },
+  {
+    "name": "CanJS",
+    "url": "https://todomvc.com/examples/canjs/"
+  },
+  {
+    "name": "Polymer",
+    "url": "https://todomvc.com/examples/polymer/index.html"
+  },
+  {
+    "name": "Mithril",
+    "url": "https://todomvc.com/examples/mithril/"
+  },
+  {
+    "name": "Marionette.js",
+    "url": "https://todomvc.com/examples/backbone_marionette/"
+  },
+  {
+    "name": "Svelte 5",
+    "url": "https://todomvc.com/examples/svelte/dist/"
+  },
+  {
+    "name": "GWT",
+    "url": "https://todomvc.com/examples/gwt/"
+  },
+  {
+    "name": "Closure",
+    "url": "https://todomvc.com/examples/closure/"
+  },
+  {
+    "name": "Elm",
+    "url": "https://todomvc.com/examples/elm/"
+  },
+  {
+    "name": "AngularDart",
+    "url": "https://todomvc.com/examples/angular-dart/web/"
+  },
+  {
+    "name": "TypeScript + Backbone.js",
+    "url": "https://todomvc.com/examples/typescript-backbone/"
+  },
+  {
+    "name": "TypeScript + AngularJS",
+    "url": "https://todomvc.com/examples/typescript-angular/"
+  },
+  {
+    "name": "TypeScript + React",
+    "url": "https://todomvc.com/examples/typescript-react/"
+  },
+  {
+    "name": "Reagent",
+    "url": "https://todomvc.com/examples/reagent/"
+  },
+  {
+    "name": "Scala.js + Binding.scala",
+    "url": "https://todomvc.com/examples/binding-scala/"
+  },
+  {
+    "name": "js_of_ocaml",
+    "url": "https://todomvc.com/examples/js_of_ocaml/"
+  },
+  {
+    "name": "Humble + GopherJS",
+    "url": "https://todomvc.com/examples/humble/"
+  },
+  {
+    "name": "Backbone.js + RequireJS",
+    "url": "https://todomvc.com/examples/backbone_require/"
+  },
+  {
+    "name": "KnockoutJS + RequireJS",
+    "url": "https://todomvc.com/examples/knockoutjs_require/"
+  },
+  {
+    "name": "AngularJS + RequireJS",
+    "url": "https://todomvc.com/examples/angularjs_require/"
+  },
+  {
+    "name": "CanJS + RequireJS",
+    "url": "https://todomvc.com/examples/canjs_require/"
+  },
+  {
+    "name": "Lavaca + RequireJS",
+    "url": "https://todomvc.com/examples/lavaca_require/"
+  },
+  {
+    "name": "cujoJS",
+    "url": "https://todomvc.com/examples/cujo/index.html"
+  },
+  {
+    "name": "soma.js",
+    "url": "https://todomvc.com/examples/somajs/"
+  },
+  {
+    "name": "DUEL",
+    "url": "https://todomvc.com/examples/duel/www/"
+  },
+  {
+    "name": "Dijon",
+    "url": "https://todomvc.com/examples/dijon/"
+  },
+  {
+    "name": "Enyo + Backbone.js",
+    "url": "https://todomvc.com/examples/enyo_backbone/"
+  },
+  {
+    "name": "Exoskeleton",
+    "url": "https://todomvc.com/examples/exoskeleton/"
+  },
+  {
+    "name": "Ractive.js",
+    "url": "https://todomvc.com/examples/ractive/"
+  },
+  {
+    "name": "Aurelia",
+    "url": "https://todomvc.com/examples/aurelia/"
+  },
+  {
+    "name": "Riot",
+    "url": "https://todomvc.com/examples/riotjs/"
+  },
+  {
+    "name": "JSBlocks",
+    "url": "https://todomvc.com/examples/jsblocks/"
+  },
+  {
+    "name": "JavaScript ES5",
+    "url": "https://todomvc.com/examples/javascript-es5/dist/"
+  },
+  {
+    "name": "Modern JavaScript",
+    "url": "https://todomvc.com/examples/javascript-es6/dist/"
+  },
+  {
+    "name": "jQuery",
+    "url": "https://todomvc.com/examples/jquery/dist/"
+  },
+  {
+    "name": "Web Components",
+    "url": "https://todomvc.com/examples/web-components/dist/"
+  }
+]

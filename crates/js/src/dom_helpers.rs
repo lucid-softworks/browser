@@ -178,12 +178,19 @@ pub(crate) fn set_inner_html(doc: &mut dom::Document, target: dom::NodeId, html:
     for child in old {
         doc.get_mut(child).parent = None;
     }
-    let frag = html::parse(html);
-    let frag_root = frag.root();
     let target_is_html = matches!(
         &doc.get(target).data,
         dom::NodeData::Element(e) if e.tag.eq_ignore_ascii_case("html")
     );
+    // Fragment content is already in a body-like insertion context. Parsing it as a
+    // complete document drops leading/inter-comment whitespace in before-body mode,
+    // which changes the sibling anchors used by compiled templates.
+    let frag = if target_is_html {
+        html::parse(html)
+    } else {
+        html::parse(&format!("<body>{html}"))
+    };
+    let frag_root = frag.root();
     if target_is_html {
         if let Some(src_html) = find_by_tag(&frag, frag_root, "html") {
             for &child in &frag.get(src_html).children {

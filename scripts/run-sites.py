@@ -157,6 +157,7 @@ def run_site(site, args, output):
             # Real website smoke tests must validate TLS; the WPT driver's default disables it.
             env["WPT_INSECURE_TLS"] = "0"
             env["NET_CACHE_DIR"] = "off"
+            env["BROWSER_STORAGE_DIR"] = str(directory / "storage")
             process = subprocess.Popen([str(args.webdriver), "--port", str(port)],
                                        stdout=log, stderr=subprocess.STDOUT, env=env)
             driver = Driver(port, started + args.timeout, args.request_timeout)

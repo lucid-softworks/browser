@@ -8364,8 +8364,8 @@ pub(crate) fn collect_hoist_ops(
 }
 
 /// Hoist `var` declarations from one statement (function declarations and Annex B promotions are
-/// collected by the later phases). `for`/`for-in/of` heads bind unconditionally (VarForce),
-/// matching the runtime behavior this replaced.
+/// collected by the later phases). Loop-head vars share the function's bindings,
+/// including parameters; hoisting must not reset an existing binding.
 fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
     match stmt {
         Stmt::ExportDecl(inner) | Stmt::ExportDefault(inner) => collect_hoist_stmt(inner, out),
@@ -8404,7 +8404,7 @@ fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
                     for (pat, _) in decls {
                         let mut names = Vec::new();
                         pattern_idents(pat, &mut names);
-                        out.extend(names.into_iter().map(HoistOp::VarForce));
+                        out.extend(names.into_iter().map(HoistOp::Var));
                     }
                 }
             }
@@ -8418,7 +8418,7 @@ fn collect_hoist_stmt(stmt: &Stmt, out: &mut Vec<HoistOp>) {
         } => {
             let mut names = Vec::new();
             pattern_idents(left, &mut names);
-            out.extend(names.into_iter().map(HoistOp::VarForce));
+            out.extend(names.into_iter().map(HoistOp::Var));
             collect_hoist_stmt(body, out);
         }
         Stmt::ForInOf { body, .. } => collect_hoist_stmt(body, out),

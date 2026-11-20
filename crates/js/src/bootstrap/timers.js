@@ -2,7 +2,7 @@
   // Two-phase clock: VIRTUAL at load (fast-forward to fire pending one-shots so the first paint is
   // complete; intervals may spin, bounded by the cap), and the REAL wall clock once the page is
   // live (driven by Engine::tick) so setInterval/setTimeout/rAF fire on actual elapsed time.
-  var loop = { timers: [], micro: [], nextId: 1, now: 0, realBase: 0, realtime: false, firedThisDrain: Object.create(null) };
+  var loop = { timers: [], nextId: 1, now: 0, realBase: 0, realtime: false, firedThisDrain: Object.create(null) };
   // Largest virtual-time jump allowed while fast-forwarding the load-time clock. Generous enough to
   // run any realistic deferred load work (setTimeout(0) chains, rAF, init delays) but well under the
   // multi-second testharness timeout, so test timeouts are deferred to the real clock instead of
@@ -50,9 +50,14 @@
   });
   define("clearInterval", globalThis.clearTimeout);
 
+  // Promise reactions and queueMicrotask share one FIFO queue. A separate JS
+  // queue would postpone framework updates past the next native input event.
+  var enqueueMicrotask = Promise.prototype.then.bind(Promise.resolve());
   define("queueMicrotask", function (fn) {
     if (typeof fn !== "function") { throw new TypeError("queueMicrotask: argument is not a function"); }
-    loop.micro.push(fn);
+    enqueueMicrotask(function () {
+      try { fn(); } catch (e) { globalThis.__timerErrors.push((e&&e.stack||String(e))); }
+    });
   });
 
   define("requestAnimationFrame", function (fn) {
@@ -85,16 +90,8 @@
   // Driver called from Rust. Returns true if it ran a task (microtask or timer), false if nothing
   // is currently runnable. One throwing task does not kill the loop: errors are collected.
   define("__runDueTimers", function () {
-    // 1. Drain ALL microtasks first (FIFO), including ones queued while draining.
-    var ranSomething = false;
-    while (loop.micro.length > 0) {
-      var m = loop.micro.shift();
-      ranSomething = true;
-      try { m(); } catch (e) { globalThis.__timerErrors.push((e&&e.stack||String(e))); }
-    }
-    if (ranSomething) { return true; }
-
-    // 2. Pick the smallest-`when` timer (skipping a repeat already fired this realtime tick).
+    // The host checkpoints microtasks first. Pick the smallest-`when` timer
+    // (skipping a repeat already fired this realtime tick).
     if (loop.timers.length === 0) { return false; }
     // A repeating timer fires at most once per drain (load OR tick) so an interval can't spin to
     // the cap — its callback runs once at load, then once per real-time tick thereafter.

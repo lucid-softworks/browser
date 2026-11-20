@@ -898,7 +898,11 @@
     return !!options;
   }
   var __eventHandlerProps = [
-    "oninput", "onchange", "onbeforeinput", "onkeydown", "onkeyup",
+    "oninput", "onchange", "onbeforeinput", "onkeydown", "onkeypress", "onkeyup",
+    "onclick", "ondblclick", "onmousedown", "onmouseup", "onmousemove",
+    "onmouseover", "onmouseout", "onmouseenter", "onmouseleave", "oncontextmenu",
+    "onpointerdown", "onpointerup", "onpointermove", "onpointerover", "onpointerout",
+    "ontouchstart", "ontouchend", "ontouchmove", "ontouchcancel", "onwheel",
     "onfocus", "onblur", "onfocusin", "onfocusout", "onsubmit",
     "onanimationstart", "onanimationend", "onanimationiteration", "ontransitionend",
     "onwebkitanimationstart", "onwebkitanimationend", "onwebkitanimationiteration",
@@ -935,7 +939,8 @@
     def(target, "__listeners", registry);
     __installEventHandlerProps(target);
     def(target, "addEventListener", function (type, cb, options) {
-      if (typeof cb !== "function") { return; }
+      if (cb == null) { return; }
+      if (typeof cb !== "function" && typeof cb !== "object") { throw new TypeError("Event listener must be an object"); }
       type = String(type);
       var capture = __captureFlag(options);
       var once = !!(options && typeof options === "object" && options.once);
@@ -971,6 +976,17 @@
   // Invoke the listeners registered on `target` for `type` whose capture flag matches `wantCapture`,
   // plus (when invoking the bubble/target set) the legacy `on<type>` handler. Honours `once` and
   // the event's stop-immediate flag.
+  var __reportingListenerError = false;
+  function reportListenerError(error) {
+    (globalThis.__timerErrors || []).push((error && error.stack) || String(error));
+    if (__reportingListenerError) { return; }
+    __reportingListenerError = true;
+    try {
+      globalThis.dispatchEvent(new globalThis.ErrorEvent("error", {
+        error: error, message: String(error && error.message || error), cancelable: true
+      }));
+    } finally { __reportingListenerError = false; }
+  }
   def(globalThis, "__runListeners", function (target, type, ev, wantCapture, includeOn) {
     if (!target) { return; }
     var s = ev && ev.__ev ? ev.__ev : null;
@@ -980,16 +996,20 @@
       var copy = list.slice();
       for (var i = 0; i < copy.length; i++) {
         var entry = copy[i];
+        if (list.indexOf(entry) < 0) { continue; }
         if (entry.capture !== wantCapture) { continue; }
         if (entry.once) { var j = list.indexOf(entry); if (j >= 0) { list.splice(j, 1); } }
-        try { entry.cb.call(target, ev); } catch (e) { (globalThis.__timerErrors || []).push((e && e.stack) || String(e)); }
+        try {
+          if (typeof entry.cb === "function") { entry.cb.call(target, ev); }
+          else { entry.cb.handleEvent(ev); }
+        } catch (e) { reportListenerError(e); }
         if (s && s.stopImmediate) { return; }
       }
     }
     if (includeOn) {
       var on = target[__handlerPropForEventType(type)];
       if (typeof on === "function") {
-        try { on.call(target, ev); } catch (e2) { (globalThis.__timerErrors || []).push((e2 && e2.stack) || String(e2)); }
+        try { on.call(target, ev); } catch (e2) { reportListenerError(e2); }
       }
     }
   });
@@ -1392,6 +1412,9 @@
       "onblur", "onerror", "onfocus", "onload", "onresize", "onscroll"].forEach(function (n) { s[n] = true; });
     return s;
   })();
+  Object.keys(globalThis.__windowReflectedBodyHandlers).forEach(function (name) {
+    if (!(name in globalThis)) { def(globalThis, name, null); }
+  });
 
   // --- DOM lifecycle dispatch (driven from Rust during the drain) --------------------------
   var readyState = "loading";
@@ -3505,7 +3528,7 @@
         // With no supported-tokens allow-list (e.g. `class`/`rel`), supports() throws TypeError.
         // Otherwise it ASCII-lowercases the token and checks membership.
         if (supported == null) { throw new TypeError("DOMTokenList has no supported tokens."); }
-        return supported.indexOf(asciiLower(String(token))) >= 0;
+        return supported.indexOf(String(token).replace(/[A-Z]/g, function (c) { return c.toLowerCase(); })) >= 0;
       },
       forEach: function (cb, thisArg) {
         if (typeof cb !== "function") { throw new TypeError("The callback provided as parameter 1 is not a function."); }
@@ -6016,8 +6039,8 @@
         var SVG = "http://www.w3.org/2000/svg";
         var ln = null, ns = null;
         try { ln = el.localName; ns = el.namespaceURI; } catch (e) {}
-        function install(prop, contentAttr) {
-          var tl = makeTokenList(node, contentAttr, null);
+        function install(prop, contentAttr, supported) {
+          var tl = makeTokenList(node, contentAttr, supported == null ? null : supported);
           Object.defineProperty(el, prop, {
             get: function () { return tl; },
             set: function (v) { tl.value = v; },
@@ -6026,13 +6049,22 @@
         }
         // relList: on HTML a/area/link. (SVG <a>.relList is defined on SVGAElement.prototype.)
         if (ns === HTML && (ln === "a" || ln === "area" || ln === "link")) {
-          install("relList", "rel");
+          // Unsupported hints (including modulepreload) return false so callers can
+          // provide their fallback; unlike classList, relList has a supported-token set.
+          install("relList", "rel", ln === "link" ? ["stylesheet"] : []);
         }
         if (ns === HTML && ln === "output") { install("htmlFor", "for"); }
         if (ns === HTML && ln === "iframe") { install("sandbox", "sandbox"); }
         if (ns === HTML && ln === "link") { install("sizes", "sizes"); }
       })();
       def(el, "dataset", makeDataset(node));
+      if (el.localName === "script") {
+        Object.defineProperty(el, "text", {
+          get: function () { return el.textContent; },
+          set: function (value) { el.textContent = String(value); },
+          configurable: true, enumerable: true
+        });
+      }
       // Form-control `value` / `checked` reflection: back them by element ATTRIBUTES so that
       // reading/writing `el.value` (and `el.checked`) is visible to layout, which renders the
       // input's text from the `value` attribute. Only for <input>/<textarea>/<select>; guard so
@@ -7819,8 +7851,7 @@
     if (!anyActive) { return; }
     globalThis.__moMicrotaskQueued = true;
     // Use a native Promise microtask via Promise.resolve().then so delivery interleaves with the page's
-    // own `await Promise.resolve()` continuations (the polyfilled queueMicrotask runs on a separate,
-    // later-drained queue).
+    // own `await Promise.resolve()` continuations.
     try {
       Promise.resolve().then(function () {
         globalThis.__moMicrotaskQueued = false;
@@ -8963,6 +8994,9 @@
   // (see __wrapNode below) so `el instanceof HTMLElement/Element/Node` returns true.
   function defClass(name, parentCtor) {
     var ctor = typeof globalThis[name] === "function" ? globalThis[name] : function () {};
+    if (name === "HTMLElement") {
+      ctor = function HTMLElement() { return globalThis.__ceConstruct(new.target); };
+    }
     // WebIDL: the interface object's `name` is the interface name (idlharness checks it). An
     // anonymous function would otherwise infer the variable name ("ctor").
     try { Object.defineProperty(ctor, "name", { value: name, writable: false, enumerable: false, configurable: true }); } catch (e) {}
@@ -9005,6 +9039,17 @@
   // hasChildNodes() on the shared Node prototype, so non-element nodes (document, text, comment,
   // doctype, …) answer it too. Element wrappers install their own faster override in enrichElement.
   def(NodeCtor.prototype, "hasChildNodes", function () { var c = this.childNodes; return !!(c && c.length); });
+  ["firstChild", "lastChild", "nextSibling", "previousSibling", "parentNode"].forEach(function (name) {
+    Object.defineProperty(NodeCtor.prototype, name, {
+      get: function () {
+        if (!this || (typeof this.__node !== "number" && !(this.host && this.host.__contentFrag === this))) {
+          throw new TypeError("Illegal invocation");
+        }
+        var descriptor = Object.getOwnPropertyDescriptor(this, name);
+        return descriptor && descriptor.get ? descriptor.get.call(this) : null;
+      }, configurable: true, enumerable: true
+    });
+  });
   (function (proto) {
     function nodeArg(value, method) {
       if (!value || typeof value.nodeType !== "number") {
@@ -9046,7 +9091,16 @@
       });
     });
   })(NodeCtor.prototype);
-  defClass("EventTarget");
+  def(globalThis, "EventTarget", function EventTarget() { installEvents(this); });
+  var EventTargetCtor = defClass("EventTarget");
+  ["addEventListener", "removeEventListener", "dispatchEvent"].forEach(function (method) {
+    def(EventTargetCtor.prototype, method, function () {
+      if (!this || !this.__listeners) { throw new TypeError("Illegal invocation"); }
+      return Object.getOwnPropertyDescriptor(this, method).value.apply(this, arguments);
+    });
+  });
+  Object.setPrototypeOf(NodeCtor.prototype, EventTargetCtor.prototype);
+  Object.setPrototypeOf(NodeCtor, EventTargetCtor);
   defClass("CharacterData", NodeCtor);
   var TextCtor = defClass("Text", globalThis.CharacterData);
   var CommentCtor = defClass("Comment", globalThis.CharacterData);
@@ -9229,6 +9283,7 @@
     }
   } catch (e) {}
   defClass("Window", globalThis.EventTarget);
+  Object.setPrototypeOf(globalThis, globalThis.Window.prototype);
   defClass("AbstractRange"); defClass("Range", globalThis.AbstractRange); defClass("StaticRange", globalThis.AbstractRange);
   var domIfaces = [
     "HTMLCollection", "NodeList", "DOMTokenList", "NamedNodeMap", "DOMStringMap", "DOMRectList",
@@ -9241,6 +9296,9 @@
     "NodeIterator", "TreeWalker",
   ];
   for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
+  var StorageCtor = defClass("Storage");
+  Object.setPrototypeOf(globalThis.localStorage, StorageCtor.prototype);
+  Object.setPrototypeOf(globalThis.sessionStorage, StorageCtor.prototype);
 
   // CSSStyleDeclaration is a WebIDL iterable<> (over its property names by index). Put the default
   // iterator on the PROTOTYPE so `Symbol.iterator in CSSStyleDeclaration.prototype` holds (instances
@@ -10314,6 +10372,13 @@
       };
       Real.prototype = ctor.prototype;
       def(globalThis, "CSSStyleSheet", Real);
+      ["replace", "replaceSync", "insertRule", "deleteRule"].forEach(function (name) {
+        def(Real.prototype, name, function () {
+          var own = Object.getOwnPropertyDescriptor(this, name);
+          if (!own || typeof own.value !== "function") { throw new TypeError("Illegal invocation"); }
+          return own.value.apply(this, arguments);
+        });
+      });
     }
   })();
 
@@ -10470,6 +10535,22 @@
     });
   }
   try { installAdoptedStyleSheets(globalThis.document, globalThis.document); } catch (e) {}
+  [globalThis.Document, globalThis.ShadowRoot].forEach(function (ctor) {
+    if (!ctor) { return; }
+    Object.defineProperty(ctor.prototype, "adoptedStyleSheets", {
+      get: function () {
+        var own = Object.getOwnPropertyDescriptor(this, "adoptedStyleSheets");
+        if (!own || !own.get) { throw new TypeError("Illegal invocation"); }
+        return own.get.call(this);
+      },
+      set: function (value) {
+        var own = Object.getOwnPropertyDescriptor(this, "adoptedStyleSheets");
+        if (!own || !own.set) { throw new TypeError("Illegal invocation"); }
+        own.set.call(this, value);
+      },
+      configurable: true, enumerable: true
+    });
+  });
 
   // Minimal Shadow DOM: `el.attachShadow({mode})` returns a shadow root. We back it with a real
   // element appended under the host so its content (incl. <style>) is laid out + cascaded — not
@@ -10480,6 +10561,8 @@
       def(globalThis.Element.prototype, "attachShadow", function (init) {
         if (this.__shadow) { return this.__shadow; }
         var root = document.createElement("div");
+        if (!globalThis.__shadowRootIds) { globalThis.__shadowRootIds = {}; }
+        globalThis.__shadowRootIds[root.__node] = true;
         try { __appendChild(this.__node, root.__node); } catch (e) {}
         root.host = this;
         root.mode = (init && init.mode) || "open";
@@ -10948,16 +11031,31 @@
   // `connectedCallback` on connect (also for elements inserted later, via the insertNode hook),
   // `disconnectedCallback` on removal (via a wrapper around the native subtree-removal primitive),
   // and `attributeChangedCallback` for the attributes named in the ctor's static `observedAttributes`
-  // (via the setAttribute/removeAttribute hook). We still skip the spec's
-  // constructor-run-with-`this`-as-the-element machinery (no engine support) and `adoptedCallback`
-  // (cross-document adoption is rare); these three reactions cover the overwhelming majority of
-  // reactive components. Direct id/class/dataset setters and toggleAttribute are not yet hooked for
+  // (via the setAttribute/removeAttribute hook). The construction stack makes HTMLElement's
+  // super() return the existing node during upgrades. adoptedCallback is not yet implemented.
+  // Direct id/class/dataset setters and toggleAttribute are not yet hooked for
   // attributeChangedCallback — only setAttribute/removeAttribute.
   try {
     var __ceReg = {};      // name -> ctor
     var __ceObs = {};      // name -> { attrName: true, … } observed-attribute set (read once at define)
     var __ceWhen = {};     // name -> { promise, resolve }
     var __ceAny = false;   // fast-path guard: stay a no-op until the first element is defined
+    var __ceConstruction = [];
+    def(globalThis, "__ceConstruct", function (ctor) {
+      var entry = __ceConstruction[__ceConstruction.length - 1];
+      if (entry && entry.ctor === ctor) {
+        if (entry.used) { throw new TypeError("Custom element already constructed"); }
+        entry.used = true;
+        return entry.element;
+      }
+      var name = null;
+      for (var key in __ceReg) { if (__ceReg[key] === ctor) { name = key; break; } }
+      if (!name) { throw new TypeError("Illegal constructor"); }
+      var element = canon(__wrapNode(__createElement(name)));
+      Object.setPrototypeOf(element, ctor.prototype);
+      def(element, "__ceUpgraded", true);
+      return element;
+    });
     function __ceConnected(el) {
       try { return !!(document.documentElement && document.documentElement.contains(el)); } catch (e) { return false; }
     }
@@ -10972,6 +11070,15 @@
       if (!ctor) { return; }
       def(el, "__ceUpgraded", true);
       try { if (ctor.prototype) { Object.setPrototypeOf(el, ctor.prototype); } } catch (e) {}
+      var entry = { ctor: ctor, element: el, used: false };
+      __ceConstruction.push(entry);
+      try {
+        if (new ctor() !== el) { throw new TypeError("Custom element constructor returned a different object"); }
+      } catch (error) {
+        def(el, "__ceFailed", true);
+        console.error(error);
+        return;
+      } finally { __ceConstruction.pop(); }
       // Spec: enqueue attributeChangedCallback (oldValue null) for each observed attribute present.
       var obs = __ceObs[__ceName(el)];
       if (obs && typeof el.attributeChangedCallback === "function" && el.getAttributeNames) {
@@ -10985,7 +11092,7 @@
     }
     function __ceConnect(el) {
       __ceUpgrade(el);
-      if (!el || !el.__ceUpgraded || el.__ceConnectedFired) { return; }
+      if (!el || !el.__ceUpgraded || el.__ceFailed || el.__ceConnectedFired) { return; }
       if (!__ceConnected(el)) { return; }
       def(el, "__ceConnectedFired", true);
       if (typeof el.connectedCallback === "function") {
@@ -11018,6 +11125,14 @@
     }
     // Called from insertNode. Cheap no-op until at least one custom element is defined.
     def(globalThis, "__ceOnInsert", function (nodeId) { if (__ceAny) { __ceWalk(nodeId); } });
+    ["createElement", "createElementNS"].forEach(function (method) {
+      var create = document[method];
+      document[method] = function () {
+        var el = create.apply(this, arguments);
+        if (__ceAny && el.namespaceURI === "http://www.w3.org/1999/xhtml") { __ceUpgrade(el); }
+        return el;
+      };
+    });
     // Called from setAttribute/removeAttribute. Fires attributeChangedCallback for observed attrs.
     def(globalThis, "__ceNoteAttrChange", function (el, attrName, oldV, newV) {
       if (!__ceAny || !el || !el.__ceUpgraded) { return; }
@@ -11199,8 +11314,16 @@
             querySelector: function (s) { try { return tpl.querySelector(s); } catch (e) { return null; } },
             querySelectorAll: function (s) { try { return tpl.querySelectorAll(s); } catch (e) { return []; } },
             getElementById: function (gid) { var found = globalThis.__findElementByIdWithin(tplNode, String(gid)); return found >= 0 ? nodeAt(found) : null; },
-            cloneNode: function () { return this; },
+            cloneNode: function (deep) {
+              var copy = document.createDocumentFragment();
+              if (deep) {
+                var children = this.childNodes;
+                for (var i = 0; i < children.length; i++) { copy.appendChild(children[i].cloneNode(true)); }
+              }
+              return copy;
+            },
           };
+          Object.setPrototypeOf(frag, globalThis.DocumentFragment.prototype);
           try { def(tpl, "__contentFrag", frag); } catch (e) { tpl.__contentFrag = frag; }
           return frag;
         },
@@ -15087,12 +15210,22 @@
       if (shape) { node = shape; }
     }
 
-    var Ctor = mouseTypes[type] ? globalThis.MouseEvent : globalThis.Event;
+    var keyboard = type === "keydown" || type === "keypress" || type === "keyup";
+    var Ctor = keyboard ? globalThis.KeyboardEvent : mouseTypes[type] ? globalThis.MouseEvent : globalThis.Event;
     var ev;
-    try { ev = new Ctor(type, { bubbles: true, cancelable: true }); }
+    var init = { bubbles: true, cancelable: true, composed: true };
+    if (props) { for (var member in props) { init[member] = props[member]; } }
+    if (mouseTypes[type] && init.buttons === undefined) {
+      init.buttons = type === "mousedown" || type === "pointerdown" ? 1 : 0;
+    }
+    try { ev = new Ctor(type, init); }
     catch (e) { ev = { type: type, bubbles: true, cancelable: true, defaultPrevented: false }; }
     // Copy caller-supplied props (clientX/clientY/button/...) onto the event.
     if (props) { for (var k in props) { try { ev[k] = props[k]; } catch (e2) {} } }
+    if (mouseTypes[type]) {
+      var buttonEvent = /^(click|dblclick|mousedown|mouseup|contextmenu|pointerdown|pointerup)$/.test(type);
+      def(ev, "which", buttonEvent ? (init.button || 0) + 1 : 0);
+    }
     // Run it through the shared capture/target/bubble dispatch (which honours stopPropagation,
     // capture listeners, and returns !defaultPrevented).
     return globalThis.__dispatchEventObject(node, ev);
@@ -15235,17 +15368,34 @@
   // Fire keydown, mutate the focused text field's value (firing input), then keyup. Returns
   // nothing; the caller reads back the updated DOM snapshot. Text-like <input>/<textarea> only.
   var textInputTypes = { text: 1, search: 1, email: 1, url: 1, tel: 1, password: 1, number: 1, "": 1 };
-  def(globalThis, "__handleKeyInput", function (nodeId, key, code) {
+  def(globalThis, "__handleKeyInput", function (nodeId, key, code, phase, allowed) {
     var el = null;
     try { el = canon(__wrapNode(nodeId)); } catch (e) { el = null; }
     if (!el) { return; }
     key = String(key);
     code = String(code);
 
-    // keydown — if defaultPrevented, still send keyup but skip the value mutation.
-    var allowMutation = __dispatchSyntheticEvent(nodeId, "keydown", { key: key, code: code });
+    // Legacy handlers still use keyCode/which and keypress. Supply physical-key
+    // codes on down/up and character codes on keypress (including Enter).
+    var keyCodes = { Enter: 13, Backspace: 8, Tab: 9, Escape: 27, Delete: 46,
+      ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Home: 36, End: 35 };
+    var keyCode = keyCodes[key] || (key.length === 1 ? key.toUpperCase().charCodeAt(0) : 0);
+    var keyProps = { key: key, code: code, keyCode: keyCode, which: keyCode, charCode: 0 };
+    // Cancellation suppresses keypress and the default edit, but not keyup.
+    var allowMutation = allowed !== false;
+    if (!phase || phase === "keydown") {
+      allowMutation = __dispatchSyntheticEvent(nodeId, "keydown", keyProps);
+      if (phase) { return allowMutation; }
+    }
+    if ((!phase || phase === "keypress") && allowMutation && (key.length === 1 || key === "Enter")) {
+      var charCode = key === "Enter" ? 13 : key.charCodeAt(0);
+      allowMutation = __dispatchSyntheticEvent(nodeId, "keypress", {
+        key: key, code: code, keyCode: charCode, charCode: charCode, which: charCode
+      });
+    }
+    if (phase === "keypress") { return allowMutation; }
 
-    if (allowMutation) {
+    if ((!phase || phase === "default") && allowMutation) {
       var tag = "";
       try { tag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : ""; } catch (e2) {}
       var isTextarea = tag === "textarea";
@@ -15278,19 +15428,25 @@
           next = cur + key; mutated = true;
         }
         if (mutated) {
+          if (el.__userEditStart === undefined) { el.__userEditStart = cur; }
           // A native edit changes the control's backing value without invoking an own JS
           // setter (React installs one to distinguish programmatic writes from user input).
           try { __setAttr(nodeId, "value", next); } catch (e7) {}
           __dispatchSyntheticEvent(nodeId, "input", {});
         }
         if (key === "Enter" && isTextInput) {
+          if (el.__userEditStart !== undefined && el.value !== el.__userEditStart) {
+            __dispatchSyntheticEvent(nodeId, "change", {});
+          }
+          el.__userEditStart = undefined;
           __submitForm(__findForm(el), null, true);
         }
       }
     }
 
     // keyup always fires.
-    __dispatchSyntheticEvent(nodeId, "keyup", { key: key, code: code });
+    if (!phase || phase === "keyup") { __dispatchSyntheticEvent(nodeId, "keyup", keyProps); }
+    return allowMutation;
   });
 
   // --- Canvas 2D context ---------------------------------------------------------------------

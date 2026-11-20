@@ -421,9 +421,17 @@ impl<'a> Parser<'a> {
                     self.flush_text();
                     self.parse_end_tag();
                 } else if self.peek_at(1) == Some(b'!') || self.peek_at(1) == Some(b'?') {
-                    // Bogus comment / processing instruction: consume to '>'.
                     self.flush_text();
+                    // HTML treats processing instructions and unknown declarations as
+                    // bogus comments. Preserve their data (including a leading '?');
+                    // template libraries use these nodes as insertion markers.
+                    self.pos += if self.peek_at(1) == Some(b'!') { 2 } else { 1 };
+                    let start = self.pos;
                     self.consume_until_byte(b'>');
+                    let content = String::from_utf8_lossy(&self.input[start..self.pos])
+                        .replace('\0', "\u{fffd}");
+                    self.doc
+                        .append_child(self.current_parent(), NodeData::Comment(content));
                     self.consume_byte(); // the '>'
                 } else {
                     // A stray '<' that doesn't begin a markup construct: literal text.
@@ -1499,6 +1507,20 @@ mod tests {
             NodeData::Comment(s) => assert_eq!(s, " hello "),
             other => panic!("expected comment, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bogus_comments_preserve_template_markers() {
+        let doc = parse("<div><?marker$><!unknown><?></div>");
+        let div = children(&doc, body_of(&doc))[0];
+        let data: Vec<_> = children(&doc, div)
+            .iter()
+            .map(|id| match &doc.get(*id).data {
+                NodeData::Comment(s) => s.as_str(),
+                other => panic!("expected comment, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(data, ["?marker$", "unknown", "?"]);
     }
 
     #[test]
