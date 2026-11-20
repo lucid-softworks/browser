@@ -298,6 +298,7 @@
   function collectDescendants(rootId, pred) {
     var out = [];
     function visit(nid, isRoot) {
+      if (!isRoot && globalThis.__shadowRootIds && globalThis.__shadowRootIds[nid]) { return; }
       if (!isRoot && __nodeType(nid) === 1 && pred(nid)) { out.push(wrap(nid)); }
       var kids = __children(nid);
       for (var i = 0; i < kids.length; i++) { visit(kids[i], false); }
@@ -509,6 +510,7 @@
       if (globalThis.__ceOnInsert) { for (var k = 0; k < moving.length; k++) { try { globalThis.__ceOnInsert(moving[k]); } catch (e) {} } }
       if (globalThis.__frameOnInsert) { for (var fk = 0; fk < moving.length; fk++) { try { globalThis.__frameOnInsert(moving[fk]); } catch (e) {} } }
       if (globalThis.__adoptOnInsert) { for (var m = 0; m < moving.length; m++) { try { globalThis.__adoptOnInsert(moving[m]); } catch (e) {} } }
+      if (globalThis.__scriptOnInsert) { for (var s = 0; s < moving.length; s++) { globalThis.__scriptOnInsert(moving[s]); } }
       return nodeId;
     }
     __insertBefore(parentId, nodeId, refId);
@@ -519,6 +521,7 @@
     if (globalThis.__frameOnInsert) { try { globalThis.__frameOnInsert(nodeId); } catch (e) {} }
     // Cross-document adoption: clear adoptedStyleSheets of shadow roots moved into a frame document.
     if (globalThis.__adoptOnInsert) { try { globalThis.__adoptOnInsert(nodeId); } catch (e) {} }
+    if (globalThis.__scriptOnInsert) { globalThis.__scriptOnInsert(nodeId); }
     return nodeId;
   }
   def(globalThis, "__insertDomNode", insertNode);
@@ -843,6 +846,7 @@
         if (offset > len) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
         if (offset + count > len) { count = len - offset; }
         __setTextContent(id, d.slice(0, offset) + insert + d.slice(offset + count));
+        if (globalThis.__scheduleMODelivery) { globalThis.__scheduleMODelivery(); }
         // Live-range step: keep any Range boundary points inside this node valid.
         if (globalThis.__rangesReplaceData) { globalThis.__rangesReplaceData(id, offset, count, insert.length); }
       };
@@ -914,7 +918,10 @@
     });
     Object.defineProperty(el, "innerHTML", {
       get: function () { return __innerHTML(id); },
-      set: function (v) { __setInnerHTML(id, v == null ? "" : String(v)); },
+      set: function (v) {
+        __setInnerHTML(id, v == null ? "" : String(v));
+        if (globalThis.__scriptMarkInert) { globalThis.__scriptMarkInert(id); }
+      },
       enumerable: true, configurable: true
     });
     Object.defineProperty(el, "outerHTML", {
@@ -945,7 +952,10 @@
     // without sanitization (we do not sanitize anyway). The `template`/shadowroot semantics of the
     // real algorithm are not modeled; a plain reparse covers the WPT callers that use it as a
     // convenience to install markup. getHTML() serializes back (≈ innerHTML).
-    def(el, "setHTMLUnsafe", function (html) { __setInnerHTML(id, html == null ? "" : String(html)); });
+    def(el, "setHTMLUnsafe", function (html) {
+      __setInnerHTML(id, html == null ? "" : String(html));
+      if (globalThis.__scriptMarkInert) { globalThis.__scriptMarkInert(id); }
+    });
     def(el, "getHTML", function () { return __innerHTML(id); });
 
     // id / className are DOMString reflections: null/undefined stringify to "null"/"undefined".
@@ -1224,7 +1234,12 @@
         return Object.getOwnPropertyDescriptor(t, prop);
       }
     });
-    Object.defineProperty(el, "attributes", { get: function () { return attrMap; }, configurable: true });
+    Object.defineProperty(el, "attributes", {
+      get: function () {
+        if (globalThis.NamedNodeMap) { Object.setPrototypeOf(attrMap, globalThis.NamedNodeMap.prototype); }
+        return attrMap;
+      }, configurable: true
+    });
     def(el, "removeAttributeNode", function (attr) {
       // Spec: if attr's element isn't this element, throw NotFoundError. Then remove it and detach
       // the SAME Attr object (it keeps its last value/name; ownerElement becomes null).
@@ -1385,6 +1400,7 @@
       var nid = __cloneNode(id, !!deep);
       if (nid < 0) { return null; }
       copyNsMetaDeep(id, nid);
+      if (globalThis.__scriptCloneState) { globalThis.__scriptCloneState(id, nid); }
       var w = wrap(nid);
       // Route through the canonical-wrapper cache (when the browser-env layer is present) so the
       // clone has a stable identity and full enrichment (style/classList/childNodes === checks).
@@ -1412,6 +1428,7 @@
       // Parse the HTML fragment into real nodes via a temp container, then move them.
       var tmp = __createElement("template");
       __setInnerHTML(tmp, html == null ? "" : String(html));
+      if (globalThis.__scriptMarkInert) { globalThis.__scriptMarkInert(tmp); }
       var parsed = __children(tmp).slice();
       if (pos === "beforebegin") {
         var p = __parent(id);
@@ -1450,9 +1467,9 @@
       return __cmpDocPos(id, other.__node);
     });
 
-    def(el, "querySelector", function (sel) { var r = __querySelectorAllWithin(id, String(sel)); return r.length ? wrap(r[0]) : null; });
+    def(el, "querySelector", function (sel) { var r = treeScoped(__querySelectorAllWithin(id, String(sel)), id); return r.length ? wrap(r[0]) : null; });
     def(el, "querySelectorAll", function (sel) {
-      var ids = __querySelectorAllWithin(id, String(sel));
+      var ids = treeScoped(__querySelectorAllWithin(id, String(sel)), id);
       return globalThis.__makeNodeList(function () { return ids.map(wrap); }, false);
     });
     def(el, "getElementsByTagName", function (tag) {
@@ -1565,7 +1582,12 @@
   var document = {};
   def(document, NODE, 0);
   def(document, "__nodeRealmToken", __nodeRealmToken);
-  def(document, "getElementById", function (idStr) { var n = __getElementById(String(idStr)); return n >= 0 ? wrap(n) : null; });
+  def(document, "getElementById", function (idStr) {
+    var name = String(idStr);
+    if (!globalThis.__shadowRootIds) { var id = __getElementById(name); return id >= 0 ? wrap(id) : null; }
+    var nodes = collectDescendants(0, function (id) { return __getAttr(id, "id") === name; });
+    return name && nodes.length ? nodes[0] : null;
+  });
   def(document, "getElementsByTagName", function (tag) {
     var qn = String(tag);
     return globalThis.__makeHTMLCollection(function () {
@@ -1574,11 +1596,22 @@
   });
   def(document, "getElementsByClassName", function (cls) {
     var classNames = String(cls);
-    return globalThis.__makeHTMLCollection(function () { return __getElementsByClassName(classNames).map(wrap); });
+    return globalThis.__makeHTMLCollection(function () { return treeScoped(__getElementsByClassName(classNames), 0).map(wrap); });
   });
-  def(document, "querySelector", function (sel) { var r = __querySelectorAll(String(sel)); return r.length ? wrap(r[0]) : null; });
+  // Shadow roots share the layout arena, but DOM queries stop at their boundary.
+  function treeScoped(ids, scope) {
+    var roots = globalThis.__shadowRootIds;
+    if (!roots) { return ids; }
+    return ids.filter(function (id) {
+      for (var p = id; p >= 0 && p !== scope; p = __parent(p)) {
+        if (roots[p]) { return false; }
+      }
+      return true;
+    });
+  }
+  def(document, "querySelector", function (sel) { var r = treeScoped(__querySelectorAll(String(sel)), 0); return r.length ? wrap(r[0]) : null; });
   def(document, "querySelectorAll", function (sel) {
-    var ids = __querySelectorAll(String(sel));
+    var ids = treeScoped(__querySelectorAll(String(sel)), 0);
     return globalThis.__makeNodeList(function () { return ids.map(wrap); }, false);
   });
   function documentCollection(predicate) {
@@ -1618,20 +1651,21 @@
     return document;
   });
   def(document, "close", function () {});
-  // document.write / writeln. We run scripts after the full parse (there is no live insertion point),
-  // so the written markup is parsed and appended to <body> (or the documentElement) — enough for the
-  // common case of a script writing extra elements (e.g. a <link>/<script>) into the page.
+  // Preserve the active script's insertion point across repeated/nested writes.
+  // Without an active parser script, fall back to appending to the body.
   def(document, "write", function () {
     var html = "";
     for (var i = 0; i < arguments.length; i++) { html += String(arguments[i]); }
-    var target = document.body || document.documentElement;
+    var point = globalThis.__scriptInsertionPoint && globalThis.__scriptInsertionPoint();
+    var target = point ? point.parent : document.body || document.documentElement;
     if (!target) { return; }
     var tmp = document.createElement("div");
     tmp.innerHTML = html;
+    if (globalThis.__scriptAllowWritten) { globalThis.__scriptAllowWritten(tmp.__node); }
     var kids = [];
     var cn = tmp.childNodes;
     for (var k = 0; k < cn.length; k++) { kids.push(cn[k]); }
-    for (var j = 0; j < kids.length; j++) { try { target.appendChild(kids[j]); } catch (e) {} }
+    for (var j = 0; j < kids.length; j++) { target.insertBefore(kids[j], point ? point.before : null); }
   });
   def(document, "writeln", function () {
     var a = Array.prototype.slice.call(arguments);

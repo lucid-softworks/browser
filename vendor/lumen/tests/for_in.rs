@@ -17,6 +17,31 @@ fn check(source: &str) {
 }
 
 #[test]
+fn loop_var_hoisting_preserves_parameters() {
+    check(r#"
+        function ordinary(value) { if (false) for (var value = 0; false;) {} return value; }
+        const destructured = (value) => { if (false) for (var [value] = []; false;) {} return value; };
+        function enumeration(value) { if (false) for (var value in {}) {} return value; }
+        function iteration(value) { if (false) for (var value of []) {} return value; }
+        assert(ordinary(11) === 11);
+        assert(destructured(12) === 12);
+        assert(enumeration(13) === 13);
+        assert(iteration(14) === 14);
+    "#);
+}
+
+#[test]
+fn function_body_in_for_initializer_allows_relational_in() {
+    check(r#"
+        var result = false;
+        for (!function() { var obj = {expand: 1}; result = 'expand' in obj; }(); false;) {}
+        assert(result);
+        for (var f = function() { return 'x' in {x: 1}; }; false;) {}
+        assert(f());
+    "#);
+}
+
+#[test]
 fn own_order_prototypes_shadowing_and_primitives() {
     check(
         r#"

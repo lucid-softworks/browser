@@ -587,7 +587,7 @@ mod tests {
         let (_doc, out) = run_with_dom(
             doc,
             vec![r#"globalThis.__log = [];
-                    class XEl {
+                    class XEl extends HTMLElement {
                       static get observedAttributes() { return ["data-x"]; }
                       connectedCallback() { __log.push("connected"); }
                       disconnectedCallback() { __log.push("disconnected"); }
@@ -609,6 +609,294 @@ mod tests {
         assert_eq!(
             out[0].value.as_deref(),
             Some("connected|attr:data-x:null:1|attr:data-x:1:2|attr:data-x:2:null|disconnected")
+        );
+    }
+
+    #[test]
+    fn custom_elements_construct_before_reactions_and_templates_clone() {
+        let doc = html::parse("<body><x-ready id=existing></x-ready></body>");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var log = [];
+            class Ready extends HTMLElement {
+                constructor() { super(); this.ready = true; log.push('construct'); }
+                connectedCallback() { log.push('connect:' + this.ready); }
+            }
+            customElements.define('x-ready', Ready);
+            var fresh = document.createElement('x-ready');
+            document.body.appendChild(fresh);
+            var direct = new Ready();
+            var t = document.createElement('template');
+            t.innerHTML = '<!----> <span>one</span> <!---->';
+            var c = t.content.cloneNode(true);
+            var first = Object.getOwnPropertyDescriptor(Node.prototype, 'firstChild').get;
+            var next = Object.getOwnPropertyDescriptor(Node.prototype, 'nextSibling').get;
+            var preserved = next.call(first.call(c)).nodeType === 3;
+            document.body.appendChild(c);
+            [log.join(','), direct.localName, direct.ready, preserved,
+             t.content.childNodes.length, c.childNodes.length].join('|')
+        "#
+            .into()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("construct,connect:true,construct,connect:true,construct|x-ready|true|true|5|0")
+        );
+    }
+
+    #[test]
+    fn selectors_do_not_cross_shadow_roots() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var host = document.createElement('div'); document.body.appendChild(host);
+            var root = host.attachShadow({mode:'open'});
+            root.innerHTML = '<input id=private class=inside>';
+            [document.querySelectorAll('.inside').length, host.querySelectorAll('input').length,
+             root.querySelectorAll('input').length, document.getElementsByTagName('input').length,
+             document.getElementById('private') === null].join('|')
+        "#
+            .into()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("0|0|1|0|true"));
+    }
+
+    #[test]
+    fn event_listener_objects_resolve_handle_event_at_dispatch() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var el = document.createElement('button'), calls = [];
+            var listener = {handleEvent(e) { calls.push(this === listener && e.target === el); }};
+            el.addEventListener('click', listener);
+            el.addEventListener('click', listener);
+            el.dispatchEvent(new Event('click'));
+            listener.handleEvent = function() { calls.push('updated'); };
+            el.dispatchEvent(new Event('click'));
+            el.removeEventListener('click', listener);
+            el.dispatchEvent(new Event('click'));
+            el.addEventListener('click', listener, {once:true});
+            el.dispatchEvent(new Event('click'));
+            el.dispatchEvent(new Event('click'));
+            calls.join('|')
+        "#
+            .into()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|updated|updated"));
+    }
+
+    #[test]
+    fn dynamic_classic_scripts_execute_once_with_current_script() {
+        let doc = html::parse("<body></body>");
+        let (session, _, outputs) = Session::new(
+            doc,
+            vec![r#"
+            var events = [];
+            var s = document.createElement('script'); s.id = 'dynamic'; s.src = '/dynamic.js';
+            s.onload = function() { events.push('load'); document.body.appendChild(s); };
+            document.head.appendChild(s);
+            var inert = document.createElement('div');
+            inert.innerHTML = '<script>events.push("inert")<\/script>';
+            document.body.appendChild(inert);
+            document.body.appendChild(inert.firstChild.cloneNode(true));
+        "#
+            .into()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            Box::new(|url| {
+                (url == "https://example.com/dynamic.js").then(|| {
+                    (
+                        "events.push(document.currentScript.id);".into(),
+                        "text/javascript".into(),
+                    )
+                })
+            }),
+            no_request(),
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(outputs.iter().all(|out| out.error.is_none()), "{outputs:?}");
+        let (value, _, _) =
+            session.repl_eval("events.join('|') + ':' + (document.currentScript === null)");
+        assert_eq!(value, "dynamic|load:true");
+    }
+
+    #[test]
+    fn event_target_subclasses_can_dispatch_through_super() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(doc, vec![r#"
+            class Model extends EventTarget { notify() { return super.dispatchEvent(new Event('change')); } }
+            var model = new Model(), count = 0;
+            model.addEventListener('change', () => ++count);
+            [model.notify(), count, document.body instanceof EventTarget,
+             'onclick' in document.createElement('button'), 'onhashchange' in window].join('|')
+        "#.into()], "https://example.com/");
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|1|true|true|true"));
+    }
+
+    #[test]
+    fn enter_commits_native_input_once() {
+        let doc = html::parse("<input id=f>");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var input = document.getElementById('f'), values = [];
+            input.addEventListener('change', () => values.push(input.value));
+            __handleKeyInput(input.__node, 'a', 'KeyA');
+            __handleKeyInput(input.__node, 'Enter', 'Enter');
+            __handleKeyInput(input.__node, 'Enter', 'Enter');
+            values.join('|')
+        "#
+            .into()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn native_keyboard_checkpoints_share_the_promise_microtask_queue() {
+        let doc = html::parse("<input id=f>");
+        let input = find_by_id(&doc, doc.root(), "f").unwrap();
+        let (session, _, outputs) = Session::new(
+            doc,
+            vec![r#"
+            var input = document.getElementById('f'), log = [];
+            input.addEventListener('keydown', e => {
+                if (e.key === 'Enter') {
+                    queueMicrotask(() => { input.value = ''; log.push('queued'); });
+                    Promise.resolve().then(() => log.push('promise'));
+                }
+            });
+            input.addEventListener('keypress', e => {
+                if (e.key === 'Enter') log.push('press:' + input.value);
+            });
+            input.addEventListener('change', () => log.push('change'));
+        "#
+            .into()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(outputs.iter().all(|o| o.error.is_none()), "{outputs:?}");
+        session.dispatch_key(input.0, "a", "KeyA");
+        session.dispatch_key(input.0, "Enter", "Enter");
+        assert_eq!(
+            session.repl_eval("log.join('|')").0,
+            "queued|promise|press:"
+        );
+    }
+
+    #[test]
+    fn parser_scripts_preserve_write_order_and_current_script() {
+        let doc = html::parse("<body><script id=first></script><script id=last></script></body>");
+        let first = find_by_id(&doc, doc.root(), "first").unwrap();
+        let last = find_by_id(&doc, doc.root(), "last").unwrap();
+        let (session, _, outputs) = Session::new_with_script_nodes(
+            doc,
+            vec![
+                (
+                    Some(first.0),
+                    r#"
+                var log = [document.currentScript.id, document.scripts.length];
+                document.write('<script id=nested src="/nested.js"><\/script>');
+                log.push(document.currentScript.id);
+                document.write('<span id=written>text</span>');
+                queueMicrotask(() => log.push(document.currentScript === null));
+            "#
+                    .into(),
+                ),
+                (
+                    Some(last.0),
+                    "log.push(document.currentScript.id, document.scripts.length);".into(),
+                ),
+            ],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            Box::new(|_| {
+                Some((
+            "log.push(document.currentScript.id); document.write('<b id=inside>nested</b>');".into(),
+            "text/javascript".into()))
+            }),
+            no_request(),
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(outputs.iter().all(|o| o.error.is_none()), "{outputs:?}");
+        assert_eq!(
+            session.repl_eval("log.join('|')").0,
+            "first|1|nested|first|true|last|3"
+        );
+        assert_eq!(
+            session
+                .repl_eval("Array.from(document.body.children).map(e => e.id).join('|')")
+                .0,
+            "first|nested|inside|written|last"
+        );
+    }
+
+    #[test]
+    fn window_and_stylesheet_prototypes_support_feature_detection() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var sheet = new CSSStyleSheet();
+            CSSStyleSheet.prototype.replaceSync.call(sheet, ':host { display: block }');
+            var host = document.createElement('div'), root = host.attachShadow({mode:'open'});
+            root.adoptedStyleSheets = [sheet];
+            [self.constructor === Window, self instanceof Window,
+             'adoptedStyleSheets' in Document.prototype, 'replace' in CSSStyleSheet.prototype,
+             root.adoptedStyleSheets[0] === sheet, sheet.cssRules.length,
+             document.body.attributes instanceof NamedNodeMap,
+             localStorage instanceof Storage, sessionStorage.constructor === Storage].join('|')
+        "#
+            .into()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true|true|true|true|true|1|true|true|true")
+        );
+    }
+
+    #[test]
+    fn native_mouse_buttons_include_legacy_which() {
+        let doc = html::parse("<button id=b>tap</button>");
+        let (_, out) = run_with_dom(doc, vec![r#"
+            var b = document.getElementById('b'), log = [];
+            ['mousedown', 'mouseup', 'click'].forEach(type => b.addEventListener(type,
+                e => log.push([e.type, e.button, e.buttons, e.which].join(':'))));
+            ['mousedown', 'mouseup', 'click'].forEach(type => __dispatchSyntheticEvent(b.__node, type, {button:0}));
+            log.join('|')
+        "#.into()], "https://example.com/");
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("mousedown:0:1:1|mouseup:0:0:1|click:0:0:1")
         );
     }
 
@@ -3437,6 +3725,53 @@ mod tests {
         assert_eq!(
             out[0].value.as_deref(),
             Some("noopener noreferrer|[object DOMTokenList]|true")
+        );
+    }
+
+    #[test]
+    fn rel_list_feature_detection_does_not_throw_for_unsupported_hints() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(doc, vec![r#"
+            var link = document.createElement('link');
+            var classThrows = false;
+            try { link.classList.supports('anything'); } catch (e) { classThrows = e instanceof TypeError; }
+            [link.relList.supports('stylesheet'), link.relList.supports('STYLESHEET'),
+             link.relList.supports('modulepreload'), link.relList.supports('unknown'),
+             document.createElement('a').relList.supports('unknown'), classThrows].join('|')
+        "#.into()], "https://example.com/");
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("true|true|false|false|false|true")
+        );
+    }
+
+    #[test]
+    fn native_keyboard_legacy_codes_and_cancellation() {
+        let doc = html::parse("<input id=f>");
+        let (_, out) = run_with_dom(doc, vec![r#"
+            var input = document.getElementById('f'), events = [], cancel = '';
+            ['keydown', 'keypress', 'keyup'].forEach(function(type) {
+                input.addEventListener(type, function(e) {
+                    events.push([e.type, e instanceof KeyboardEvent, e.keyCode, e.charCode, e.which].join(':'));
+                    if(e.type === cancel) e.preventDefault();
+                });
+            });
+            __handleKeyInput(input.__node, 'a', 'KeyA');
+            cancel = 'keypress';
+            __handleKeyInput(input.__node, 'Enter', 'Enter');
+            cancel = 'keydown';
+            __handleKeyInput(input.__node, 'b', 'KeyB');
+            input.value + '|' + events.join(',')
+        "#.into()], "https://example.com/");
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(concat!(
+                "a|keydown:true:65:0:65,keypress:true:97:97:97,keyup:true:65:0:65,",
+                "keydown:true:13:0:13,keypress:true:13:13:13,keyup:true:13:0:13,",
+                "keydown:true:66:0:66,keyup:true:66:0:66"
+            ))
         );
     }
 

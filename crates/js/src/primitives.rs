@@ -539,6 +539,10 @@ pub(crate) fn percent_decode_str(s: &str) -> String {
 
 /// Directory where `localStorage` buckets persist (one JSON file per origin).
 pub(crate) fn storage_dir() -> std::path::PathBuf {
+    // Headless test runs and separate browser profiles must not share user data.
+    if let Some(directory) = std::env::var_os("BROWSER_STORAGE_DIR") {
+        return std::path::PathBuf::from(directory);
+    }
     let base = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);

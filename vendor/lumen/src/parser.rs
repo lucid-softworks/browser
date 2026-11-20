@@ -3741,7 +3741,11 @@ impl Parser {
         self.iter_depth = 0;
         self.switch_depth = 0;
         self.next_scope_is_fn_boundary = true;
+        // A function body is a new grammar context even inside a for initializer.
+        // The enclosing Expression[~In] must not suppress relational `in` here.
+        let saved_no_in = std::mem::replace(&mut self.no_in, false);
         let body = self.parse_block_body();
+        self.no_in = saved_no_in;
         self.fn_depth -= 1;
         if !is_arrow {
             self.nonarrow_fn_depth -= 1;

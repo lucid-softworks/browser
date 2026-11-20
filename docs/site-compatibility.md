@@ -80,6 +80,45 @@ sets assertion polling time (default 8 seconds). Cleanup allows an additional
 10 seconds for diagnostics and up to 4 seconds to terminate the process. No
 interactive browser window is opened; screenshots come from the browser engine.
 
+## All TodoMVC implementations
+
+The separate TodoMVC runner covers the 46 unique example links listed on the
+homepage on 2026-11-20, recorded in
+[`tools/sites/todomvc.json`](../tools/sites/todomvc.json). It runs the same eight
+checks in this engine, Google Chrome, and Firefox: input readiness, two task
+additions, completion, Active and Completed filters, Clear completed, and All.
+Open shadow roots are included in read-only assertions. Typing and clicks use
+native WebDriver commands throughout.
+
+```sh
+cargo build -p webdriver
+python3 scripts/run-todomvc.py engine --output target/todomvc-run
+CHROME=/path/to/google-chrome python3 scripts/run-todomvc.py chrome --output target/todomvc-run
+FIREFOX=/path/to/firefox python3 scripts/run-todomvc.py firefox --output target/todomvc-run
+```
+
+Install matching `chromedriver` and `geckodriver` executables on PATH, or set
+`CHROMEDRIVER` / `GECKODRIVER`. `WEBDRIVER_BIN` selects an alternate engine build.
+Use `--filter lit` to select URLs and `--jobs 1` to run serially. Without
+`--output`, each invocation creates a timestamped directory under `target/todomvc`.
+An existing browser subdirectory is rejected to prevent stale task data.
+
+Both runners set `BROWSER_STORAGE_DIR` to a separate folder for each journey.
+New processes alone do **not** isolate the engine's persistent localStorage.
+Without this variable, the engine uses its normal user storage directory.
+
+The TodoMVC output contains `<browser>-results.json` plus per-example reports,
+screenshots, page source, driver logs, and shadow-tree snapshots. A failed step
+stops that journey; subsequent checks are `not_run`. All failures produce exit
+status 1, including failures shared with the reference browsers. These checks
+measure functionality, not speed or visual fidelity.
+
+On 2026-11-20, all three browsers passed the same **31/46 complete journeys**.
+The other 15 live examples also failed in Chrome and Firefox; some contain
+missing dependencies or omit controls required by this common journey. This is
+not a claim that every failing demo is entirely unusable, or that all browsers
+fail at the same step. Preserve the per-step reports when comparing runs.
+
 These are live-network diagnostics: outages, rate limiting, changing site
 content, and connectivity can fail a run. Keep them manual or optional scheduled
 checks, separate from required offline unit tests. Use deterministic local
