@@ -158,6 +158,10 @@ For interactive compatibility checks against example.com, Wikipedia, Hacker News
 TodoMVC, see [`docs/site-compatibility.md`](docs/site-compatibility.md). The manual live-site
 runner drives this engine through WebDriver and saves step reports, screenshots, and page source.
 
+For repeatable application performance workloads and Chrome/Firefox comparisons, see
+[`docs/running-speedometer.md`](docs/running-speedometer.md). Engine runs include iframe
+painting and compositing; results remain diagnostic pending broader rendering validation.
+
 **Claiming an issue:** comment `/claim` (or `.take`) on any open issue to have it assigned to you —
 a bot assigns you and labels it `claimed`, no maintainer needed. Comment `/unclaim` to release it.
 Then open a PR that says `Closes #<n>` so it auto-closes on merge.

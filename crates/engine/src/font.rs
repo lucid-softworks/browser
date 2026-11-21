@@ -100,8 +100,9 @@ fn fallback_fonts() -> &'static [fontdue::Font] {
     })
 }
 
+#[derive(Clone)]
 pub struct SystemFont {
-    font: fontdue::Font,
+    font: std::sync::Arc<fontdue::Font>,
 }
 
 /// The set of fonts available while measuring/painting a page: the system fallback face plus any
@@ -139,7 +140,9 @@ impl SystemFont {
                 continue;
             };
             if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
-                return Some(Self { font });
+                return Some(Self {
+                    font: std::sync::Arc::new(font),
+                });
             }
         }
         None
@@ -157,7 +160,9 @@ impl SystemFont {
         };
         fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .ok()
-            .map(|font| Self { font })
+            .map(|font| Self {
+                font: std::sync::Arc::new(font),
+            })
     }
 
     /// Pick the font to draw `ch` with: this face if it has the glyph, otherwise the first fallback

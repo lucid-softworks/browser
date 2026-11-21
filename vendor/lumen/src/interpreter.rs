@@ -313,24 +313,53 @@ impl Binding {
 thread_local! {
     /// Every Scope created on this thread, weakly — the cycle collector's scope snapshot
     /// (mirrors `value::GC_REGISTRY` for objects).
-    static SCOPE_REGISTRY: RefCell<Vec<std::rc::Weak<RefCell<Scope>>>> =
-        const { RefCell::new(Vec::new()) };
+    static SCOPE_REGISTRY: RefCell<Rc<RefCell<Vec<std::rc::Weak<RefCell<Scope>>>>>> =
+        RefCell::new(Rc::new(RefCell::new(Vec::new())));
+}
+
+fn with_scope_registry<T>(f: impl FnOnce(&RefCell<Vec<std::rc::Weak<RefCell<Scope>>>>) -> T) -> T {
+    let registry = SCOPE_REGISTRY.with(|r| r.borrow().clone());
+    f(&registry)
+}
+
+pub(crate) struct CoroutineThreadState {
+    gc: Rc<crate::value::GcState>,
+    symbols: Rc<RefCell<HashMap<String, Rc<crate::value::SymbolData>>>>,
+    scopes: Rc<RefCell<Vec<std::rc::Weak<RefCell<Scope>>>>>,
+}
+
+impl CoroutineThreadState {
+    pub(crate) fn capture() -> Self {
+        Self {
+            symbols: SYM_FOR.with(|r| r.borrow().clone()),
+            gc: crate::value::gc_thread_state(),
+            scopes: SCOPE_REGISTRY.with(|r| r.borrow().clone()),
+        }
+    }
+
+    pub(crate) fn replace(self) -> Self {
+        Self {
+            symbols: SYM_FOR.with(|r| r.replace(self.symbols)),
+            gc: crate::value::replace_gc_thread_state(self.gc),
+            scopes: SCOPE_REGISTRY.with(|r| r.replace(self.scopes)),
+        }
+    }
 }
 
 fn register_scope(e: &Env) {
-    SCOPE_REGISTRY.with(|r| r.borrow_mut().push(Rc::downgrade(e)));
+    with_scope_registry(|r| r.borrow_mut().push(Rc::downgrade(e)));
 }
 
 /// Registered scope entries (live + not-yet-purged dead weaks) on this thread.
 fn scope_registry_len() -> usize {
-    SCOPE_REGISTRY.with(|r| r.borrow().len())
+    with_scope_registry(|r| r.borrow().len())
 }
 
 /// Purge dead weak entries, returning the live count. A dead `Weak` still pins its `RcBox`
 /// allocation, so an interpreter that churns through scopes without allocating many objects
 /// (which is what arms the main GC) must prune on scope volume too — see `gc_check`.
 fn scope_registry_prune() -> usize {
-    SCOPE_REGISTRY.with(|r| {
+    with_scope_registry(|r| {
         let mut reg = r.borrow_mut();
         reg.retain(|w| w.strong_count() > 0);
         reg.len()
@@ -340,7 +369,7 @@ fn scope_registry_prune() -> usize {
 /// The live scopes on this thread (purging dead weak entries as it goes).
 fn scope_snapshot_into(live: &mut Vec<Env>) {
     live.clear();
-    SCOPE_REGISTRY.with(|r| {
+    with_scope_registry(|r| {
         let mut reg = r.borrow_mut();
         live.reserve(reg.len());
         reg.retain(|w| match w.upgrade() {
@@ -472,36 +501,43 @@ pub(crate) fn update_abrupt_empty(a: Abrupt, v: Value) -> Abrupt {
 
 thread_local! {
     /// The GlobalSymbolRegistry (`Symbol.for`): shared by every realm (incl. ShadowRealms).
-    static SYM_FOR: std::cell::RefCell<HashMap<String, Rc<crate::value::SymbolData>>> =
-        RefCell::new(Default::default());
+    static SYM_FOR: RefCell<Rc<RefCell<HashMap<String, Rc<crate::value::SymbolData>>>>> =
+        RefCell::new(Rc::new(RefCell::new(HashMap::new())));
 }
 
 /// Reset the `Symbol.for` registry (a fresh Engine starts a fresh agent, but ShadowRealms and
 /// synthesized realms inside one engine keep sharing it).
+fn with_symbols<T>(
+    f: impl FnOnce(&RefCell<HashMap<String, Rc<crate::value::SymbolData>>>) -> T,
+) -> T {
+    let registry = SYM_FOR.with(|m| m.borrow().clone());
+    f(&registry)
+}
+
 pub(crate) fn sym_for_reset() {
-    SYM_FOR.with(|m| m.borrow_mut().clear());
+    with_symbols(|m| m.borrow_mut().clear());
 }
 
 /// Look up a `Symbol.for` registry entry.
 pub(crate) fn sym_for_get(key: &str) -> Option<Rc<crate::value::SymbolData>> {
-    SYM_FOR.with(|m| m.borrow().get(key).cloned())
+    with_symbols(|m| m.borrow().get(key).cloned())
 }
 
 /// Register a `Symbol.for` symbol.
 pub(crate) fn sym_for_insert(key: String, sym: Rc<crate::value::SymbolData>) {
-    SYM_FOR.with(|m| {
+    with_symbols(|m| {
         m.borrow_mut().insert(key, sym);
     });
 }
 
 /// Whether `sym` is a registered `Symbol.for` symbol (Symbol.keyFor's check).
 pub(crate) fn sym_for_contains(sym: &Rc<crate::value::SymbolData>) -> bool {
-    SYM_FOR.with(|m| m.borrow().values().any(|r| Rc::ptr_eq(r, sym)))
+    with_symbols(|m| m.borrow().values().any(|r| Rc::ptr_eq(r, sym)))
 }
 
 /// The registry key of a registered symbol, if any.
 pub(crate) fn sym_for_key_of(sym: &Rc<crate::value::SymbolData>) -> Option<String> {
-    SYM_FOR.with(|m| {
+    with_symbols(|m| {
         m.borrow()
             .iter()
             .find(|(_, r)| Rc::ptr_eq(r, sym))
@@ -953,10 +989,10 @@ pub struct Interp {
     /// Default referrer for a bare `import()` in script code (so relative specifiers resolve).
     pub(crate) import_base: String,
     /// Loaded module namespace objects, keyed by canonical specifier (for `import()` + caching).
-    pub(crate) modules: std::collections::HashMap<String, Value>,
+    pub(crate) modules: crate::modules::RealmModuleMap<Value>,
     /// Full module records (parsed body, environment, resolved export tables, evaluation status),
     /// keyed by canonical specifier. Drives the two-phase Instantiate/Evaluate module linking.
-    pub(crate) module_recs: std::collections::HashMap<String, crate::modules::ModuleRec>,
+    pub(crate) module_recs: crate::modules::RealmModuleMap<crate::modules::ModuleRec>,
     /// Host module loader: `(specifier, referrer, attr_type)` → `(canonical_key, source)`.
     /// `attr_type` is the import's `with { type: ... }` attribute — an attribute-aware host
     /// returns RAW file contents for `json`/`text`/`bytes` (binary latin-1-decoded, one char per
@@ -1047,6 +1083,9 @@ pub struct Interp {
     pub(crate) realms: crate::fasthash::FastMap<usize, RealmState>,
     /// Detached realms remain usable while an escaped object or function reaches their intrinsics.
     pub(crate) retired_realms: crate::fasthash::FastSet<usize>,
+    /// Host graph components (e.g. DOM trees): reaching any member retains all members.
+    /// Providers hold weak handles only, and must not execute JS or allocate JS objects.
+    host_gc_groups: crate::fasthash::FastMap<usize, Rc<dyn Fn() -> Vec<Vec<Value>>>>,
     pub(crate) realm_host_roots:
         crate::fasthash::FastMap<usize, crate::fasthash::FastMap<&'static str, Value>>,
     pub(crate) realm_host_resources: crate::fasthash::FastMap<
@@ -1136,7 +1175,7 @@ pub struct Interp {
     /// Accessing a property of one evaluates the module (then the entry is removed).
     pub(crate) deferred_ns: crate::fasthash::FastMap<usize, String>,
     /// module key → its (single) deferred namespace object.
-    pub(crate) deferred_ns_objs: crate::fasthash::FastMap<String, Value>,
+    pub(crate) deferred_ns_objs: crate::modules::RealmModuleMap<Value>,
     /// Promise-state forwarding: when a native super() grafts a fresh promise's state onto the
     /// subclass `this`, the original object's resolvers redirect here.
     pub(crate) promise_forward: crate::fasthash::FastMap<usize, Value>,
@@ -1145,7 +1184,7 @@ pub struct Interp {
     /// parameter bindings.
     pub(crate) mapped_arguments: crate::fasthash::FastMap<usize, (Env, Vec<Option<String>>)>,
     /// Source-phase imports: canonical module key → its (cached) ModuleSource object.
-    pub(crate) module_source_objs: crate::fasthash::FastMap<String, Value>,
+    pub(crate) module_source_objs: crate::modules::RealmModuleMap<Value>,
     /// FinalizationRegistry registrations (ptr → unregister tokens), for `unregister`'s result.
     pub(crate) fr_tokens: crate::fasthash::FastMap<usize, Vec<Value>>,
     /// Async generators mid-step (running or parked at an `await`): further next/return/throw
@@ -1249,6 +1288,7 @@ pub const MAX_STR_LEN: usize = 1 << 26; // ~67M
 /// A realm's intrinsics: the global object, its environment, and the per-realm prototypes/constructors
 /// installed by `builtins::install`. Well-known symbols and the engine side tables are shared, not here.
 pub struct RealmState {
+    import_base: String,
     pub global: Gc,
     pub global_env: Env,
     pub object_proto: Gc,
@@ -1267,6 +1307,7 @@ impl Interp {
     /// Snapshot the current realm's intrinsics so they can be swapped out and back.
     fn snapshot_realm(&self) -> RealmState {
         RealmState {
+            import_base: self.import_base.clone(),
             global: self.global.clone(),
             global_env: self.global_env.clone(),
             object_proto: self.object_proto.clone(),
@@ -1284,6 +1325,8 @@ impl Interp {
 
     /// Install a realm's intrinsics as the active ones.
     fn restore_realm(&mut self, r: &RealmState) {
+        self.import_base = r.import_base.clone();
+        self.modules.set_realm(Rc::as_ptr(&r.global) as usize);
         self.global = r.global.clone();
         self.global_env = r.global_env.clone();
         self.object_proto = r.object_proto.clone();
@@ -1350,6 +1393,7 @@ impl Interp {
         self.boolean_proto = boolean_proto;
         self.symbol_proto = symbol_proto;
         self.global = global.clone();
+        self.modules.set_realm(Rc::as_ptr(&global) as usize);
         self.global_env = new_var_scope(None);
         self.error_protos = Default::default();
         self.extra_protos = Default::default();
@@ -1435,6 +1479,7 @@ impl RealmState {
 
     fn snapshot_clone(&self) -> RealmState {
         RealmState {
+            import_base: self.import_base.clone(),
             global: self.global.clone(),
             global_env: self.global_env.clone(),
             object_proto: self.object_proto.clone(),
@@ -1487,6 +1532,7 @@ impl Interp {
         let symbol_proto = Object::new(Some(object_proto.clone()));
         let global = Object::new(Some(object_proto.clone()));
         let global_env = new_var_scope(None);
+        let module_realm = Rc::new(std::cell::Cell::new(Rc::as_ptr(&global) as usize));
         Interp {
             execution_control: None,
             execution_tick: 0,
@@ -1516,8 +1562,8 @@ impl Interp {
             short_circuit: false,
             import_meta: None,
             import_base: String::new(),
-            modules: Default::default(),
-            module_recs: Default::default(),
+            modules: crate::modules::RealmModuleMap::new(module_realm.clone()),
+            module_recs: crate::modules::RealmModuleMap::new(module_realm.clone()),
             module_loader: None,
             module_ns: Default::default(),
             tier: match std::env::var("LUMEN_TIER").as_deref() {
@@ -1568,6 +1614,7 @@ impl Interp {
             ctor_caller_realm: None,
             realms: Default::default(),
             retired_realms: Default::default(),
+            host_gc_groups: Default::default(),
             realm_host_roots: Default::default(),
             realm_host_resources: Default::default(),
             promises: Default::default(),
@@ -1597,10 +1644,10 @@ impl Interp {
             decorator_initializers: Vec::new(),
             annexb_fn_sync: Default::default(),
             deferred_ns: Default::default(),
-            deferred_ns_objs: Default::default(),
+            deferred_ns_objs: crate::modules::RealmModuleMap::new(module_realm.clone()),
             promise_forward: Default::default(),
             mapped_arguments: Default::default(),
-            module_source_objs: Default::default(),
+            module_source_objs: crate::modules::RealmModuleMap::new(module_realm.clone()),
             fr_tokens: Default::default(),
             async_gen_busy: std::collections::HashSet::new(),
             async_gen_queue: Default::default(),
@@ -2028,6 +2075,30 @@ impl Interp {
             if self.realms.contains_key(&ptr) {
                 self.retired_realms.insert(ptr);
             }
+        }
+    }
+
+    /// Register native graph components for this realm. The callback must only upgrade weak
+    /// handles; its returned values are internal graph edges, not external roots.
+    pub fn set_gc_groups_for_host(
+        &mut self,
+        global: &Value,
+        provider: Rc<dyn Fn() -> Vec<Vec<Value>>>,
+    ) {
+        if let Some(ptr) = self.object_addr(global) {
+            self.host_gc_groups.insert(ptr, provider);
+        }
+    }
+
+    /// Evaluate a module in the active realm using the installed host loader.
+    pub fn eval_module_for_host(&mut self, source: &str, key: &str) -> Result<Value, Value> {
+        self.load_module(key, source).map_err(abrupt_value)
+    }
+
+    pub fn set_import_base_for_host(&mut self, base: &str) {
+        self.import_base = base.to_string();
+        if let Some(realm) = self.realms.get_mut(&(Rc::as_ptr(&self.global) as usize)) {
+            realm.import_base = base.to_string();
         }
     }
 
@@ -4429,6 +4500,13 @@ impl Interp {
             out.push(user.env.clone());
         }
         let ptr = Rc::as_ptr(o) as usize;
+        if let Some(bindings) = self.module_ns.get(&ptr) {
+            for binding in bindings.values() {
+                if let crate::modules::NsBinding::Live(env, _) = binding {
+                    out.push(env.clone());
+                }
+            }
+        }
         if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
             out.push(env.clone());
         }
@@ -4439,7 +4517,7 @@ impl Interp {
 
     /// Heap values in pointer-keyed side tables are edges of their owning object, not
     /// permanent external roots. Include them in both reference counting and tracing.
-    fn object_refs_for_gc(&self, object: &Gc, refs: &mut Vec<Gc>) {
+    fn object_refs_for_gc(&self, object: &Gc, refs: &mut Vec<Gc>, counting: bool) {
         crate::value::gc_edges::object_refs_into(object, refs);
         let ptr = Rc::as_ptr(object) as usize;
         let mut add = |value: &Value| {
@@ -4447,14 +4525,25 @@ impl Interp {
                 refs.push(o.clone());
             }
         };
+        if let Some(bindings) = self.module_ns.get(&ptr) {
+            for binding in bindings.values() {
+                if let crate::modules::NsBinding::Static(value) = binding {
+                    add(value);
+                }
+            }
+        }
         if let Some((target, handler)) = self.proxies.get(&ptr) {
             add(target);
             add(handler);
         }
         if let Some(data) = self.map_data.get(&ptr) {
-            for (key, value) in data.iter() {
-                add(key);
-                add(value);
+            // Weak entries contribute to internal reference counts, but are not strong graph
+            // edges. Their values are traced separately, only after their keys become reachable.
+            if counting || !data.kind().is_weak() {
+                for (key, value) in data.iter() {
+                    add(key);
+                    add(value);
+                }
             }
         }
         if let Some(promise) = self.promises.get(&ptr) {
@@ -4497,6 +4586,18 @@ impl Interp {
         }
     }
 
+    fn module_values(&self, realm: usize) -> impl Iterator<Item = &Value> {
+        self.modules
+            .values_in(realm)
+            .chain(self.module_source_objs.values_in(realm))
+            .chain(self.deferred_ns_objs.values_in(realm))
+            .chain(
+                self.module_recs
+                    .values_in(realm)
+                    .flat_map(|rec| rec.values()),
+            )
+    }
+
     pub(crate) fn gc_collect(&mut self) {
         let _inline_roots = self.inline_gc_roots();
         let mut scratch = std::mem::take(&mut self.gc_scratch);
@@ -4525,12 +4626,23 @@ impl Interp {
             b.gc_mark.set(false);
             b.gc_internal.set(0);
         }
+        let host_groups: Vec<_> = self
+            .host_gc_groups
+            .values()
+            .flat_map(|provider| provider())
+            .collect();
+        for value in host_groups.iter().flatten() {
+            if let Value::Obj(object) = value {
+                let b = object.borrow();
+                b.gc_internal.set(b.gc_internal.get() + 1);
+            }
+        }
         let object_refs = &mut scratch.object_refs;
         let scope_refs = &mut scratch.scope_refs;
         object_refs.clear();
         scope_refs.clear();
         for o in live {
-            self.object_refs_for_gc(o, object_refs);
+            self.object_refs_for_gc(o, object_refs, true);
             for p in object_refs.drain(..) {
                 let pb = p.borrow();
                 pb.gc_internal.set(pb.gc_internal.get() + 1);
@@ -4592,6 +4704,20 @@ impl Interp {
                 s_internal[k] += 1;
             }
             realm_scopes.insert(env_id, id);
+            for value in self.module_values(id) {
+                if let Value::Obj(object) = value {
+                    let b = object.borrow();
+                    b.gc_internal.set(b.gc_internal.get() + 1);
+                    realm_anchors.insert(Rc::as_ptr(object) as usize, id);
+                }
+            }
+            for record in self.module_recs.values_in(id) {
+                let ptr = Rc::as_ptr(record.env()) as usize;
+                if let Some(&k) = sidx.get(&ptr) {
+                    s_internal[k] += 1;
+                }
+                realm_scopes.insert(ptr, id);
+            }
             if let Some(values) = self.realm_host_roots.get(&id) {
                 for value in values.values() {
                     if let Value::Obj(object) = value {
@@ -4685,7 +4811,7 @@ impl Interp {
         // Mark everything reachable from the roots, across both node types.
         loop {
             if let Some(o) = stack.pop() {
-                self.object_refs_for_gc(&o, object_refs);
+                self.object_refs_for_gc(&o, object_refs, false);
                 for p in object_refs.drain(..) {
                     if !p.borrow().gc_mark.get() {
                         p.borrow().gc_mark.set(true);
@@ -4704,6 +4830,48 @@ impl Interp {
                 continue;
             }
             if stack.is_empty() && sstack.is_empty() {
+                for group in &host_groups {
+                    if group
+                        .iter()
+                        .any(|value| matches!(value, Value::Obj(o) if o.borrow().gc_mark.get()))
+                    {
+                        for value in group {
+                            if let Value::Obj(object) = value {
+                                if !object.borrow().gc_mark.get() {
+                                    object.borrow().gc_mark.set(true);
+                                    stack.push(object.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Ephemeron fixed point: a reachable WeakMap and independently reachable key
+                // retain the value. Values can reach more keys, so drain the queues and repeat.
+                // Symbols are conservatively retained; the object graph does not trace them.
+                for (ptr, data) in &self.map_data {
+                    if !data.kind().is_weak()
+                        || !self
+                            .gc_pins
+                            .get(ptr)
+                            .is_some_and(|o| o.borrow().gc_mark.get())
+                    {
+                        continue;
+                    }
+                    for (key, value) in data.iter() {
+                        let key_live = match key {
+                            Value::Obj(key) => key.borrow().gc_mark.get(),
+                            _ => true,
+                        };
+                        if key_live {
+                            if let Value::Obj(value) = value {
+                                if !value.borrow().gc_mark.get() {
+                                    value.borrow().gc_mark.set(true);
+                                    stack.push(value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 // The ordinary graph queues may have newly reached an anchor or global scope.
                 // Expand each retired realm once, before processing those queues. No cloned roots
                 // are retained during the root-count phase above.
@@ -4725,6 +4893,22 @@ impl Interp {
                 for id in reached {
                     if !reached_realms.insert(id) {
                         continue;
+                    }
+                    for value in self.module_values(id) {
+                        if let Value::Obj(object) = value {
+                            if !object.borrow().gc_mark.get() {
+                                object.borrow().gc_mark.set(true);
+                                stack.push(object.clone());
+                            }
+                        }
+                    }
+                    for record in self.module_recs.values_in(id) {
+                        if let Some(&k) = sidx.get(&(Rc::as_ptr(record.env()) as usize)) {
+                            if !s_mark[k] {
+                                s_mark[k] = true;
+                                sstack.push(record.env().clone());
+                            }
+                        }
                     }
                     for ((owner, _), value) in &self.template_cache {
                         if *owner == id {
@@ -4804,6 +4988,25 @@ impl Interp {
         // before the sweep clears any property/side-table edge that could drop an object.
         crate::value::gc_restore_registry_slots();
 
+        // Remove dead weak keys before sweeping their objects. Snapshot handles keep each key
+        // alive until the sweep ends, so address reuse cannot expose a stale collection entry.
+        for data in self
+            .map_data
+            .values_mut()
+            .filter(|data| data.kind().is_weak())
+        {
+            let dead: Vec<_> = data
+                .iter()
+                .filter_map(|(key, _)| match key {
+                    Value::Obj(key) if !key.borrow().gc_mark.get() => Some(Value::Obj(key.clone())),
+                    _ => None,
+                })
+                .collect();
+            for key in dead {
+                data.remove(&key);
+            }
+        }
+
         // Sweep: clear unmarked (garbage) objects to break their cycles; once `live` drops, their
         // refcounts hit zero and they are freed. Also evict them from pointer-keyed side tables so a
         // future object reusing the address can't inherit stale metadata.
@@ -4836,6 +5039,7 @@ impl Interp {
                 self.async_gen_queue.remove(&ptr);
                 self.mapped_arguments.remove(&ptr);
                 self.deferred_ns.remove(&ptr);
+                self.module_ns.remove(&ptr);
                 self.promise_forward.remove(&ptr);
                 self.gc_pins.remove(&ptr);
                 let mut b = o.borrow_mut();
@@ -4861,9 +5065,14 @@ impl Interp {
             .filter(|id| !reached_realms.contains(id))
             .collect();
         for id in dead_realms {
+            self.modules.remove_realm(id);
+            self.module_recs.remove_realm(id);
+            self.module_source_objs.remove_realm(id);
+            self.deferred_ns_objs.remove_realm(id);
             self.realms.remove(&id);
             self.realm_host_roots.remove(&id);
             self.realm_host_resources.remove(&id);
+            self.host_gc_groups.remove(&id);
             self.retired_realms.remove(&id);
             self.template_cache.retain(|(owner, _), _| *owner != id);
         }

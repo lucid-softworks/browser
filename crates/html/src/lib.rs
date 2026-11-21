@@ -339,6 +339,7 @@ impl<'a> Parser<'a> {
         let html = self.doc.append_child(
             root,
             NodeData::Element(ElementData {
+                value: None,
                 tag: "html".into(),
                 attrs: Default::default(),
                 namespace: None,
@@ -361,6 +362,7 @@ impl<'a> Parser<'a> {
         let head = self.doc.append_child(
             html,
             NodeData::Element(ElementData {
+                value: None,
                 tag: "head".into(),
                 attrs: Default::default(),
                 namespace: None,
@@ -393,6 +395,7 @@ impl<'a> Parser<'a> {
             let head = self.doc.append_child(
                 html,
                 NodeData::Element(ElementData {
+                    value: None,
                     tag: "head".into(),
                     attrs: Default::default(),
                     namespace: None,
@@ -404,6 +407,7 @@ impl<'a> Parser<'a> {
         let body = self.doc.append_child(
             html,
             NodeData::Element(ElementData {
+                value: None,
                 tag: "body".into(),
                 attrs: Default::default(),
                 namespace: None,
@@ -883,6 +887,7 @@ impl<'a> Parser<'a> {
         let node = self.doc.append_child(
             parent,
             NodeData::Element(ElementData {
+                value: None,
                 tag: tag.clone(),
                 attrs,
                 namespace,

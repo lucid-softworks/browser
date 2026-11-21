@@ -142,6 +142,7 @@ pub fn parse_xml(src: &str) -> Document {
             let node = doc.append_child(
                 parent,
                 NodeData::Element(ElementData {
+                    value: None,
                     tag: local.to_string(),
                     attrs,
                     namespace,

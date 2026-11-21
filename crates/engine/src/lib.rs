@@ -7,6 +7,7 @@
 
 mod canvas;
 mod font;
+mod frames;
 mod svg;
 mod woff2;
 
@@ -226,6 +227,10 @@ pub struct Engine {
     /// composed at the full viewport size. Painted on the canvas after the background color; the
     /// originating box does not paint it. `None` when no root/body background image is set.
     canvas_bg: Option<DecodedImage>,
+    frame_renderers: HashMap<dom::NodeId, frames::FrameRenderer>,
+    frame_snapshots: Option<Vec<js::FrameSnapshot>>,
+    frame_canvas_lists: Option<String>,
+    frame_scroll_offsets: Option<String>,
 }
 
 /// A fetched/decoded `mask-image` source, ready to rasterize to a per-box coverage bitmap.
@@ -1079,14 +1084,18 @@ mod tests {
         let f = e.focused_node_for_test().expect("focused node");
         assert!(e.has_text_focus(), "an input must report text focus");
 
-        // Type "h" then "i": the input's value attribute reflects the typed text.
+        // Typing changes the live value, preserving the default-value content attribute.
         assert!(e.dispatch_key("h", "KeyH"));
         assert!(e.dispatch_key("i", "KeyI"));
-        assert_eq!(e.node_attr(f, "value").as_deref(), Some("hi"));
+        assert_eq!(
+            e.console_eval("document.querySelector('input').value"),
+            "hi"
+        );
+        assert_eq!(e.node_attr(f, "value"), None);
 
         // Backspace removes the last character.
         assert!(e.dispatch_key("Backspace", "Backspace"));
-        assert_eq!(e.node_attr(f, "value").as_deref(), Some("h"));
+        assert_eq!(e.console_eval("document.querySelector('input').value"), "h");
 
         let _ = std::fs::remove_file(&path);
     }

@@ -1,8 +1,16 @@
 (function () {
+  // Events remain branded when passed between same-origin browsing contexts.
+  var eventBrand = globalThis.__eventBrands;
+  function brandEvent(event) { Object.defineProperty(event, eventBrand, { value: event }); }
+  function isEvent(event) { return !!event && event[eventBrand] === event; }
+  delete globalThis.__eventBrands;
   function def(obj, name, value) {
     Object.defineProperty(obj, name, { value: value, enumerable: false, configurable: true, writable: true });
   }
   function fn() {}
+  // Numeric ids do not keep detached DOM wrappers alive. Painting only needs elements whose
+  // scroll offsets were explicitly set, not a wrapper for every node in a large static page.
+  var scrolledElementIds = new Set();
 
   // --- legacy / missing language polyfills the host engine lacks ---------------------------
   // String.prototype.substr (deprecated but heavily used by real-world minified code, e.g.
@@ -484,7 +492,13 @@
   }
   function __setLocationUrlPart(prop, v) {
     var json = __urlSet(locationState.href || parts.href, prop, String(v));
-    if (json != null) { try { __setLocationHref(JSON.parse(json).href); } catch (e) {} }
+    if (json != null) { try {
+      var href = JSON.parse(json).href;
+      // Setting the current fragment is a no-op, including from a hashchange handler.
+      // Passing it to the host would look like an explicit reload of the current URL.
+      if (prop === "hash" && href === locationState.href) { return; }
+      __setLocationHref(href);
+    } catch (e) {} }
   }
   var location = {
     assign: function (url) { __setLocationHref(url); },
@@ -917,19 +931,22 @@
   function __handlerPropForEventType(type) {
     return __eventTypeToHandlerProp[type] || ("on" + type);
   }
+  var __eventHandlerDescriptors = __eventHandlerProps.map(function (prop) {
+    return {
+      get: function () { return this.__eventHandlers[prop] || null; },
+      set: function (value) { this.__eventHandlers[prop] = (typeof value === "function") ? value : null; },
+      enumerable: true,
+      configurable: true
+    };
+  });
   function __installEventHandlerProps(target) {
     var handlers = target.__eventHandlers;
     if (!handlers) { handlers = Object.create(null); def(target, "__eventHandlers", handlers); }
     for (var i = 0; i < __eventHandlerProps.length; i++) {
-      (function (prop) {
-        if (Object.prototype.hasOwnProperty.call(target, prop)) { return; }
-        Object.defineProperty(target, prop, {
-          get: function () { return handlers[prop] || null; },
-          set: function (value) { handlers[prop] = (typeof value === "function") ? value : null; },
-          enumerable: true,
-          configurable: true
-        });
-      })(__eventHandlerProps[i]);
+      var prop = __eventHandlerProps[i];
+      if (!Object.prototype.hasOwnProperty.call(target, prop)) {
+        Object.defineProperty(target, prop, __eventHandlerDescriptors[i]);
+      }
     }
   }
   function installEvents(target) {
@@ -967,7 +984,7 @@
       for (var i = 0; i < list.length; i++) { if (list[i].cb === cb && list[i].capture === capture) { list.splice(i, 1); return; } }
     });
     def(target, "dispatchEvent", function (ev) {
-      if (!(ev instanceof globalThis.Event) || !ev.__ev) {
+      if (!isEvent(ev) || !ev.__ev) {
         throw new TypeError("Failed to execute 'dispatchEvent': parameter 1 is not of type 'Event'.");
       }
       return globalThis.__dispatchEventObject(target, ev);
@@ -1452,7 +1469,7 @@
   };
 
   function makeEvent(type) {
-    return new globalThis.Event(type);
+    return new globalThis.Event(type, { bubbles: type === "DOMContentLoaded" });
   }
   function fireOn(target, type) {
     if (target && typeof target.dispatchEvent === "function") {
@@ -4885,22 +4902,17 @@
   }
 
   // --- per-node wrapper cache (stable identity + expando persistence) ----------------------
-  // Native DOM methods/accessors return a FRESH wrapper object on every call (each carrying the
-  // hidden `__node` id). Frameworks like Vue stash internal state directly on DOM nodes
-  // (`el.__vnode`, `el._vei`, `el.$once`, ...) and rely on `getElementById(x) === getElementById(x)`
-  // and on those expandos surviving across lookups. To honor that we keep a JS-side map from node
-  // id -> the one canonical enriched wrapper, and route every element the native layer hands back
-  // through `canon()`, which returns the cached wrapper (copying over the fresh wrapper's own
-  // function bindings on first sight). The cache lives entirely on the JS side, so Boa's GC roots
-  // the wrappers for us — no Boa values are held in Rust (same discipline as elsewhere).
-  var __nodeCache = Object.create(null);
+  // Frameworks like Vue stash internal state directly on DOM nodes.
+  // Canonical wrappers are weakly cached by the host. GC traces native DOM components, so
+  // connected nodes and reachable detached subtrees retain identity and expandos, while dead
+  // detached trees can be collected.
   function canon(el) {
     if (!el || typeof el !== "object") { return el; }
     var node = el.__node;
     if (typeof node !== "number") { return enrichElement(el); }
-    var cached = __nodeCache[node];
+    var cached = __cachedNode(node);
     if (cached) { return cached; }
-    __nodeCache[node] = el;       // record BEFORE enriching so re-entrant lookups dedupe
+    __cacheNode(node, el);       // record BEFORE enriching so re-entrant lookups dedupe
     enrichElement(el);
     return el;
   }
@@ -4928,7 +4940,16 @@
   }
   // Look up the canonical wrapper for a node id, if one was already created (createElement / a prior
   // lookup). Returns null if the node was never wrapped. Lets out-of-scope code resolve a node id.
-  def(globalThis, "__nodeById", function (id) { return __nodeCache[id] || null; });
+  def(globalThis, "__nodeById", function (id) { return __cachedNode(id) || null; });
+  def(globalThis, "__frameDisconnected", function (id) {
+    var el = __cachedNode(id);
+    if (el) {
+      el.__frameLoadedKey = undefined;
+      el.__cdocWrap = undefined;
+      el.__cwinReal = undefined;
+    }
+    if (globalThis.__framesByNode) { delete globalThis.__framesByNode[id]; }
+  });
 
   // Map a tag name to the most specific DOM interface prototype we have, so element wrappers
   // satisfy `el instanceof HTMLElement/Element/Node` (and SVG/MathML where appropriate). The
@@ -5507,7 +5528,12 @@
     "ValueText"];
 
   // Define one reflected accessor on `el` for (idlName, data) backed by content attribute on `node`.
-  function defineReflected(el, node, idlName, data) {
+  var __reflectionDescriptors = Object.create(null);
+  function defineReflected(el, node, idlName, data, cacheKey) {
+    var existing = Object.getOwnPropertyDescriptor(el, idlName);
+    if (existing && (existing.get || existing.set)) { return; }
+    var shared = __reflectionDescriptors[cacheKey];
+    if (shared) { Object.defineProperty(el, idlName, shared); return; }
     if (typeof data === "string") { data = { type: data }; }
     var type = data.type;
     if (__refl.skip[type]) { return; }
@@ -5518,18 +5544,19 @@
     // checks their *type* and their setter behaviour (it skips the get/default asserts). The plain
     // factory getter is the right JS TYPE, so installing it lets those typeof/setter subtests pass.
     // Don't clobber an accessor the wrapper already defines correctly (value/checked/href/src/etc.).
-    var existing = null;
-    try { existing = Object.getOwnPropertyDescriptor(el, idlName); } catch (e) {}
-    if (existing && (existing.get || existing.set)) { return; }
     // The content attribute name is the explicit domAttrName, else the ASCII-lowercased idlName
     // (HTML attributes are stored lowercased; e.g. maxLength <-> maxlength, colSpan <-> colspan).
     var contentAttr = data.domAttrName || __asciiLower(idlName);
-    var io = __refl.mk(node, contentAttr);
-    var desc = factory(io, data);
+    // Reflection functions are shared across nodes. Build the small attribute adapter only on
+    // access; eagerly retaining six closures per reflected attribute overwhelms large DOMs.
+    shared = {
+      get: function () { return factory(__refl.mk(this.__node, contentAttr), data).get(); },
+      set: function (value) { factory(__refl.mk(this.__node, contentAttr), data).set(value); },
+      enumerable: true, configurable: true
+    };
+    __reflectionDescriptors[cacheKey] = shared;
     try {
-      Object.defineProperty(el, idlName, {
-        get: desc.get, set: desc.set, enumerable: true, configurable: true
-      });
+      Object.defineProperty(el, idlName, shared);
     } catch (e) {}
   }
 
@@ -5542,13 +5569,13 @@
     for (var gk in __reflGlobals) {
       if (!Object.prototype.hasOwnProperty.call(__reflGlobals, gk)) { continue; }
       if (!__isHtmlEl && !__htmlOrSvgGlobal[gk]) { continue; }
-      defineReflected(el, node, gk, __reflGlobals[gk]);
+      defineReflected(el, node, gk, __reflGlobals[gk], "global:" + gk);
     }
     // ARIA nullable-string reflection (HTMLElement + Element).
-    defineReflected(el, node, "role", { type: "nullable string", domAttrName: "role" });
+    defineReflected(el, node, "role", { type: "nullable string", domAttrName: "role" }, "role");
     for (var ai = 0; ai < __reflAria.length; ai++) {
       var nm = __reflAria[ai];
-      defineReflected(el, node, "aria" + nm, { type: "nullable string", domAttrName: "aria-" + __asciiLower(nm) });
+      defineReflected(el, node, "aria" + nm, { type: "nullable string", domAttrName: "aria-" + __asciiLower(nm) }, "aria:" + nm);
     }
     // ARIA element reflection (aria*Element / aria*Elements) — Element / FrozenArray<Element>.
     applyAomElementReflection(el, node);
@@ -5557,7 +5584,7 @@
     var tbl = __reflTables[tag];
     if (tbl && el.namespaceURI === "http://www.w3.org/1999/xhtml") {
       for (var k in tbl) {
-        if (Object.prototype.hasOwnProperty.call(tbl, k)) { defineReflected(el, node, k, tbl[k]); }
+        if (Object.prototype.hasOwnProperty.call(tbl, k)) { defineReflected(el, node, k, tbl[k], tag + ":" + k); }
       }
     }
   }
@@ -5882,7 +5909,8 @@
 
   // Attach the declarative partial-update methods ({append,prepend,before,after,replaceWith}HTML
   // [Unsafe]) to a node. Parent-position methods route through a <template>'s content.
-  globalThis.__addPartialMethods = function (el) {
+  var __partialMethods = {};
+  (function (el) {
     var defs = [["append", 1], ["prepend", 1], ["before", 0], ["after", 0], ["replaceWith", 0]];
     for (var pi = 0; pi < defs.length; pi++) {
       (function (base, isParent) {
@@ -5940,6 +5968,13 @@
         });
       } });
     });
+  })(__partialMethods);
+  var __partialMethodNames = Object.getOwnPropertyNames(__partialMethods);
+  globalThis.__addPartialMethods = function (el) {
+    for (var i = 0; i < __partialMethodNames.length; i++) {
+      var name = __partialMethodNames[i];
+      if (typeof el[name] !== "function") { def(el, name, __partialMethods[name]); }
+    }
   };
 
   // Deep structural node equality (DOM `isEqualNode`): same type and type-specific data, equal
@@ -6019,15 +6054,19 @@
       // `style` lives on the prototype chain (ElementCSSInlineStyle mixin) so it passes
       // assert_idl_attribute (own-property check). We stash the per-node CSSStyleDeclaration as a
       // hidden own property; the prototype accessor returns it ([SameObject], [PutForwards=cssText]).
-      def(el, "__styleObj", makeStyle(node));
+      Object.defineProperty(el, "__styleObj", {
+        get: function () { var value = makeStyle(node); def(this, "__styleObj", value); return value; },
+        configurable: true
+      });
       // classList is [SameObject, PutForwards=value]: a per-element cached DOMTokenList whose
       // getter always returns the same object, and assigning `el.classList = x` forwards to
       // `el.classList.value = x` (so it never replaces the object and never throws in strict mode).
       (function () {
-        var __cl = makeClassList(node);
+        var __cl;
+        function classList() { return __cl || (__cl = makeClassList(node)); }
         Object.defineProperty(el, "classList", {
-          get: function () { return __cl; },
-          set: function (v) { __cl.value = v; },
+          get: classList,
+          set: function (v) { classList().value = v; },
           enumerable: true, configurable: true
         });
       })();
@@ -6057,7 +6096,11 @@
         if (ns === HTML && ln === "iframe") { install("sandbox", "sandbox"); }
         if (ns === HTML && ln === "link") { install("sizes", "sizes"); }
       })();
-      def(el, "dataset", makeDataset(node));
+      Object.defineProperty(el, "dataset", {
+        get: function () { var value = makeDataset(node); def(this, "dataset", value); return value; },
+        set: function (value) { def(this, "dataset", value); },
+        configurable: true
+      });
       if (el.localName === "script") {
         Object.defineProperty(el, "text", {
           get: function () { return el.textContent; },
@@ -6089,6 +6132,19 @@
                 configurable: true, enumerable: true
               });
             } else if (__formTag === "select") {
+              var __optionsCollection;
+              Object.defineProperty(el, "options", {
+                get: function () {
+                  if (!__optionsCollection) {
+                    var select = this;
+                    __optionsCollection = globalThis.__makeHTMLCollection(function () {
+                      return Array.from(select.querySelectorAll("option"));
+                    });
+                  }
+                  return __optionsCollection;
+                },
+                configurable: true, enumerable: true
+              });
               // A <select>'s value is the selected <option>'s value (or its text if no value attr);
               // empty when nothing is selected. selectedIndex is the selected option's index.
               // Setting value selects the first matching option; setting selectedIndex selects by
@@ -6139,8 +6195,13 @@
               });
             } else {
               Object.defineProperty(el, "value", {
-                get: function () { var v = __getAttr(node, "value"); return v == null ? "" : String(v); },
-                set: function (v) { __setAttr(node, "value", String(v == null ? "" : v)); },
+                get: function () { return __inputValue(node); },
+                set: function (v) {
+                  var type = String(__getAttr(node, "type") || "text").toLowerCase();
+                  if (/^(hidden|submit|image|reset|button|checkbox|radio)$/.test(type)) {
+                    __setAttr(node, "value", String(v == null ? "" : v));
+                  } else { __setInputValue(node, String(v == null ? "" : v)); }
+                },
                 configurable: true, enumerable: true
               });
             }
@@ -6204,6 +6265,16 @@
         // Setting an <iframe>'s src navigates its nested browsing context: re-run the frame loader so
         // a connected frame (re)loads the new document.
         if (__formTag === "iframe") {
+          Object.defineProperty(el, "srcdoc", {
+            get: function () { return __getAttr(node, "srcdoc") || ""; },
+            set: function (v) {
+              __setAttr(node, "srcdoc", String(v));
+              if (this.isConnected && typeof globalThis.__loadFrameEl === "function") {
+                globalThis.__loadFrameEl(this);
+              }
+            },
+            enumerable: true, configurable: true
+          });
           var __srcDesc = Object.getOwnPropertyDescriptor(el, "src");
           if (__srcDesc && __srcDesc.set) {
             var __srcSet = __srcDesc.set;
@@ -6363,6 +6434,9 @@
       if (!("classList" in el) || el.classList == null) { def(el, "classList", { add: fn, remove: fn, toggle: function () { return false; }, contains: function () { return false; }, item: function () { return null; } }); }
       if (!("dataset" in el) || el.dataset == null) { def(el, "dataset", {}); }
     }
+    // Arena-backed accessors already return canonical wrappers from document.js. Only legacy
+    // non-arena facades need an additional canonicalization layer.
+    if (typeof node !== "number") {
     // Element-returning native methods hand back un-enriched wrappers; wrap them so the result
     // is enriched (gets style/classList/dataset) before page code touches it.
     var elemMethods = ["querySelector", "closest"];
@@ -6394,6 +6468,8 @@
         var d = Object.getOwnPropertyDescriptor(el, an);
         if (d && d.get) { var og = d.get; Object.defineProperty(el, an, { get: function () { var r = og.call(this); if (r && typeof r.length === "number") { for (var i = 0; i < r.length; i++) { r[i] = canon(r[i]); } } return r; }, configurable: true, enumerable: d.enumerable }); }
       })(listAccessors[ci]);
+    }
+
     }
 
     // <style> (and stylesheet <link>) expose a live CSSStyleSheet via `.sheet`. The accessor lives on
@@ -6520,6 +6596,7 @@
       var __metricProps = {
         offsetWidth: "ow", offsetHeight: "oh", offsetTop: "ot", offsetLeft: "ol",
         clientWidth: "cw", clientHeight: "ch", // padding box: content + padding, no borders
+        clientLeft: "cl", clientTop: "ct",
         scrollWidth: "sw", scrollHeight: "sh"
       };
       for (var __mk in __metricProps) {
@@ -6791,6 +6868,7 @@
             set: function (v) {
               Object.defineProperty(this, backing,
                 { value: clamp(this, v), writable: true, configurable: true, enumerable: false });
+              scrolledElementIds.add(this.__node);
             },
             configurable: true, enumerable: true
           });
@@ -6803,15 +6881,13 @@
     // has been scrolled so resetting scrollTop/Left translates its subtree back to the origin.
     if (typeof globalThis.__elementScrollOffsets !== "function") {
       globalThis.__elementScrollOffsets = function () {
-        var out = [], all = [];
-        try { all = document.querySelectorAll("*"); } catch (e) {}
-        for (var i = 0; i < all.length; i++) {
-          var n = all[i];
-          if (Object.prototype.hasOwnProperty.call(n, "__scrollLeftVal") ||
-              Object.prototype.hasOwnProperty.call(n, "__scrollTopVal")) {
-            out.push(String(n.__node) + ":" + String(Number(n.scrollLeft) || 0) + ":" + String(Number(n.scrollTop) || 0));
-          }
-        }
+        var out = [];
+        scrolledElementIds.forEach(function (id) {
+          var n = globalThis.__cachedNode(id);
+          if (!n) { scrolledElementIds.delete(id); return; }
+          if (!n.isConnected) { return; }
+          out.push(String(id) + ":" + String(Number(n.scrollLeft) || 0) + ":" + String(Number(n.scrollTop) || 0));
+        });
         return out.join(";");
       };
     }
@@ -8157,11 +8233,15 @@
     // instance. now() is high-res time since a real wall-clock origin, clamped monotonically.
     defClass("Performance", globalThis.EventTarget);
     var Pp = globalThis.Performance.prototype;
+    var monotonicNow = globalThis.__monotonicNow;
+    var monotonicOrigin = monotonicNow();
     // Named function expressions so `.name` is the operation name (WebIDL / idlharness).
     Pp.now = function now() {
       if (!Object.prototype.hasOwnProperty.call(this, "__origin")) { throw new TypeError("Illegal invocation"); }
       var t;
-      try { t = Date.now() - this.__origin; } catch (e) { t = this.__last; }
+      // Read elapsed real time, independently of Date.now and the load-time virtual clock.
+      // Reduce precision to 100 microseconds for this non-isolated browser context.
+      t = Math.floor((monotonicNow() - monotonicOrigin) * 10) / 10;
       if (!(t >= this.__last)) { t = this.__last; }
       this.__last = t;
       return t;
@@ -9175,11 +9255,9 @@
   for (var hi = 0; hi < htmlSubclasses.length; hi++) { defClass(htmlSubclasses[hi], HTMLElementCtor); }
 
   // Parsing can populate the wrapper cache before the interface constructors above are installed.
-  for (var cachedNode in __nodeCache) {
-    if (Object.prototype.hasOwnProperty.call(__nodeCache, cachedNode)) {
-      try { applyNodePrototype(__nodeCache[cachedNode], Number(cachedNode)); } catch (e) {}
-    }
-  }
+  __cachedNodeIds().forEach(function (cachedNode) {
+    try { applyNodePrototype(__cachedNode(cachedNode), cachedNode); } catch (e) {}
+  });
 
   // ElementCSSInlineStyle: `style` on the prototype chain (so assert_idl_attribute passes — it must
   // NOT be an own property). Returns the per-element cached CSSStyleDeclaration stashed by
@@ -10561,6 +10639,7 @@
       def(globalThis.Element.prototype, "attachShadow", function (init) {
         if (this.__shadow) { return this.__shadow; }
         var root = document.createElement("div");
+        def(root, "getElementById", globalThis.DocumentFragment.prototype.getElementById);
         if (!globalThis.__shadowRootIds) { globalThis.__shadowRootIds = {}; }
         globalThis.__shadowRootIds[root.__node] = true;
         try { __appendChild(this.__node, root.__node); } catch (e) {}
@@ -10749,6 +10828,7 @@
         if (key === "") { return; }
         if (el.__frameLoadedKey === key && navType !== "reload") { return; }
         el.__frameLoadedKey = key;
+        el.__cdocWrap = undefined;
         // Timer cancellation alone is insufficient once an earlier callback has entered the due
         // queue. Associate every navigation with a generation so a superseded about:blank load
         // cannot dispatch after src/srcdoc starts a real navigation.
@@ -10863,8 +10943,8 @@
       def(globalThis, "__frameOnInsert", function (nodeId) {
         if (nodeId == null || nodeId < 0) { return; }
         try {
-          var el = globalThis.__canonNode(globalThis.__wrapNode(nodeId));
-          if (el && el.tagName && el.tagName.toLowerCase() === "iframe") {
+          if (__tag(nodeId) === "iframe") {
+            var el = globalThis.__canonNode(globalThis.__wrapNode(nodeId));
             // Load on insertion whether or not there's a src/srcdoc — a srcless iframe gets an
             // about:blank browsing context and still fires `load` (the navigation-timing step machines
             // gate their first step on the frame's initial onload).
@@ -11339,7 +11419,9 @@
         var od = null;
         var walk = function (cid) {
           if (cid == null || cid < 0) { return; }
-          var w = globalThis.__elFor(cid);
+          // A shadow root can only have been attached to an existing wrapper. Avoid
+          // materializing every descendant merely to check whether it has one.
+          var w = __cachedNode(cid);
           if (w && w.__shadow) {
             var doc = globalThis.__ownerDocumentOf(w);
             if (doc && doc.__isFrameDoc) {
@@ -14420,6 +14502,7 @@
         path: []
       };
       def(ev, "__ev", s);
+      brandEvent(ev);
       return s;
     }
     function st(ev) { return ev.__ev || initEventState(ev); }
@@ -15431,7 +15514,10 @@
           if (el.__userEditStart === undefined) { el.__userEditStart = cur; }
           // A native edit changes the control's backing value without invoking an own JS
           // setter (React installs one to distinguish programmatic writes from user input).
-          try { __setAttr(nodeId, "value", next); } catch (e7) {}
+          try {
+            if (isTextInput) { __setInputValue(nodeId, next); }
+            else { __setAttr(nodeId, "value", next); }
+          } catch (e7) {}
           __dispatchSyntheticEvent(nodeId, "input", {});
         }
         if (key === "Enter" && isTextInput) {

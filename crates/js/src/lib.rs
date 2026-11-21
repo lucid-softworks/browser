@@ -7,7 +7,9 @@ use lumen::{
 mod embedding;
 mod execution;
 pub(crate) use embedding::*;
-use execution::{controlled_engine, ExecutionControl, EXECUTION_BUDGET, EXECUTION_STOPPED};
+use execution::{
+    controlled_engine, execution_budget, ExecutionControl, EXECUTION_BUDGET, EXECUTION_STOPPED,
+};
 mod realms;
 pub(crate) use realms::*;
 
@@ -82,7 +84,9 @@ struct MutationRec {
 /// State shared between Rust and native callbacks, registered per realm in Lumen OpState.
 /// Callbacks recover an Rc through host_state; RefCell permits DOM mutation on the session thread.
 struct HostState {
+    clock_origin: std::time::Instant,
     doc: SharedDoc,
+    node_wrappers: RefCell<HashMap<dom::NodeId, lumen::embed::WeakObject>>,
     console: RefCell<Vec<String>>,
     /// Host network fetcher (the same one the engine passes into `run_modules`). Called on the
     /// isolate's own worker thread by the `__fetch` native primitive that backs JS `fetch()`.
@@ -240,6 +244,8 @@ impl HostState {
         cookie_setter: Arc<dyn Fn(&str, &str) -> bool + Send + Sync>,
     ) -> Rc<Self> {
         Rc::new(HostState {
+            node_wrappers: RefCell::new(HashMap::new()),
+            clock_origin: std::time::Instant::now(),
             doc,
             console: RefCell::new(Vec::new()),
             fetcher,
@@ -294,6 +300,7 @@ mod eval_loop;
 mod forced_layout;
 mod host_context;
 mod iframe;
+pub use iframe::{FramePixels, FrameSnapshot};
 mod modules;
 mod primitives;
 mod runtime;
@@ -656,15 +663,19 @@ mod tests {
             var host = document.createElement('div'); document.body.appendChild(host);
             var root = host.attachShadow({mode:'open'});
             root.innerHTML = '<input id=private class=inside>';
+            var nested = root.appendChild(document.createElement('div')).attachShadow({mode:'open'});
+            nested.innerHTML = '<input id=nested>';
             [document.querySelectorAll('.inside').length, host.querySelectorAll('input').length,
              root.querySelectorAll('input').length, document.getElementsByTagName('input').length,
-             document.getElementById('private') === null].join('|')
+             document.getElementById('private') === null,
+             root.getElementById('private') === root.querySelector('.inside'),
+             root.getElementById('nested') === null].join('|')
         "#
             .into()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        assert_eq!(out[0].value.as_deref(), Some("0|0|1|0|true"));
+        assert_eq!(out[0].value.as_deref(), Some("0|0|1|0|true|true|true"));
     }
 
     #[test]
@@ -6767,6 +6778,94 @@ mod tests {
     }
 
     #[test]
+    fn async_iframe_navigation_accepts_cross_realm_events() {
+        let (doc, body) = doc_with_body("");
+        let source = r#"
+            var frame, received = 0;
+            window.addEventListener('DOMContentLoaded', function (event) {
+                document.body.setAttribute('data-ready', String(event.target === document && event.bubbles));
+            });
+            async function setup() {
+                await 0;
+                frame = document.body.appendChild(document.createElement('iframe'));
+                frame.srcdoc = '<body><button>Run</button></body>';
+                await 0;
+                var button = frame.contentDocument.querySelector('button');
+                button.addEventListener('click', () => received++);
+                button.dispatchEvent(new Event('click'));
+                var rejected = false;
+                try { button.dispatchEvent({__ev: {}, type: 'click'}); } catch(e) { rejected = true; }
+                document.body.setAttribute('data-result', received + ':' + rejected);
+            }
+            setup().catch(e => document.body.setAttribute('data-result', String(e.stack || e)));
+        "#;
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![source.into()],
+            vec![],
+            HashMap::new(),
+            "https://example.test/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "{out:?}");
+        let dom::NodeData::Element(element) = &snapshot.get(body).data else {
+            panic!("body");
+        };
+        assert_eq!(
+            element.attrs.get("data-result").map(String::as_str),
+            Some("1:true")
+        );
+        assert_eq!(
+            element.attrs.get("data-ready").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn iframe_modules_have_independent_instances_and_globals() {
+        let (doc, body) = doc_with_body("");
+        let mut modules = HashMap::new();
+        modules.insert("https://example.test/counter.mjs".into(),
+            "globalThis.count = (globalThis.count || 0) + 1; export const count = globalThis.count;".into());
+        let source = r#"
+            var fixtures = [];
+            for (var i = 0; i < 2; i++) {
+                var frame = document.createElement('iframe');
+                frame.srcdoc = '<body><script type="module">import {count} from "https://example.test/counter.mjs"; document.body.setAttribute("data-count", count);</script></body>';
+                document.body.appendChild(frame);
+                fixtures.push(frame);
+            }
+            document.body.setAttribute('data-result', fixtures.map(f => f.contentWindow.count + ':' + f.contentDocument.body.getAttribute('data-count')).join(',') + ':' + typeof globalThis.count);
+        "#;
+        let (_session, snapshot, out) = Session::new(
+            doc,
+            vec![source.into()],
+            vec![],
+            modules,
+            "https://example.test/",
+            no_fetch(),
+            no_request(),
+            no_ws(),
+            noop_cookie_get(),
+            noop_cookie_set(),
+            None,
+        );
+        assert!(out.iter().all(|o| o.error.is_none()), "{out:?}");
+        let dom::NodeData::Element(element) = &snapshot.get(body).data else {
+            panic!("body")
+        };
+        assert_eq!(
+            element.attrs.get("data-result").map(String::as_str),
+            Some("1:1,1:1:undefined")
+        );
+    }
+
+    #[test]
     fn iframe_document_imports_parent_realm_subtree_on_append() {
         let (doc, body) = doc_with_body("");
         let entry = "https://x/app.js".to_string();
@@ -7020,6 +7119,15 @@ mod tests {
                 b.setAttribute('data-coi', typeof self.crossOriginIsolated);
                 var n1 = performance.now(), n2 = performance.now();
                 b.setAttribute('data-monotonic', String((n2 - n1) >= 0));
+                var dateNow = Date.now;
+                Date.now = function () { return 0; };
+                var start = performance.now(), fractional = false;
+                for (var i = 0; i < 1000; i++) {
+                    var sample = performance.now();
+                    fractional = fractional || sample % 1 !== 0;
+                }
+                b.setAttribute('data-real-clock', String(sample > start && fractional));
+                Date.now = dateNow;
             "#
             .to_string(),
         );
@@ -7066,6 +7174,7 @@ mod tests {
             Some("true"),
             "now() monotonic"
         );
+        assert_eq!(attr("data-real-clock").as_deref(), Some("true"));
     }
 
     #[test]
@@ -7920,6 +8029,225 @@ mod tests {
     }
 
     #[test]
+    fn input_default_value_does_not_overwrite_dirty_value() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var input = document.createElement('input');
+            input.defaultValue = 'initial';
+            var values = [input.value];
+            input.value = 'edited';
+            input.addEventListener('input', () => { input.defaultValue = ''; });
+            input.dispatchEvent(new Event('input', {bubbles:true}));
+            values.push(input.value, input.defaultValue, input.getAttribute('value'));
+            values.push(input.cloneNode().value);
+            values.join('|')
+        "#
+            .into()],
+            "https://example.test/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("initial|edited|||edited"));
+    }
+
+    #[test]
+    fn select_options_remain_live_across_mutation_and_selection() {
+        let doc = html::parse(
+            "<html><body><select id=s><option value=a>A</option></select></body></html>",
+        );
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var s = document.getElementById('s'), opts = s.options;
+                var result = [opts === s.options, opts.length, opts.item(0).value];
+                var group = document.createElement('optgroup');
+                group.innerHTML = '<option id=b value=b>B</option>';
+                s.appendChild(group);
+                result.push(opts.length, opts.namedItem('b') === group.firstChild);
+                opts[1].selected = true;
+                result.push(s.value);
+                s.firstChild.remove();
+                result.push(opts.length, opts[0].value);
+                result.join('|')
+            "#
+            .into()],
+            "https://example.test/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("true|1|a|2|true|b|1|b"));
+    }
+
+    #[test]
+    fn computed_width_for_new_auto_sized_descendant_flushes_layout() {
+        let (doc, _) = doc_with_body("");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var parent = document.createElement('div');
+            parent.style.width = '120px';
+            parent.innerHTML = '<div></div>';
+            document.body.appendChild(parent);
+            var before = getComputedStyle(parent.firstChild).width;
+            parent.style.width = '240px';
+            before + '|' + getComputedStyle(parent.firstChild).width
+        "#
+            .into()],
+            "https://example.test/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("120px|240px"));
+    }
+
+    #[test]
+    fn nested_flex_scroll_container_keeps_assigned_viewport_height() {
+        let doc = html::parse("<body style='display:flex;height:600px;padding:5px;margin:0;box-sizing:border-box'><div id='app' style='flex:1;display:flex;flex-direction:column'><div style='height:30px'></div><div id='editor' style='flex:1;overflow:auto;padding:2px 5px'><div style='height:2000px'></div></div></div></body>");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var a = document.getElementById('app'), e = document.getElementById('editor');
+            [a.clientHeight, e.clientHeight, e.scrollHeight > e.clientHeight].join('|')
+        "#
+            .into()],
+            "https://example.test/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("590|560|true"));
+    }
+
+    #[test]
+    fn computed_overflow_resolves_axes_and_does_not_inherit() {
+        let doc = html::parse(
+            "<body><div id='box' style='overflow:auto'><div id='child'></div></div></body>",
+        );
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var b = document.getElementById('box'), c = document.getElementById('child');
+            var values = [getComputedStyle(b).overflow, getComputedStyle(c).overflow];
+            b.style.overflow = 'visible hidden';
+            values.push(getComputedStyle(b).overflowX, getComputedStyle(b).overflowY);
+            b.style.overflow = 'clip';
+            values.push(getComputedStyle(b).overflow);
+            b.style.overflow = 'visible';
+            values.push(getComputedStyle(b).overflow);
+            values.join('|')
+        "#
+            .into()],
+            "https://example.test/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("auto|visible|auto|hidden|clip|visible")
+        );
+    }
+
+    #[test]
+    fn client_dimensions_use_layout_for_auto_and_border_box_sizes() {
+        let doc = html::parse("<body><div style='width:240px'><div id='auto' style='padding:5px;border:3px solid'><div style='height:40px'></div></div></div><div id='border' style='box-sizing:border-box;width:100px;height:80px;padding:7px;border:3px solid'></div></body>");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var a = document.getElementById('auto'), b = document.getElementById('border');
+            [a.clientWidth, a.clientHeight, b.clientWidth, b.clientHeight].join('|')
+            "#
+            .into()],
+            "https://example.test/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("234|50|94|74"));
+    }
+
+    #[test]
+    fn client_border_offsets_are_numeric_for_html_and_svg() {
+        let doc = html::parse("<body><div style='border-left:3px solid; border-top:5px solid'>x</div><svg><rect width='20' height='20'/></svg></body>");
+        let (_, out) = run_with_dom(
+            doc,
+            vec![r#"
+            var d = document.querySelector('div'), r = document.querySelector('rect');
+            [d.clientLeft, d.clientTop, r.clientLeft, r.clientTop].join('|')
+        "#
+            .into()],
+            "https://example.test/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("3|5|0|0"));
+    }
+
+    #[test]
+    fn dom_wrapper_gc_preserves_reachable_trees_and_collects_detached_cycles() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        install_host_state(
+            ctx,
+            HostState::new(Rc::new(RefCell::new(html::parse("<body></body>")))),
+        );
+        install_browser_environment(ctx, "https://example.test/");
+        let result = eval_source(
+            ctx,
+            r#"
+            var held;
+            (function () {
+                var parent = document.createElement('div');
+                parent.innerHTML = '<span></span><i></i>';
+                parent.firstChild.marker = 42;
+                held = parent.lastChild;
+                var live = document.createElement('p');
+                live.marker = 7;
+                document.body.appendChild(live);
+            })();
+        "#,
+            "fixture",
+        );
+        assert_eq!(result.error, None);
+        ctx.collect_garbage_for_host();
+        assert_eq!(
+            eval_source(
+                ctx,
+                "held.parentNode.firstChild.marker + '|' + document.body.firstChild.marker",
+                "identity"
+            )
+            .value
+            .as_deref(),
+            Some("42|7")
+        );
+        assert!(eval_source(ctx, "held = null;", "release").error.is_none());
+        ctx.collect_garbage_for_host();
+        let first_new_node = host_state(ctx).doc.borrow().len();
+        assert!(eval_source(
+            ctx,
+            r#"
+            (function () {
+                for (var i = 0; i < 300; i++) {
+                    var parent = document.createElement('div');
+                    parent.innerHTML = '<span></span>';
+                    parent.firstChild.parentExpando = parent;
+                    document.body.appendChild(parent);
+                    parent.remove();
+                }
+            })();
+        "#,
+            "churn"
+        )
+        .error
+        .is_none());
+        let wrappers: Vec<_> = host_state(ctx)
+            .node_wrappers
+            .borrow()
+            .iter()
+            .filter(|(id, _)| id.0 >= first_new_node)
+            .map(|(_, weak)| weak.clone())
+            .collect();
+        assert!(!wrappers.is_empty());
+        ctx.collect_garbage_for_host();
+        assert!(
+            wrappers.iter().all(|weak| weak.upgrade().is_none()),
+            "detached wrappers must not accumulate"
+        );
+    }
+
+    #[test]
     fn session_key_input_appends_and_fires_input_handler() {
         let doc = html::parse("<html><body><input id=f></body></html>");
         let (session, snapshot, outputs) = Session::new(
@@ -7948,7 +8276,11 @@ mod tests {
         let (after, _c) = session.dispatch_key(f.0, "b", "KeyB");
 
         let input = find_by_id(&after, after.root(), "f").expect("input node");
-        assert_eq!(attr_of(&after, input, "value").as_deref(), Some("ab"));
+        let dom::NodeData::Element(element) = &after.get(input).data else {
+            panic!("input")
+        };
+        assert_eq!(element.current_value(), Some("ab"));
+        assert_eq!(attr_of(&after, input, "value"), None);
         let body = find_by_tag(&after, after.root(), "body").expect("body node");
         assert_eq!(attr_of(&after, body, "data-v").as_deref(), Some("ab"));
     }
@@ -7974,7 +8306,11 @@ mod tests {
         let f = find_by_id(&snapshot, snapshot.root(), "f").expect("input node");
         let (after, _c) = session.dispatch_key(f.0, "Backspace", "Backspace");
         let input = find_by_id(&after, after.root(), "f").expect("input node");
-        assert_eq!(attr_of(&after, input, "value").as_deref(), Some("h"));
+        let dom::NodeData::Element(element) = &after.get(input).data else {
+            panic!("input")
+        };
+        assert_eq!(element.current_value(), Some("h"));
+        assert_eq!(attr_of(&after, input, "value").as_deref(), Some("hi"));
     }
 
     #[test]

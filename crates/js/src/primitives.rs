@@ -126,6 +126,7 @@ pub(crate) fn prim_create_element(scope: &mut Ctx, args: NativeArgs, rv: &mut Na
     let state = host_state(scope);
     let id = state.doc.borrow_mut().alloc(
         dom::NodeData::Element(dom::ElementData {
+            value: None,
             tag,
             attrs: Default::default(),
             namespace: None,
@@ -319,6 +320,30 @@ pub(crate) fn prim_get_attr(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeRe
             rv.set(s);
         }
         None => rv.set_null(),
+    }
+}
+
+fn prim_input_value(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
+    let node = arg_node(scope, &args, 0);
+    let state = host_state(scope);
+    let value = node
+        .and_then(|node| match &state.doc.borrow().get(node).data {
+            dom::NodeData::Element(element) => element.current_value().map(str::to_owned),
+            _ => None,
+        })
+        .unwrap_or_default();
+    rv.set(js_str(scope, &value));
+}
+
+fn prim_set_input_value(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
+    let node = arg_node(scope, &args, 0);
+    let value = arg_str(scope, &args, 1);
+    let state = host_state(scope);
+    if let Some(node) = node {
+        if let dom::NodeData::Element(element) = &mut state.doc.borrow_mut().get_mut(node).data {
+            element.value = Some(value);
+        }
+        state.bump_dom_version();
     }
 }
 
@@ -781,6 +806,7 @@ pub(crate) fn prim_remove_child(scope: &mut Ctx, args: NativeArgs, _rv: &mut Nat
             was_child
         };
         if removed {
+            crate::iframe::detach_subtree(scope, child, true);
             state.record_mutation(MutationRec {
                 kind: "childList",
                 target: parent,
@@ -1085,32 +1111,16 @@ pub(crate) fn prim_elem_metrics(scope: &mut Ctx, args: NativeArgs, rv: &mut Nati
     let state = host_state(scope);
     crate::forced_layout::ensure_layout_fresh(&state);
     let rect = node.and_then(|n| state.layout_rects.borrow().get(&n.0).copied());
-    // Client box (padding box: content + padding, excluding borders) computed from the cascade.
+    // Client box uses the laid-out padding box, including automatic and flex sizes.
     // `clientWidth`/`clientHeight` exclude borders/scrollbars, so they cannot reuse the border-box
     // `ow`/`oh`.
     let client_box = node.and_then(|n| {
         rect.map(|(_, _, w, h)| {
             with_cascade_map(&state, |_doc, map| {
                 map.get(&n).map_or((w, h), |cs| {
-                    let laid_out = (
-                        (w - cs.border.left - cs.border.right).max(0.0),
-                        (h - cs.border.top - cs.border.bottom).max(0.0),
-                    );
-                    let specified = (
-                        cs.width.unwrap_or(0.0) + cs.padding.left + cs.padding.right,
-                        cs.height.unwrap_or(0.0) + cs.padding.top + cs.padding.bottom,
-                    );
                     (
-                        if cs.contain_width {
-                            laid_out.0
-                        } else {
-                            specified.0
-                        },
-                        if cs.contain_height {
-                            laid_out.1
-                        } else {
-                            specified.1
-                        },
+                        (w - cs.border.left - cs.border.right).max(0.0).round(),
+                        (h - cs.border.top - cs.border.bottom).max(0.0).round(),
                     )
                 })
             })
@@ -1228,6 +1238,13 @@ pub(crate) fn prim_elem_metrics(scope: &mut Ctx, args: NativeArgs, rv: &mut Nati
             }
         })
     };
+    let (client_left, client_top) = node.filter(|_| rect.is_some()).map_or((0.0, 0.0), |n| {
+        with_cascade_map(&state, |_doc, map| {
+            map.get(&n).map_or((0.0, 0.0), |cs| {
+                (cs.border.left.round(), cs.border.top.round())
+            })
+        })
+    });
     let obj = Value::Obj(scope.new_object());
     let mut put = |k: &str, v: f32| {
         let key = k;
@@ -1247,10 +1264,12 @@ pub(crate) fn prim_elem_metrics(scope: &mut Ctx, args: NativeArgs, rv: &mut Nati
     put("oh", h);
     put("cw", cw);
     put("ch", ch);
+    put("cl", client_left);
+    put("ct", client_top);
     put("ot", ot);
     put("ol", ol);
-    put("sw", sw);
-    put("sh", sh);
+    put("sw", sw.round());
+    put("sh", sh.round());
     rv.set(obj);
 }
 
@@ -1284,6 +1303,7 @@ pub(crate) fn prim_set_text_content(scope: &mut Ctx, args: NativeArgs, _rv: &mut
         } else {
             None
         };
+        crate::iframe::detach_subtree(scope, n, false);
         set_text_content(&mut state.doc.borrow_mut(), n, &text);
         if let Some((_, old)) = char_old {
             state.record_mutation(MutationRec {
@@ -1326,6 +1346,7 @@ pub(crate) fn prim_set_inner_html(scope: &mut Ctx, args: NativeArgs, _rv: &mut N
     let html = arg_str(scope, &args, 1);
     let state = host_state(scope);
     if let Some(n) = node {
+        crate::iframe::detach_subtree(scope, n, false);
         state.bump_dom_version(); // invalidate getComputedStyle cache (subtree replaced)
         set_inner_html(&mut state.doc.borrow_mut(), n, &html);
     }
@@ -1898,10 +1919,12 @@ pub(crate) fn set_fn(
     name: &str,
     cb: fn(&mut Ctx, NativeArgs, &mut NativeReturn),
 ) {
+    let host_context = crate::HostContext::current();
     let func = scope.new_native_fn(
         name,
         0,
         Rc::new(move |scope, _this, args| {
+            let _host = host_context.enter();
             let mut rv = NativeReturn::default();
             cb(scope, NativeArgs::new(args), &mut rv);
             rv.finish()
@@ -2096,8 +2119,78 @@ fn prim_normalize_css_numbers(scope: &mut Ctx, args: NativeArgs, rv: &mut Native
     rv.set(js_str(scope, &normalized));
 }
 
+fn prim_monotonic_now(scope: &mut Ctx, _args: NativeArgs, rv: &mut NativeReturn) {
+    let elapsed = host_state(scope).clock_origin.elapsed().as_secs_f64() * 1000.0;
+    rv.set(Value::Num(elapsed));
+}
+
+fn prim_dom_version(scope: &mut Ctx, _args: NativeArgs, rv: &mut NativeReturn) {
+    rv.set(Value::Num(host_state(scope).dom_version.get() as f64));
+}
+
+fn prim_cached_node(scope: &mut Ctx, args: NativeArgs, rv: &mut NativeReturn) {
+    if let Some(node) = arg_node(scope, &args, 0) {
+        if let Some(value) = host_state(scope)
+            .node_wrappers
+            .borrow()
+            .get(&node)
+            .and_then(|w| w.upgrade())
+        {
+            rv.set(value);
+        }
+    }
+}
+
+fn prim_cache_node(scope: &mut Ctx, args: NativeArgs, _rv: &mut NativeReturn) {
+    if let Some(node) = arg_node(scope, &args, 0) {
+        if let Some(weak) = lumen::embed::WeakObject::new(&args.get(1)) {
+            host_state(scope)
+                .node_wrappers
+                .borrow_mut()
+                .insert(node, weak);
+        }
+    }
+}
+
+fn prim_cached_node_ids(scope: &mut Ctx, _args: NativeArgs, rv: &mut NativeReturn) {
+    let ids: Vec<_> = host_state(scope)
+        .node_wrappers
+        .borrow()
+        .keys()
+        .copied()
+        .collect();
+    rv.set(js_id_array(scope, &ids));
+}
+
 /// Install the node-id DOM primitives onto `globalThis`.
 pub(crate) fn install_dom_primitives(scope: &mut Ctx, global: &Value) {
+    let state = host_state(scope);
+    scope.set_gc_groups_for_host(
+        global,
+        Rc::new(move || {
+            let doc = state.doc.borrow();
+            let mut groups: HashMap<dom::NodeId, Vec<Value>> = HashMap::new();
+            state.node_wrappers.borrow_mut().retain(|node, weak| {
+                let Some(value) = weak.upgrade() else {
+                    return false;
+                };
+                let mut root = *node;
+                while let Some(parent) = doc.get(root).parent {
+                    root = parent;
+                }
+                groups.entry(root).or_default().push(value);
+                true
+            });
+            groups.into_values().collect()
+        }),
+    );
+    set_fn(scope, global, "__cachedNode", prim_cached_node);
+    set_fn(scope, global, "__cacheNode", prim_cache_node);
+    set_fn(scope, global, "__cachedNodeIds", prim_cached_node_ids);
+    set_fn(scope, global, "__monotonicNow", prim_monotonic_now);
+    set_fn(scope, global, "__domVersion", prim_dom_version);
+    set_fn(scope, global, "__inputValue", prim_input_value);
+    set_fn(scope, global, "__setInputValue", prim_set_input_value);
     if scope
         .realm_value_for_host(global, "browser.array")
         .is_none()

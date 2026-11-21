@@ -60,6 +60,22 @@ pub struct HostContextGuard {
 }
 
 impl HostContext {
+    /// A child document shares browser settings and cancellation, but owns its viewport and outputs.
+    pub(crate) fn child_viewport(&self, width: u32, height: u32) -> Self {
+        let child = Self::default();
+        {
+            let parent = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let mut data = child.0.lock().unwrap_or_else(|e| e.into_inner());
+            data.execution = parent.execution.clone();
+            data.shutdown = parent.shutdown;
+            data.metrics = (width.max(1), height.max(1), parent.metrics.2);
+            data.dark = parent.dark;
+            data.isolated = parent.isolated;
+            data.font = parent.font.clone();
+        }
+        child
+    }
+
     /// Cancel the current page execution from any thread. A new Session installs a fresh control.
     pub fn cancel_execution(&self) {
         self.0

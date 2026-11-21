@@ -44,7 +44,13 @@ pub(crate) fn textarea_text_content(doc: &dom::Document, id: dom::NodeId) -> Str
 ///     conventional label when absent);
 ///   * other input types (checkbox/radio/hidden/file/image/color/range/date…): `None` (no text).
 pub(crate) fn input_display_text(el: &dom::ElementData, textarea_default: &str) -> Option<String> {
-    let attr = |name: &str| el.attrs.get(name).map(|s| s.as_str());
+    let attr = |name: &str| {
+        if name == "value" {
+            el.current_value()
+        } else {
+            el.attrs.get(name).map(|s| s.as_str())
+        }
+    };
     if el.tag.eq_ignore_ascii_case("textarea") {
         // A textarea's value is its current `value` (set via JS) or, failing that, its text content
         // (the default value) — it has no `value` content attribute, so the text node is the source.
@@ -122,7 +128,10 @@ pub(crate) fn range_fraction(el: &dom::ElementData) -> f32 {
     let min = num_attr(el, "min").unwrap_or(0.0);
     let max = num_attr(el, "max").unwrap_or(100.0);
     let span = max - min;
-    let value = num_attr(el, "value").unwrap_or(min + span / 2.0);
+    let value = el
+        .current_value()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .unwrap_or(min + span / 2.0);
     if span.abs() < f32::EPSILON {
         0.0
     } else {
@@ -288,6 +297,7 @@ pub(crate) fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         border_collapse: cs.border_collapse,
         is_table_cell: cs.display == style::Display::TableCell,
         is_legend: false,
+        is_iframe: false,
         underline: cs.underline,
         line_through: cs.line_through,
         overline: cs.overline,
@@ -451,14 +461,19 @@ pub(crate) fn build_replaced_or_control(
         || el.tag.eq_ignore_ascii_case("svg")
         || el.tag.eq_ignore_ascii_case("object")
         || el.tag.eq_ignore_ascii_case("embed")
+        || el.tag.eq_ignore_ascii_case("iframe")
     {
         let is_canvas = el.tag.eq_ignore_ascii_case("canvas");
+        let is_frame = el.tag.eq_ignore_ascii_case("iframe");
         // `<object>`/`<embed>` rendering an image/SVG resource behave like `<img>` for sizing: the
         // width/height attributes set the used size and a bitmap is supplied for the node id.
         let is_img = el.tag.eq_ignore_ascii_case("img")
             || el.tag.eq_ignore_ascii_case("object")
-            || el.tag.eq_ignore_ascii_case("embed");
-        let intrinsic = if is_canvas {
+            || el.tag.eq_ignore_ascii_case("embed")
+            || is_frame;
+        let intrinsic = if is_frame {
+            Some((300.0, 150.0))
+        } else if is_canvas {
             // Prefer the explicit width/height attributes; fall back to the spec default 300x150.
             let aw = el
                 .attrs
@@ -509,48 +524,52 @@ pub(crate) fn build_replaced_or_control(
                 height
             }
         });
-        let (cw, ch) = match (css_w, css_h, cs.aspect_ratio, cs.aspect_ratio_auto) {
-            (Some(width), None, Some(ratio), false) if ratio > 0.0 => {
-                if border_box {
-                    (
-                        (width - horizontal_edges).max(0.0),
-                        (width / ratio - vertical_edges).max(0.0),
-                    )
-                } else {
-                    (width.max(0.0), (width / ratio).max(0.0))
-                }
-            }
-            (None, Some(height), Some(ratio), false) if ratio > 0.0 => {
-                if border_box {
-                    (
-                        (height * ratio - horizontal_edges).max(0.0),
-                        (height - vertical_edges).max(0.0),
-                    )
-                } else {
-                    ((height * ratio).max(0.0), height.max(0.0))
-                }
-            }
-            _ => {
-                let attribute_intrinsic = if is_img {
-                    el.attrs
-                        .get("width")
-                        .and_then(|width| width.trim().parse::<f32>().ok())
-                        .zip(
-                            el.attrs
-                                .get("height")
-                                .and_then(|height| height.trim().parse::<f32>().ok()),
+        let (cw, ch) = if is_frame && cs.aspect_ratio.is_none() {
+            (content_w.unwrap_or(300.0), content_h.unwrap_or(150.0))
+        } else {
+            match (css_w, css_h, cs.aspect_ratio, cs.aspect_ratio_auto) {
+                (Some(width), None, Some(ratio), false) if ratio > 0.0 => {
+                    if border_box {
+                        (
+                            (width - horizontal_edges).max(0.0),
+                            (width / ratio - vertical_edges).max(0.0),
                         )
-                } else {
-                    None
-                };
-                let natural = if cs.aspect_ratio_auto {
-                    intrinsic
-                        .or(attribute_intrinsic)
-                        .or_else(|| cs.aspect_ratio.map(|ratio| (ratio, 1.0)))
-                } else {
-                    intrinsic.or(attribute_intrinsic)
-                };
-                image_content_size(content_w, content_h, natural)
+                    } else {
+                        (width.max(0.0), (width / ratio).max(0.0))
+                    }
+                }
+                (None, Some(height), Some(ratio), false) if ratio > 0.0 => {
+                    if border_box {
+                        (
+                            (height * ratio - horizontal_edges).max(0.0),
+                            (height - vertical_edges).max(0.0),
+                        )
+                    } else {
+                        ((height * ratio).max(0.0), height.max(0.0))
+                    }
+                }
+                _ => {
+                    let attribute_intrinsic = if is_img {
+                        el.attrs
+                            .get("width")
+                            .and_then(|width| width.trim().parse::<f32>().ok())
+                            .zip(
+                                el.attrs
+                                    .get("height")
+                                    .and_then(|height| height.trim().parse::<f32>().ok()),
+                            )
+                    } else {
+                        None
+                    };
+                    let natural = if cs.aspect_ratio_auto {
+                        intrinsic
+                            .or(attribute_intrinsic)
+                            .or_else(|| cs.aspect_ratio.map(|ratio| (ratio, 1.0)))
+                    } else {
+                        intrinsic.or(attribute_intrinsic)
+                    };
+                    image_content_size(content_w, content_h, natural)
+                }
             }
         };
         if cw <= 0.0 || ch <= 0.0 {
@@ -577,6 +596,7 @@ pub(crate) fn build_replaced_or_control(
             return None; // nothing known to draw; skip producing a box
         }
         let mut bx = LayoutBox::new(BoxContent::Image(id), paint_style_of(cs), Some(id));
+        bx.style.is_iframe = is_frame;
         bx.dimensions.margin = edges_of(cs.margin);
         bx.dimensions.padding = edges_of(cs.padding);
         bx.dimensions.border = edges_of(cs.border);
@@ -647,9 +667,8 @@ pub(crate) fn build_replaced_or_control(
     // <input type=color>: a small swatch filled with the chosen color (default #000000).
     if is_input && input_ty == "color" {
         let rgb = el
-            .attrs
-            .get("value")
-            .and_then(|v| parse_hex_color(v))
+            .current_value()
+            .and_then(parse_hex_color)
             .unwrap_or((0, 0, 0));
         size_widget_box(&mut bx, cs, 44.0, 23.0);
         bx.content = BoxContent::Widget(WidgetKind::Color { rgb });
@@ -683,11 +702,7 @@ pub(crate) fn build_replaced_or_control(
         // placeholder only when there's no real value; browsers hide the placeholder while editing,
         // so suppress it and show just the caret. We can tell value from placeholder by checking
         // the raw `value` attribute.
-        let has_value = el
-            .attrs
-            .get("value")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
+        let has_value = el.current_value().map(|v| !v.is_empty()).unwrap_or(false)
             || el.tag.eq_ignore_ascii_case("textarea");
         let show_text = if caret && !has_value {
             String::new()
@@ -842,6 +857,7 @@ pub(crate) fn build_box(
                 || el.tag.eq_ignore_ascii_case("svg")
                 || el.tag.eq_ignore_ascii_case("object")
                 || el.tag.eq_ignore_ascii_case("embed")
+                || el.tag.eq_ignore_ascii_case("iframe")
                 || el.tag.eq_ignore_ascii_case("input")
                 || el.tag.eq_ignore_ascii_case("textarea")
                 || el.tag.eq_ignore_ascii_case("select")

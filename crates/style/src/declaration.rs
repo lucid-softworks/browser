@@ -1692,17 +1692,31 @@ pub(crate) fn apply_declaration(
             "inline-end" => style.clear = Clear::Right,
             _ => {}
         },
-        // `overflow` (and the `-x`/`-y` longhands): we only need whether the box becomes a scroll
-        // container (anything but `visible`), which is the containing block for `sticky` insets.
         "overflow" | "overflow-x" | "overflow-y" => {
-            // A single value applies to both axes; the shorthand may carry two. Any non-`visible`
-            // (and non-`clip`-without-scrollport — we treat `clip` as a scrollport too, matching the
-            // sticky containing-block rule) token marks this box as a scrollport.
-            let any_non_visible = val
-                .split_whitespace()
-                .any(|tok| !matches!(tok.trim().to_ascii_lowercase().as_str(), "visible" | ""));
-            if any_non_visible {
-                style.overflow_scrollport = true;
+            let lower = val.trim().to_ascii_lowercase();
+            let values: Vec<_> = lower.split_whitespace().collect();
+            let valid = |v: &&str| matches!(*v, "visible" | "hidden" | "clip" | "scroll" | "auto");
+            if !values.is_empty()
+                && values.len() <= if prop == "overflow" { 2 } else { 1 }
+                && values.iter().all(valid)
+            {
+                if prop == "overflow" {
+                    style
+                        .extra_properties
+                        .insert("overflow-x".into(), values[0].into());
+                    style.extra_properties.insert(
+                        "overflow-y".into(),
+                        values.get(1).unwrap_or(&values[0]).to_string(),
+                    );
+                } else {
+                    style.extra_properties.insert(prop.into(), values[0].into());
+                }
+                style.overflow_scrollport = ["overflow-x", "overflow-y"].iter().any(|axis| {
+                    matches!(
+                        style.get_property(axis).as_str(),
+                        "hidden" | "scroll" | "auto"
+                    )
+                });
             }
         }
         "top" => {

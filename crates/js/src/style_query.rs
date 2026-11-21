@@ -800,6 +800,7 @@ pub(crate) fn prim_computed_style_prop(scope: &mut Ctx, args: NativeArgs, rv: &m
                     }
                 })
             } else if let Some(is_width) = size_is_width {
+                crate::forced_layout::ensure_layout_fresh(&state);
                 with_computed_style(&state, n, |cs| {
                     let cs = match cs {
                         Some(c) => c,

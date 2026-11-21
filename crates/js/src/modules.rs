@@ -55,7 +55,7 @@ impl ModuleRegistry {
 /// Lumen supplies import.meta.url; the browser also supplies the URL resolver required by HTML.
 /// Build the resolver in the global environment and capture the module URL explicitly: author
 /// bindings named `globalThis`, `URL`, or `Function` must not shadow the resolver's intrinsics.
-fn prepare_module_source(source: &str) -> String {
+pub(crate) fn prepare_module_source(source: &str) -> String {
     const PRELUDE: &str =
         "import.meta.resolve = (function(){}).constructor('base', 'return function(specifier) { return new globalThis.URL(specifier, base).href; };')(import.meta.url);\n";
     if source.starts_with("#!") {

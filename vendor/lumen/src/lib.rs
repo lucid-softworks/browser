@@ -143,7 +143,9 @@ pub struct Engine {
 }
 
 impl Drop for Engine {
-    fn drop(&mut self) { self.interp.dispose_for_host(); }
+    fn drop(&mut self) {
+        self.interp.dispose_for_host();
+    }
 }
 
 impl Default for Engine {
@@ -257,7 +259,7 @@ impl Engine {
 
     /// The default referrer for a bare `import()` in script code (so relative specifiers resolve).
     pub fn set_import_base(&mut self, base: &str) {
-        self.interp.import_base = base.to_string();
+        self.interp.set_import_base_for_host(base);
     }
 
     /// Evaluate `src` as an ES module identified by `key`. `loader(specifier, referrer)` resolves an
@@ -292,7 +294,12 @@ impl Engine {
     /// touches any codegen path; `Bytecode` compiles eligible functions after
     /// [`set_tier_threshold`](Engine::set_tier_threshold) calls.
     pub fn set_tier(&mut self, tier: bytecode::Tier) {
-        self.interp.tier = if self.interp.execution_control.is_some() && tier == bytecode::Tier::Jit { bytecode::Tier::Bytecode } else { tier };
+        self.interp.tier = if self.interp.execution_control.is_some() && tier == bytecode::Tier::Jit
+        {
+            bytecode::Tier::Bytecode
+        } else {
+            tier
+        };
     }
 
     /// Calls before a function is considered for bytecode compilation (0 = immediately).
@@ -351,7 +358,7 @@ pub mod embed {
     /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
     /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
-    pub use crate::value::{NativeClosure, NativeFn, Value};
+    pub use crate::value::{NativeClosure, NativeFn, Value, WeakObject};
 }
 
 /// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`

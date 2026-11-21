@@ -118,17 +118,16 @@ pub fn run_with_dom(
                 let scope = engine.ctx();
                 install_host_state(scope, HostState::new(Rc::clone(&shared)));
                 install_browser_environment(scope, &url);
-                crate::set_page_context(
-                    crate::realms::Realm::current(scope)
-                        .unwrap_or_else(|_| panic!("page realm must be available")),
-                );
+                let page_realm = crate::realms::Realm::current(scope)
+                    .unwrap_or_else(|_| panic!("page realm must be available"));
+                crate::set_page_context(scope, page_realm);
                 let mut results: Vec<EvalOutput> = sources
                     .iter()
                     .map(|source| eval_source(scope, source, "<script>"))
                     .collect();
                 drain_runtime(&mut engine, &mut results, None, None);
-                crate::clear_workers();
-                crate::clear_frames();
+                crate::clear_workers(engine.ctx());
+                crate::clear_frames(engine.ctx());
                 // Recover the owned Document. Dropping the engine releases the context (and HostState
                 // slot, which holds the only other Rc clone of `shared`), so `try_unwrap` succeeds.
                 drop(engine);

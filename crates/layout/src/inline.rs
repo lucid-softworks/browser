@@ -570,9 +570,10 @@ pub(crate) fn collect_inline_items(
                 let containing = Rect {
                     x: 0.0,
                     y: 0.0,
-                    width: 0.0,
+                    width: cb_width,
                     height: 0.0,
                 };
+                crate::block::size_iframe(&mut child, containing, styles);
                 layout_image_box(&mut child, containing);
                 out.push(InlineItem::Atomic(Box::new(child)));
             }

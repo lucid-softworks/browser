@@ -308,6 +308,28 @@ impl ComputedStyle {
         }
         // Normalize: lowercase + trim (callers pass kebab-case, but be defensive).
         let name = trimmed.to_ascii_lowercase();
+        if matches!(name.as_str(), "overflow" | "overflow-x" | "overflow-y") {
+            let x = self
+                .extra_properties
+                .get("overflow-x")
+                .map_or("visible", String::as_str);
+            let y = self
+                .extra_properties
+                .get("overflow-y")
+                .map_or("visible", String::as_str);
+            let resolve = |value, other| match (value, other) {
+                ("visible", "hidden" | "scroll" | "auto") => "auto",
+                ("clip", "hidden" | "scroll" | "auto") => "hidden",
+                _ => value,
+            };
+            let (x, y) = (resolve(x, y), resolve(y, x));
+            return match name.as_str() {
+                "overflow-x" => x.to_string(),
+                "overflow-y" => y.to_string(),
+                _ if x == y => x.to_string(),
+                _ => format!("{x} {y}"),
+            };
+        }
         if name == "white-space" && !self.extra_properties.contains_key("white-space") {
             let collapse = self
                 .extra_properties
@@ -831,6 +853,8 @@ impl ComputedStyle {
             "hyphenate-character",
             "hyphenate-limit-chars",
             "line-break",
+            "overflow-x",
+            "overflow-y",
             "overflow-wrap",
             "word-wrap",
             "word-break",

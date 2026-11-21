@@ -240,11 +240,16 @@ pub const UNSUPPORTED_MSG: &str =
 /// so `Job` is `Send`; moving the captured `Rc`s to the worker is sound for the same ping-pong
 /// reason `spawn` was — the driver stops touching them the instant it sends.
 struct Job {
+    heap: SendHeap,
     ptr: InterpPtr,
     body: SendBody,
     resume_rx: Receiver<Resume>,
     suspend_tx: Sender<Suspend>,
 }
+
+// The heap registries travel with the interpreter under the same strict handoff as InterpPtr.
+struct SendHeap(crate::interpreter::CoroutineThreadState);
+unsafe impl Send for SendHeap {}
 
 /// Idle worker threads waiting for their next coroutine. Guarded by a plain `Mutex`: under the
 /// strict ping-pong exactly one thread touches the interpreter at a time, so contention is
@@ -280,12 +285,14 @@ fn worker_loop(job_rx: Receiver<Job>, self_tx: Sender<Job>) {
 /// inherit from its previous job.
 fn run_job(job: Job) {
     let Job {
+        heap,
         ptr,
         body,
         resume_rx,
         suspend_tx,
     } = job;
     let SendBody(body) = body;
+    let previous_heap = heap.0.replace();
     // A plain async body never sets ASYNC_GEN, so it must not inherit a previous async-generator
     // job's `true`.
     ASYNC_GEN.with(|c| c.set(false));
@@ -300,15 +307,25 @@ fn run_job(job: Job) {
     let outcome = match first {
         Err(_) => {
             YIELDER.with(|y| *y.borrow_mut() = None);
+            drop(body);
+            previous_heap.replace();
             return; // dropped before first drive
         }
         Ok(Resume::Next(_)) => {
             let interp = unsafe { &mut *ptr.0 };
             body(interp)
         }
-        Ok(Resume::Return(v)) => Suspend::Done(v),
-        Ok(Resume::Throw(e)) => Suspend::Throw(e),
+        Ok(Resume::Return(v)) => {
+            drop(body);
+            Suspend::Done(v)
+        }
+        Ok(Resume::Throw(e)) => {
+            drop(body);
+            Suspend::Throw(e)
+        }
     };
+    // Release this worker's registry handles before waking the driver.
+    previous_heap.replace();
     let _ = suspend_tx.send(outcome);
     // Clear the TLS so the next job starts clean and `in_coroutine()` reads false between jobs.
     YIELDER.with(|y| *y.borrow_mut() = None);
@@ -321,6 +338,7 @@ pub fn spawn_coroutine(interp: *mut Interp, body: SendBody) -> std::io::Result<C
     let (suspend_tx, suspend_rx) = channel::<Suspend>();
     let worker = get_worker()?;
     let job = Job {
+        heap: SendHeap(crate::interpreter::CoroutineThreadState::capture()),
         ptr: InterpPtr(interp),
         body,
         resume_rx,

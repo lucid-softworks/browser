@@ -960,6 +960,8 @@ pub(crate) fn compute_element_style<'a>(
     // These CSSOM-only entries are non-inherited; `extra_properties` otherwise begins as the
     // inherited text-property set.
     for property in [
+        "overflow-x",
+        "overflow-y",
         "contain",
         "content-visibility",
         "contain-intrinsic-size",

@@ -53,6 +53,8 @@ pub struct ProcessingInstructionData {
 
 #[derive(Debug, Clone, Default)]
 pub struct ElementData {
+    /// Dirty input value, separate from the `value` content attribute (the default value).
+    pub value: Option<String>,
     pub tag: String,
     pub attrs: AttrMap,
     /// The element's namespace URI. `None` = the HTML namespace (the common case; kept `None` so
@@ -63,6 +65,11 @@ pub struct ElementData {
 }
 
 impl ElementData {
+    pub fn current_value(&self) -> Option<&str> {
+        self.value
+            .as_deref()
+            .or_else(|| self.attrs.get("value").map(String::as_str))
+    }
     pub fn id(&self) -> Option<&str> {
         self.attrs.get("id").map(String::as_str)
     }
@@ -156,6 +163,7 @@ impl Document {
         self.append_child(
             parent,
             NodeData::Element(ElementData {
+                value: None,
                 tag: tag.to_string(),
                 attrs: Default::default(),
                 namespace: None,

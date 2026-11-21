@@ -17,7 +17,22 @@ pub(crate) fn eval_internal(scope: &mut Ctx, source: &str, name: &str) -> bool {
 }
 
 pub(crate) fn install_browser_environment(scope: &mut Ctx, url: &str) {
+    #[derive(Clone)]
+    struct EventBrands(Value);
     let global = scope.global_this();
+    if !scope.op_state().has::<EventBrands>() {
+        let constructor = scope.member_get(&global, "Symbol").ok().expect("Symbol");
+        let brands = scope
+            .invoke(constructor, Value::Undefined, &[])
+            .ok()
+            .expect("event brand");
+        scope.op_state().put(EventBrands(brands));
+    }
+    let brands = scope.op_state().get::<EventBrands>().unwrap().0.clone();
+    scope
+        .member_set(&global, "__eventBrands", brands)
+        .ok()
+        .expect("event brands");
     install_console_sink(scope, &global);
     install_dom_primitives(scope, &global);
     // Test harness host operations are retained privately, never exposed to page scripts.
@@ -114,6 +129,10 @@ pub(crate) const SVG_BOOTSTRAP: &str = include_str!("bootstrap/svg.js");
 /// Maximum number of `__runDueTimers()` iterations when draining the event loop.
 pub(crate) const EVENT_LOOP_CAP: usize = 10_000;
 
+/// Live browser sessions yield between tasks so the host can render before the next frame.
+/// Batch evaluators keep their existing run-to-idle behavior.
+pub(crate) struct RenderTurns;
+
 /// Evaluate in the persistent realm, capturing thrown values and console output.
 pub(crate) fn eval_source(scope: &mut Ctx, source: &str, name: &str) -> EvalOutput {
     host_state(scope).console.borrow_mut().clear();
@@ -180,6 +199,7 @@ pub(crate) fn drain_event_loop(
 
     // Interpreter safe points enforce the host deadline even inside a single callback.
     // These shorter budgets additionally bound cooperative event-loop work.
+    let render_turn = scope.op_state().has::<RenderTurns>();
     let start = std::time::Instant::now();
     // Idle budget keeps ticks snappy; the network budget is raised because a page legitimately
     // waiting on a slow request (the slowest imlunahey _serverFn is ~6.8s) needs longer than 3s.
@@ -238,6 +258,11 @@ pub(crate) fn drain_event_loop(
         let (wran, wif) = pump_realms(scope);
         worker_in_flight = wif;
         iterations += 1;
+        if render_turn {
+            did_work |= ran || wran;
+            scope.drain_microtasks_for_host();
+            break;
+        }
         if ran || wran {
             did_work = true;
         } else {
@@ -305,7 +330,9 @@ pub(crate) fn drain_event_loop(
             scope.drain_microtasks_for_host();
             // A callback may have scheduled timers; let one round of due work run so e.g. a
             // setTimeout(0) inside an observer still progresses within this drain.
-            run_due_timers(scope);
+            if !render_turn {
+                run_due_timers(scope);
+            }
             scope.drain_microtasks_for_host();
             did_work = true;
             rounds += 1;
@@ -315,7 +342,7 @@ pub(crate) fn drain_event_loop(
     // Final worker drain: a last few passes so any worker task queued right at the end (e.g. a
     // testharness completion message posted to the page) is delivered, ping-ponging with the page
     // loop until both go quiet (bounded).
-    {
+    if !render_turn {
         let mut rounds = 0usize;
         loop {
             let (w, wif) = pump_realms(scope);
