@@ -107,8 +107,16 @@ const VOID_ELEMENTS: &[&str] = &[
     "track", "wbr",
 ];
 
-/// Elements whose content is raw text (not parsed as HTML).
-const RAWTEXT_ELEMENTS: &[&str] = &["script", "style"];
+/// Elements whose content is raw text (not parsed as HTML): markup inside is literal
+/// text until the matching end tag. `noscript` counts because this engine always runs
+/// scripts (the spec only parses `<noscript>` children when scripting is disabled).
+/// `plaintext` is handled separately — it has no end tag.
+const RAWTEXT_ELEMENTS: &[&str] = &[
+    "script", "style", "xmp", "iframe", "noembed", "noframes", "noscript",
+];
+
+/// Elements whose content is RCDATA: like raw text but character references are decoded.
+const RCDATA_ELEMENTS: &[&str] = &["title", "textarea"];
 
 /// "Metadata content" start tags that belong in `<head>` when they appear before any flow
 /// content. Anything not in this set is treated as flow content and opens `<body>`.
@@ -123,6 +131,10 @@ fn is_void(tag: &str) -> bool {
 
 fn is_rawtext(tag: &str) -> bool {
     RAWTEXT_ELEMENTS.contains(&tag)
+}
+
+fn is_rcdata(tag: &str) -> bool {
+    RCDATA_ELEMENTS.contains(&tag)
 }
 
 fn is_metadata(tag: &str) -> bool {
@@ -787,8 +799,8 @@ impl<'a> Parser<'a> {
             "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dialog"
             | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
             | "hgroup" | "main" | "menu" | "nav" | "ol" | "p" | "section" | "summary" | "ul"
-            | "pre" | "listing" | "hr" | "table" | "xmp" | "h1" | "h2" | "h3" | "h4" | "h5"
-            | "h6" => {
+            | "pre" | "listing" | "hr" | "table" | "xmp" | "plaintext" | "h1" | "h2" | "h3"
+            | "h4" | "h5" | "h6" => {
                 self.close_p_in_button_scope();
                 if matches!(lt.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
                     && matches!(
@@ -885,11 +897,35 @@ impl<'a> Parser<'a> {
             return;
         }
 
-        if is_rawtext(&tag) {
-            // Raw-text element: consume everything up to the matching end tag as one text
-            // node and do not push onto the open stack.
-            self.consume_rawtext(&tag, node);
+        if tag == "plaintext" {
+            // The PLAINTEXT state has no end tag: everything left is literal text.
+            self.open.push(node);
+            let text = std::str::from_utf8(&self.input[self.pos..])
+                .unwrap_or("")
+                .to_string();
+            self.pos = self.input.len();
+            if !text.is_empty() {
+                self.doc.append_child(node, NodeData::Text(text));
+            }
             return;
+        }
+
+        if is_rawtext(&tag) || is_rcdata(&tag) {
+            // `<textarea>` additionally discards one newline immediately after its start
+            // tag (the source-formatting LF, shared with pre/listing below).
+            if tag == "textarea" && self.peek_at(0) == Some(b'\n') {
+                self.pos += 1;
+            }
+            // Text-only element: consume everything up to the matching end tag as one
+            // text node and do not push onto the open stack.
+            self.consume_text_only(&tag, node, is_rcdata(&tag));
+            return;
+        }
+
+        // A newline immediately after `<pre>`/`<listing>` is a source-formatting
+        // artifact, not content — skip it.
+        if matches!(tag.as_str(), "pre" | "listing") && self.peek_at(0) == Some(b'\n') {
+            self.pos += 1;
         }
 
         self.open.push(node);
@@ -908,23 +944,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Consume raw text up to (but not parsing) `</tag>`, appending it as a single text
-    /// child of `node`.
-    fn consume_rawtext(&mut self, tag: &str, node: NodeId) {
+    /// Consume text-only content — raw text (`script`/`style`/`xmp`/`iframe`/`noembed`/
+    /// `noframes`/`noscript`) or RCDATA (`title`/`textarea`) — up to the *appropriate* end
+    /// tag, appending it as a single text child of `node`. RCDATA additionally decodes
+    /// character references; raw text passes `&` through literally.
+    fn consume_text_only(&mut self, tag: &str, node: NodeId, rcdata: bool) {
         let close = format!("</{tag}");
-        let start = self.pos;
-        let end = loop {
-            if self.pos >= self.input.len() {
-                break self.input.len();
+        let mut content = String::new();
+        // `seg` bounds the pending run of verbatim bytes between decoded references.
+        let mut seg = self.pos;
+        while self.pos < self.input.len() {
+            if self.at_appropriate_end_tag(&close) {
+                break;
             }
-            if self.starts_with_ci(&close) {
-                break self.pos;
+            if rcdata && self.peek_at(0) == Some(b'&') {
+                content.push_str(std::str::from_utf8(&self.input[seg..self.pos]).unwrap_or(""));
+                let decoded = self.read_entity();
+                content.push_str(&decoded);
+                seg = self.pos;
+            } else {
+                self.pos += 1;
             }
-            self.pos += 1;
-        };
-        let content = std::str::from_utf8(&self.input[start..end])
-            .unwrap_or("")
-            .to_string();
+        }
+        content.push_str(std::str::from_utf8(&self.input[seg..self.pos]).unwrap_or(""));
         if !content.is_empty() {
             self.doc.append_child(node, NodeData::Text(content));
         }
@@ -935,6 +977,17 @@ impl<'a> Parser<'a> {
             self.consume_until_byte(b'>');
             self.consume_byte();
         }
+    }
+
+    /// True at an "appropriate end tag" for a text-only element: `</tag` (ASCII
+    /// case-insensitive) followed by whitespace, `/`, or `>`. A partial `</tag` at EOF or
+    /// a name mismatch like `</titlex` is content, not a closer.
+    fn at_appropriate_end_tag(&self, close: &str) -> bool {
+        self.starts_with_ci(close)
+            && matches!(
+                self.input.get(self.pos + close.len()),
+                Some(b) if b.is_ascii_whitespace() || *b == b'/' || *b == b'>'
+            )
     }
 
     fn parse_end_tag(&mut self) {
@@ -1615,6 +1668,76 @@ mod tests {
         assert_eq!(tag_of(&doc, path), "path");
         assert!(children(&doc, path).is_empty());
         assert_eq!(tag_of(&doc, body_kids[1]), "p");
+    }
+
+    #[test]
+    fn rcdata_elements_keep_markup_as_text() {
+        // title/textarea contents are text, not elements; references decode (RCDATA).
+        let doc = parse("<title>a &amp; <b>c</title>");
+        let title = children(&doc, head_of(&doc))[0];
+        assert_eq!(tag_of(&doc, title), "title");
+        assert_eq!(text_of(&doc, children(&doc, title)[0]), Some("a & <b>c"));
+
+        let doc = parse("<div><textarea><b>x</b> &amp; y</textarea></div>");
+        let div = children(&doc, body_of(&doc))[0];
+        let ta = children(&doc, div)[0];
+        assert_eq!(tag_of(&doc, ta), "textarea");
+        assert_eq!(text_of(&doc, children(&doc, ta)[0]), Some("<b>x</b> & y"));
+    }
+
+    #[test]
+    fn rawtext_elements_keep_markup_as_text() {
+        // iframe/xmp/noembed/noframes contents are literal text — markup and
+        // references both pass through untouched.
+        let doc = parse("<div><iframe><p>fallback</p> &amp;</iframe><p>after</p></div>");
+        let div = children(&doc, body_of(&doc))[0];
+        let iframe = children(&doc, div)[0];
+        assert_eq!(tag_of(&doc, iframe), "iframe");
+        assert_eq!(
+            text_of(&doc, children(&doc, iframe)[0]),
+            Some("<p>fallback</p> &amp;")
+        );
+        let p = children(&doc, div)[1];
+        assert_eq!(tag_of(&doc, p), "p");
+
+        let doc = parse("<div><xmp><b>shown</b></xmp></div>");
+        let xmp = children(&doc, children(&doc, body_of(&doc))[0])[0];
+        assert_eq!(tag_of(&doc, xmp), "xmp");
+        assert_eq!(text_of(&doc, children(&doc, xmp)[0]), Some("<b>shown</b>"));
+    }
+
+    #[test]
+    fn text_only_end_tag_needs_a_terminator() {
+        // `</titlex` is not the appropriate end tag — it stays content, and the
+        // real `</title>` still closes.
+        let doc = parse("<title>a</titlex>b</title>");
+        let title = children(&doc, head_of(&doc))[0];
+        assert_eq!(text_of(&doc, children(&doc, title)[0]), Some("a</titlex>b"));
+    }
+
+    #[test]
+    fn pre_and_textarea_skip_leading_newline() {
+        // pre/listing/textarea discard a single LF right after the start tag.
+        let doc = parse("<pre>\nline</pre>");
+        let pre = children(&doc, body_of(&doc))[0];
+        assert_eq!(text_of(&doc, children(&doc, pre)[0]), Some("line"));
+
+        let doc = parse("<textarea>\nvalue</textarea>");
+        let ta = children(&doc, body_of(&doc))[0];
+        assert_eq!(text_of(&doc, children(&doc, ta)[0]), Some("value"));
+    }
+
+    #[test]
+    fn plaintext_consumes_everything_to_eof() {
+        // The PLAINTEXT state has no end tag: the rest of the document is text.
+        let doc = parse("<div><plaintext><p>not</p> markup");
+        let div = children(&doc, body_of(&doc))[0];
+        let pt = children(&doc, div)[0];
+        assert_eq!(tag_of(&doc, pt), "plaintext");
+        assert_eq!(
+            text_of(&doc, children(&doc, pt)[0]),
+            Some("<p>not</p> markup")
+        );
     }
 
     #[test]
