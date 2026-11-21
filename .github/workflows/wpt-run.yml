@@ -59,20 +59,29 @@ jobs:
         with:
           toolchain: '1.99.1'
       - name: Cache Rust compilations
-        uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+        uses: ./.github/actions/rust-cache
         with:
-          version: '2.1.1'
-          cache-key-prefix: kache-release
-          max-size: '2GiB'
-          pr-comment: false
+          prefix: kache-release
+          max-size: '4GiB'
       - name: Build WebDriver server
-        run: cargo build --release -p webdriver
+        run: cargo build --release -p webdriver --timings
+      - name: Upload compilation timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-webdriver
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Upload WebDriver binary
         uses: actions/upload-artifact@v4
         with:
           name: webdriver-bin
           path: target/release/webdriver
           retention-days: 1
+      - name: Stop cache writer before archiving
+        if: ${{ always() && env.KACHE_CACHE_DIR != '' }}
+        run: kache daemon stop
 
   wpt:
     needs: [scope, webdriver]
