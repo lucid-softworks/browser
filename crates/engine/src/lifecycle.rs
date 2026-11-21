@@ -5,6 +5,10 @@ impl Engine {
         InterruptHandle(self.js_context.clone())
     }
     pub fn new() -> Self {
+        Self::with_font(SystemFont::load())
+    }
+
+    pub(crate) fn with_font(font: Option<SystemFont>) -> Self {
         let js_context = js::HostContext::default();
         {
             let _host = js_context.enter();
@@ -16,7 +20,7 @@ impl Engine {
             vp_h: 600,
             scale: 1.0,
             state: LoadState::Empty,
-            font: SystemFont::load(),
+            font,
             font_faces: HashMap::new(),
             scroll_y: 0.0,
             is_dark: false,
@@ -40,6 +44,10 @@ impl Engine {
             bg_sources: HashMap::new(),
             bg_bitmaps: HashMap::new(),
             canvas_bg: None,
+            frame_renderers: HashMap::new(),
+            frame_snapshots: None,
+            frame_canvas_lists: None,
+            frame_scroll_offsets: None,
         }
     }
 
@@ -61,6 +69,7 @@ impl Engine {
         };
         js::set_font_data(bytes);
         self.font = Some(font);
+        self.frame_renderers.clear();
         self.layout_cache = None;
         self.framebuffer = None;
         // Canvas/SVG text and geometry may have used the old default face. Rebuild on render.
@@ -207,6 +216,10 @@ impl Engine {
         self.hovered_node = None; // and nothing is hovered
         self.prev_intersecting.clear(); // observer change-tracking is per-page
         self.prev_size.clear();
+        self.frame_renderers.clear();
+        self.frame_snapshots = None;
+        self.frame_canvas_lists = None;
+        self.frame_scroll_offsets = None;
         self.session = None; // drop the previous page's runtime (stops its thread)
         self.selection = None; // a new page starts with nothing selected
         js::set_active_selection(None); // and no programmatic (::selection) selection
@@ -635,10 +648,6 @@ impl Engine {
     /// stream into an RGBA bitmap. Guarded: returns immediately if there's no script Session or the
     /// loaded DOM contains no `<canvas>` (the common case), so non-canvas pages pay nothing.
     pub(crate) fn update_canvas_bitmaps(&mut self) {
-        let session = match &self.session {
-            Some(s) => s,
-            None => return,
-        };
         // Guard: skip the JS round-trip unless the DOM actually has a <canvas>.
         let has_canvas = matches!(&self.state, LoadState::Loaded { doc: Some(d), .. }
             if (0..d.len()).any(|i| matches!(&d.get(dom::NodeId(i)).data,
@@ -649,7 +658,13 @@ impl Engine {
             }
             return;
         }
-        let json = session.canvas_lists();
+        let json = match &self.session {
+            Some(session) => session.canvas_lists(),
+            None => self
+                .frame_canvas_lists
+                .clone()
+                .unwrap_or_else(|| "[]".into()),
+        };
         let font = self.font.as_ref();
         // Source pixels for drawImage: decoded <img> bitmaps (by node id) plus PREVIOUS-frame canvas
         // bitmaps (canvas-draws-canvas uses last frame — a one-frame lag, acceptable).
@@ -678,7 +693,9 @@ impl Engine {
             .iter()
             .map(|(id, img)| (id.0, img.w, img.h, img.rgba.clone()))
             .collect();
-        session.set_canvas_pixels(pixels);
+        if let Some(session) = &self.session {
+            session.set_canvas_pixels(pixels);
+        }
         self.canvas_bitmaps = next;
     }
 
@@ -953,7 +970,7 @@ impl Engine {
     fn sync_element_scroll_offsets(&mut self) -> bool {
         let raw = match &self.session {
             Some(session) => session.element_scroll_offsets(),
-            None => return false,
+            None => self.frame_scroll_offsets.clone().unwrap_or_default(),
         };
         let mut next: HashMap<dom::NodeId, (f32, f32)> = HashMap::new();
         for entry in raw.split(';').filter(|s| !s.is_empty()) {
@@ -1035,6 +1052,8 @@ impl Engine {
         if layout_changed {
             self.update_bg_image_bitmaps();
         }
+
+        self.update_frame_bitmaps();
 
         let mut fb = Framebuffer::new(dw, dh);
         let mut scroll_y = self.scroll_y;

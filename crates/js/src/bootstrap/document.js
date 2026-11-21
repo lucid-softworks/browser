@@ -35,6 +35,16 @@
   function makeCollection(Ctor, resolver, live) {
     var snapshot = live ? null : resolver().slice();
     var resolve = live ? resolver : function () { return snapshot; };
+    // HTMLCollections all resolve against this realm's arena. Reuse their membership until a
+    // DOM mutation: indexed iteration must not walk the whole subtree for every single item.
+    if (live && Ctor === HTMLCollection && typeof __domVersion === "function") {
+      var version = -1, items;
+      resolve = function () {
+        var current = __domVersion();
+        if (current !== version) { items = resolver(); version = current; }
+        return items;
+      };
+    }
     var target = Object.create(Ctor.prototype);
     var proxy = new Proxy(target, {
       get: function (obj, prop, receiver) {
@@ -313,6 +323,7 @@
       var kids = __children(nid);
       for (var i = 0; i < kids.length; i++) {
         var kid = kids[i];
+        if (globalThis.__shadowRootIds && globalThis.__shadowRootIds[kid]) { continue; }
         if (__nodeType(kid) === 1 && __getAttr(kid, "id") === target) { return kid; }
         var found = visit(kid);
         if (found >= 0) { return found; }
@@ -709,6 +720,12 @@
 
   function wrap(id) {
     if (typeof id !== "number" || id < 0) { return null; }
+    // Reuse a live wrapper before allocating its accessors and methods. Canonicalizing only
+    // after construction creates hundreds of short-lived closures on every node lookup.
+    if (globalThis.__cachedNode) {
+      var cached = globalThis.__cachedNode(id);
+      if (cached) { return cached; }
+    }
     var el = {};
     def(el, NODE, id);
     def(el, "__nodeRealmToken", __nodeRealmToken);

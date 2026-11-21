@@ -19,6 +19,55 @@ use crate::value::{Object, Property, Value};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Each realm has its own module map, even when several documents load the same URL.
+pub(crate) struct RealmModuleMap<T> {
+    active: Rc<std::cell::Cell<usize>>,
+    realms: HashMap<usize, HashMap<String, T>>,
+}
+
+impl<T> RealmModuleMap<T> {
+    pub(crate) fn new(active: Rc<std::cell::Cell<usize>>) -> Self {
+        Self {
+            active,
+            realms: HashMap::new(),
+        }
+    }
+    pub(crate) fn set_realm(&self, id: usize) {
+        self.active.set(id);
+    }
+    pub(crate) fn get(&self, key: &str) -> Option<&T> {
+        self.realms.get(&self.active.get())?.get(key)
+    }
+    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut T> {
+        self.realms.get_mut(&self.active.get())?.get_mut(key)
+    }
+    pub(crate) fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+    pub(crate) fn insert(&mut self, key: String, value: T) -> Option<T> {
+        self.realms
+            .entry(self.active.get())
+            .or_default()
+            .insert(key, value)
+    }
+    pub(crate) fn values_in(&self, realm: usize) -> impl Iterator<Item = &T> {
+        self.realms
+            .get(&realm)
+            .into_iter()
+            .flat_map(|map| map.values())
+    }
+    pub(crate) fn remove_realm(&mut self, realm: usize) {
+        self.realms.remove(&realm);
+    }
+}
+
+impl<T, Q: AsRef<str> + ?Sized> std::ops::Index<&Q> for RealmModuleMap<T> {
+    type Output = T;
+    fn index(&self, key: &Q) -> &T {
+        self.get(key.as_ref()).expect("registered module")
+    }
+}
+
 /// How a module-namespace property reads its current value.
 #[derive(Clone)]
 pub enum NsBinding {
@@ -76,6 +125,19 @@ pub(crate) struct ModuleRec {
     on_stack: bool,
     /// The root of this module's strongly-connected component ([[CycleRoot]]).
     cycle_root: Option<String>,
+}
+
+impl ModuleRec {
+    pub(crate) fn env(&self) -> &Env {
+        &self.env
+    }
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Value> {
+        [&self.ns, &self.meta]
+            .into_iter()
+            .chain(self.preparation_error.iter())
+            .chain(self.eval_error.iter())
+            .chain(self.top_promise.iter())
+    }
 }
 
 /// The origin of a local name that is an import binding (so re-exports resolve to the source).

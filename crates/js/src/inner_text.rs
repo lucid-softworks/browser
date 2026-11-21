@@ -630,6 +630,7 @@ fn rendered_text_fragment(input: &str) -> Vec<dom::NodeData> {
                 i += 1;
             }
             out.push(dom::NodeData::Element(dom::ElementData {
+                value: None,
                 tag: "br".to_string(),
                 attrs: Default::default(),
                 namespace: None,

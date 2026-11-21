@@ -55,6 +55,16 @@ pub(crate) enum SessionCmd {
     SetCanvasPixels {
         pixels: Vec<(usize, u32, u32, Vec<u8>)>,
     },
+    FramePixels {
+        updates: Vec<crate::FramePixels>,
+    },
+    FrameSnapshots {
+        reply: std::sync::mpsc::Sender<Vec<crate::FrameSnapshot>>,
+    },
+    Inspect {
+        source: String,
+        reply: std::sync::mpsc::Sender<String>,
+    },
     /// Stop the loop; the engine is torn down on the thread it lives on.
     Stop,
 }
@@ -81,6 +91,38 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn set_frame_pixels(&self, updates: Vec<crate::FramePixels>) {
+        let _ = self.tx.send(SessionCmd::FramePixels { updates });
+    }
+
+    pub fn frame_snapshots(&self) -> Vec<crate::FrameSnapshot> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self
+            .tx
+            .send(SessionCmd::FrameSnapshots { reply: tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.recv_timeout(execution_budget()).unwrap_or_default()
+    }
+
+    // Rendering queries must not advance timers, mutate the page, or drain future animation frames.
+    fn inspect(&self, source: &str) -> String {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if self
+            .tx
+            .send(SessionCmd::Inspect {
+                source: source.into(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return String::new();
+        }
+        rx.recv_timeout(execution_budget()).unwrap_or_default()
+    }
+
     pub fn execution_stopped(&self) -> bool {
         self.execution.is_cancelled()
     }
@@ -97,7 +139,7 @@ impl Session {
         &self,
         receiver: std::sync::mpsc::Receiver<(dom::Document, Vec<String>)>,
     ) -> (dom::Document, Vec<String>) {
-        match receiver.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+        match receiver.recv_timeout(execution_budget() + std::time::Duration::from_secs(2)) {
             Ok((doc, console)) => {
                 self.remember(&doc);
                 (doc, console)
@@ -261,7 +303,7 @@ impl Session {
 
         // Block (bounded) for the initial load to finish. On timeout/panic, render the pre-script
         // DOM — matching the existing channel-timeout fallback in run_with_dom/run_modules.
-        let budget = EXECUTION_BUDGET + std::time::Duration::from_secs(2);
+        let budget = execution_budget() + std::time::Duration::from_secs(2);
         let (snapshot, outputs) = match init_rx.recv_timeout(budget) {
             Ok(result) => result,
             Err(_) => {
@@ -399,28 +441,21 @@ impl Session {
     /// (`[{kind:"io"|"ro", observerId, nodeId}, ...]`). Empty `[]` when no such observers exist —
     /// the engine uses this to skip geometry work entirely on pages without observers.
     pub fn observed_targets(&self) -> String {
-        let (out, _doc, _console) =
-            self.eval_full("JSON.stringify(__observedTargets())".to_string());
-        out.value.unwrap_or_else(|| "[]".to_string())
+        self.inspect("JSON.stringify(__observedTargets())")
     }
 
     /// Return the JSON display lists of every `<canvas>` that has a 2D context, for the engine to
     /// rasterize: `[{id,width,height,commands:[...]}, ...]`. Empty `[]` when no canvas has a
     /// context. The engine gates this on the DOM actually containing a `<canvas>`.
     pub fn canvas_lists(&self) -> String {
-        let (out, _doc, _console) = self.eval_full(
-            "JSON.stringify((globalThis.__canvasLists||function(){return[]})())".to_string(),
-        );
-        out.value.unwrap_or_else(|| "[]".to_string())
+        self.inspect("JSON.stringify((globalThis.__canvasLists||function(){return[]})())")
     }
 
     /// Return element scroll offsets as `node:left:top;...`. Only elements whose scrolling
     /// accessors have been written are included; zero entries remain present so the engine can
     /// undo a previously-applied translation.
     pub fn element_scroll_offsets(&self) -> String {
-        let (out, _doc, _console) = self
-            .eval_full("(globalThis.__elementScrollOffsets||function(){return ''})()".to_string());
-        out.value.unwrap_or_default()
+        self.inspect("(globalThis.__elementScrollOffsets||function(){return ''})()")
     }
 
     /// Deliver computed IntersectionObserver/ResizeObserver geometry to the page: invokes the JS
@@ -444,7 +479,7 @@ impl Session {
         {
             return self.stopped_output();
         }
-        match reply_rx.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+        match reply_rx.recv_timeout(execution_budget() + std::time::Duration::from_secs(2)) {
             Ok((out, doc, console)) => {
                 self.remember(&doc);
                 (out, doc, console)
@@ -531,7 +566,7 @@ impl Session {
         if self.tx.send(SessionCmd::Tick { reply: reply_tx }).is_err() {
             return None;
         }
-        match reply_rx.recv_timeout(EXECUTION_BUDGET + std::time::Duration::from_secs(2)) {
+        match reply_rx.recv_timeout(execution_budget() + std::time::Duration::from_secs(2)) {
             Ok(result) => {
                 if let Some((doc, _)) = &result {
                     self.remember(doc);
@@ -601,7 +636,7 @@ pub(crate) fn session_thread_main(
     // Background socket threads deliver WebSocket events here; the receiver lives for the whole
     // session and is drained (non-blocking) on every drain pass alongside the fetch channel.
     let (ws_evt_tx, ws_evt_rx) = std::sync::mpsc::channel::<WsEvent>();
-    let initial_operation = execution.enter(EXECUTION_BUDGET);
+    let initial_operation = execution.enter(execution_budget());
     let mut engine = controlled_engine(&execution);
     let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> = Rc::new(move |u: &str| fetcher(u));
     let registry = install_module_loader(&mut engine, modules, fetcher.clone(), &url);
@@ -623,10 +658,9 @@ pub(crate) fn session_thread_main(
 
         // Register the page context NOW (before the initial scripts run), so a worker created during
         // page load can immediately deliver `postMessage` back into the page.
-        crate::set_page_context(
-            crate::realms::Realm::current(scope)
-                .unwrap_or_else(|_| panic!("page realm must be available")),
-        );
+        let page_realm = crate::realms::Realm::current(scope)
+            .unwrap_or_else(|_| panic!("page realm must be available"));
+        crate::set_page_context(scope, page_realm);
 
         // Seed the engine-computed layout rects BEFORE scripts run, so synchronous
         // getBoundingClientRect / elementFromPoint / caret*FromPoint reads during page load see real
@@ -704,16 +738,17 @@ pub(crate) fn session_thread_main(
 
     drop(initial_operation);
     if execution.is_cancelled() {
-        crate::clear_workers();
-        crate::clear_frames();
+        crate::clear_workers(engine.ctx());
+        crate::clear_frames(engine.ctx());
         return;
     }
+    engine.ctx().op_state().put(crate::eval_loop::RenderTurns);
     // Commands reuse the persistent Lumen page realm.
     for cmd in cmd_rx {
         if execution.is_cancelled() {
             break;
         }
-        let _operation = execution.enter(EXECUTION_BUDGET);
+        let _operation = execution.enter(execution_budget());
         let __cmd_t0 = std::time::Instant::now();
         match cmd {
             SessionCmd::Dispatch {
@@ -846,6 +881,19 @@ pub(crate) fn session_thread_main(
                     map.insert(id, (w, h, rgba));
                 }
             }
+            SessionCmd::FramePixels { updates } => {
+                crate::iframe::set_frame_pixels(engine.ctx(), updates)
+            }
+            SessionCmd::FrameSnapshots { reply } => {
+                let _ = reply.send(crate::iframe::snapshot_frames(engine.ctx()));
+            }
+            SessionCmd::Inspect { source, reply } => {
+                let scope = engine.ctx();
+                let value = eval_value(scope, &source)
+                    .map(|v| v.to_rust_string_lossy(scope))
+                    .unwrap_or_default();
+                let _ = reply.send(value);
+            }
             SessionCmd::Stop => break,
         }
         // Per-tab stats for the tab tooltip: active JS time this command (CPU proxy — the thread is
@@ -861,8 +909,8 @@ pub(crate) fn session_thread_main(
     }
     // Loop ended (Stop or sender dropped). Drop worker realms + the page-context handle BEFORE the
     // engine so the thread-local doesn't outlive the engine it holds handles into.
-    crate::clear_workers();
-    crate::clear_frames();
+    crate::clear_workers(engine.ctx());
+    crate::clear_frames(engine.ctx());
     drop(engine);
 }
 

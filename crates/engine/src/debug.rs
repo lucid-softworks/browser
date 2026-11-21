@@ -40,6 +40,9 @@ impl Engine {
             c.extend(console);
             self.layout_cache = None; // the eval may have mutated the DOM
         }
+        if self.has_frame_content() {
+            self.render();
+        }
         display
     }
 

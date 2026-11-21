@@ -9,6 +9,23 @@ use std::rc::Rc;
 
 pub type Gc = Rc<RefCell<Object>>;
 
+/// An embedder's non-owning object handle. It does not keep an otherwise unreachable object alive.
+#[derive(Clone)]
+pub struct WeakObject(std::rc::Weak<RefCell<Object>>);
+
+impl WeakObject {
+    pub fn new(value: &Value) -> Option<Self> {
+        match value {
+            Value::Obj(object) => Some(Self(Rc::downgrade(object))),
+            _ => None,
+        }
+    }
+
+    pub fn upgrade(&self) -> Option<Value> {
+        self.0.upgrade().map(Value::Obj)
+    }
+}
+
 /// A native (Rust-implemented) function. It can only throw (via `Err`), never break/return/continue,
 /// so a plain `Result<Value, Value>` (Err = the thrown value) is the whole contract.
 pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> Result<Value, Value>;
@@ -823,7 +840,7 @@ impl Object {
     /// the map from moved stack values before allocation, avoiding an empty map plus RefCell
     /// replacement on every object.
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
-        GC_STATE.with(|state| {
+        with_gc_state(|state| {
             state.live.set(state.live.get() + 1);
             let mut reg = state.registry.borrow_mut();
             let slot = match reg.free.pop() {
@@ -858,7 +875,8 @@ impl Drop for Object {
         // is O(1), does not touch another (possibly borrowed) object, and bounds registry memory
         // by peak simultaneously-live objects instead of cumulative allocation count.
         let slot = self.gc_internal.get() as usize;
-        let _ = GC_STATE.try_with(|state| {
+        let _ = GC_STATE.try_with(|current| {
+            let state = current.borrow().clone();
             let mut reg = state.registry.borrow_mut();
             if slot < reg.entries.len() && !reg.entries[slot].is_null() {
                 reg.entries[slot] = std::ptr::null();
@@ -880,34 +898,46 @@ struct GcRegistry {
     free: Vec<usize>,
 }
 
-struct GcState {
+pub(crate) struct GcState {
     registry: RefCell<GcRegistry>,
     live: Cell<i64>,
 }
 
 thread_local! {
-    static GC_STATE: GcState = GcState {
+    static GC_STATE: RefCell<Rc<GcState>> = RefCell::new(Rc::new(GcState {
         registry: RefCell::new(GcRegistry {
             entries: Vec::new(),
             free: Vec::new(),
         }),
         live: Cell::new(0),
-    };
+    }));
+}
+
+pub(crate) fn gc_thread_state() -> Rc<GcState> {
+    GC_STATE.with(|slot| slot.borrow().clone())
+}
+
+pub(crate) fn replace_gc_thread_state(state: Rc<GcState>) -> Rc<GcState> {
+    GC_STATE.with(|slot| slot.replace(state))
+}
+
+fn with_gc_state<T>(f: impl FnOnce(&GcState) -> T) -> T {
+    f(&gc_thread_state())
 }
 
 /// Number of live heap objects right now.
 pub fn live_objects() -> i64 {
-    GC_STATE.with(|state| state.live.get())
+    with_gc_state(|state| state.live.get())
 }
 
-/// Stable address of this thread's live-object counter. The Rc-based runtime and its compiled
-/// chunks are `!Send`, so generated code executes on the thread that baked this TLS address.
+/// Stable address of the active heap's live-object counter. Coroutine workers install the same
+/// heap under the strict interpreter handoff, so generated code retains this address there.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) fn live_objects_ptr() -> *const i64 {
-    GC_STATE.with(|state| state.live.as_ptr())
+    with_gc_state(|state| state.live.as_ptr())
 }
 
 /// Strong handles to every currently-live heap object. Registry slots are non-owning raw
@@ -923,7 +953,7 @@ pub fn gc_snapshot() -> Vec<Gc> {
 /// Fill a reusable buffer with strong handles to every currently-live heap object.
 pub(crate) fn gc_snapshot_into(live: &mut Vec<Gc>) {
     live.clear();
-    GC_STATE.with(|state| {
+    with_gc_state(|state| {
         let reg = state.registry.borrow();
         live.reserve(reg.entries.len().saturating_sub(reg.free.len()));
         for &ptr in &reg.entries {
@@ -942,7 +972,7 @@ pub(crate) fn gc_snapshot_into(live: &mut Vec<Gc>) {
 /// this after marking and before sweeping side tables/properties can release the final owner of
 /// any object, so `Object::drop` always sees its stable slot.
 pub(crate) fn gc_restore_registry_slots() {
-    GC_STATE.with(|state| {
+    with_gc_state(|state| {
         let reg = state.registry.borrow();
         for (slot, &ptr) in reg.entries.iter().enumerate() {
             if !ptr.is_null() {
@@ -955,7 +985,7 @@ pub(crate) fn gc_restore_registry_slots() {
 
 #[cfg(test)]
 pub(crate) fn gc_registry_stats() -> (usize, usize) {
-    GC_STATE.with(|state| {
+    with_gc_state(|state| {
         let reg = state.registry.borrow();
         (reg.entries.len(), reg.free.len())
     })

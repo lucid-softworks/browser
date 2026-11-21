@@ -613,6 +613,11 @@ impl Engine {
         if self.apply_pending_scroll() {
             dirty = true;
         }
+        // Headless drivers also need rendering opportunities: a subsequent animation callback
+        // must observe the cost of painting the previous task, including child documents.
+        if dirty {
+            self.render();
+        }
         dirty
     }
 

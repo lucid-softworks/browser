@@ -80,6 +80,8 @@ pub struct PaintStyle {
     /// True for a `<legend>` element. Its fieldset parent lays it out inside the block-start border
     /// (rather than as a normal in-flow child) and offsets the following content by the legend height.
     pub is_legend: bool,
+    /// Iframes have an independent viewport, without an intrinsic aspect ratio.
+    pub is_iframe: bool,
     /// Draw an underline under text runs (`text-decoration: underline`).
     pub underline: bool,
     /// Draw a strike-through line over text runs (`text-decoration: line-through`).
@@ -160,6 +162,7 @@ impl Default for PaintStyle {
             border_collapse: style::BorderCollapse::Separate,
             is_table_cell: false,
             is_legend: false,
+            is_iframe: false,
             underline: false,
             line_through: false,
             overline: false,

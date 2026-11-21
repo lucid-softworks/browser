@@ -22,6 +22,10 @@ pub(crate) enum CollectionKind {
 }
 
 impl CollectionKind {
+    pub(crate) fn is_weak(self) -> bool {
+        matches!(self, Self::WeakMap | Self::WeakSet)
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Map => "Map",

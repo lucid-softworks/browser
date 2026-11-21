@@ -14,6 +14,24 @@ pub(crate) fn layout_flex(
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
 ) -> f32 {
+    let height = explicit_height(boxx, styles).map(|h| {
+        if box_sizing_of(boxx, styles) == style::BoxSizing::BorderBox {
+            let d = &boxx.dimensions;
+            (h - d.padding.top - d.padding.bottom - d.border.top - d.border.bottom).max(0.0)
+        } else {
+            h
+        }
+    });
+    layout_flex_with_height(boxx, ctx, styles, measurer, height)
+}
+
+fn layout_flex_with_height(
+    boxx: &mut LayoutBox,
+    ctx: Ctx,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    measurer: &dyn TextMeasurer,
+    definite_height: Option<f32>,
+) -> f32 {
     let cs = style_of(boxx, styles).cloned().unwrap_or_default();
     let content = boxx.dimensions.content;
     let is_row = matches!(
@@ -48,10 +66,10 @@ pub(crate) fn layout_flex(
     let main_avail = if main_horizontal {
         content.width
     } else {
-        explicit_height(boxx, styles).unwrap_or(f32::INFINITY)
+        definite_height.unwrap_or(f32::INFINITY)
     };
     let cross_container = if main_horizontal {
-        explicit_height(boxx, styles) // None → derived from lines
+        definite_height // None → derived from lines
     } else {
         Some(content.width)
     };
@@ -339,6 +357,7 @@ pub(crate) fn layout_flex(
         // extent (so alignment / stretch are measured against the container box).
         let content_cross: f32 = line.iter().map(|&mi| actual_cross[mi]).fold(0.0, f32::max);
         let line_cross: f32 = match cross_container {
+            Some(c) if !wrap => c,
             Some(c) if lines.len() == 1 => c.max(content_cross),
             _ => content_cross,
         };
@@ -387,7 +406,11 @@ pub(crate) fn layout_flex(
                 item_main
             } else {
                 let has_explicit_main = explicit_height(&boxx.children[meta.idx], styles).is_some();
-                if has_explicit_main {
+                if has_explicit_main
+                    || (main_avail.is_finite()
+                        && style_of(&boxx.children[meta.idx], styles)
+                            .is_some_and(|cs| cs.overflow_scrollport))
+                {
                     item_main
                 } else {
                     let laid_main = actual_laid[mi] + meta.main_edges;
@@ -432,7 +455,18 @@ pub(crate) fn layout_flex(
             };
 
             // Re-lay out contents at the final position so descendant boxes are correctly placed.
-            layout_flex_item_contents(child, ctx, styles, measurer);
+            // A definite flex main size, or stretch into a definite cross size, becomes the
+            // nested flex container's available height. Do not replace it with intrinsic content.
+            let child_height = if (!main_horizontal && main_avail.is_finite())
+                || (main_horizontal
+                    && matches!(align, style::AlignSelf::Stretch)
+                    && cross_container.is_some())
+            {
+                Some(ch)
+            } else {
+                None
+            };
+            layout_item_contents_with_height(child, ctx, styles, measurer, child_height);
 
             if main_horizontal {
                 pos += item_main + main_gap + between_extra;
@@ -453,7 +487,7 @@ pub(crate) fn layout_flex(
     let total_cross: f32 = line_cross_sizes.iter().sum::<f32>()
         + cross_gap * (line_cross_sizes.len().saturating_sub(1) as f32);
     if main_horizontal {
-        explicit_height(boxx, styles).unwrap_or(total_cross)
+        definite_height.unwrap_or(total_cross)
     } else {
         // column: height is the main size used.
         let used = line_cross_sizes; // not used here
@@ -466,7 +500,7 @@ pub(crate) fn layout_flex(
                     max_bottom.max(c.dimensions.margin_box().y + c.dimensions.margin_box().height);
             }
         }
-        explicit_height(boxx, styles).unwrap_or((max_bottom - content.y).max(0.0))
+        definite_height.unwrap_or((max_bottom - content.y).max(0.0))
     }
 }
 
@@ -928,6 +962,16 @@ pub(crate) fn layout_flex_item_contents(
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
 ) -> f32 {
+    layout_item_contents_with_height(boxx, ctx, styles, measurer, None)
+}
+
+fn layout_item_contents_with_height(
+    boxx: &mut LayoutBox,
+    ctx: Ctx,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    measurer: &dyn TextMeasurer,
+    definite_height: Option<f32>,
+) -> f32 {
     let child_ctx = if !matches!(position_of(boxx, styles), style::Position::Static) {
         Ctx {
             positioned: boxx.dimensions.padding_box(),
@@ -940,7 +984,11 @@ pub(crate) fn layout_flex_item_contents(
     let display = display_of(boxx, styles);
     let laid_out = match display {
         style::Display::Flex | style::Display::InlineFlex => {
-            layout_flex(boxx, child_ctx, styles, measurer)
+            if let Some(height) = definite_height {
+                layout_flex_with_height(boxx, child_ctx, styles, measurer, Some(height))
+            } else {
+                layout_flex(boxx, child_ctx, styles, measurer)
+            }
         }
         style::Display::Grid | style::Display::InlineGrid => {
             layout_grid(boxx, child_ctx, styles, measurer)

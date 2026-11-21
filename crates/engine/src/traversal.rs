@@ -1078,7 +1078,7 @@ pub(crate) fn node_value(doc: &dom::Document, id: dom::NodeId) -> Option<String>
         return None;
     }
     match &doc.get(id).data {
-        dom::NodeData::Element(e) => Some(e.attrs.get("value").cloned().unwrap_or_default()),
+        dom::NodeData::Element(e) => Some(e.current_value().unwrap_or_default().to_string()),
         _ => None,
     }
 }

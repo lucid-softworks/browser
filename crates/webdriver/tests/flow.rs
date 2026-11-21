@@ -537,6 +537,20 @@ document.getElementById('cancel').addEventListener('click', function(e) {{ e.pre
         Json::Str("popstate,hashchange".into()),
         "fragment navigation preserves the document and notifies hash routers"
     );
+    command(
+        "POST",
+        "/execute/sync",
+        Some(r#"{"script":"location.hash = location.hash","args":[]}"#),
+    );
+    assert_eq!(
+        command(
+            "POST",
+            "/execute/sync",
+            Some(r#"{"script":"return navigationEvents.join(',')","args":[]}"#)
+        ),
+        Json::Str("popstate,hashchange".into()),
+        "assigning the current fragment neither reloads the document nor fires events"
+    );
     command("POST", "/back", Some("{}"));
     assert_eq!(
         command(

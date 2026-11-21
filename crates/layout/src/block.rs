@@ -117,6 +117,7 @@ pub(crate) fn layout_block(
     // an image (origin inside the containing block) and don't run block/inline formatting (which
     // would zero its pre-set height).
     if matches!(boxx.content, BoxContent::Widget(_) | BoxContent::Image(_)) {
+        size_iframe(boxx, containing, styles);
         layout_image_box(boxx, containing);
         return;
     }
@@ -444,7 +445,10 @@ pub(crate) fn layout_block_children(
             BoxContent::Block => {
                 grow_stack(|| layout_block(child, containing, ctx, styles, measurer))
             }
-            BoxContent::Image(_) | BoxContent::Widget(_) => layout_image_box(child, containing),
+            BoxContent::Image(_) | BoxContent::Widget(_) => {
+                size_iframe(child, containing, styles);
+                layout_image_box(child, containing)
+            }
             BoxContent::Anonymous => {
                 // Anonymous blocks inherit the establishing block's text-align; the first one also
                 // carries the block's `text-indent` (consumed so siblings aren't re-indented).
@@ -624,6 +628,37 @@ fn layout_float_child(
     // Place the margin box and slide the whole subtree from its tentative origin to the slot.
     let (fx, fy) = floats.place(mb.width, mb.height, start_y, side);
     shift_subtree(child, fx - mb.x, fy - mb.y);
+}
+
+/// Resolve a child browsing context's percentage viewport dimensions against its container.
+pub(crate) fn size_iframe(
+    boxx: &mut LayoutBox,
+    containing: Rect,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) {
+    if !boxx.style.is_iframe {
+        return;
+    }
+    let Some(cs) = style_of(boxx, styles) else {
+        return;
+    };
+    let border_box = cs.box_sizing == style::BoxSizing::BorderBox;
+    if let Some(pct) = cs.width_pct {
+        let edges = if border_box {
+            cs.padding.left + cs.padding.right + cs.border.left + cs.border.right
+        } else {
+            0.0
+        };
+        boxx.dimensions.content.width = (containing.width * pct - edges).max(0.0);
+    }
+    if let Some(pct) = cs.height_pct.filter(|_| containing.height > 0.0) {
+        let edges = if border_box {
+            cs.padding.top + cs.padding.bottom + cs.border.top + cs.border.bottom
+        } else {
+            0.0
+        };
+        boxx.dimensions.content.height = (containing.height * pct - edges).max(0.0);
+    }
 }
 
 /// Position a replaced (image) box within `containing`. The content size was pre-computed at
