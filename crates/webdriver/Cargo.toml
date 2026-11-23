@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 engine = { path = "../engine" }
 net = { path = "../net" }
-base64 = "0.22"
+base64 = "0.23"
 image = "0.25"
 
 [lints]
