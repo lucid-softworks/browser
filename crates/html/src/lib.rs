@@ -587,8 +587,8 @@ impl<'a> Parser<'a> {
             if self.peek_at(0) == Some(b';') {
                 self.pos += 1;
             }
-            return match code.and_then(char::from_u32) {
-                Some(ch) => ch.to_string(),
+            return match code {
+                Some(n) => decode_numeric_reference(n).to_string(),
                 None => '\u{FFFD}'.to_string(),
             };
         }
@@ -1139,6 +1139,42 @@ fn is_tag_name_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'-' || c == b':' || c == b'_'
 }
 
+/// Decode a numeric character reference using the HTML spec's Windows-1252
+/// replacements for C1 controls (e.g. `&#150;` is an en dash, not U+0096).
+fn decode_numeric_reference(code: u32) -> char {
+    match code {
+        0x00 => '\u{FFFD}',
+        0x80 => '\u{20AC}',
+        0x82 => '\u{201A}',
+        0x83 => '\u{0192}',
+        0x84 => '\u{201E}',
+        0x85 => '\u{2026}',
+        0x86 => '\u{2020}',
+        0x87 => '\u{2021}',
+        0x88 => '\u{02C6}',
+        0x89 => '\u{2030}',
+        0x8A => '\u{0160}',
+        0x8B => '\u{2039}',
+        0x8C => '\u{0152}',
+        0x8E => '\u{017D}',
+        0x91 => '\u{2018}',
+        0x92 => '\u{2019}',
+        0x93 => '\u{201C}',
+        0x94 => '\u{201D}',
+        0x95 => '\u{2022}',
+        0x96 => '\u{2013}',
+        0x97 => '\u{2014}',
+        0x98 => '\u{02DC}',
+        0x99 => '\u{2122}',
+        0x9A => '\u{0161}',
+        0x9B => '\u{203A}',
+        0x9C => '\u{0153}',
+        0x9E => '\u{017E}',
+        0x9F => '\u{0178}',
+        n => char::from_u32(n).unwrap_or('\u{FFFD}'),
+    }
+}
+
 /// Decode a named character reference. Returns `None` for unknown names.
 ///
 /// Covers the comprehensive HTML5 named character reference set: core, Latin-1
@@ -1533,6 +1569,17 @@ mod tests {
         let p = children(&doc, body_of(&doc))[0];
         let t = children(&doc, p)[0];
         assert_eq!(text_of(&doc, t), Some("a & b <c> 'x' A \u{00A0}\u{00A9}"));
+    }
+
+    #[test]
+    fn numeric_refs_follow_html_replacement_rules() {
+        let doc = parse("<p>&#150; &#x97; &#128; &#x9F; &#0;</p>");
+        let p = children(&doc, body_of(&doc))[0];
+        let t = children(&doc, p)[0];
+        assert_eq!(
+            text_of(&doc, t),
+            Some("\u{2013} \u{2014} \u{20AC} \u{0178} \u{FFFD}")
+        );
     }
 
     #[test]
